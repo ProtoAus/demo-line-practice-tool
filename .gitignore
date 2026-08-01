@@ -1,0 +1,33 @@
+# Build output
+*.obj
+*.dll
+*.exe
+*.pdb
+*.exp
+*.lib
+*.ilk
+*.idb
+
+# Runtime data.
+#
+# Not just build noise: wrlines_data\paths\ holds .wrpath files derived from
+# other players' downloaded demos, and every one of them carries that player's
+# name and SteamID64. They are yours to generate locally, not to publish.
+# wrlines.log and wrlines_offsets.ini are per-machine too.
+wrlines_data/
+
+# Third-party trees, cloned by hand -- see README, "Build".
+imgui/
+minhook/
+
+# Python
+__pycache__/
+*.pyc
+
+# Editors / IDE
+.vs/
+.vscode/
+*.user
+*.suo
+*.sln
+*.vcxproj*

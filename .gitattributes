@@ -1,0 +1,12 @@
+# Normalise to LF in the repository, check out native.
+* text=auto
+
+# cmd.exe is happiest with CRLF in a batch file.
+*.bat text eol=crlf
+
+# Never let git touch these if any ever get committed.
+*.wrpath binary
+*.mtv binary
+*.dll binary
+*.exe binary
+*.pdb binary
