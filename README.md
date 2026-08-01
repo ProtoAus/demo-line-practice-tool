@@ -272,6 +272,12 @@ known-good single-stage demos and testing the stitched points against that geome
   are reported as `FAIL`, never silently written.
 - Short stage runs that start near the world origin can be indistinguishable from the
   velocity stream by magnitude alone. These are reported as failures with the reason given.
+- **Some maps are simply much worse.** `surf_colin_blaster_69000` is the worst measured: of
+  141 demos, 66 failed, and of the 75 written only 17 passed the max-speed check. Median
+  coverage was 30.1 % against 96.8 % on `surf_demise`. The 58 flagged ones are drawn with a
+  `!` in the Runs tab and should be treated as suspect rather than merely incomplete — the
+  median max-speed error across them is 36 u/s, where a confirmed chain matches to about
+  0.01. It also took 68 s per demo there versus 0.7 s on a normal map.
 - Split markers are only drawn when the anchoring passed its confidence check. Wrong
   markers are worse than no markers.
 
