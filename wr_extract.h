@@ -29,15 +29,28 @@
 
 #include "wr_common.h"
 
+// Must match EXTRACTOR_REVISION in wrpath_extract.py. A recorded failure from a
+// different revision is ignored here, which reports the demo as unprocessed --
+// the safe direction, since the worst case is offering to redo work.
+#define WR_EXTRACTOR_REVISION 1
+
 // Start counting demos for this map, on a background thread. Cheap to call.
 void WrExtractOnMapChanged(const char *map);
 
 // Results of that count. Returns false while it is still running.
-bool WrExtractCounts(int *forThisMap, int *alreadyDone, int *notYetDone);
+//
+// knownBad is demos the extractor has already tried and given up on, recorded
+// in paths\<map>\_failed.txt. They are counted separately from notYetDone on
+// purpose: surf_colin_blaster_69000 has 66 of them, they take four and a half
+// minutes to fail again, and without this the panel offered "66 new" forever
+// and each press of the button spent those minutes reaching the same answer.
+bool WrExtractCounts(int *forThisMap, int *alreadyDone, int *notYetDone,
+                     int *knownBad);
 
 // Start the extractor for the current map. No-op if one is already running or no
-// python could be found.
-void WrExtractRun(void);
+// python could be found. retryFailed passes --retry-failed, which is the only
+// way to make it reconsider the recorded failures.
+void WrExtractRun(bool retryFailed);
 bool WrExtractRunning(void);
 
 // Which interpreter we found, or why we could not find one.

@@ -246,6 +246,38 @@ costs seconds rather than minutes.
 Needs `py.exe` or `python.exe` on `PATH`; the panel says which it found, or that it found
 neither.
 
+The panel is there whether or not the map has any paths yet. A map with nothing extracted is
+exactly when you need the button most.
+
+### Demos that cannot be extracted
+
+Some demos cannot be read at all — see [Known limits](#known-limits). Failing to read one is
+not cheap: on `surf_colin_blaster_69000` the 66 unreadable demos take **220 seconds** to fail,
+every time, and until now every press of Extract paid that again and reported the same 66 as
+"new".
+
+So failures are recorded, in `wrlines_data\paths\<map>\_failed.txt`, with the reason and the
+demo's size:
+
+```
+# extractor-revision <TAB> bytes <TAB> demo <TAB> why
+1  19307  00d30670475ca1b1b6769664992ec66a3c86db7e  origin stream identified but only 11% of ticks could be recovered
+```
+
+`--skip-existing` then skips them, and the Runs tab counts them separately — "75 extracted,
+0 new, 66 could not be extracted and are being skipped" rather than a permanent, misleading
+66 new. Measured: 220.5 s → **0.6 s**.
+
+Three things keep the record from going stale on its own:
+
+- The size is checked as well as the name, so a re-downloaded demo gets another go.
+- The record carries `EXTRACTOR_REVISION`. Bumping it when the extraction logic changes
+  invalidates every record automatically, so improving the extractor retries everything it
+  used to give up on without anyone deleting a file.
+- Any demo that later succeeds is dropped from the record.
+
+`--retry-failed`, or the button beside Extract, tries them anyway.
+
 **1. Generate paths for a map**, if you would rather use a terminal. From this folder:
 
 ```
@@ -363,7 +395,9 @@ known-good single-stage demos and testing the stitched points against that geome
   coverage was 30.1 % against 96.8 % on `surf_demise`. The 58 flagged ones are drawn with a
   `!` in the Runs tab and should be treated as suspect rather than merely incomplete — the
   median max-speed error across them is 36 u/s, where a confirmed chain matches to about
-  0.01. It also took 68 s per demo there versus 0.7 s on a normal map.
+  0.01. It also took 68 s per demo there versus 0.7 s on a normal map. Re-measured since: the
+  66 failures are deterministic, cost 220 s to reproduce, and are now recorded and skipped —
+  see [Demos that cannot be extracted](#demos-that-cannot-be-extracted).
 - Split markers are only drawn when the anchoring passed its confidence check. Wrong
   markers are worse than no markers.
 
@@ -473,6 +507,39 @@ as much as the rest: a constant projection matrix in `.data`, and about twenty i
 fixed-viewpoint matrices for skybox and cubemap passes, both pass every static test and produce
 a line that snaps around the screen.
 
+### When more than one candidate is right
+
+The oracle identifies *a* world→clip matrix for this viewport. It cannot identify *the* one
+the world you are looking at was drawn with, because a Source frame contains several — any
+pass rendered from the player's own eye is orthonormal, has the right aspect ratio, solves to
+a camera inside the world, reprojects to screen centre, changes every frame and follows the
+player. The only thing that separates them is the field of view.
+
+Picking the wrong one is subtle rather than obvious: the lines still track the world, they are
+still correct where you are aiming, and they drift further off towards the edges of the screen.
+It is easy to read as the tool being broken.
+
+Two things follow from that, and both are deliberate:
+
+- **A map change does not rescan.** It used to, and that re-entered the lottery every time —
+  so the tool could come back from a map change using a different matrix than it went in with.
+  The chosen address is fully re-validated every frame anyway; if a level load really did move
+  it, it stops validating and the stale-address path rescans on its own. (The old rescan also
+  blocked the render thread for up to three seconds, from inside `Present`, during a level
+  load. Restarts are asynchronous now.)
+- **Diagnostics lists every candidate** with its address, field of view, aspect ratio and how
+  far its camera has followed you, and lets you switch with one click. **Remember this one**
+  writes it to `wrlines_data\wrlines_matrix.ini` as *module + offset* — never a bare address,
+  since ASLR moves the module every launch — and the next launch adopts it in the first second
+  instead of re-deriving it. It is still validated every frame, so a game update that moves it
+  falls back to scanning rather than pointing the renderer at nothing.
+
+Where a rule can be justified it is applied automatically: among otherwise equal candidates the
+one whose aspect ratio matches the backbuffer most exactly wins, then the fewest
+discontinuities, then the most ground covered. Two candidates with the *same* aspect and
+different fields of view are both genuine, and nothing measurable from outside the engine says
+which is which — hence the list.
+
 This is strictly safer than probing, not just differently risky: **scanning never writes
 and never transfers control**, so it cannot corrupt engine state. Every read goes through
 `ReadProcessMemory` on our own process, which returns `false` on an unmapped page instead
@@ -536,7 +603,19 @@ wr_hook             swapchain vtable, Present/ResizeBuffers, window proc
 wr_imgui            our own ImGui context, separate from the game's
 wr_render           projection, near-plane clip, LOD, polylines, markers, tags, HUD
 wr_path             .wrpath loading, run store, live recording
+wr_limit            the frame cap
+wr_extract          counting unextracted demos, running the extractor
 wr_ui               the panel
+```
+
+Everything the tool writes lives under `wrlines_data\`, next to the DLL:
+
+```
+paths\<map>\*.wrpath      extracted run paths
+paths\<map>\_failed.txt   demos that could not be extracted, and why
+wrlines.log               everything, flushed per line
+wrlines_offsets.ini       remembered vtable indices (probing only, off by default)
+wrlines_matrix.ini        remembered world->screen matrix, as module + offset
 ```
 
 ---

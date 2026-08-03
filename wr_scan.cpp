@@ -25,6 +25,7 @@
 #include "wr_log.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 
@@ -110,6 +111,16 @@ struct Candidate
     float travel;
     int jumps;              // frames the origin moved implausibly far
     bool changedThisFrame;  // did the bytes differ from last time we looked
+
+    // The optics this matrix describes. Two candidates can be equally valid
+    // world->clip matrices for this viewport and still disagree about the field
+    // of view, because they belong to different render passes -- and picking the
+    // wrong one draws lines that are right at the crosshair and wrong at the
+    // edges. Recorded so the difference is visible instead of invisible.
+    float fov;              // horizontal, degrees
+    float aspect;
+
+    bool pinned;            // the user vouched for this address, see the pin file
     char note[128];
 };
 
@@ -124,6 +135,7 @@ static volatile LONG g_stop = 0;
 static volatile LONG g_busy = 0;
 static volatile LONG g_phase = 0;
 static volatile LONG64 g_bytes = 0;
+static volatile LONG g_restartPending = 0;
 
 static int g_frames = 0;
 static int g_chosen = -1;
@@ -192,6 +204,136 @@ static char g_status[192] = "not started";
 static char g_note[128] = {0};
 
 // ---------------------------------------------------------------------------
+// The pinned address
+// ---------------------------------------------------------------------------
+//
+// Written only when the user presses "Remember this one". Stored as module +
+// offset, never as an absolute address: ASLR moves engine.dll every launch, so
+// an absolute address remembered from last session would point at something
+// else entirely -- which is precisely the failure this is meant to prevent.
+//
+// It is a hint, not an override. The pinned address is added as a candidate and
+// still has to pass the full oracle every frame like any other; if a game update
+// moves it, it simply never validates and the ordinary scan takes over.
+
+static char g_pinModule[64] = {0};
+static unsigned long long g_pinOffset = 0;
+static bool g_pinTransposed = false;
+static bool g_pinValid = false;
+static char g_pinDesc[128] = {0};
+
+static const char *PinPath(void) { return WrDataPath("wrlines_matrix.ini"); }
+
+static bool AddrToModule(const void *p, char *mod, int modLen,
+                         unsigned long long *off)
+{
+    HMODULE h = NULL;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCSTR)p, &h) || !h)
+        return false;
+
+    char path[MAX_PATH];
+    if (!GetModuleFileNameA(h, path, sizeof(path)))
+        return false;
+    const char *slash = strrchr(path, '\\');
+    strcpy_s(mod, modLen, slash ? slash + 1 : path);
+    *off = (unsigned long long)((const unsigned char *)p -
+                                (const unsigned char *)h);
+    return true;
+}
+
+static void LoadPin(void)
+{
+    static bool loaded = false;
+    if (loaded)
+        return;
+    loaded = true;
+
+    FILE *f = NULL;
+    if (fopen_s(&f, PinPath(), "r") != 0 || !f)
+        return;
+
+    char line[256];
+    while (fgets(line, sizeof(line), f))
+    {
+        if (line[0] == ';' || line[0] == '#' || line[0] == '[')
+            continue;
+        char *eq = strchr(line, '=');
+        if (!eq)
+            continue;
+        *eq = '\0';
+        char *val = eq + 1;
+        while (*val == ' ' || *val == '\t')
+            val++;
+        for (int i = (int)strlen(line) - 1; i >= 0 &&
+             (line[i] == ' ' || line[i] == '\t'); i--)
+            line[i] = '\0';
+
+        if (_stricmp(line, "module") == 0)
+        {
+            strcpy_s(g_pinModule, sizeof(g_pinModule), val);
+            for (int i = (int)strlen(g_pinModule) - 1; i >= 0 &&
+                 (g_pinModule[i] == '\n' || g_pinModule[i] == '\r' ||
+                  g_pinModule[i] == ' '); i--)
+                g_pinModule[i] = '\0';
+        }
+        else if (_stricmp(line, "offset") == 0)
+            g_pinOffset = _strtoui64(val, NULL, 0);
+        else if (_stricmp(line, "transposed") == 0)
+            g_pinTransposed = (atoi(val) != 0);
+    }
+    fclose(f);
+
+    if (g_pinModule[0] && g_pinOffset)
+    {
+        g_pinValid = true;
+        _snprintf_s(g_pinDesc, sizeof(g_pinDesc), _TRUNCATE, "%s+0x%llX%s",
+                    g_pinModule, g_pinOffset,
+                    g_pinTransposed ? " (transposed)" : "");
+        WrLogf("scan: remembered matrix %s (will still be validated)", g_pinDesc);
+    }
+}
+
+static void SavePin(void)
+{
+    FILE *f = NULL;
+    if (fopen_s(&f, PinPath(), "w") != 0 || !f)
+        return;
+    fprintf(f, "; WrLines remembered world->screen matrix.\n");
+    fprintf(f, "; Module-relative on purpose: ASLR moves the module every launch.\n");
+    fprintf(f, "; This is only a hint -- it is re-validated every frame, so a game\n");
+    fprintf(f, "; update that moves it just falls back to scanning.\n");
+    fprintf(f, "; Delete this file, or press Forget in Diagnostics, to clear it.\n\n");
+    fprintf(f, "module     = %s\n", g_pinModule);
+    fprintf(f, "offset     = 0x%llX\n", g_pinOffset);
+    fprintf(f, "transposed = %d\n", g_pinTransposed ? 1 : 0);
+    fclose(f);
+}
+
+// Resolve the pin against this launch's module base. NULL if the module is not
+// loaded or the offset is past the end of its image.
+static const unsigned char *ResolvePin(void)
+{
+    if (!g_pinValid)
+        return NULL;
+    HMODULE h = GetModuleHandleA(g_pinModule);
+    if (!h)
+        return NULL;
+
+    IMAGE_DOS_HEADER dos;
+    if (!WrSafeReadBytes(h, &dos, sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE)
+        return NULL;
+    IMAGE_NT_HEADERS64 nt;
+    if (!WrSafeReadBytes((const unsigned char *)h + dos.e_lfanew, &nt, sizeof(nt)) ||
+        nt.Signature != IMAGE_NT_SIGNATURE)
+        return NULL;
+    if (g_pinOffset + MATRIX_BYTES > nt.OptionalHeader.SizeOfImage)
+        return NULL;
+    return (const unsigned char *)h + g_pinOffset;
+}
+
+// ---------------------------------------------------------------------------
 // Candidate bookkeeping
 // ---------------------------------------------------------------------------
 
@@ -217,15 +359,20 @@ static void AddCandidate(const unsigned char *addr, bool transposed,
         }
     if (!dup && g_candCount < MAX_CANDIDATES)
     {
-        Candidate *c = &g_cand[g_candCount++];
+        // Fill it in first and publish the count last. The Diagnostics list
+        // reads this array from the render thread without taking the lock, and
+        // incrementing first would let it read a half-written entry.
+        Candidate *c = &g_cand[g_candCount];
         memset(c, 0, sizeof(*c));
         c->addr = addr;
         c->transposed = transposed;
         c->alive = true;
         if (note)
             strcpy_s(c->note, sizeof(c->note), note);
+        int index = g_candCount;
+        g_candCount++;
         if (g_candCount <= LOG_FIRST_N)
-            WrLogf("scan: candidate %d @ %p%s  %s", g_candCount - 1, addr,
+            WrLogf("scan: candidate %d @ %p%s  %s", index, addr,
                    transposed ? " (transposed)" : "", note ? note : "");
     }
     LeaveCriticalSection(&g_cs);
@@ -522,6 +669,22 @@ static void EnsureCs(void)
     }
 }
 
+// Seed the candidate list with the address the user vouched for, so a launch
+// with a pin drawn lines within a frame or two instead of after a full sweep.
+static void AddPinnedCandidate(void)
+{
+    const unsigned char *p = ResolvePin();
+    if (!p)
+        return;
+    AddCandidate(p, g_pinTransposed, "remembered from last session");
+    EnterCriticalSection(&g_cs);
+    for (int i = 0; i < g_candCount; i++)
+        if (g_cand[i].addr == p && g_cand[i].transposed == g_pinTransposed)
+            g_cand[i].pinned = true;
+    LeaveCriticalSection(&g_cs);
+    WrLogf("scan: seeded with remembered matrix %s @ %p", g_pinDesc, p);
+}
+
 void WrScanStart(void)
 {
     if (g_thread)
@@ -535,6 +698,9 @@ void WrScanStart(void)
     if (bw <= 0 || bh <= 0)
         return;
 
+    LoadPin();
+    AddPinnedCandidate();
+
     g_stop = 0;
     g_thread = CreateThread(NULL, 0, ScanThread, NULL, 0, NULL);
     if (g_thread)
@@ -546,31 +712,69 @@ void WrScanStart(void)
         strcpy_s(g_status, sizeof(g_status), "could not start scan thread");
 }
 
-// A level load frees and reallocates most of what we were watching, and the
-// candidates found at the main menu are largely meaningless anyway -- there is
-// no player camera there for the oracle to confirm against. So start over.
+// A level load used to throw everything away and scan again. That was wrong in
+// two separate ways, and between them they are most of "switching maps breaks
+// the lines".
+//
+//   It stalls. The restart ran from inside Present and waited up to three
+//   seconds for the scan thread to notice it should stop -- on the render
+//   thread, during a level load.
+//
+//   It re-rolls the choice. Several different matrices in a frame pass the
+//   oracle, and which one wins depends on the order candidates happened to be
+//   found and how the camera happened to move in the first second. Rescanning
+//   on every map change means re-entering that lottery every time, so the tool
+//   can come back from a map change using a DIFFERENT matrix than it went in
+//   with -- lines correct at the crosshair and progressively wrong towards the
+//   edges of the screen, which is exactly what a mismatched field of view looks
+//   like.
+//
+// The chosen address is re-validated in full every frame anyway. If the load
+// really did move it, it stops validating and the stale-address path below
+// rescans on its own. So the right thing on a map change is to keep the pick
+// and only reset the per-frame continuity state, which the level load genuinely
+// does invalidate: the camera teleports, and the matrix is frozen while the
+// loading screen is up.
 void WrScanOnMapChanged(void)
 {
     if (!g_everStarted)
         return;
-    g_restarts = 0;
-    WrLogf("scan: map changed, starting over");
-    WrScanRestart();
+
+    g_haveLastOrigin = false;   // the camera legitimately jumps across a load
+    g_pendingFrames = 0;
+    g_lastAcceptTicks = 0;
+    g_heldFrames = 0;
+    g_frozenSince = 0;
+    g_frozenSeconds = 0.0f;
+    g_staleFrames = 0;
+
+    if (g_chosen >= 0)
+    {
+        WrLogf("scan: map changed -- keeping matrix @ %p (re-validated every "
+               "frame; a rescan would re-roll which matrix gets picked)",
+               g_cand[g_chosen].addr);
+        return;
+    }
+
+    // Nothing picked yet. If the sweep already finished empty, the candidates it
+    // found at the menu are largely meaningless -- there was no player camera
+    // for the oracle to confirm against -- so this is the moment to try again.
+    // If it is still running, let it finish.
+    if (InterlockedCompareExchange(&g_phase, 0, 0) >= 3)
+    {
+        g_restarts = 0;
+        WrLogf("scan: map changed with nothing resolved, scanning again");
+        WrScanRestart();
+    }
 }
 
+// Asks for a restart and returns immediately. WrScanTick starts the new thread
+// once the old one has actually exited.
 void WrScanRestart(void)
 {
-    InterlockedExchange(&g_stop, 1);
-    if (g_thread)
-    {
-        WaitForSingleObject(g_thread, 3000);
-        CloseHandle(g_thread);
-        g_thread = NULL;
-    }
     EnsureCs();
-    EnterCriticalSection(&g_cs);
-    g_candCount = 0;
-    LeaveCriticalSection(&g_cs);
+    InterlockedExchange(&g_stop, 1);
+    InterlockedExchange(&g_restartPending, 1);
 
     g_chosen = -1;
     g_frames = 0;
@@ -585,10 +789,39 @@ void WrScanRestart(void)
     g_frozenSince = 0;
     g_frozenSeconds = 0.0f;
     g_note[0] = '\0';
+    strcpy_s(g_status, sizeof(g_status), "restarting the scan...");
+    WrLogf("scan: restart requested");
+}
+
+// Called at the top of every tick. Does nothing until the old scan thread has
+// exited on its own, so nothing here ever blocks the render thread.
+static void ServiceRestart(void)
+{
+    if (!InterlockedCompareExchange(&g_restartPending, 0, 0))
+        return;
+    if (g_thread && WaitForSingleObject(g_thread, 0) != WAIT_OBJECT_0)
+        return;                 // still winding down; try again next frame
+
+    if (g_thread)
+    {
+        CloseHandle(g_thread);
+        g_thread = NULL;
+    }
+    EnterCriticalSection(&g_cs);
+    g_candCount = 0;
+    LeaveCriticalSection(&g_cs);
+
+    // g_chosen is an INDEX into the list we just emptied. Leaving it set would
+    // point it at whatever candidate the new scan happens to put in that slot.
+    g_chosen = -1;
+    g_matrixValid = false;
+    g_staleFrames = 0;
+    g_roundRobin = 0;
+
     InterlockedExchange64(&g_bytes, 0);
     InterlockedExchange(&g_phase, 0);
-    g_stop = 0;
-    WrLogf("scan: restarting");
+    InterlockedExchange(&g_restartPending, 0);
+    InterlockedExchange(&g_stop, 0);
     WrScanStart();
 }
 
@@ -612,6 +845,18 @@ static bool ValidateCandidate(Candidate *c, VMatrix *out)
     c->last = m;
     c->haveLast = true;
     c->changedThisFrame = changed;
+
+    // What this matrix thinks the camera's optics are. |row0| is 1/tan(fovx/2)
+    // and |row1|/|row0| is the aspect ratio -- the same two quantities the
+    // oracle checks, kept here so the Diagnostics list can show why two equally
+    // valid candidates disagree.
+    float l0 = WrLength(WrVec(m.m[0][0], m.m[0][1], m.m[0][2]));
+    float l1 = WrLength(WrVec(m.m[1][0], m.m[1][1], m.m[1][2]));
+    if (l0 > 1e-6f)
+    {
+        c->fov = 2.0f * atanf(1.0f / l0) * 57.2957795f;
+        c->aspect = l1 / l0;
+    }
 
     // Track how the camera this matrix describes behaves over time. Smooth
     // travel means it is following the player; teleport-sized steps every frame
@@ -710,6 +955,17 @@ void WrScanTick(void)
 {
     if (!g_csReady)
         return;
+
+    ServiceRestart();
+
+    // A restart that has been asked for but not yet serviced -- the scan thread
+    // is still winding down. The candidates still in the list are about to be
+    // thrown away, so do not pick one and do not draw through one.
+    if (InterlockedCompareExchange(&g_restartPending, 0, 0))
+    {
+        g_matrixValid = false;
+        return;
+    }
 
     g_frames++;
 
@@ -929,13 +1185,29 @@ void WrScanTick(void)
     // module data does neither, and refusing to pick one that has never updated
     // is what stops the earlier mistake from repeating.
     int best = -1;
-    float bestScore = -1.0f;
     int updating = 0, moving = 0;
+
+    int sw = 0, sh = 0;
+    WrBackbufferSize(&sw, &sh);
+    float screenAspect = (sh > 0) ? (float)sw / (float)sh : 0.0f;
 
     for (int i = 0; i < n; i++)
     {
         Candidate *c = &g_cand[i];
-        if (!c->alive || c->hits < MIN_HITS_TO_PICK)
+        if (!c->alive)
+            continue;
+
+        // An address the user vouched for wins outright, as soon as it has
+        // proved it is still live. It does not have to demonstrate travel: the
+        // whole reason for pinning one is that the automatic rules could not
+        // tell it apart from its neighbours in the first place.
+        if (c->pinned && c->hits >= 30 && c->changes >= 10)
+        {
+            best = i;
+            break;
+        }
+
+        if (c->hits < MIN_HITS_TO_PICK)
             continue;
         if (c->changes < MIN_UPDATES_TO_PICK)
             continue;
@@ -947,14 +1219,37 @@ void WrScanTick(void)
             continue;                       // a slot shared between passes
         moving++;
 
-        // Among what is left, prefer the smoothest: fewest discontinuities,
-        // then the most travel.
-        float score = c->travel - (float)c->jumps * 1000.0f;
-        if (score > bestScore)
+        if (best < 0)
         {
-            bestScore = score;
             best = i;
+            continue;
         }
+
+        // Among what is left, in order:
+        //
+        //   1. the aspect ratio closest to the actual backbuffer. The oracle
+        //      allows 10% slack so an unusual render target cannot lock us out
+        //      entirely, but 10% of the horizontal field of view is a visible
+        //      error at the edges of the screen while being invisible at the
+        //      crosshair -- so when there is a choice, take the exact one.
+        //   2. fewest discontinuities.
+        //   3. the most ground covered.
+        //
+        // Note what this deliberately does NOT claim to settle: two candidates
+        // with the SAME aspect and different fields of view are both genuine
+        // matrices for different passes of the same frame, and nothing
+        // measurable from here says which one the world is drawn with. That is
+        // what the Diagnostics list and the pin are for.
+        Candidate *b = &g_cand[best];
+        int ea = (screenAspect > 0.0f)
+               ? (int)(fabsf(c->aspect - screenAspect) / screenAspect * 200.0f) : 0;
+        int eb = (screenAspect > 0.0f)
+               ? (int)(fabsf(b->aspect - screenAspect) / screenAspect * 200.0f) : 0;
+        bool better = (ea != eb) ? (ea < eb)
+                    : (c->jumps != b->jumps) ? (c->jumps < b->jumps)
+                    : (c->travel > b->travel);
+        if (better)
+            best = i;
     }
 
     if (best >= 0)
@@ -963,11 +1258,13 @@ void WrScanTick(void)
         g_staleFrames = 0;
         strcpy_s(g_note, sizeof(g_note), g_cand[best].note);
         WrLogf("scan: using matrix @ %p%s  (%d hits, %d updates, %.0f units "
-               "travelled, %d jumps, %d other live candidate%s)  %s",
+               "travelled, %d jumps, fov %.0f, aspect %.3f vs %.3f, "
+               "%d other live candidate%s)%s",
                g_cand[best].addr, g_cand[best].transposed ? " (transposed)" : "",
                g_cand[best].hits, g_cand[best].changes, g_cand[best].travel,
-               g_cand[best].jumps, alive - 1, alive == 2 ? "" : "s",
-               g_cand[best].note);
+               g_cand[best].jumps, g_cand[best].fov, g_cand[best].aspect,
+               screenAspect, alive - 1, alive == 2 ? "" : "s",
+               g_cand[best].pinned ? "  [remembered]" : "");
     }
     else if (alive > 0)
     {
@@ -1015,6 +1312,86 @@ double WrScanMegabytes(void)
 
 float WrScanFrozenSeconds(void) { return g_frozenSeconds; }
 float *WrScanFrozenLimit(void) { return &g_frozenLimit; }
+
+bool WrScanCandidateAt(int i, WrScanCandidateInfo *out)
+{
+    if (!out || i < 0 || i >= g_candCount)
+        return false;
+    const Candidate *c = &g_cand[i];
+    out->addr = c->addr;
+    out->transposed = c->transposed;
+    out->alive = c->alive;
+    out->chosen = (i == g_chosen);
+    out->pinned = c->pinned;
+    out->hits = c->hits;
+    out->changes = c->changes;
+    out->jumps = c->jumps;
+    out->travel = c->travel;
+    out->fov = c->fov;
+    out->aspect = c->aspect;
+    return true;
+}
+
+void WrScanUseCandidate(int i)
+{
+    if (i < 0 || i >= g_candCount)
+        return;
+    g_cand[i].alive = true;         // an explicit choice un-retires it
+    g_chosen = i;
+    g_staleFrames = 0;
+    g_heldFrames = 0;
+    g_haveLastOrigin = false;       // the camera can be anywhere; start clean
+    g_pendingFrames = 0;
+    g_lastAcceptTicks = 0;
+    g_frozenSince = 0;
+    g_frozenSeconds = 0.0f;
+    strcpy_s(g_note, sizeof(g_note), g_cand[i].note);
+    WrLogf("scan: matrix @ %p%s chosen by hand (fov %.0f, aspect %.3f)",
+           g_cand[i].addr, g_cand[i].transposed ? " (transposed)" : "",
+           g_cand[i].fov, g_cand[i].aspect);
+}
+
+bool WrScanPinChosen(void)
+{
+    if (g_chosen < 0)
+        return false;
+
+    char mod[64];
+    unsigned long long off = 0;
+    if (!AddrToModule(g_cand[g_chosen].addr, mod, sizeof(mod), &off))
+    {
+        WrLogf("[!] scan: matrix @ %p is not inside a loaded module, so its "
+               "address is different every launch and there is nothing worth "
+               "remembering", g_cand[g_chosen].addr);
+        return false;
+    }
+
+    strcpy_s(g_pinModule, sizeof(g_pinModule), mod);
+    g_pinOffset = off;
+    g_pinTransposed = g_cand[g_chosen].transposed;
+    g_pinValid = true;
+    g_cand[g_chosen].pinned = true;
+    _snprintf_s(g_pinDesc, sizeof(g_pinDesc), _TRUNCATE, "%s+0x%llX%s",
+                g_pinModule, g_pinOffset,
+                g_pinTransposed ? " (transposed)" : "");
+    SavePin();
+    WrLogf("scan: remembered matrix %s", g_pinDesc);
+    return true;
+}
+
+void WrScanForgetPin(void)
+{
+    g_pinValid = false;
+    g_pinModule[0] = '\0';
+    g_pinOffset = 0;
+    g_pinDesc[0] = '\0';
+    for (int i = 0; i < g_candCount; i++)
+        g_cand[i].pinned = false;
+    DeleteFileA(PinPath());
+    WrLogf("scan: forgot the remembered matrix");
+}
+
+const char *WrScanPinDescription(void) { return g_pinValid ? g_pinDesc : ""; }
 
 int WrScanUpdatingCount(void)
 {

@@ -163,24 +163,6 @@ static void DrawRunsTab(void)
         ImGui::EndPopup();
     }
 
-    if (WrRunCount() == 0 && inMap)
-    {
-        ImGui::Separator();
-        ImGui::TextWrapped(
-            "No cached paths for this map yet. Generate them from the demos the "
-            "game already downloaded:");
-        ImGui::Spacing();
-        char cmd[256];
-        _snprintf_s(cmd, sizeof(cmd), _TRUNCATE,
-                    "python wrpath_extract.py --map %s", map);
-        ImGui::InputText("##cmd", cmd, sizeof(cmd), ImGuiInputTextFlags_ReadOnly);
-        if (ImGui::Button("Copy command"))
-            ImGui::SetClipboardText(cmd);
-        ImGui::SameLine();
-        ImGui::TextDisabled("run it in the wrlines folder, then press Reload");
-        return;
-    }
-
     // Say plainly what kind of library this map has. On a staged map the run
     // list is dominated by single-leg runs that are nowhere near you, and
     // without this the only symptom is "the lines are missing".
@@ -220,7 +202,13 @@ static void DrawRunsTab(void)
     }
 
     // --- extraction ---------------------------------------------------------
+    //
+    // Above the "no paths for this map" message, and not inside it. This panel
+    // used to sit below an early return taken whenever the map had no runs
+    // loaded -- which is the one case where you most need it, and it left the
+    // only route into extraction being the command line the message printed.
     ImGui::Separator();
+    if (inMap)
     {
         int loadDone = 0, loadTotal = 0;
         if (WrPathLoading(&loadDone, &loadTotal))
@@ -233,8 +221,8 @@ static void DrawRunsTab(void)
                        "time you loaded a map.");
         }
 
-        int total = 0, done = 0, fresh = 0;
-        bool haveCounts = WrExtractCounts(&total, &done, &fresh);
+        int total = 0, done = 0, fresh = 0, bad = 0;
+        bool haveCounts = WrExtractCounts(&total, &done, &fresh, &bad);
         bool running = WrExtractRunning();
 
         if (running)
@@ -248,15 +236,35 @@ static void DrawRunsTab(void)
                                "%d demo%s for this map, %d extracted, %d new",
                                total, total == 1 ? "" : "s", done, fresh);
         else
-            ImGui::Text("%d demo%s for this map, all extracted", total,
-                        total == 1 ? "" : "s");
+            ImGui::Text("%d demo%s for this map, %d extracted", total,
+                        total == 1 ? "" : "s", done);
+
+        // Demos that have already been tried and could not be read. Shown
+        // separately because they are not work waiting to be done -- they are
+        // work already done, that failed, and repeating it costs the same
+        // minutes it cost the first time.
+        if (haveCounts && bad > 0)
+        {
+            ImGui::TextDisabled("%d could not be extracted and are being "
+                                "skipped", bad);
+            ImGui::SameLine();
+            HelpMarker("Some demos cannot be read. The extractor finds the path "
+                       "by locating the player's origin stream in an "
+                       "undocumented netstream and confirming it against the "
+                       "run's own recorded top speed; when a map's stream is too "
+                       "fragmented for that, it says so rather than writing a "
+                       "plausible-looking line that is wrong.\n\n"
+                       "Which ones failed, and why, is recorded in "
+                       "_failed.txt next to that map's paths, so the same "
+                       "minutes are not spent reaching the same answer every "
+                       "time. Improving the extractor clears the record "
+                       "automatically.");
+        }
 
         if (running)
             ImGui::BeginDisabled();
         if (ImGui::Button(fresh > 0 ? "Extract new demos" : "Re-run extractor"))
-            WrExtractRun();
-        if (running)
-            ImGui::EndDisabled();
+            WrExtractRun(false);
         ImGui::SameLine();
         HelpMarker("Launches wrpath_extract.py in the background, at below-normal "
                    "priority so it does not fight the game for CPU. It only "
@@ -264,6 +272,19 @@ static void DrawRunsTab(void)
                    "again costs seconds.\n\n"
                    "This starts a separate python process. It is never run "
                    "automatically -- only when you press this.");
+        if (bad > 0)
+        {
+            ImGui::SameLine();
+            if (ImGui::Button("Retry the failures"))
+                WrExtractRun(true);
+            ImGui::SameLine();
+            HelpMarker("Tries the recorded failures again. Worth doing after a "
+                       "game update, and not otherwise -- nothing about them "
+                       "changes on its own, so this is the slow path by "
+                       "definition.");
+        }
+        if (running)
+            ImGui::EndDisabled();
 
         int nLines = WrExtractLineCount();
         if (nLines > 0)
@@ -281,6 +302,31 @@ static void DrawRunsTab(void)
         }
         if (!WrExtractRunning() && !haveCounts)
             ImGui::TextDisabled("%s", WrExtractInterpreter());
+    }
+
+    if (WrRunCount() == 0)
+    {
+        ImGui::Separator();
+        if (!inMap)
+        {
+            ImGui::TextDisabled("Load a map, or pick one above.");
+            return;
+        }
+        ImGui::TextWrapped(
+            "No cached paths for this map yet. The button above generates them "
+            "from the demos the game already downloaded. If you would rather do "
+            "it in a terminal:");
+        ImGui::Spacing();
+        char cmd[256];
+        _snprintf_s(cmd, sizeof(cmd), _TRUNCATE,
+                    "python wrpath_extract.py --map %s --skip-existing", map);
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputText("##cmd", cmd, sizeof(cmd), ImGuiInputTextFlags_ReadOnly);
+        if (ImGui::Button("Copy command"))
+            ImGui::SetClipboardText(cmd);
+        ImGui::SameLine();
+        ImGui::TextDisabled("run it in the wrlines folder, then press Reload");
+        return;
     }
 
     ImGui::Separator();
@@ -331,9 +377,19 @@ static void DrawRunsTab(void)
     ImGui::SetNextItemWidth(160.0f);
     ImGui::SliderFloat("within", &s_nearRadius, 512.0f, 16384.0f, "%.0f u");
 
+    // The list takes whatever height is left, so dragging the window taller
+    // shows more runs instead of a taller empty panel around a fixed 320-pixel
+    // box. One line is held back for the "enabled but only N drawn" warning
+    // underneath, which is the one thing that must not be pushed off the bottom.
+    float reserve = ImGui::GetTextLineHeightWithSpacing() +
+                    ImGui::GetStyle().ItemSpacing.y;
+    float tableHeight = ImGui::GetContentRegionAvail().y - reserve;
+    if (tableHeight < 140.0f)
+        tableHeight = 140.0f;    // below this the header eats the whole list
+
     ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                             ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit;
-    if (ImGui::BeginTable("runs", 9, flags, ImVec2(0.0f, 320.0f)))
+    if (ImGui::BeginTable("runs", 9, flags, ImVec2(0.0f, tableHeight)))
     {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("On");
@@ -808,6 +864,118 @@ static void DrawDiagnosticsTab(void)
         WrScanRestart();
     ImGui::SameLine();
     ImGui::TextDisabled("read-only; cannot affect the game");
+
+    // --- choosing between them by hand --------------------------------------
+    //
+    // The reason this exists: more than one matrix per frame is a genuine
+    // world->clip matrix for this viewport, and no test available from outside
+    // the engine separates the one the world is drawn with from one belonging to
+    // another pass through the same eye. Picking wrong looks like the lines
+    // being mapped slightly wrong -- correct at the crosshair, drifting towards
+    // the edges -- which is easy to mistake for the tool being broken.
+    if (WrScanCandidateCount() > 0)
+    {
+        ImGui::Spacing();
+        if (ImGui::TreeNode("candidates", "Every matrix that passes the test (%d)",
+                            WrScanLiveCandidateCount()))
+        {
+            ImGui::TextWrapped(
+                "If the lines track the world but are mapped slightly wrong -- "
+                "right where you are aiming and increasingly off towards the "
+                "edges of the screen -- one of the others is the right one. Try "
+                "them: the change is immediate, and Remember keeps it across "
+                "restarts.");
+            ImGui::Spacing();
+
+            const char *pin = WrScanPinDescription();
+            if (pin[0])
+            {
+                ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f),
+                                   "remembered: %s", pin);
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Forget"))
+                    WrScanForgetPin();
+            }
+
+            ImGuiTableFlags cflags = ImGuiTableFlags_Borders |
+                                     ImGuiTableFlags_RowBg |
+                                     ImGuiTableFlags_ScrollY |
+                                     ImGuiTableFlags_SizingFixedFit;
+            if (ImGui::BeginTable("cands", 7, cflags, ImVec2(0.0f, 180.0f)))
+            {
+                ImGui::TableSetupScrollFreeze(0, 1);
+                ImGui::TableSetupColumn("Use");
+                ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("FOV");
+                ImGui::TableSetupColumn("Aspect");
+                ImGui::TableSetupColumn("Travel");
+                ImGui::TableSetupColumn("Hits");
+                ImGui::TableSetupColumn("Jumps");
+                ImGui::TableHeadersRow();
+
+                for (int i = 0; i < WrScanCandidateCount(); i++)
+                {
+                    WrScanCandidateInfo c;
+                    if (!WrScanCandidateAt(i, &c) || !c.alive)
+                        continue;
+                    ImGui::TableNextRow();
+                    ImGui::PushID(i);
+
+                    ImGui::TableSetColumnIndex(0);
+                    if (c.chosen)
+                        ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "in use");
+                    else if (ImGui::SmallButton("use"))
+                        WrScanUseCandidate(i);
+
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::Text("%p%s%s", c.addr, c.transposed ? " T" : "",
+                                c.pinned ? " *" : "");
+
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::Text("%.0f", c.fov);
+                    ImGui::TableSetColumnIndex(3);
+                    ImGui::Text("%.3f", c.aspect);
+                    ImGui::TableSetColumnIndex(4);
+                    ImGui::Text("%.0f", c.travel);
+                    ImGui::TableSetColumnIndex(5);
+                    ImGui::Text("%d", c.hits);
+                    ImGui::TableSetColumnIndex(6);
+                    ImGui::Text("%d", c.jumps);
+
+                    ImGui::PopID();
+                }
+                ImGui::EndTable();
+            }
+
+            if (haveScan)
+            {
+                if (ImGui::Button("Remember this one"))
+                {
+                    if (!WrScanPinChosen())
+                        ImGui::OpenPopup("nopin");
+                }
+                ImGui::SameLine();
+                HelpMarker("Writes it to wrlines_data\\wrlines_matrix.ini as "
+                           "module + offset, never as a bare address -- the "
+                           "module moves every launch. Next time it is adopted "
+                           "in the first second instead of being re-derived, "
+                           "which also means the choice cannot silently come "
+                           "out differently.\n\n"
+                           "It is still validated every frame, so a game update "
+                           "that moves it falls back to scanning rather than "
+                           "pointing the renderer at nothing.");
+                if (ImGui::BeginPopup("nopin"))
+                {
+                    ImGui::TextWrapped(
+                        "That matrix is not inside a loaded module -- it lives on "
+                        "the heap, at a different address every launch, so there "
+                        "is nothing stable to remember.");
+                    ImGui::EndPopup();
+                }
+            }
+            ImGui::TreePop();
+        }
+    }
 
     ImGui::SeparatorText("Camera");
     Vec3 camNow;

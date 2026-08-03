@@ -21,6 +21,15 @@ static WrPoint g_live[WR_LIVE_POINTS];
 static int g_liveCount = 0;
 static bool g_liveOn = true;
 
+// Set when a load finishes, cleared by the first WrUpdateNearest with a live
+// camera, which is where the default run selection is actually made.
+static bool g_autoEnablePending = false;
+
+// What counts as "on the leg I am standing in" for that default. Matches the
+// panel's own default radius: enough to cover one stage of a surf map without
+// reaching into the next one.
+#define AUTO_ENABLE_RADIUS 4096.0f
+
 // A distinct, readable palette. Gold first so the best run reads as the best
 // run without needing a legend.
 static const unsigned int kPalette[] = {
@@ -416,6 +425,35 @@ void WrUpdateNearest(const Vec3 &cam)
         r->nearestDist = sqrtf(best);
         r->nearestIndex = bestIdx;
     }
+
+    // The first time distances are known after a load, turn on the fastest run
+    // that actually comes near you rather than the fastest run in the file list.
+    //
+    // Those are usually not the same run. Momentum records a separate demo per
+    // stage, so on a staged map the fastest recorded time is generally a single
+    // short stage somewhere else entirely -- and enabling it puts a line in the
+    // map that you cannot see from where you spawned, which reads exactly like
+    // "I changed map and no lines showed up".
+    //
+    // Deferred to here rather than done at load time because it needs a live
+    // camera, and during a level load the last known camera still belongs to the
+    // previous map.
+    if (g_autoEnablePending && g_runCount > 0)
+    {
+        g_autoEnablePending = false;
+        WrEnableBestNearby(1, AUTO_ENABLE_RADIUS);
+        int on = 0;
+        for (int i = 0; i < g_runCount; i++)
+            if (g_runs[i].enabled)
+                on++;
+        if (on == 0)
+        {
+            g_runs[0].enabled = true;   // nothing nearby: the overall best it is
+            WrLogf("no run passes within %.0f units of you; enabled the fastest "
+                   "one instead (\"%s\", %s)", AUTO_ENABLE_RADIUS,
+                   g_runs[0].player, WrTrackName(&g_runs[0]));
+        }
+    }
 }
 
 void WrEnableBestNearby(int count, float radius)
@@ -467,8 +505,9 @@ static void FinishLoad(void)
     for (int i = 0; i < g_runCount; i++)
     {
         g_runs[i].colour = PaletteColour(i);
-        g_runs[i].enabled = (i == 0);       // best run on by default
+        g_runs[i].enabled = (i == 0);       // provisional; see WrUpdateNearest
     }
+    g_autoEnablePending = true;
 
     WrLogf("loaded %d run%s for \"%s\"%s", g_runCount, g_runCount == 1 ? "" : "s",
            g_loadedMap, g_pendingFailed ? " (some files rejected)" : "");

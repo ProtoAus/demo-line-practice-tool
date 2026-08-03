@@ -41,6 +41,11 @@ void WrScanTick(void);
 
 // Throw away everything and scan again. Used when the resolved address goes
 // stale (a level change can move a heap-resident matrix).
+//
+// Never blocks: it asks the scan thread to stop and the next WrScanTick starts
+// the new one once the old has actually exited. It used to WaitForSingleObject
+// for up to three seconds, from inside Present, which is a three-second freeze
+// on the render thread at the worst possible moment.
 void WrScanRestart(void);
 
 // A level load invalidates most of what we were watching. Call on map change.
@@ -67,5 +72,46 @@ double WrScanMegabytes(void);
 // motionless, and drawing a route through it puts the whole map over the menu.
 float WrScanFrozenSeconds(void);
 float *WrScanFrozenLimit(void);  // settable from the UI
+
+// ---------------------------------------------------------------------------
+// Choosing between candidates by hand
+// ---------------------------------------------------------------------------
+//
+// More than one matrix in a Source frame is a genuine world->clip matrix for
+// this viewport. The main view is one; any pass that renders from the player's
+// own eye with a different field of view is another, and it passes every test
+// here -- orthonormal basis, right aspect ratio, camera inside the world,
+// reprojects to screen centre, changes every frame, follows the player. The
+// only difference is the FOV, and the symptom of picking the wrong one is
+// subtle: lines that track the world correctly at the crosshair and drift
+// further out towards the edges of the screen.
+//
+// No heuristic here can tell those apart, so rather than guess harder, show
+// them and let the answer be one click -- and remember it.
+struct WrScanCandidateInfo
+{
+    const void *addr;
+    bool transposed;
+    bool alive;
+    bool chosen;
+    bool pinned;
+    int hits;
+    int changes;
+    int jumps;
+    float travel;
+    float fov;          // horizontal, degrees
+    float aspect;
+};
+
+bool WrScanCandidateAt(int i, WrScanCandidateInfo *out);
+void WrScanUseCandidate(int i);      // pick this one by hand, right now
+
+// Remember the chosen address as module+offset so the next launch adopts it
+// immediately instead of re-deriving it (and possibly landing on a different
+// one). Returns false if it does not live inside a loaded module, in which case
+// its address is different every launch and there is nothing to remember.
+bool WrScanPinChosen(void);
+void WrScanForgetPin(void);
+const char *WrScanPinDescription(void);   // "engine.dll+0x1a2b3c4", or ""
 
 #endif // WR_SCAN_H

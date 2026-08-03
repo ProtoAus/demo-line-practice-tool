@@ -16,6 +16,10 @@
 #define WR_EXTRACT_LINES 400
 #define WR_EXTRACT_LINE_MAX 200
 
+// Recorded failures. Written by wrpath_extract.py, read here only.
+#define WR_FAILED_FILE "_failed.txt"
+#define WR_MAX_FAILED 512
+
 static CRITICAL_SECTION g_cs;
 static bool g_csReady = false;
 
@@ -26,6 +30,7 @@ static bool g_haveCounts = false;
 static int g_forThisMap = 0;
 static int g_alreadyDone = 0;
 static int g_notYetDone = 0;
+static int g_knownBad = 0;
 
 static volatile LONG g_running = 0;
 static volatile LONG g_finished = 0;
@@ -103,6 +108,82 @@ static bool PeekMap(const char *path, char *out, int outLen)
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// The failure record
+// ---------------------------------------------------------------------------
+//
+// paths\<map>\_failed.txt, one demo per line:
+//
+//     revision <TAB> bytes <TAB> basename <TAB> why
+//
+// Read on the counting thread and held for the length of one count. The size is
+// checked as well as the name so that a re-downloaded demo -- a different file
+// that happens to have the same name -- is not written off on the strength of
+// the old one's failure.
+
+struct FailedRec
+{
+    char base[80];
+    long long size;
+};
+
+static FailedRec *g_failed = NULL;
+static int g_failedCount = 0;
+
+static void LoadFailures(const char *pathsDir)
+{
+    free(g_failed);
+    g_failed = NULL;
+    g_failedCount = 0;
+
+    char path[MAX_PATH];
+    _snprintf_s(path, sizeof(path), _TRUNCATE, "%s\\%s", pathsDir, WR_FAILED_FILE);
+
+    FILE *f = NULL;
+    if (fopen_s(&f, path, "r") != 0 || !f)
+        return;
+
+    g_failed = (FailedRec *)malloc(sizeof(FailedRec) * WR_MAX_FAILED);
+    if (!g_failed)
+    {
+        fclose(f);
+        return;
+    }
+
+    char line[512];
+    while (fgets(line, sizeof(line), f) && g_failedCount < WR_MAX_FAILED)
+    {
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r')
+            continue;
+
+        // revision \t size \t basename \t why
+        char *tab1 = strchr(line, '\t');
+        if (!tab1) continue;
+        char *tab2 = strchr(tab1 + 1, '\t');
+        if (!tab2) continue;
+        char *tab3 = strchr(tab2 + 1, '\t');
+        if (!tab3) continue;
+        *tab1 = *tab2 = *tab3 = '\0';
+
+        if (atoi(line) != WR_EXTRACTOR_REVISION)
+            continue;           // written by a different extractor; retry it
+
+        FailedRec *r = &g_failed[g_failedCount];
+        r->size = _atoi64(tab1 + 1);
+        strncpy_s(r->base, sizeof(r->base), tab2 + 1, _TRUNCATE);
+        g_failedCount++;
+    }
+    fclose(f);
+}
+
+static bool IsKnownBad(const char *base, long long size)
+{
+    for (int i = 0; i < g_failedCount; i++)
+        if (g_failed[i].size == size && _stricmp(g_failed[i].base, base) == 0)
+            return true;
+    return false;
+}
+
 static void CountInTree(const char *root, const char *map, const char *pathsDir)
 {
     char pattern[MAX_PATH];
@@ -152,6 +233,9 @@ static void CountInTree(const char *root, const char *map, const char *pathsDir)
         _snprintf_s(wrp, sizeof(wrp), _TRUNCATE, "%s\\%s.wrpath", pathsDir, base);
         if (GetFileAttributesA(wrp) != INVALID_FILE_ATTRIBUTES)
             g_alreadyDone++;
+        else if (IsKnownBad(base, ((long long)fd.nFileSizeHigh << 32) |
+                                  fd.nFileSizeLow))
+            g_knownBad++;
         else
             g_notYetDone++;
     } while (FindNextFileA(h, &fd));
@@ -169,7 +253,7 @@ static DWORD WINAPI CountThread(LPVOID)
     strcpy_s(map, sizeof(map), g_map);
     LeaveCriticalSection(&g_cs);
 
-    g_forThisMap = g_alreadyDone = g_notYetDone = 0;
+    g_forThisMap = g_alreadyDone = g_notYetDone = g_knownBad = 0;
 
     if (map[0] && WrGameDir()[0])
     {
@@ -178,16 +262,23 @@ static DWORD WINAPI CountThread(LPVOID)
         char pathsDir[MAX_PATH];
         strcpy_s(pathsDir, sizeof(pathsDir), WrDataPath(rel));
 
+        LoadFailures(pathsDir);
+
         char root[MAX_PATH];
         _snprintf_s(root, sizeof(root), _TRUNCATE, "%s\\momentum\\momtv", WrGameDir());
         CountInTree(root, map, pathsDir);
+
+        free(g_failed);
+        g_failed = NULL;
+        g_failedCount = 0;
     }
 
     g_haveCounts = true;
     InterlockedExchange(&g_counting, 0);
-    if (g_notYetDone > 0)
-        WrLogf("extract: %s has %d demo%s, %d not yet extracted", map,
-               g_forThisMap, g_forThisMap == 1 ? "" : "s", g_notYetDone);
+    if (g_notYetDone > 0 || g_knownBad > 0)
+        WrLogf("extract: %s has %d demo%s, %d extracted, %d new, %d that failed "
+               "before", map, g_forThisMap, g_forThisMap == 1 ? "" : "s",
+               g_alreadyDone, g_notYetDone, g_knownBad);
     return 0;
 }
 
@@ -211,13 +302,15 @@ void WrExtractOnMapChanged(const char *map)
         InterlockedExchange(&g_counting, 0);
 }
 
-bool WrExtractCounts(int *forThisMap, int *alreadyDone, int *notYetDone)
+bool WrExtractCounts(int *forThisMap, int *alreadyDone, int *notYetDone,
+                     int *knownBad)
 {
     if (!g_haveCounts)
         return false;
     if (forThisMap) *forThisMap = g_forThisMap;
     if (alreadyDone) *alreadyDone = g_alreadyDone;
     if (notYetDone) *notYetDone = g_notYetDone;
+    if (knownBad) *knownBad = g_knownBad;
     return true;
 }
 
@@ -321,12 +414,17 @@ static DWORD WINAPI ReadThread(LPVOID param)
     return 0;
 }
 
-void WrExtractRun(void)
+void WrExtractRun(bool retryFailed)
 {
     EnsureCs();
     FindInterpreter();
     if (!g_interpFound)
+    {
+        // Say so in the panel. Returning silently makes the button look broken,
+        // which is the worst way to find out Python is not installed.
+        PushLine(g_interp);
         return;
+    }
     if (InterlockedCompareExchange(&g_running, 1, 0) != 0)
         return;
 
@@ -356,8 +454,9 @@ void WrExtractRun(void)
     // without it the panel would show nothing at all until the run ended.
     char cmd[2048];
     _snprintf_s(cmd, sizeof(cmd), _TRUNCATE,
-                "\"%s\" %s-u \"%s\" --map \"%s\" --game \"%s\" --skip-existing",
-                g_interp, g_interpIsPy ? "-3 " : "", script, map, WrGameDir());
+                "\"%s\" %s-u \"%s\" --map \"%s\" --game \"%s\" --skip-existing%s",
+                g_interp, g_interpIsPy ? "-3 " : "", script, map, WrGameDir(),
+                retryFailed ? " --retry-failed" : "");
 
     SECURITY_ATTRIBUTES sa;
     sa.nLength = sizeof(sa);

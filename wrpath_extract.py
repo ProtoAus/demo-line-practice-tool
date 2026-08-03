@@ -76,6 +76,23 @@ DEFAULT_GAME = r"C:\Program Files (x86)\Steam\steamapps\common\Momentum Mod Play
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_OUT = os.path.join(SCRIPT_DIR, "wrlines_data", "paths")
 
+# Bumped whenever anything that decides whether a demo can be extracted changes.
+#
+# Failures are recorded per map (see FAILURES_FILE) so that re-running a map
+# costs seconds instead of minutes -- surf_colin_blaster_69000 has 66 demos that
+# all fail, and re-deriving that takes four and a half minutes every time. The
+# record carries this number, and a record written by a different revision is
+# ignored, so improving the extractor automatically retries everything it
+# previously gave up on. Nobody has to remember to delete a file.
+#
+# Keep in sync with WR_EXTRACTOR_REVISION in wr_extract.h, which reads the same
+# file to report the count in-game. If they ever disagree, the in-game count
+# simply falls back to treating those demos as unprocessed, which is the safe
+# direction: it offers to do work that has already been done, rather than hiding
+# work that has not.
+EXTRACTOR_REVISION = 1
+FAILURES_FILE = "_failed.txt"
+
 # ---------------------------------------------------------------------------
 # .mtv container
 # ---------------------------------------------------------------------------
@@ -1095,12 +1112,77 @@ def wrpath_for(out_dir, demo_path, map_name):
     return os.path.join(out_dir, map_name, base + ".wrpath")
 
 
+def failures_path(out_dir, map_name):
+    return os.path.join(out_dir, map_name, FAILURES_FILE)
+
+
+def load_failures(out_dir, map_name):
+    """basename -> (size, reason), for demos that already failed once.
+
+    Records written by a different EXTRACTOR_REVISION are ignored rather than
+    deleted: they cost nothing to leave in place and the next write rewrites the
+    file anyway.
+    """
+    out = {}
+    try:
+        with open(failures_path(out_dir, map_name), "r",
+                  encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if not line.strip() or line.startswith("#"):
+                    continue
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 4:
+                    continue
+                try:
+                    rev, size = int(parts[0]), int(parts[1])
+                except ValueError:
+                    continue
+                if rev == EXTRACTOR_REVISION:
+                    out[parts[2]] = (size, parts[3])
+    except OSError:
+        pass
+    return out
+
+
+def save_failures(out_dir, map_name, records):
+    path = failures_path(out_dir, map_name)
+    if not records:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("# WrLines: demos on this map that could not be extracted.\n")
+        f.write("# Re-running the extractor skips these, because deriving the\n")
+        f.write("# same failure again costs the same minutes it cost the first\n")
+        f.write("# time. Pass --retry-failed to try them anyway; delete this\n")
+        f.write("# file to forget them entirely.\n")
+        f.write("# extractor-revision <TAB> bytes <TAB> demo <TAB> why\n")
+        for base in sorted(records):
+            size, why = records[base]
+            why = why.replace("\t", " ").replace("\n", " ")
+            f.write("%d\t%d\t%s\t%s\n" % (EXTRACTOR_REVISION, size, base, why))
+    os.replace(tmp, path)
+
+
+def _size_of(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return -1
+
+
 def cmd_extract(args):
     already = 0
+    known_bad = 0
     if args.file:
-        targets = [args.file]
+        targets = [(args.file, peek_map(args.file) or "")]
     else:
         targets = []
+        failures_by_map = {}
         for _tree, path in iter_demos(args.game):
             m = peek_map(path) or ""
             if args.map and m.lower() != args.map.lower():
@@ -1109,18 +1191,45 @@ def cmd_extract(args):
                     wrpath_for(args.out, path, m)):
                 already += 1
                 continue
-            targets.append(path)
+            # Demos that failed before, at this revision, with this exact file
+            # size. A re-download that changed the file is not the same demo and
+            # gets another go.
+            if args.skip_existing and m and not args.retry_failed:
+                if m not in failures_by_map:
+                    failures_by_map[m] = load_failures(args.out, m)
+                rec = failures_by_map[m].get(
+                    os.path.splitext(os.path.basename(path))[0])
+                if rec and rec[0] == _size_of(path):
+                    known_bad += 1
+                    continue
+            targets.append((path, m))
     if already:
         print("%d already extracted, skipping them" % already)
+    if known_bad:
+        print("%d failed before and are being skipped (--retry-failed to try "
+              "them again)" % known_bad)
+
+    # What we learn this run, per map, so the record can be updated in place:
+    # newly failed demos are added, and any that succeed this time are dropped.
+    seen_maps = set()
+    now_failed = {}
+    now_ok = {}
 
     done = ok = skipped = failed = lowconf = 0
     cov = []
     t0 = time.time()
-    for path in targets:
+    for path, demo_map in targets:
         if args.limit and done >= args.limit:
             break
         done += 1
         kind, name, msg, extra = process_one(path, args)
+        base = os.path.splitext(name)[0]
+        if demo_map:
+            seen_maps.add(demo_map)
+            if kind == "error":
+                now_failed.setdefault(demo_map, {})[base] = (_size_of(path), msg)
+            elif kind == "ok":
+                now_ok.setdefault(demo_map, set()).add(base)
         if kind == "error":
             failed += 1
             print("  FAIL %-44s %s" % (name[:44], msg))
@@ -1152,6 +1261,20 @@ def cmd_extract(args):
               % (100 * cov[len(cov) // 2], 100 * cov[0], 100 * cov[-1]))
     if not args.verify and ok:
         print("wrote %d .wrpath files under %s" % (ok, args.out))
+
+    # --verify writes nothing, and that has to include this.
+    if not args.verify:
+        recorded = 0
+        for m in seen_maps:
+            recs = load_failures(args.out, m)
+            recs.update(now_failed.get(m, {}))
+            for base in now_ok.get(m, ()):        # rescued: forget the failure
+                recs.pop(base, None)
+            save_failures(args.out, m, recs)
+            recorded += len(now_failed.get(m, {}))
+        if recorded:
+            print("recorded %d failure%s so re-running this map skips them"
+                  % (recorded, "" if recorded == 1 else "s"))
     return 0 if failed == 0 else 1
 
 
@@ -1168,8 +1291,12 @@ def main(argv):
                     help="extract and report, but write nothing")
     ap.add_argument("--limit", type=int, default=0, help="stop after N demos")
     ap.add_argument("--skip-existing", action="store_true",
-                    help="skip demos that already have a .wrpath; makes "
-                         "re-running a map cost seconds instead of minutes")
+                    help="skip demos that already have a .wrpath, and demos "
+                         "recorded as having failed before; makes re-running a "
+                         "map cost seconds instead of minutes")
+    ap.add_argument("--retry-failed", action="store_true",
+                    help="with --skip-existing, try the recorded failures "
+                         "again anyway")
     args = ap.parse_args(argv)
 
     if not os.path.isdir(args.game):
