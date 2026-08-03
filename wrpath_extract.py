@@ -1304,6 +1304,7 @@ def cmd_extract(args):
             m = peek_map(path) or ""
             if args.map and m.lower() != args.map.lower():
                 continue
+            stale_out = False
             if args.skip_existing and m:
                 out = wrpath_for(args.out, path, m)
                 if os.path.exists(out):
@@ -1311,10 +1312,17 @@ def cmd_extract(args):
                         already += 1
                         continue
                     stale += 1      # written by an older extractor; redo it
+                    stale_out = True
             # Demos that failed before, at this revision, with this exact file
             # size. A re-download that changed the file is not the same demo and
             # gets another go.
-            if args.skip_existing and m and not args.retry_failed:
+            #
+            # Not applied when there is an out-of-date output on disk. That
+            # combination is real -- a demo can have succeeded under the old
+            # extractor and fail under the new one -- and skipping it would leave
+            # the old file in place forever, still loaded, still drawn, derived
+            # from an assumption we have since established was wrong.
+            if args.skip_existing and m and not args.retry_failed and not stale_out:
                 if m not in failures_by_map:
                     failures_by_map[m] = load_failures(args.out, m)
                 rec = failures_by_map[m].get(
@@ -1341,6 +1349,7 @@ def cmd_extract(args):
         targets = targets[:args.limit]
 
     done = ok = skipped = failed = lowconf = 0
+    removed = []
     cov = []
     t0 = time.time()
     total = len(targets)
@@ -1358,6 +1367,20 @@ def cmd_extract(args):
         pre = "[%d/%d]" % (done, total)
         if kind == "error":
             failed += 1
+            # An older extractor may have left an output for this demo. We have
+            # just established the current one cannot produce it, so that file is
+            # a path derived from an assumption we no longer trust -- remove it
+            # rather than go on drawing it. Current-revision files are never
+            # touched.
+            if not args.verify and demo_map:
+                out = wrpath_for(args.out, path, demo_map)
+                try:
+                    if (os.path.exists(out)
+                            and wrpath_revision(out) != EXTRACTOR_REVISION):
+                        os.remove(out)
+                        removed.append(base)
+                except OSError:
+                    pass
             print("%s FAIL %-44s %s" % (pre, name[:44], msg))
         elif kind == "skip":
             skipped += 1
@@ -1387,6 +1410,9 @@ def cmd_extract(args):
               % (100 * cov[len(cov) // 2], 100 * cov[0], 100 * cov[-1]))
     if not args.verify and ok:
         print("wrote %d .wrpath files under %s" % (ok, args.out))
+    if removed:
+        print("removed %d out-of-date .wrpath file%s whose demo can no longer be "
+              "extracted" % (len(removed), "" if len(removed) == 1 else "s"))
 
     # --verify writes nothing, and that has to include this.
     if not args.verify:
