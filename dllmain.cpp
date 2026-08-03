@@ -31,10 +31,16 @@
 
 static char g_lastMap[72] = {0};
 
-// Called once per frame from the render thread, before the UI is drawn.
+// Called once per frame from inside Present, BEFORE we decide whether to draw.
+//
+// Everything here has to keep working on frames where nothing is on screen --
+// the map has to be noticed changing, the matrix scan has to keep tracking, the
+// energy history has to stay continuous. None of it touches the device or ImGui,
+// which is what lets the whole draw path be skipped on an idle frame.
+//
 // Lives here rather than in wr_imgui.cpp so the per-frame ordering of the whole
 // tool is visible in one place.
-void WrFrameTick(void)
+void WrIdleTick(void)
 {
     WrEngineTick();
 
@@ -49,6 +55,20 @@ void WrFrameTick(void)
         WrEnergyReset();
     }
 
+    // Our own frame time. ImGui's io.DeltaTime is not available here: on an idle
+    // frame there is no ImGui frame at all, and using it would make the energy
+    // sampler's velocity baseline silently wrong whenever the panel was shut.
+    static LARGE_INTEGER freq = {0};
+    static LARGE_INTEGER prev = {0};
+    if (freq.QuadPart == 0)
+        QueryPerformanceFrequency(&freq);
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    float dt = 0.0f;
+    if (prev.QuadPart != 0 && freq.QuadPart != 0)
+        dt = (float)((double)(now.QuadPart - prev.QuadPart) / (double)freq.QuadPart);
+    prev = now;
+
     // Feed the live recorder and the energy sampler from the camera we already
     // solved for rendering. Both want it every frame, not only while the panel
     // is open.
@@ -56,10 +76,11 @@ void WrFrameTick(void)
     if (WrCameraOrigin(&cam))
     {
         WrLiveRecord(cam);
-        WrEnergySample(cam, ImGui::GetIO().DeltaTime);
+        WrEnergySample(cam, dt);
     }
 
-    // Advance a couple of pending Steam avatar lookups.
+    // Advance a couple of pending Steam avatar lookups. Does nothing unless a
+    // tag asked for one, which only happens while drawing.
     WrSteamTick();
 }
 

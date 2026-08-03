@@ -28,6 +28,12 @@
 #include "wr_hook.h"
 #include "wr_log.h"
 #include "wr_imgui.h"
+#include "wr_render.h"
+
+// Defined in dllmain.cpp: per-frame bookkeeping that must run even on frames we
+// do not draw. Declared here rather than pulled in through a header so this
+// translation unit keeps its short include list.
+void WrIdleTick(void);
 
 #include <d3d11.h>
 #include <dxgi.h>
@@ -74,6 +80,10 @@ static bool g_sawRawInput = false;
 static bool g_renderReady = false;
 static bool g_isDxvk = false;
 static char g_d3d11Path[MAX_PATH] = {0};
+static bool g_presentPreHooked = false;
+static char g_presentBytes[32] = {0};
+static unsigned int g_framesDrawn = 0;
+static unsigned int g_framesSkipped = 0;
 
 bool WrMenuOpen(void) { return g_menuOpen != 0; }
 HWND WrGameWindow(void) { return g_window; }
@@ -81,6 +91,15 @@ ID3D11Device *WrDevice(void) { return g_device; }
 ID3D11DeviceContext *WrContext(void) { return g_context; }
 bool WrIsDxvk(void) { return g_isDxvk; }
 const char *WrD3D11Path(void) { return g_d3d11Path; }
+bool WrPresentPreHooked(void) { return g_presentPreHooked; }
+const char *WrPresentFirstBytes(void) { return g_presentBytes; }
+bool WrWndProcInstalled(void) { return g_origWndProc != NULL; }
+
+void WrFrameCounts(unsigned int *drawn, unsigned int *skipped)
+{
+    if (drawn) *drawn = g_framesDrawn;
+    if (skipped) *skipped = g_framesSkipped;
+}
 
 void WrBackbufferSize(int *w, int *h)
 {
@@ -104,6 +123,10 @@ void WrCursorUpdate(void)
     g_cursorFollowsOS = false;
     if (!g_window)
         return;
+    // Two syscalls whose only consumer is the panel. Nothing reads the result
+    // while it is shut, so do not pay for them 300 times a second.
+    if (!WrMenuOpen())
+        return;
 
     CURSORINFO ci;
     ci.cbSize = sizeof(ci);
@@ -119,6 +142,9 @@ void WrCursorUpdate(void)
     g_cursorFollowsOS = true;
 }
 
+static void SubclassWindow(HWND hwnd);
+static void UnsubclassWindow(void);
+
 void WrSetMenuOpen(bool open)
 {
     InterlockedExchange(&g_menuOpen, open ? 1 : 0);
@@ -128,6 +154,13 @@ void WrSetMenuOpen(bool open)
         // cursor happens to have been parked by the game's recentring.
         g_curX = g_bbWidth * 0.5f;
         g_curY = g_bbHeight * 0.5f;
+        // The window procedure goes in only for as long as the panel is up. See
+        // SubclassWindow for why.
+        SubclassWindow(g_window);
+    }
+    else
+    {
+        UnsubclassWindow();
     }
     WrLogf("menu %s", open ? "opened" : "closed");
 }
@@ -232,10 +265,26 @@ static LRESULT CALLBACK WrWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
         }
     }
 
-    return g_wndUnicode ? CallWindowProcW(g_origWndProc, hwnd, msg, wParam, lParam)
-                        : CallWindowProcA(g_origWndProc, hwnd, msg, wParam, lParam);
+    // Read once into a local. The panel can be closed from the hotkey thread
+    // while a message is being handled here, and that restores the original
+    // procedure and clears the global -- calling through a NULL would be a crash
+    // in a code path that is otherwise never exercised.
+    WNDPROC orig = g_origWndProc;
+    if (!orig)
+        return g_wndUnicode ? DefWindowProcW(hwnd, msg, wParam, lParam)
+                            : DefWindowProcA(hwnd, msg, wParam, lParam);
+
+    return g_wndUnicode ? CallWindowProcW(orig, hwnd, msg, wParam, lParam)
+                        : CallWindowProcA(orig, hwnd, msg, wParam, lParam);
 }
 
+// Installed when the panel opens, removed when it closes.
+//
+// It used to go in at the first Present and stay for the whole session, which is
+// exactly what other overlays watch for -- SpecialK monitors the window
+// procedure and complains when something replaces it. Since the only consumer is
+// the panel, and the INSERT hotkey is polled on its own thread rather than
+// coming through here, there is no reason to hold it during normal play.
 static void SubclassWindow(HWND hwnd)
 {
     if (g_origWndProc || !hwnd)
@@ -245,6 +294,32 @@ static void SubclassWindow(HWND hwnd)
         ? (WNDPROC)SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)WrWndProc)
         : (WNDPROC)SetWindowLongPtrA(hwnd, GWLP_WNDPROC, (LONG_PTR)WrWndProc);
     WrLogf("subclassed window %p (%s)", (void *)hwnd, g_wndUnicode ? "unicode" : "ansi");
+}
+
+static void UnsubclassWindow(void)
+{
+    if (!g_origWndProc || !g_window)
+        return;
+
+    // Only unhook if we are still the top of the chain. If something else
+    // subclassed on top of us in the meantime, restoring the original would cut
+    // that other thing out entirely -- a much worse bug than leaving ours in.
+    WNDPROC current = g_wndUnicode
+        ? (WNDPROC)GetWindowLongPtrW(g_window, GWLP_WNDPROC)
+        : (WNDPROC)GetWindowLongPtrA(g_window, GWLP_WNDPROC);
+    if (current != (WNDPROC)WrWndProc)
+    {
+        WrLogf("[!] not restoring the window procedure: something subclassed on "
+               "top of us (now %p). Leaving ours in the chain.", (void *)current);
+        return;
+    }
+
+    if (g_wndUnicode)
+        SetWindowLongPtrW(g_window, GWLP_WNDPROC, (LONG_PTR)g_origWndProc);
+    else
+        SetWindowLongPtrA(g_window, GWLP_WNDPROC, (LONG_PTR)g_origWndProc);
+    g_origWndProc = NULL;
+    WrLogf("window procedure restored");
 }
 
 // ---------------------------------------------------------------------------
@@ -318,7 +393,6 @@ static HRESULT WINAPI HookedPresent(IDXGISwapChain *sc, UINT interval, UINT flag
     {
         if (AcquireDeviceFrom(sc))
         {
-            SubclassWindow(g_window);
             if (CreateRenderTarget(sc) && WrImGuiInit(g_window, g_device, g_context))
             {
                 g_renderReady = true;
@@ -327,18 +401,63 @@ static HRESULT WINAPI HookedPresent(IDXGISwapChain *sc, UINT interval, UINT flag
         }
     }
 
-    if (g_renderReady)
-    {
-        if (!g_rtv)
-            CreateRenderTarget(sc);
+    if (!g_renderReady)
+        return g_origPresent(sc, interval, flags);
 
-        if (g_rtv)
-        {
-            // Under the flip model the render target is unbound after every
-            // Present, so this has to happen every frame, not once at init.
-            g_context->OMSetRenderTargets(1, &g_rtv, NULL);
-            WrImGuiFrame();
-        }
+    // The panel can be opened before the window is known, in which case
+    // WrSetMenuOpen had nothing to subclass. Catch up here.
+    if (WrMenuOpen() && !g_origWndProc)
+        SubclassWindow(g_window);
+
+    // Bookkeeping that has to keep running whether or not we draw: map changes,
+    // the matrix scan, energy sampling. Cheap, and none of it touches the device.
+    WrStageBegin(WR_STAGE_IDLE);
+    WrIdleTick();
+    WrStageEnd(WR_STAGE_IDLE);
+
+    // Nothing to draw? Then touch nothing at all -- no render target binding, no
+    // ImGui frame, no draw calls, no device state saved or restored. Present
+    // becomes a straight passthrough plus the bookkeeping above.
+    //
+    // This is not only about saving work. A frame limiter that paces itself
+    // inside its own Present hook -- SpecialK's does -- oscillates badly when
+    // the cost below it varies from frame to frame, which is what turned a
+    // steady 300 fps into 150 bouncing around.
+    if (!WrHasAnythingToDraw())
+    {
+        g_framesSkipped++;
+        return g_origPresent(sc, interval, flags);
+    }
+
+    if (!g_rtv)
+        CreateRenderTarget(sc);
+
+    if (g_rtv)
+    {
+        // Save what was bound so we can put it back. We used to leave the
+        // pipeline pointing at our render target, and since ImGui's own state
+        // backup happens *after* this it faithfully restored ours rather than
+        // the game's -- so anything drawing later in the same Present, which is
+        // exactly what another overlay is, inherited it.
+        ID3D11RenderTargetView *prevRtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {0};
+        ID3D11DepthStencilView *prevDsv = NULL;
+        g_context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT,
+                                      prevRtv, &prevDsv);
+
+        // Under the flip model the render target is unbound after every
+        // Present, so this has to happen every frame, not once at init.
+        g_context->OMSetRenderTargets(1, &g_rtv, NULL);
+        WrImGuiFrame();
+        g_framesDrawn++;
+
+        g_context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT,
+                                      prevRtv, prevDsv);
+        // OMGetRenderTargets AddRefs everything it hands back.
+        for (int i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; i++)
+            if (prevRtv[i])
+                prevRtv[i]->Release();
+        if (prevDsv)
+            prevDsv->Release();
     }
 
     return g_origPresent(sc, interval, flags);
@@ -435,9 +554,27 @@ static bool ReadSwapChainVTable(HMODULE d3d11, void **outPresent, void **outResi
     ID3D11Device *dev = NULL;
     ID3D11DeviceContext *ctx = NULL;
 
-    HRESULT hr = create(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, want,
-                        (UINT)(sizeof(want) / sizeof(want[0])), D3D11_SDK_VERSION,
-                        &sd, &sc, &dev, &got, &ctx);
+    // WARP first, hardware only as a fallback.
+    //
+    // All we want is the vtable layout, which belongs to the loaded d3d11.dll
+    // and not to any adapter, so a software device answers the question exactly
+    // as well. It also avoids handing other overlays something confusing to
+    // reason about: SpecialK hooks D3D11CreateDeviceAndSwapChain and tracks the
+    // swapchains it sees, and a phantom hardware swapchain appearing on a hidden
+    // 8x8 window mid-session is not a helpful thing to show it. DXVK may not
+    // offer WARP at all, hence the fallback.
+    D3D_DRIVER_TYPE types[] = { D3D_DRIVER_TYPE_WARP, D3D_DRIVER_TYPE_HARDWARE };
+    HRESULT hr = E_FAIL;
+    for (int t = 0; t < 2 && !sc; t++)
+    {
+        hr = create(NULL, types[t], NULL, 0, want,
+                    (UINT)(sizeof(want) / sizeof(want[0])), D3D11_SDK_VERSION,
+                    &sd, &sc, &dev, &got, &ctx);
+        if (SUCCEEDED(hr) && sc)
+            WrLogf("vtable read from a %s device",
+                   types[t] == D3D_DRIVER_TYPE_WARP ? "WARP (software)" : "hardware");
+    }
+
     bool ok = false;
     if (SUCCEEDED(hr) && sc)
     {
@@ -447,11 +584,17 @@ static bool ReadSwapChainVTable(HMODULE d3d11, void **outPresent, void **outResi
         ok = true;
 
         // If something has already hooked DXGI (Steam overlay, RTSS, SpecialK)
-        // the first bytes will be a jump. Worth having in the log before we add
-        // ourselves on top of it.
+        // the first bytes will be a jump. Worth having in the log -- and in
+        // Diagnostics -- before we add ourselves on top of it.
         const unsigned char *p = (const unsigned char *)*outPresent;
-        WrLogf("Present @ %p  first bytes %02X %02X %02X %02X %02X",
-               *outPresent, p[0], p[1], p[2], p[3], p[4]);
+        _snprintf_s(g_presentBytes, sizeof(g_presentBytes), _TRUNCATE,
+                    "%02X %02X %02X %02X %02X", p[0], p[1], p[2], p[3], p[4]);
+        // E9 = rel32 jmp, FF 25 = indirect jmp, 48 B8 = mov rax, imm64 (the
+        // usual opening of a 64-bit detour).
+        g_presentPreHooked = (p[0] == 0xE9) || (p[0] == 0xFF && p[1] == 0x25) ||
+                             (p[0] == 0x48 && p[1] == 0xB8) || (p[0] == 0xEB);
+        WrLogf("Present @ %p  first bytes %s%s", *outPresent, g_presentBytes,
+               g_presentPreHooked ? "   (already hooked by something else)" : "");
         WrLogf("ResizeBuffers @ %p", *outResize);
     }
     else

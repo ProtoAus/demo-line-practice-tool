@@ -819,8 +819,18 @@ static bool ParseMapFromServerInfo(const unsigned char *buf, int len, char *out,
     return false;
 }
 
+// Throttle: a map change does not need three-millisecond resolution, and the
+// stat below is a filesystem syscall sitting in the Present path.
+#define MAP_POLL_MS 250
+
 static void RefreshMapFromDemoHeader(void)
 {
+    static DWORD lastPoll = 0;
+    DWORD now = GetTickCount();
+    if (lastPoll != 0 && (now - lastPoll) < MAP_POLL_MS)
+        return;
+    lastPoll = now;
+
     const char *path = DemoHeaderPath();
 
     WIN32_FILE_ATTRIBUTE_DATA fad;

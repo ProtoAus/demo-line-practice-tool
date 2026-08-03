@@ -46,6 +46,29 @@ void WrRenderWorld(void);
 void WrRenderStats(int *segments, int *pointsConsidered, int *batches,
                    float *millis);
 
+// Would this frame put anything on screen? Asked inside Present, before any
+// device state is touched; see HookedPresent in wr_hook.cpp.
+bool WrHasAnythingToDraw(void);
+
+// --- where the frame goes ----------------------------------------------------
+//
+// Four stage timers, smoothed, in milliseconds. Added because the last
+// performance question was answered by reading code and reasoning rather than by
+// measuring, which is one lucky guess away from being wrong.
+enum WrStage
+{
+    WR_STAGE_IDLE = 0,      // map poll + matrix scan + energy sampling
+    WR_STAGE_EMIT,          // projecting and batching the lines
+    WR_STAGE_UI,            // building the panel
+    WR_STAGE_SUBMIT,        // ImGui::Render + RenderDrawData
+    WR_STAGE_COUNT
+};
+
+void WrStageBegin(WrStage s);
+void WrStageEnd(WrStage s);
+float WrStageMillis(WrStage s);
+const char *WrStageName(WrStage s);
+
 // The run the energy readout is comparing you against -- the fastest enabled
 // one whose line is currently within g_energy.compareRadius -- or NULL when
 // nothing enabled is near enough for the comparison to mean anything.

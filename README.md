@@ -94,6 +94,30 @@ Press **INSERT** in game. Tick runs in the Runs tab. **ESC** closes the panel.
 - **It does not decode the demo netstream properly.** See below — the extractor is a
   pattern-matcher, and it tells you when it is unsure rather than guessing quietly.
 
+### Living with other overlays
+
+SpecialK, RTSS and the Steam overlay all hook `Present` too, and a second hook in that chain
+is a real thing to be careful with — a frame limiter that paces itself inside its own Present
+hook will oscillate if the work below it varies frame to frame. Three deliberate choices:
+
+- **Nothing to draw means nothing happens.** When no runs are ticked, the panel is shut and
+  the energy readout is off — and always at menus and loading screens — `Present` binds no
+  render target, builds no ImGui frame and touches no device state. Diagnostics counts the
+  frames it skipped, so you can confirm it.
+- **The render target is put back.** What was bound before we draw is saved and restored.
+  ImGui's own state backup happens *after* we bind ours, so without this it faithfully
+  restores the wrong thing and whatever draws next in the same frame inherits our target.
+- **The window procedure is only replaced while the panel is open**, and restored on close —
+  and if something else subclassed on top of us in the meantime, we leave the chain alone
+  rather than cut it out, and say so in the log.
+
+The vtable read at startup uses a WARP (software) device rather than a hardware one. All it
+needs is the layout, which belongs to the loaded `d3d11.dll`, and it avoids showing other
+overlays a phantom swapchain to reason about.
+
+With the energy readout on — which is the default — a small, *constant* amount of work happens
+every frame. Turning it off in the Energy tab makes `Present` a complete passthrough.
+
 ### Fair play
 
 This is a client-side visualisation tool. It shows you a route that is already public in the

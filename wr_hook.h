@@ -37,4 +37,25 @@ bool WrCursorFollowsOS(void);
 bool WrIsDxvk(void);
 const char *WrD3D11Path(void);
 
+// --- coexisting with other overlays -----------------------------------------
+//
+// Provided by wr_render.cpp. When this is false the whole draw path is skipped
+// inside Present: no render target is bound, no ImGui frame is built, nothing is
+// submitted and no device state is touched. That matters beyond saving work --
+// a frame limiter that paces itself inside its own Present hook (SpecialK does)
+// oscillates when the cost below it varies frame to frame.
+bool WrHasAnythingToDraw(void);
+
+// True if something had already hooked Present before we got there.
+bool WrPresentPreHooked(void);
+const char *WrPresentFirstBytes(void);
+
+// Is our window procedure currently installed? It goes in when the panel opens
+// and comes out when it closes, so during normal play the game's window is
+// untouched.
+bool WrWndProcInstalled(void);
+
+// Frames Present ran with nothing for us to do, and frames we actually drew.
+void WrFrameCounts(unsigned int *drawn, unsigned int *skipped);
+
 #endif // WR_HOOK_H

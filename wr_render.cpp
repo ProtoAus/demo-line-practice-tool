@@ -37,7 +37,10 @@ WrRenderSettings g_render;
 
 #define NEAR_W 1.0f
 #define MAX_BATCH 4096
-#define ALPHA_BUCKETS 8
+// Buckets for the distance FADE, not for the alpha setting -- see EmitPath.
+// Twelve rather than eight makes the fade ramp smoother; the cost is at most a
+// few extra polyline flushes on a path that spans the whole fade band.
+#define ALPHA_BUCKETS 12
 #define COLOUR_BUCKETS 16
 #define OFFSCREEN_BREAK 8
 
@@ -72,6 +75,91 @@ void WrRenderDefaults(void)
     g_render.maxTags = 12;
     g_render.drawDipSpeeds = true;
     g_render.maxDipsPerRun = 24;
+}
+
+// ---------------------------------------------------------------------------
+// Stage timers
+// ---------------------------------------------------------------------------
+
+static long long g_stageStart[WR_STAGE_COUNT];
+static float g_stageMs[WR_STAGE_COUNT];
+
+// QueryPerformanceFrequency is a constant for the life of the process. It was
+// being asked for once per frame.
+static long long Qpf(void)
+{
+    static long long f = 0;
+    if (f == 0)
+    {
+        LARGE_INTEGER q;
+        QueryPerformanceFrequency(&q);
+        f = q.QuadPart ? q.QuadPart : 1;
+    }
+    return f;
+}
+
+void WrStageBegin(WrStage s)
+{
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    g_stageStart[s] = t.QuadPart;
+}
+
+void WrStageEnd(WrStage s)
+{
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    float ms = (float)((double)(t.QuadPart - g_stageStart[s]) * 1000.0 / (double)Qpf());
+    // Smoothed, or the numbers are unreadable at 300 fps.
+    g_stageMs[s] = g_stageMs[s] * 0.95f + ms * 0.05f;
+}
+
+float WrStageMillis(WrStage s)
+{
+    return (s >= 0 && s < WR_STAGE_COUNT) ? g_stageMs[s] : 0.0f;
+}
+
+const char *WrStageName(WrStage s)
+{
+    switch (s)
+    {
+    case WR_STAGE_IDLE:   return "bookkeeping";
+    case WR_STAGE_EMIT:   return "lines";
+    case WR_STAGE_UI:     return "panel";
+    case WR_STAGE_SUBMIT: return "imgui submit";
+    default:              return "?";
+    }
+}
+
+// Would this frame put anything on screen?
+//
+// Asked from inside Present, before any device state is touched. If the answer
+// is no, the entire draw path is skipped -- see HookedPresent in wr_hook.cpp for
+// why that matters more than the work it saves.
+bool WrHasAnythingToDraw(void)
+{
+    if (WrMenuOpen())
+        return true;
+
+    // Everything else is drawn inside WrRenderWorld, which gives up immediately
+    // without a world-to-screen matrix. No matrix -- main menu, loading screen,
+    // scan still searching -- means nothing can appear no matter what is ticked.
+    VMatrix m;
+    if (!WrWorldToScreen(&m))
+        return false;
+
+    // The energy readouts need a camera as much as the lines do.
+    if ((g_energy.showHud || g_energy.showOverlay) && WrEnergyValid())
+        return true;
+    if (g_render.drawLive && WrLiveEnabled())
+        return true;
+    for (int i = 0; i < WrRunCount(); i++)
+    {
+        const WrRun *r = WrRunAt(i);
+        if (r && r->enabled && r->pointCount >= 2)
+            return true;
+    }
+    return false;
 }
 
 void WrRenderStats(int *segments, int *pointsConsidered, int *batches,
@@ -329,13 +417,21 @@ static void EmitPath(ImDrawList *dl, const WrPoint *pts, int count,
             offscreenRun = 0;
         }
 
-        // Fade with distance, quantised so runs of equal alpha batch together.
+        // Fade with distance. Only the FADE is quantised -- it varies per point,
+        // so runs of equal fade are what batch together. The alpha setting is
+        // constant across the whole path and is multiplied in exactly.
+        //
+        // Quantising their product, which is what this used to do, meant the
+        // slider only had ALPHA_BUCKETS reachable values and moved in visible
+        // steps. Splitting them costs nothing: the batch key is still the fade
+        // bucket, so the number of AddPolyline calls is unchanged.
         float dist = sqrtf(dsq);
         float fade = 1.0f;
         if (dist > fadeStart && maxDist > fadeStart)
             fade = 1.0f - (dist - fadeStart) / (maxDist - fadeStart);
-        float a01 = WrClampF(g_render.alpha * fade, 0.0f, 1.0f);
-        int aBucket = (int)(a01 * (ALPHA_BUCKETS - 1) + 0.5f);
+        int fBucket = (int)(WrClampF(fade, 0.0f, 1.0f) * (ALPHA_BUCKETS - 1) + 0.5f);
+        float a01 = WrClampF(g_render.alpha * (float)fBucket / (ALPHA_BUCKETS - 1),
+                             0.0f, 1.0f);
 
         unsigned int colour;
         int bucket;
@@ -348,14 +444,13 @@ static void EmitPath(ImDrawList *dl, const WrPoint *pts, int count,
             int cBucket = (int)(t * (COLOUR_BUCKETS - 1) + 0.5f);
             colour = WithAlpha(SpeedColour(g_render.speedMin +
                         (g_render.speedMax - g_render.speedMin) *
-                        ((float)cBucket / (COLOUR_BUCKETS - 1))),
-                        (float)aBucket / (ALPHA_BUCKETS - 1));
-            bucket = aBucket * COLOUR_BUCKETS + cBucket;
+                        ((float)cBucket / (COLOUR_BUCKETS - 1))), a01);
+            bucket = fBucket * COLOUR_BUCKETS + cBucket;
         }
         else
         {
-            colour = WithAlpha(baseColour, (float)aBucket / (ALPHA_BUCKETS - 1));
-            bucket = aBucket;
+            colour = WithAlpha(baseColour, a01);
+            bucket = fBucket;
         }
 
         if (have && bucket != lastBucket)
@@ -941,8 +1036,7 @@ void WrRenderWorld(void)
     if (bw <= 0 || bh <= 0)
         return;
 
-    LARGE_INTEGER t0, t1, freq;
-    QueryPerformanceFrequency(&freq);
+    LARGE_INTEGER t0, t1;
     QueryPerformanceCounter(&t0);
 
     g_m = &m;
@@ -987,5 +1081,6 @@ void WrRenderWorld(void)
 
     QueryPerformanceCounter(&t1);
     g_statMillis = (float)((double)(t1.QuadPart - t0.QuadPart) * 1000.0 /
-                           (double)freq.QuadPart);
+                           (double)Qpf());
+    g_stageMs[WR_STAGE_EMIT] = g_stageMs[WR_STAGE_EMIT] * 0.95f + g_statMillis * 0.05f;
 }

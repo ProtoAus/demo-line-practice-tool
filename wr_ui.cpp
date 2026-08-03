@@ -728,6 +728,54 @@ static void DrawDiagnosticsTab(void)
     ImGui::Text("batches     %d AddPolyline calls", batches);
     ImGui::Text("frame       %.1f fps", ImGui::GetIO().Framerate);
 
+    // --- where the frame actually goes --------------------------------------
+    ImGui::SeparatorText("Cost, per frame");
+    float total = 0.0f;
+    for (int s = 0; s < WR_STAGE_COUNT; s++)
+        total += WrStageMillis((WrStage)s);
+    for (int s = 0; s < WR_STAGE_COUNT; s++)
+        ImGui::Text("%-13s %.3f ms", WrStageName((WrStage)s),
+                    WrStageMillis((WrStage)s));
+    ImGui::Text("%-13s %.3f ms", "total", total);
+
+    unsigned int drawn = 0, skipped = 0;
+    WrFrameCounts(&drawn, &skipped);
+    ImGui::Text("frames      %u drawn, %u skipped", drawn, skipped);
+    ImGui::SameLine();
+    HelpMarker("A skipped frame is one where Present did nothing at all: no "
+               "render target bound, no ImGui frame built, no device state "
+               "touched.\n\n"
+               "It happens whenever nothing would appear -- menus and loading "
+               "screens always, and in a map when the panel is closed, no runs "
+               "are ticked and the energy readouts are off.\n\n"
+               "Note the energy readout is ON by default, so while you are "
+               "playing this counter will normally sit still. That is working "
+               "as intended: the cost is small and, more importantly, the same "
+               "every frame. If another overlay's frame limiter is still "
+               "unhappy, turning the energy readout off in the Energy tab makes "
+               "Present a complete passthrough.");
+
+    // --- who else is in the Present chain ------------------------------------
+    ImGui::SeparatorText("Other overlays");
+    ImGui::Text("Present     first bytes %s", WrPresentFirstBytes());
+    if (WrPresentPreHooked())
+        ImGui::TextWrapped(
+            "Something had already hooked Present before we got there -- Steam "
+            "overlay, RTSS, SpecialK or similar. That is normal and supported. "
+            "If a frame limiter is misbehaving, the 'skipped' counter above is "
+            "the thing to watch: while it climbs we are adding nothing to the "
+            "frame for it to fight with.");
+    else
+        ImGui::TextDisabled("Nothing else appears to have hooked Present first.");
+    ImGui::Text("window proc %s", WrWndProcInstalled() ? "installed (panel open)"
+                                                       : "not installed");
+    ImGui::SameLine();
+    HelpMarker("The game's window procedure is only replaced while the panel is "
+               "open, and restored when it closes -- other overlays watch for "
+               "that being held permanently. If something subclasses on top of "
+               "us we leave ours in place rather than cut theirs out; the log "
+               "says so when that happens.");
+
     ImGui::SeparatorText("Steam");
     bool steamOn = WrSteamEnabled();
     if (ImGui::Checkbox("Look up names and avatars", &steamOn))

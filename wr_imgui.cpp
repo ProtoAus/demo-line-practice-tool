@@ -15,8 +15,9 @@
 static ImGuiContext *g_ctx = NULL;
 static bool g_backendsReady = false;
 
-// Defined in dllmain.cpp.
-void WrFrameTick(void);
+// Defined in dllmain.cpp. Called from Present before the draw decision, not from
+// here -- it has to run on frames where nothing is drawn at all.
+void WrIdleTick(void);
 
 bool WrImGuiInit(HWND hwnd, ID3D11Device *device, ID3D11DeviceContext *context)
 {
@@ -119,19 +120,23 @@ void WrImGuiFrame(void)
 
     ImGui::NewFrame();
 
-    // Engine resolution, map-change handling and live recording. Defined in
-    // dllmain.cpp so the per-frame ordering of the whole tool reads in one place.
-    WrFrameTick();
-
     // World lines go into the background draw list so they composite beneath
-    // the panel without any window or z-order juggling.
+    // the panel without any window or z-order juggling. Map detection, the
+    // matrix scan and energy sampling already ran in WrIdleTick, before Present
+    // decided whether this frame draws anything at all.
     WrRenderWorld();
 
     if (WrMenuOpen())
+    {
+        WrStageBegin(WR_STAGE_UI);
         WrUiDraw();
+        WrStageEnd(WR_STAGE_UI);
+    }
 
+    WrStageBegin(WR_STAGE_SUBMIT);
     ImGui::Render();
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    WrStageEnd(WR_STAGE_SUBMIT);
 
     if (prev && prev != g_ctx)
         ImGui::SetCurrentContext(prev);

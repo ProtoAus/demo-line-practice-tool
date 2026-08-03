@@ -64,13 +64,33 @@
 // jumps thousands of units between frames as different views are written into
 // it, which is what made the line snap between world-locked and screen-locked.
 // A real player camera cannot move more than a few hundred units in one frame.
+//
+// This one is only used for RANKING candidates, where a per-frame threshold is
+// fine because every candidate is judged over the same frames. The per-frame
+// acceptance gate uses a speed instead -- see MAX_CAMERA_SPEED.
 #define JUMP_UNITS 900.0f
 #define MAX_JUMP_FRACTION 0.05f
+
+// The acceptance gate, in units per SECOND.
+//
+// A fixed per-frame distance cannot work here: 900 units at 300 fps is 270,000
+// u/s, but a single 250 ms hitch at surf speed covers 1000 units and reads as a
+// teleport. That is exactly what made the lines freeze to the screen once enough
+// runs were loaded to cause hitching. Dividing by real elapsed time makes the
+// test independent of frame rate. 12,000 u/s is far above any surf speed --
+// surf_demise peaks near 4,900 -- and far below a teleport.
+#define MAX_CAMERA_SPEED 12000.0f
 
 // Even the right address can be caught mid-overwrite or hold another pass's view
 // on a given frame. Rather than draw with it, hold the previous good matrix --
 // unless the new position persists, which means the player genuinely teleported.
 #define TELEPORT_CONFIRM_FRAMES 6
+
+// ...but hold it for this long and no longer. A stray pass lasts a frame or two;
+// beyond that, continuing to draw the world through a matrix we have decided is
+// wrong is worse than drawing nothing, because it renders as lines welded to the
+// screen while the player moves.
+#define MAX_HELD_FRAMES 3
 
 struct Candidate
 {
@@ -118,6 +138,16 @@ static bool g_everStarted = false;
 #define IDLE_RESCAN_FRAMES 1800
 #define MAX_AUTO_RESCANS 5
 
+// How many non-chosen candidates to re-check per frame once a winner is picked.
+// They are no longer consulted for anything, so this exists purely to keep the
+// alive count in Diagnostics truthful.
+#define REVALIDATE_PER_FRAME 2
+
+// Validations a candidate may accumulate without its camera going anywhere
+// before it is written off as a fixed viewpoint (skybox, cubemap face, shadow
+// cascade). Deliberately large: see the guard where this is used.
+#define FIXED_VIEWPOINT_HITS 1200
+
 static VMatrix g_matrix;
 static bool g_matrixValid = false;
 
@@ -126,6 +156,22 @@ static Vec3 g_lastOrigin;
 static bool g_haveLastOrigin = false;
 static Vec3 g_pendingOrigin;
 static int g_pendingFrames = 0;
+static long long g_lastAcceptTicks = 0;
+static int g_heldFrames = 0;        // consecutive frames drawing a held matrix
+static int g_roundRobin = 0;        // where the slow re-check left off
+
+// The performance counter frequency is a constant for the life of the process.
+static long long QpcFreq(void)
+{
+    static long long f = 0;
+    if (f == 0)
+    {
+        LARGE_INTEGER q;
+        QueryPerformanceFrequency(&q);
+        f = q.QuadPart ? q.QuadPart : 1;
+    }
+    return f;
+}
 
 static bool AcceptForFrame(const VMatrix &m);
 
@@ -520,6 +566,9 @@ void WrScanRestart(void)
     g_matrixValid = false;
     g_haveLastOrigin = false;
     g_pendingFrames = 0;
+    g_lastAcceptTicks = 0;
+    g_heldFrames = 0;
+    g_roundRobin = 0;
     g_note[0] = '\0';
     InterlockedExchange64(&g_bytes, 0);
     InterlockedExchange(&g_phase, 0);
@@ -591,6 +640,17 @@ static bool AcceptForFrame(const VMatrix &m)
     if (!WrSolveCameraOrigin(m, &o))
         return false;
 
+    // Elapsed time since the last accepted frame, so the test is a speed rather
+    // than a distance. Clamped: a multi-second stall (alt-tab, loading) would
+    // otherwise permit an arbitrarily large step.
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    float dt = 0.0f;
+    if (g_haveLastOrigin && g_lastAcceptTicks != 0)
+        dt = (float)((double)(now.QuadPart - g_lastAcceptTicks) / (double)QpcFreq());
+    g_lastAcceptTicks = now.QuadPart;
+    dt = WrClampF(dt, 1.0f / 1000.0f, 0.5f);
+
     if (!g_haveLastOrigin)
     {
         g_lastOrigin = o;
@@ -598,7 +658,11 @@ static bool AcceptForFrame(const VMatrix &m)
         return true;
     }
 
-    if (WrDist(g_lastOrigin, o) <= JUMP_UNITS)
+    float budget = MAX_CAMERA_SPEED * dt;
+    if (budget < 64.0f)         // floor, so a 300 fps frame is not absurdly tight
+        budget = 64.0f;
+
+    if (WrDist(g_lastOrigin, o) <= budget)
     {
         g_lastOrigin = o;
         g_pendingFrames = 0;
@@ -606,12 +670,12 @@ static bool AcceptForFrame(const VMatrix &m)
     }
 
     // Too far to be movement. Is it a teleport, or a stray frame?
-    if (g_pendingFrames > 0 && WrDist(g_pendingOrigin, o) <= JUMP_UNITS)
+    if (g_pendingFrames > 0 && WrDist(g_pendingOrigin, o) <= budget)
     {
         if (++g_pendingFrames >= TELEPORT_CONFIRM_FRAMES)
         {
-            WrLogf("scan: camera jumped %.0f units and stayed -- teleport",
-                   WrDist(g_lastOrigin, o));
+            WrLogf("scan: camera jumped %.0f units in %.1f ms and stayed -- teleport",
+                   WrDist(g_lastOrigin, o), dt * 1000.0f);
             g_lastOrigin = o;
             g_pendingFrames = 0;
             return true;
@@ -668,10 +732,72 @@ void WrScanTick(void)
         return;
     }
 
-    // Re-validate everything still in play. Cheap: 64 bytes each.
+    // Re-validate. Which candidates, and how often, depends entirely on whether
+    // we have already picked a winner.
+    //
+    // Before we have: every candidate, every frame. That is the whole selection
+    // process -- hits, changes and travel only accumulate by watching.
+    //
+    // After we have: the chosen one every frame, and a couple of the others in
+    // round-robin. Re-running the full oracle on all 192 forever was pure waste:
+    // once a winner is picked the others are never consulted again, because a
+    // chosen address going stale triggers a complete re-scan rather than a
+    // promotion. Each one is a ReadProcessMemory syscall plus a 3x3 solve, and
+    // at 300 fps that was the single largest thing this tool did while idle.
+    // Nothing is dropped, only re-checked slowly, so Diagnostics stays honest.
     int alive = 0;
-    for (int i = 0; i < n; i++)
+    bool selecting = (g_chosen < 0);
+
+    if (!selecting)
     {
+        Candidate *c = &g_cand[g_chosen];
+        VMatrix m;
+        if (ValidateCandidate(c, &m))
+        {
+            c->hits++;
+            c->consecutiveMisses = 0;
+            if (AcceptForFrame(m))
+            {
+                g_matrix = m;
+                g_matrixValid = true;
+                g_staleFrames = 0;
+                g_heldFrames = 0;
+                strcpy_s(g_note, sizeof(g_note), c->note);
+            }
+            else if (++g_heldFrames > MAX_HELD_FRAMES)
+            {
+                // A stray render pass lasts a frame or two. Past that, drawing
+                // the world through a matrix we have decided is wrong renders as
+                // lines welded to the screen while the player moves -- which is
+                // the exact bug this gate exists to prevent. Draw nothing.
+                g_matrixValid = false;
+            }
+        }
+        else
+        {
+            c->misses++;
+            c->consecutiveMisses++;
+            g_matrixValid = false;
+            g_staleFrames++;
+        }
+    }
+
+    for (int pass = 0; pass < n; pass++)
+    {
+        int i;
+        if (selecting)
+        {
+            i = pass;
+        }
+        else
+        {
+            if (pass >= REVALIDATE_PER_FRAME)
+                break;
+            i = (g_roundRobin + pass) % n;
+            if (i == g_chosen)
+                continue;           // already done above, every frame
+        }
+
         Candidate *c = &g_cand[i];
         if (!c->alive)
             continue;
@@ -681,17 +807,12 @@ void WrScanTick(void)
         {
             c->hits++;
             c->consecutiveMisses = 0;
-            if (i == g_chosen)
+            if (selecting && i == g_chosen && AcceptForFrame(m))
             {
-                if (AcceptForFrame(m))
-                {
-                    g_matrix = m;
-                    g_matrixValid = true;
-                    g_staleFrames = 0;
-                    strcpy_s(g_note, sizeof(g_note), c->note);
-                }
-                // else: this frame's contents are another pass's view. Keep the
-                // previous matrix rather than drawing the world through it.
+                g_matrix = m;
+                g_matrixValid = true;
+                g_staleFrames = 0;
+                strcpy_s(g_note, sizeof(g_note), c->note);
             }
         }
         else
@@ -703,12 +824,30 @@ void WrScanTick(void)
             // not so eagerly that a loading screen kills the real one.
             if (c->consecutiveMisses > MAX_MISSES && i != g_chosen)
                 c->alive = false;
-            if (i == g_chosen)
-            {
-                g_matrixValid = false;
-                g_staleFrames++;
-            }
         }
+    }
+    if (!selecting)
+        g_roundRobin = (g_roundRobin + REVALIDATE_PER_FRAME) % (n > 0 ? n : 1);
+
+    // Retire fixed viewpoints: a candidate that has validated for a long time
+    // and never moved, while some other candidate covered real ground over the
+    // same stretch. The second clause matters -- a player standing still makes
+    // the REAL matrix report zero travel too, and without it a quiet moment on
+    // the start pad would kill the only good candidate we have.
+    float maxTravel = 0.0f;
+    for (int i = 0; i < n; i++)
+        if (g_cand[i].alive && g_cand[i].travel > maxTravel)
+            maxTravel = g_cand[i].travel;
+
+    for (int i = 0; i < n; i++)
+    {
+        Candidate *c = &g_cand[i];
+        if (!c->alive)
+            continue;
+        if (i != g_chosen && c->hits > FIXED_VIEWPOINT_HITS &&
+            c->travel < MIN_TRAVEL_TO_PICK &&
+            maxTravel > MIN_TRAVEL_TO_PICK * 4.0f)
+            c->alive = false;
         if (c->alive)
             alive++;
     }
