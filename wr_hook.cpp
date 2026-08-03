@@ -270,7 +270,14 @@ static LRESULT CALLBACK WrWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
     // while a message is being handled here, and that restores the original
     // procedure and clears the global -- calling through a NULL would be a crash
     // in a code path that is otherwise never exercised.
+    //
+    // The second test is a hard stop, not a tidy-up: if we ever end up recorded
+    // as our own predecessor, calling through it recurses until the window
+    // thread dies and the game hangs unkillably. The locking in SubclassWindow
+    // is what prevents that; this is here so no future path can bring it back.
     WNDPROC orig = g_origWndProc;
+    if (orig == (WNDPROC)WrWndProc)
+        orig = NULL;
     if (!orig)
         return g_wndUnicode ? DefWindowProcW(hwnd, msg, wParam, lParam)
                             : DefWindowProcA(hwnd, msg, wParam, lParam);
@@ -286,41 +293,94 @@ static LRESULT CALLBACK WrWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
 // procedure and complains when something replaces it. Since the only consumer is
 // the panel, and the INSERT hotkey is polled on its own thread rather than
 // coming through here, there is no reason to hold it during normal play.
+//
+// BOTH OF THESE ARE CALLED FROM MORE THAN ONE THREAD, AND THAT MATTERS
+//
+// The hotkey thread opens the panel; the render thread catches up if the panel
+// was opened before the window was known; the window thread itself closes the
+// panel on ESC. The first version of this guarded on g_origWndProc being null,
+// which is not a guard at all across threads: the hotkey thread set the
+// menu-open flag and then subclassed, and in the gap between those two the
+// render thread saw "menu open, not subclassed yet" and subclassed as well.
+//
+// Both calls succeeded, so the second one got OUR OWN procedure back as the
+// "previous" one and stored it. Every message then went WrWndProc ->
+// CallWindowProc(WrWndProc) -> WrWndProc, forever. The window thread stopped
+// pumping messages, so the game hung and could not even be closed.
+//
+// Hence the lock, and hence reading the current procedure before writing rather
+// than trusting what SetWindowLongPtr hands back.
+static CRITICAL_SECTION g_wndCs;
+static bool g_wndCsReady = false;
+
 static void SubclassWindow(HWND hwnd)
 {
-    if (g_origWndProc || !hwnd)
+    if (!hwnd || !g_wndCsReady)
         return;
-    g_wndUnicode = IsWindowUnicode(hwnd) != FALSE;
-    g_origWndProc = g_wndUnicode
-        ? (WNDPROC)SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)WrWndProc)
-        : (WNDPROC)SetWindowLongPtrA(hwnd, GWLP_WNDPROC, (LONG_PTR)WrWndProc);
-    WrLogf("subclassed window %p (%s)", (void *)hwnd, g_wndUnicode ? "unicode" : "ansi");
+
+    EnterCriticalSection(&g_wndCs);
+    if (!g_origWndProc)
+    {
+        bool unicode = IsWindowUnicode(hwnd) != FALSE;
+        WNDPROC current = unicode
+            ? (WNDPROC)GetWindowLongPtrW(hwnd, GWLP_WNDPROC)
+            : (WNDPROC)GetWindowLongPtrA(hwnd, GWLP_WNDPROC);
+
+        // Already ours with no original recorded? Then something is wrong and
+        // installing again would build the self-referential chain described
+        // above. Do nothing; the panel keeps working either way.
+        if (current == (WNDPROC)WrWndProc)
+        {
+            WrLogf("[!] window already carries our procedure but no original was "
+                   "recorded -- not installing again");
+        }
+        else
+        {
+            g_wndUnicode = unicode;
+            g_origWndProc = current;
+            if (unicode)
+                SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)WrWndProc);
+            else
+                SetWindowLongPtrA(hwnd, GWLP_WNDPROC, (LONG_PTR)WrWndProc);
+            WrLogf("subclassed window %p (%s), original %p", (void *)hwnd,
+                   unicode ? "unicode" : "ansi", (void *)current);
+        }
+    }
+    LeaveCriticalSection(&g_wndCs);
 }
 
 static void UnsubclassWindow(void)
 {
-    if (!g_origWndProc || !g_window)
+    if (!g_wndCsReady)
         return;
 
-    // Only unhook if we are still the top of the chain. If something else
-    // subclassed on top of us in the meantime, restoring the original would cut
-    // that other thing out entirely -- a much worse bug than leaving ours in.
-    WNDPROC current = g_wndUnicode
-        ? (WNDPROC)GetWindowLongPtrW(g_window, GWLP_WNDPROC)
-        : (WNDPROC)GetWindowLongPtrA(g_window, GWLP_WNDPROC);
-    if (current != (WNDPROC)WrWndProc)
+    EnterCriticalSection(&g_wndCs);
+    if (g_origWndProc && g_window)
     {
-        WrLogf("[!] not restoring the window procedure: something subclassed on "
-               "top of us (now %p). Leaving ours in the chain.", (void *)current);
-        return;
+        // Only unhook if we are still the top of the chain. If something else
+        // subclassed on top of us in the meantime, restoring the original would
+        // cut that other thing out entirely -- a much worse bug than leaving
+        // ours in.
+        WNDPROC current = g_wndUnicode
+            ? (WNDPROC)GetWindowLongPtrW(g_window, GWLP_WNDPROC)
+            : (WNDPROC)GetWindowLongPtrA(g_window, GWLP_WNDPROC);
+        if (current != (WNDPROC)WrWndProc)
+        {
+            WrLogf("[!] not restoring the window procedure: something subclassed "
+                   "on top of us (now %p). Leaving ours in the chain.",
+                   (void *)current);
+        }
+        else
+        {
+            if (g_wndUnicode)
+                SetWindowLongPtrW(g_window, GWLP_WNDPROC, (LONG_PTR)g_origWndProc);
+            else
+                SetWindowLongPtrA(g_window, GWLP_WNDPROC, (LONG_PTR)g_origWndProc);
+            g_origWndProc = NULL;
+            WrLogf("window procedure restored");
+        }
     }
-
-    if (g_wndUnicode)
-        SetWindowLongPtrW(g_window, GWLP_WNDPROC, (LONG_PTR)g_origWndProc);
-    else
-        SetWindowLongPtrA(g_window, GWLP_WNDPROC, (LONG_PTR)g_origWndProc);
-    g_origWndProc = NULL;
-    WrLogf("window procedure restored");
+    LeaveCriticalSection(&g_wndCs);
 }
 
 // ---------------------------------------------------------------------------
@@ -623,6 +683,11 @@ static bool ReadSwapChainVTable(HMODULE d3d11, void **outPresent, void **outResi
 
 bool WrHookInit(void)
 {
+    // Before any hook is live and before the hotkey thread exists, so nothing
+    // can be racing for it yet.
+    InitializeCriticalSection(&g_wndCs);
+    g_wndCsReady = true;
+
     HMODULE d3d11 = WaitForD3D11(60000);
     if (!d3d11)
     {
