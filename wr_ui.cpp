@@ -20,6 +20,7 @@
 #include "imgui.h"
 
 #include <float.h>
+#include <math.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -722,6 +723,51 @@ static void DrawFrameCapTab(void)
 
     ImGui::Text("capping at %.1f fps  (%.3f ms)", WrLimitTargetFps(),
                 1000.0f / WrLimitTargetFps());
+
+    // How the cap sits against the panel, which is the thing most likely to be
+    // wrong and is invisible otherwise.
+    //
+    // A cap that is not a whole fraction of the refresh rate cannot be shown
+    // evenly unless variable refresh is actually engaged. 240 on a 360 Hz panel
+    // is 1.5 refreshes per frame: with a fixed 360 Hz the panel has to alternate
+    // one refresh and two, so the frames arrive 2.8 ms, 5.6 ms, 2.8 ms, 5.6 ms
+    // -- an average of exactly 240 that looks nothing like 240.
+    float hz = WrLimitRefreshHz();
+    if (hz > 1.0f)
+    {
+        float per = hz / WrLimitTargetFps();
+        float nearest = (float)(int)(per + 0.5f);
+        bool even = (nearest >= 1.0f) && (fabsf(per - nearest) < 0.04f);
+        if (even)
+            ImGui::TextDisabled("%.0f Hz / %.0f = %.2f refreshes per frame -- even",
+                                hz, WrLimitTargetFps(), per);
+        else
+        {
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
+                               "%.0f Hz / %.0f = %.2f refreshes per frame",
+                               hz, WrLimitTargetFps(), per);
+            ImGui::TextWrapped(
+                "That is not a whole number, so unless variable refresh is "
+                "actually engaged the panel cannot show these frames evenly -- "
+                "it has to alternate between holding a frame for one refresh and "
+                "for two, which reads as far worse than the number suggests.");
+            ImGui::TextDisabled("Even divisions of %.0f Hz:", hz);
+            for (int d = 1; d <= 6; d++)
+            {
+                float f = hz / (float)d;
+                if (f < WR_LIMIT_MIN_FPS || f > WR_LIMIT_MAX_FPS)
+                    continue;
+                ImGui::SameLine();
+                char lbl[24];
+                _snprintf_s(lbl, sizeof(lbl), _TRUNCATE, "%.0f", f);
+                if (ImGui::SmallButton(lbl))
+                {
+                    g_limit.targetFps = f;
+                    g_limit.autoTarget = false;
+                }
+            }
+        }
+    }
 
     ImGui::SeparatorText("Measured");
     float ms = WrLimitFrameMs();

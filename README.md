@@ -128,14 +128,52 @@ the default buys accuracy nobody can see for seven times the CPU.
 
 Two behaviours worth knowing about:
 
-- **The schedule is absolute, and its catch-up is bounded.** Targets advance from the previous
-  target, so ordinary jitter cancels instead of accumulating. But after a real hitch the
-  schedule is in debt by more than a frame, and repaying that at once fires a burst of frames
-  arriving far too early — on a VRR display that is a second visible spike, not a fix for the
-  first. An injected 14 ms hitch produced a 4.0 ms deviation on the following frames before
-  this was bounded, and 0.2 ms after.
+- **The schedule is absolute, and it never catches up.** Targets advance from the previous
+  target, so ordinary jitter cancels instead of accumulating and the long-run cadence is exact
+  to a microsecond. But a frame that overruns leaves the schedule in debt, and repaying that
+  debt means releasing the next frame *early* — which on a variable-refresh display is not a
+  correction, it is a second artefact, because the panel refreshes when the frame arrives. So
+  a late frame is absorbed and the schedule resynchronises from where it landed.
 - **It cannot invent performance.** A cap above what the machine sustains does nothing; the tab
   detects that and says so rather than showing a target it is not meeting.
+
+### What the catch-up rule cost
+
+The first version repaid the debt at up to a quarter of a frame each, which sounded modest and
+was not. Driving the schedule with a wobbling workload and a 6 ms spike every 37th frame,
+against a 240 fps target:
+
+| after a spike | repay a quarter-period | no catch-up |
+| --- | --- | --- |
+| shortest interval | 3.125 ms — **released early** | 4.167 ms |
+| worst step between consecutive frames | 1.92× | **1.44×** |
+| intervals more than 10 % off target | 113 / 1999 | **54 / 1999** |
+
+One overrunning frame was being turned into *two* wrong intervals instead of one. The schedule
+arithmetic is `wr_pacing.h`, kept free of Windows and D3D so it can be driven by a script of
+frame timings — `tests/test_pacing.cpp`, which also runs the old policy alongside the new one,
+because "this is better" should be a number.
+
+That harness immediately found a second bug it was not looking for: the first frame of every
+session set the phase a period ahead *and* then advanced it again, so the second frame of every
+session waited two full periods — an 8.3 ms interval against a 4.2 ms target.
+
+### The cap has to suit the panel
+
+The tab now shows refresh ÷ cap, because a cap that is not a whole fraction of the refresh rate
+cannot be displayed evenly unless variable refresh is genuinely engaged. **240 fps on a 360 Hz
+panel is 1.5 refreshes per frame** — the panel has to alternate between holding a frame for one
+refresh and for two, so frames land 2.8 ms, 5.6 ms, 2.8 ms, 5.6 ms. The average is exactly 240
+and it looks nothing like 240. When the division is not whole, the tab says so and offers the
+ones that are.
+
+### Where the wait happens
+
+At the **top** of the Present hook, before the camera matrix is read and before anything is
+drawn. It used to be at the bottom: read the matrix, draw the lines, hold the frame for up to a
+millisecond, then present — which left the lines a whole wait older than the frame they landed
+on, and only when the cap was on. That is a one-line ordering change and it removes the entire
+wait from the matrix-to-present latency.
 
 None of it is derived from any other limiter's source. Frame pacing is standard technique, and
 reproducing a GPL-licensed implementation would have relicensed this MIT project by accident.
@@ -676,9 +714,11 @@ wr_path             .wrpath loading, run store, live recording
 wr_limit            the frame cap
 wr_extract          counting unextracted demos, running the extractor
 wr_matrixlife.h     when a chosen matrix has died -- pure logic, tested
+wr_pacing.h         when the next frame may be presented -- pure logic, tested
 wr_ui               the panel
 tests\              standalone harnesses, built by hand:
                     cl /nologo /EHsc /I.. tests\test_matrixlife.cpp
+                    cl /nologo /EHsc /I.. tests\test_pacing.cpp
 ```
 
 Everything the tool writes lives under `wrlines_data\`, next to the DLL:

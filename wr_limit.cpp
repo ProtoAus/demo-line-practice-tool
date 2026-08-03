@@ -1,6 +1,7 @@
 // wr_limit.cpp  --  see wr_limit.h for why this exists and how it paces.
 
 #include "wr_limit.h"
+#include "wr_pacing.h"
 #include "wr_hook.h"
 #include "wr_log.h"
 
@@ -18,7 +19,7 @@ typedef HANDLE (WINAPI *CreateWaitableTimerExW_t)(LPSECURITY_ATTRIBUTES, LPCWSTR
 WrLimitSettings g_limit;
 
 static long long g_qpf = 0;
-static long long g_nextTarget = 0;
+static WrPacing g_pace = {0, false};
 static long long g_lastPresent = 0;
 static HANDLE g_timer = NULL;
 static bool g_timerHiRes = false;
@@ -191,7 +192,7 @@ void WrLimitTick(void)
 {
     if (!g_limit.enabled)
     {
-        g_nextTarget = 0;
+        WrPacingReset(&g_pace);
         g_cpuBound = false;
         g_spinPercent = 0.0f;
         g_jitterMs = 0.0f;
@@ -202,8 +203,8 @@ void WrLimitTick(void)
     RefreshDisplayRate();
     EnsureTimer();
 
-    float target = WrLimitTargetFps();
-    long long period = (long long)((double)Qpf() / (double)target);
+    float targetFps = WrLimitTargetFps();
+    long long period = (long long)((double)Qpf() / (double)targetFps);
     float targetMs = (float)((double)period * 1000.0 / (double)Qpf());
     if (period <= 0)
     {
@@ -212,17 +213,17 @@ void WrLimitTick(void)
     }
 
     long long now = Now();
-    if (g_nextTarget == 0)
+    long long target = WrPacingTargetFor(&g_pace, now, period);
+    if (target == 0)
     {
-        g_nextTarget = now + period;
-        RecordInterval(now, targetMs);
+        RecordInterval(now, targetMs);      // first frame: sets the phase only
         return;
     }
 
     // Did this frame's work already overrun the budget? If so no amount of
     // waiting helps, and the cap is not what is limiting the frame rate.
     g_totalFrames++;
-    if (now > g_nextTarget)
+    if (now > target)
         g_lateFrames++;
     if (g_totalFrames >= 120)
     {
@@ -237,7 +238,7 @@ void WrLimitTick(void)
     for (;;)
     {
         long long t = Now();
-        long long remaining = g_nextTarget - t;
+        long long remaining = target - t;
         if (remaining <= 0)
             break;
 
@@ -267,27 +268,7 @@ void WrLimitTick(void)
     g_spinPercent = g_spinPercent * 0.95f + pct * 0.05f;
 
     long long done = Now();
-
-    // Advance the schedule rather than restarting it from now, so ordinary
-    // jitter cancels instead of accumulating: a frame that lands 0.2 ms late is
-    // followed by one that waits 0.2 ms less.
-    g_nextTarget += period;
-
-    // But bound how fast the schedule may catch up. After a real hitch it is in
-    // debt by more than a frame, and repaying that all at once means a burst of
-    // frames arriving far too early -- on a variable-refresh display that is a
-    // second visible spike, not a fix for the first. Measured: an injected 14 ms
-    // hitch produced a 4.0 ms deviation on the frames after it; capping the
-    // repayment at a quarter of a frame each spreads it over several frames,
-    // where it is imperceptible.
-    //
-    // This also subsumes the huge-stall case. An alt-tab or a loading screen
-    // simply repays at the same bounded rate and is back on cadence in a few
-    // frames, with no burst at any point.
-    long long earliest = done + period - period / 4;
-    if (g_nextTarget < earliest)
-        g_nextTarget = earliest;
-
+    WrPacingAdvance(&g_pace, done, period);     // see wr_pacing.h
     RecordInterval(done, targetMs);
 }
 

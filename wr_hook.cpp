@@ -443,11 +443,21 @@ static bool AcquireDeviceFrom(IDXGISwapChain *sc)
     return g_window != NULL;
 }
 
-// Every real present goes through here, so the frame pacing happens in exactly
-// one place and cannot be bypassed by one of the early exits below.
+// Every real present goes through here, so no early exit below can skip it.
+//
+// The pacing wait itself is NOT here. It happens at the top of HookedPresent,
+// before the camera matrix is read and before anything is drawn, and that
+// ordering is the point: whatever we wait, we wait it BEFORE sampling the
+// matrix, not between sampling it and presenting.
+//
+// It used to be the other way round -- read the matrix, draw the lines, then
+// hold the frame for up to a millisecond, then present. The lines were therefore
+// always a whole wait older than the frame they landed on, and the bigger the
+// gap between the game's own frame rate and the cap, the further behind they
+// sat. With the cap off the wait is zero and the effect vanishes, which is
+// exactly the reported behaviour: lines a frame behind, but only when capped.
 static inline HRESULT PacedPresent(IDXGISwapChain *sc, UINT interval, UINT flags)
 {
-    WrLimitTick();
     return g_origPresent(sc, interval, flags);
 }
 
@@ -459,6 +469,14 @@ static HRESULT WINAPI HookedPresent(IDXGISwapChain *sc, UINT interval, UINT flag
     // nothing.
     if (flags & DXGI_PRESENT_TEST)
         return g_origPresent(sc, interval, flags);
+
+    // Pace here, first, before anything else in the frame.
+    //
+    // By this point the game has finished rendering, so holding the frame is
+    // legitimate wherever it happens -- but everything after this line reads the
+    // camera matrix and draws with it, and doing that AFTER the wait is what
+    // keeps the lines on the same frame as the world they are drawn over.
+    WrLimitTick();
 
     if (!g_device)
     {
