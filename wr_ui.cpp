@@ -1108,7 +1108,11 @@ static void DrawDiagnosticsTab(void)
     ImGui::SeparatorText("World");
     float frozen = WrScanFrozenSeconds();
     float *frozenLimit = WrScanFrozenLimit();
-    if (frozen > *frozenLimit)
+    if (WrScanHoldingForPanel())
+        ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.0f, 1.0f),
+                           "held  (unchanged for %.1f s, but this panel is open "
+                           "-- using the panel means standing still)", frozen);
+    else if (frozen > *frozenLimit)
         ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
                            "frozen for %.1f s -- treating this as \"not in a map\", "
                            "drawing nothing", frozen);
@@ -1126,7 +1130,12 @@ static void DrawDiagnosticsTab(void)
                "Standing perfectly still in a map produces an identical matrix "
                "too, so the lines can pause while you are genuinely in the "
                "world. They come back the moment you move. Raise this if that "
-               "bothers you.");
+               "bothers you.\n\n"
+               "It is suspended entirely while this panel is open, since using "
+               "the panel means standing still and the lines you are ticking on "
+               "and off are the whole point. That hold is only taken if the "
+               "matrix was live in the ten seconds before you opened it, so "
+               "opening the panel at the main menu still draws nothing.");
 
     // --- who else is in the Present chain ------------------------------------
     ImGui::SeparatorText("Other overlays");

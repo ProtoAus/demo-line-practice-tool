@@ -19,6 +19,7 @@
 // the candidate list itself.
 
 #include "wr_scan.h"
+#include "wr_matrixlife.h"
 #include "wr_engine.h"
 #include "wr_probe.h"
 #include "wr_hook.h"
@@ -44,8 +45,10 @@
 // picked, and lose this many in a row before it is dropped.
 #define MIN_HITS_TO_PICK 90
 #define MAX_MISSES 90
-#define RESOLVED_GRACE 600      // frames a resolved address may stay invalid
-                                // (menus, loading screens) before we re-scan
+
+// When a chosen address has died, and how that is told apart from a level load,
+// live in wr_matrixlife.h -- pure arithmetic, so it can be tested against a
+// script of frames instead of only against a running game.
 
 // The live world->clip matrix is rewritten every frame; a constant projection
 // matrix compiled into engine.dll's data is not. Structural checks cannot tell
@@ -59,7 +62,14 @@
 // 13744) for its whole life and reported 0 units travelled.
 //
 // So the camera this matrix describes has to actually move through the map...
-#define MIN_TRAVEL_TO_PICK 96.0f
+//
+// 512, not 96. At 96 the log read "96 units travelled" -- exactly the threshold,
+// meaning the winner was simply whichever candidate crossed the line first, on a
+// frame where they all crossed it together, decided by array order. There is
+// nothing to rank on until the candidates have had time to differ. 512 units is
+// a couple of seconds of moving, once per session, and it buys a pick made on
+// evidence instead of on a race.
+#define MIN_TRAVEL_TO_PICK 512.0f
 
 // ...and it has to move *continuously*. A slot shared between render passes
 // jumps thousands of units between frames as different views are written into
@@ -177,6 +187,35 @@ static int g_roundRobin = 0;        // where the slow re-check left off
 static long long g_frozenSince = 0;
 static float g_frozenSeconds = 0.0f;
 static float g_frozenLimit = 1.5f;
+
+// Death detection for the chosen address; see wr_matrixlife.h.
+static WrMatrixLife g_life = {0.0f, 0.0f, false};
+static long long g_tickTicks = 0;        // for this function's own dt
+static long long g_othersMovedTicks = 0; // last time any other candidate changed
+static long long g_lastLiveTicks = 0;    // last frame we had a usable matrix
+
+// Freeze detection versus the panel.
+//
+// Standing perfectly still in a map produces a byte-identical matrix, so the
+// freeze cutoff fires and the lines stop. The most common way to stand perfectly
+// still is to open this panel -- input goes to the panel, not the game -- so
+// ticking runs on and off made the very lines you were ticking disappear a
+// second and a half later. Exactly backwards.
+//
+// So while the panel is open the cutoff is suspended and the last good matrix is
+// held. Not unconditionally: it is only held if the matrix was live shortly
+// before the panel was opened, which is what stops it from painting a dead
+// route over the main menu if you open the panel there.
+static bool g_menuWasOpen = false;
+static bool g_holdForPanel = false;
+#define PANEL_HOLD_GRACE 10.0f      // seconds since live, at the moment it opens
+
+// Only two non-chosen candidates are re-checked per frame, so "did another
+// candidate change on this exact frame" is mostly a question about which two
+// came up in the round robin. Remembering the last time one did, and treating
+// the world as live for a short while afterwards, turns that into a signal that
+// tracks real time instead of sampling luck.
+#define WORLD_ALIVE_MEMORY 0.5f
 
 // The performance counter frequency is a constant for the life of the process.
 static long long QpcFreq(void)
@@ -747,12 +786,22 @@ void WrScanOnMapChanged(void)
     g_frozenSince = 0;
     g_frozenSeconds = 0.0f;
     g_staleFrames = 0;
+    WrMatrixLifeOnMapChange(&g_life);
+
+    // A new level is a fresh situation: re-arm the automatic rescan budget that
+    // earlier fumbling in this session may have used up. Without this, a chosen
+    // address that dies later in the session is silently replaced from the
+    // leftover candidate list instead of being scanned for -- which is exactly
+    // what the log showed happening, three times in 1.5 seconds.
+    g_restarts = 0;
 
     if (g_chosen >= 0)
     {
-        WrLogf("scan: map changed -- keeping matrix @ %p (re-validated every "
-               "frame; a rescan would re-roll which matrix gets picked)",
-               g_cand[g_chosen].addr);
+        // Keeping it is right when it is the matrix -- the address does not move
+        // and rescanning would only re-roll the choice. But it is not proof, so
+        // it goes on probation: see the death check in WrScanTick.
+        WrLogf("scan: map changed -- keeping matrix @ %p, on probation until it "
+               "is seen moving again", g_cand[g_chosen].addr);
         return;
     }
 
@@ -788,6 +837,7 @@ void WrScanRestart(void)
     g_roundRobin = 0;
     g_frozenSince = 0;
     g_frozenSeconds = 0.0f;
+    WrMatrixLifeReset(&g_life);
     g_note[0] = '\0';
     strcpy_s(g_status, sizeof(g_status), "restarting the scan...");
     WrLogf("scan: restart requested");
@@ -817,6 +867,7 @@ static void ServiceRestart(void)
     g_matrixValid = false;
     g_staleFrames = 0;
     g_roundRobin = 0;
+    WrMatrixLifeReset(&g_life);
 
     InterlockedExchange64(&g_bytes, 0);
     InterlockedExchange(&g_phase, 0);
@@ -1021,6 +1072,37 @@ void WrScanTick(void)
     int alive = 0;
     bool selecting = (g_chosen < 0);
 
+    // This function's own elapsed time, for the death checks below.
+    long long nowTicks = Now();
+    float tickDt = 0.0f;
+    if (g_tickTicks != 0)
+        tickDt = (float)((double)(nowTicks - g_tickTicks) / (double)QpcFreq());
+    g_tickTicks = nowTicks;
+    tickDt = WrClampF(tickDt, 0.0f, 0.25f);
+
+    bool chosenMoved = false;
+    bool chosenValidated = false;
+    bool othersMoved = false;
+
+    // Decide the panel hold once, on the frame it opens. Deciding it every frame
+    // would be circular: holding keeps the matrix live, which would then justify
+    // continuing to hold it.
+    bool menuOpen = WrMenuOpen();
+    if (menuOpen && !g_menuWasOpen)
+    {
+        float sinceLive = (g_lastLiveTicks == 0) ? 1e9f
+            : (float)((double)(nowTicks - g_lastLiveTicks) / (double)QpcFreq());
+        g_holdForPanel = (sinceLive < PANEL_HOLD_GRACE);
+        if (!g_holdForPanel)
+            WrLogf("scan: panel opened with no live matrix in the last %.0fs -- "
+                   "not holding one", PANEL_HOLD_GRACE);
+    }
+    else if (!menuOpen)
+    {
+        g_holdForPanel = false;
+    }
+    g_menuWasOpen = menuOpen;
+
     if (!selecting)
     {
         Candidate *c = &g_cand[g_chosen];
@@ -1029,6 +1111,8 @@ void WrScanTick(void)
         {
             c->hits++;
             c->consecutiveMisses = 0;
+            chosenValidated = true;
+            chosenMoved = c->changedThisFrame;
 
             // --- have we left the map? ---------------------------------------
             //
@@ -1046,7 +1130,7 @@ void WrScanTick(void)
                 g_frozenSince = tick;
             g_frozenSeconds = (float)((double)(tick - g_frozenSince) / (double)QpcFreq());
 
-            if (g_frozenSeconds > g_frozenLimit)
+            if (g_frozenSeconds > g_frozenLimit && !g_holdForPanel)
             {
                 // Standing perfectly still in a map produces an identical matrix
                 // too, so this can fire while genuinely in the world. It costs a
@@ -1062,6 +1146,7 @@ void WrScanTick(void)
             {
                 g_matrix = m;
                 g_matrixValid = true;
+                g_lastLiveTicks = tick;
                 g_staleFrames = 0;
                 g_heldFrames = 0;
                 strcpy_s(g_note, sizeof(g_note), c->note);
@@ -1109,6 +1194,8 @@ void WrScanTick(void)
         {
             c->hits++;
             c->consecutiveMisses = 0;
+            if (c->changedThisFrame)
+                othersMoved = true;     // something is rendering a live world
             if (selecting && i == g_chosen && AcceptForFrame(m))
             {
                 g_matrix = m;
@@ -1154,25 +1241,59 @@ void WrScanTick(void)
             alive++;
     }
 
+    if (othersMoved)
+        g_othersMovedTicks = nowTicks;
+    bool worldAlive =
+        (g_othersMovedTicks != 0) &&
+        ((float)((double)(nowTicks - g_othersMovedTicks) / (double)QpcFreq()) <
+         WORLD_ALIVE_MEMORY);
+
     if (g_chosen >= 0)
     {
-        // Menus and loading screens legitimately have no valid view matrix, so
-        // give it a long grace period before concluding the address moved.
-        if (g_staleFrames > RESOLVED_GRACE)
+        const char *why = WrMatrixLifeTick(&g_life, tickDt, chosenValidated,
+                                           chosenMoved, worldAlive);
+        if (why)
         {
-            WrLogf("[!] scan: chosen matrix @ %p went stale, re-scanning",
-                   g_cand[g_chosen].addr);
+            WrLogf("[!] scan: matrix @ %p %s -- it did not survive the level "
+                   "load. Choosing again from scratch.",
+                   g_cand[g_chosen].addr, why);
+
+            // Make every candidate earn it again. Their hit counts, updates and
+            // travel were all accumulated on the PREVIOUS level, so leaving them
+            // in place means the next pick is made instantly on evidence that no
+            // longer applies -- which is how three duds got chosen in a second
+            // and a half. Dead candidates stay dead: retiring a fixed viewpoint
+            // was a correct conclusion and does not need re-deriving.
+            for (int i = 0; i < n; i++)
+            {
+                Candidate *c = &g_cand[i];
+                if (!c->alive)
+                    continue;
+                c->hits = c->misses = c->consecutiveMisses = 0;
+                c->changes = c->jumps = 0;
+                c->travel = 0.0f;
+                c->haveLast = c->haveOrigin = false;
+            }
+
             g_chosen = -1;
             g_staleFrames = 0;
-            if (g_restarts++ < 3)
-                WrScanRestart();
+            g_matrixValid = false;
+            g_haveLastOrigin = false;
+            g_pendingFrames = 0;
+            g_heldFrames = 0;
+            // Deliberately no immediate re-scan. The candidate list is almost
+            // certainly still correct -- the matrix is in module data, at an
+            // address that does not move -- so re-deriving it costs seconds for
+            // nothing. If none of them can prove itself, the idle path above
+            // starts a real scan on its own.
         }
         else
         {
             _snprintf_s(g_status, sizeof(g_status), _TRUNCATE,
-                        "matrix @ %p%s -- %s", g_cand[g_chosen].addr,
+                        "matrix @ %p%s -- %s%s", g_cand[g_chosen].addr,
                         g_cand[g_chosen].transposed ? " (transposed)" : "",
-                        g_matrixValid ? "live" : "idle (no world?)");
+                        g_matrixValid ? "live" : "idle (no world?)",
+                        g_life.proving ? ", on probation" : "");
         }
         return;
     }
@@ -1256,6 +1377,7 @@ void WrScanTick(void)
     {
         g_chosen = best;
         g_staleFrames = 0;
+        WrMatrixLifeReset(&g_life);   // a fresh pick starts with a clean clock
         strcpy_s(g_note, sizeof(g_note), g_cand[best].note);
         WrLogf("scan: using matrix @ %p%s  (%d hits, %d updates, %.0f units "
                "travelled, %d jumps, fov %.0f, aspect %.3f vs %.3f, "
@@ -1312,6 +1434,7 @@ double WrScanMegabytes(void)
 
 float WrScanFrozenSeconds(void) { return g_frozenSeconds; }
 float *WrScanFrozenLimit(void) { return &g_frozenLimit; }
+bool WrScanHoldingForPanel(void) { return g_holdForPanel; }
 
 bool WrScanCandidateAt(int i, WrScanCandidateInfo *out)
 {
@@ -1345,6 +1468,7 @@ void WrScanUseCandidate(int i)
     g_lastAcceptTicks = 0;
     g_frozenSince = 0;
     g_frozenSeconds = 0.0f;
+    WrMatrixLifeReset(&g_life);
     strcpy_s(g_note, sizeof(g_note), g_cand[i].note);
     WrLogf("scan: matrix @ %p%s chosen by hand (fov %.0f, aspect %.3f)",
            g_cand[i].addr, g_cand[i].transposed ? " (transposed)" : "",

@@ -73,6 +73,11 @@ double WrScanMegabytes(void);
 float WrScanFrozenSeconds(void);
 float *WrScanFrozenLimit(void);  // settable from the UI
 
+// True while the freeze cutoff is being deliberately ignored because the panel
+// is open -- otherwise opening the panel to tick runs on and off would make the
+// lines you are ticking vanish, since using the panel means standing still.
+bool WrScanHoldingForPanel(void);
+
 // ---------------------------------------------------------------------------
 // Choosing between candidates by hand
 // ---------------------------------------------------------------------------

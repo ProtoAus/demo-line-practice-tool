@@ -72,7 +72,10 @@ Press **INSERT** in game. Tick runs in the Runs tab. **ESC** closes the panel.
   loaded a few per frame so a big map does not stall on load.
 - Stops drawing when you leave a map. Disconnecting does not clear the camera matrix or stop
   it looking valid — it just stops being written — so without this the whole route stayed
-  drawn over the main menu, frozen in place.
+  drawn over the main menu, frozen in place. That rule is suspended while the panel is open,
+  since using the panel means standing still and the lines you are ticking on and off are the
+  entire point; the suspension is only taken if the matrix was live shortly before you opened
+  it, so opening the panel at the main menu still draws nothing.
 
 ## What it deliberately doesn't do
 
@@ -521,12 +524,10 @@ It is easy to read as the tool being broken.
 
 Two things follow from that, and both are deliberate:
 
-- **A map change does not rescan.** It used to, and that re-entered the lottery every time —
-  so the tool could come back from a map change using a different matrix than it went in with.
-  The chosen address is fully re-validated every frame anyway; if a level load really did move
-  it, it stops validating and the stale-address path rescans on its own. (The old rescan also
-  blocked the render thread for up to three seconds, from inside `Present`, during a level
-  load. Restarts are asynchronous now.)
+- **A map change does not rescan** — it keeps the address, on probation. Rescanning re-entered
+  the lottery every time, so the tool could come back from a map change using a different
+  matrix than it went in with. (The old rescan also blocked the render thread for up to three
+  seconds, from inside `Present`, during a level load. Restarts are asynchronous now.)
 - **Diagnostics lists every candidate** with its address, field of view, aspect ratio and how
   far its camera has followed you, and lets you switch with one click. **Remember this one**
   writes it to `wrlines_data\wrlines_matrix.ini` as *module + offset* — never a bare address,
@@ -539,6 +540,53 @@ one whose aspect ratio matches the backbuffer most exactly wins, then the fewest
 discontinuities, then the most ground covered. Two candidates with the *same* aspect and
 different fields of view are both genuine, and nothing measurable from outside the engine says
 which is which — hence the list.
+
+Nothing is picked until a candidate has followed the camera for **512 units**. It used to be
+96, and the log read `96 units travelled` — exactly the threshold, meaning the winner was
+whichever candidate crossed the line first on a frame where they all crossed together, decided
+by array order. There is nothing to rank on until they have had time to differ.
+
+### Knowing when the address has died
+
+Probation exists because an address can die in two ways, and one of them is invisible.
+
+**It stops passing the oracle.** Easy to see, hard to judge: a level load produces exactly the
+same long run of failures and that is not the address's fault. The grace period used to be 600
+frames, described in the code as "a long grace period" for menus and loading screens. It is
+not — a loading screen still presents at several hundred frames per second, so 600 frames was
+1.5 seconds. In one logged session a good address was declared stale 1.39 s into a level load,
+replaced from the leftover candidate list, declared stale again, and again: three swaps in a
+second and a half, ending on a matrix that only worked on that one map. It is **15 seconds**
+now, and seconds are the point.
+
+**It stops being written.** Memory keeps its last contents, so a dead slot goes on passing the
+oracle forever — valid, motionless, and completely dead. Nothing separates that from a player
+standing still *except the company it keeps*: if other candidates are being rewritten, a world
+is being drawn and this one is not part of it. Four seconds of that, and only after a map
+change, and the address is given up.
+
+That second rule is why a slow level load is safe: during a load nothing changes anywhere, so
+no evidence accumulates and the clock does not run.
+
+When an address is given up, every candidate's hit count, update count and travel is **reset**.
+Those were accumulated on the previous level; leaving them in place is what let three duds be
+chosen in a second and a half, each one instantly "eligible" on evidence that no longer
+applied.
+
+This logic is `wr_matrixlife.h` — deliberately free of Windows, D3D and engine types so it can
+be run against scripted frames rather than only against a running game:
+
+```
+> tests\test_matrixlife.exe
+the address survives the load          an 8 s load at 400 fps does not kill it        ok
+the address does not survive the load  frozen while the world moves is caught         ok
+how long that takes                    caught after 4.00 s (budget 4.0 s)             ok
+standing still is not death            ten minutes motionless is never called death   ok
+the menu                               ten minutes at the menu triggers no re-pick    ok
+the frame rate does not change it      60 fps 4.017 s / 300 fps 4.003 s / 1000 4.001  ok
+```
+
+That last line is the regression the frame-counted version would have failed by 16×.
 
 This is strictly safer than probing, not just differently risky: **scanning never writes
 and never transfers control**, so it cannot corrupt engine state. Every read goes through
@@ -605,7 +653,10 @@ wr_render           projection, near-plane clip, LOD, polylines, markers, tags, 
 wr_path             .wrpath loading, run store, live recording
 wr_limit            the frame cap
 wr_extract          counting unextracted demos, running the extractor
+wr_matrixlife.h     when a chosen matrix has died -- pure logic, tested
 wr_ui               the panel
+tests\              standalone harnesses, built by hand:
+                    cl /nologo /EHsc /I.. tests\test_matrixlife.cpp
 ```
 
 Everything the tool writes lives under `wrlines_data\`, next to the DLL:
