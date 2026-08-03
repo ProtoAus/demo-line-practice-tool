@@ -176,6 +176,32 @@ static void LoadFailures(const char *pathsDir)
     fclose(f);
 }
 
+// Which extractor wrote this .wrpath. The revision sits at offset 0xFC of the
+// 0x100-byte header; files written before that field existed read as 0.
+//
+// This is checked rather than mere existence because an out-of-date .wrpath is
+// not "done" -- surf_colin_blaster_69000 had 75 of them, all extracted under a
+// world limit half the size of the map, all present and mostly wrong. Reporting
+// those as extracted is how they stayed wrong.
+static unsigned int WrpathRevision(const char *path)
+{
+    HANDLE h = CreateFileA(path, GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE)
+        return 0;
+
+    unsigned int rev = 0;
+    DWORD got = 0;
+    if (SetFilePointer(h, 0xFC, NULL, FILE_BEGIN) != INVALID_SET_FILE_POINTER)
+    {
+        if (!ReadFile(h, &rev, sizeof(rev), &got, NULL) || got != sizeof(rev))
+            rev = 0;
+    }
+    CloseHandle(h);
+    return rev;
+}
+
 static bool IsKnownBad(const char *base, long long size)
 {
     for (int i = 0; i < g_failedCount; i++)
@@ -232,7 +258,12 @@ static void CountInTree(const char *root, const char *map, const char *pathsDir)
         char wrp[MAX_PATH];
         _snprintf_s(wrp, sizeof(wrp), _TRUNCATE, "%s\\%s.wrpath", pathsDir, base);
         if (GetFileAttributesA(wrp) != INVALID_FILE_ATTRIBUTES)
-            g_alreadyDone++;
+        {
+            if (WrpathRevision(wrp) == WR_EXTRACTOR_REVISION)
+                g_alreadyDone++;
+            else
+                g_notYetDone++;     // out of date counts as work still to do
+        }
         else if (IsKnownBad(base, ((long long)fd.nFileSizeHigh << 32) |
                                   fd.nFileSizeLow))
             g_knownBad++;

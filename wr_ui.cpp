@@ -22,6 +22,7 @@
 #include <float.h>
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static char g_uiMap[72] = {0};
@@ -79,6 +80,92 @@ static unsigned int PackColour(const ImVec4 &v)
 }
 
 // ---------------------------------------------------------------------------
+
+// Click-to-sort for the run table.
+//
+// The run store is deliberately NOT reordered. Two things depend on its order
+// being fastest-first: "max runs drawn" means the fastest N, and the delta
+// column finds the best run of a track by taking the first match. So sorting
+// happens on a list of indices that exists only for display.
+enum
+{
+    RUNCOL_TRACK = 1,
+    RUNCOL_PLAYER,
+    RUNCOL_TIME,
+    RUNCOL_NEAR,
+    RUNCOL_POINTS,
+    RUNCOL_SPLITS,
+};
+
+static const ImGuiTableSortSpecs *g_sortSpecs = NULL;
+
+static int CompareOneColumn(const WrRun *a, const WrRun *b, ImGuiID col)
+{
+    switch (col)
+    {
+    case RUNCOL_TRACK:
+        if (a->trackType != b->trackType)
+            return a->trackType < b->trackType ? -1 : 1;
+        if (a->trackNum != b->trackNum)
+            return a->trackNum < b->trackNum ? -1 : 1;
+        return 0;
+    case RUNCOL_PLAYER:
+        return _stricmp(a->player, b->player);
+    case RUNCOL_TIME:
+        if (a->runTime != b->runTime)
+            return a->runTime < b->runTime ? -1 : 1;
+        return 0;
+    case RUNCOL_NEAR:
+    {
+        // "Not measured yet" sorts last either way round rather than pretending
+        // to be nearer than everything else.
+        float da = a->nearestDist < 0.0f ? 3.0e38f : a->nearestDist;
+        float db = b->nearestDist < 0.0f ? 3.0e38f : b->nearestDist;
+        if (da != db)
+            return da < db ? -1 : 1;
+        return 0;
+    }
+    case RUNCOL_POINTS:
+        if (a->pointCount != b->pointCount)
+            return a->pointCount < b->pointCount ? -1 : 1;
+        return 0;
+    case RUNCOL_SPLITS:
+        if (a->markerCount != b->markerCount)
+            return a->markerCount < b->markerCount ? -1 : 1;
+        return 0;
+    default:
+        return 0;
+    }
+}
+
+static int __cdecl CompareRunRows(const void *pa, const void *pb)
+{
+    const WrRun *a = WrRunAt(*(const int *)pa);
+    const WrRun *b = WrRunAt(*(const int *)pb);
+    if (!a || !b || !g_sortSpecs)
+        return 0;
+
+    for (int s = 0; s < g_sortSpecs->SpecsCount; s++)
+    {
+        const ImGuiTableColumnSortSpecs *spec = &g_sortSpecs->Specs[s];
+        int c = CompareOneColumn(a, b, spec->ColumnUserID);
+        if (c != 0)
+            return spec->SortDirection == ImGuiSortDirection_Ascending ? c : -c;
+    }
+    // Ties fall back to the run time, so the order never wobbles between frames.
+    if (a->runTime != b->runTime)
+        return a->runTime < b->runTime ? -1 : 1;
+    return 0;
+}
+
+static void SortRunOrder(int *order, int count, ImGuiTableSortSpecs *specs)
+{
+    if (!specs || specs->SpecsCount <= 0 || count < 2)
+        return;
+    g_sortSpecs = specs;
+    qsort(order, (size_t)count, sizeof(int), CompareRunRows);
+    g_sortSpecs = NULL;
+}
 
 // The fastest run of the same leg. Runs are already sorted fastest-first, so the
 // first match is it. Comparing a stage-3 time against a full-map time would be
@@ -388,21 +475,32 @@ static void DrawRunsTab(void)
         tableHeight = 140.0f;    // below this the header eats the whole list
 
     ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-                            ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit;
+                            ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit |
+                            ImGuiTableFlags_Sortable | ImGuiTableFlags_SortMulti;
     if (ImGui::BeginTable("runs", 9, flags, ImVec2(0.0f, tableHeight)))
     {
         ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn("On");
-        ImGui::TableSetupColumn("Col");
-        ImGui::TableSetupColumn("Track");
-        ImGui::TableSetupColumn("Player", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Time");
-        ImGui::TableSetupColumn("Delta");
-        ImGui::TableSetupColumn("Near");
-        ImGui::TableSetupColumn("Pts");
-        ImGui::TableSetupColumn("Splits");
+        // Sorting is on the columns where an order means something. "On" and
+        // "Col" are per-row controls, not values, so they are left alone.
+        ImGui::TableSetupColumn("On", ImGuiTableColumnFlags_NoSort);
+        ImGui::TableSetupColumn("Col", ImGuiTableColumnFlags_NoSort);
+        ImGui::TableSetupColumn("Track", 0, 0.0f, RUNCOL_TRACK);
+        ImGui::TableSetupColumn("Player", ImGuiTableColumnFlags_WidthStretch,
+                                0.0f, RUNCOL_PLAYER);
+        ImGui::TableSetupColumn("Time", ImGuiTableColumnFlags_DefaultSort, 0.0f,
+                                RUNCOL_TIME);
+        ImGui::TableSetupColumn("Delta", ImGuiTableColumnFlags_NoSort);
+        ImGui::TableSetupColumn("Near", 0, 0.0f, RUNCOL_NEAR);
+        ImGui::TableSetupColumn("Pts", 0, 0.0f, RUNCOL_POINTS);
+        ImGui::TableSetupColumn("Splits", 0, 0.0f, RUNCOL_SPLITS);
         ImGui::TableHeadersRow();
 
+        // The store itself stays sorted by time -- "max runs drawn" means the
+        // fastest N, and the delta column looks up the best of each track by
+        // taking the first match. So the click-to-sort order is a separate list
+        // of indices used only for display.
+        int order[WR_MAX_RUNS];
+        int shown = 0;
         for (int i = 0; i < WrRunCount(); i++)
         {
             WrRun *r = WrRunAt(i);
@@ -410,6 +508,16 @@ static void DrawRunsTab(void)
                 continue;
             if (s_nearOnly && !(r->nearestDist >= 0.0f &&
                                 r->nearestDist <= s_nearRadius))
+                continue;
+            order[shown++] = i;
+        }
+        SortRunOrder(order, shown, ImGui::TableGetSortSpecs());
+
+        for (int row = 0; row < shown; row++)
+        {
+            int i = order[row];
+            WrRun *r = WrRunAt(i);
+            if (!r)
                 continue;
             ImGui::TableNextRow();
             ImGui::PushID(i);

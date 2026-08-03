@@ -90,7 +90,7 @@ DEFAULT_OUT = os.path.join(SCRIPT_DIR, "wrlines_data", "paths")
 # simply falls back to treating those demos as unprocessed, which is the safe
 # direction: it offers to do work that has already been done, rather than hiding
 # work that has not.
-EXTRACTOR_REVISION = 1
+EXTRACTOR_REVISION = 2
 FAILURES_FILE = "_failed.txt"
 
 # ---------------------------------------------------------------------------
@@ -248,7 +248,17 @@ def decompress_body(data, h):
 # Path extraction
 # ---------------------------------------------------------------------------
 
-WORLD_LIMIT = 16384.0
+# NOT the 16384 that every Source reference quotes. Strata's maps are bigger:
+# measured from the demos themselves, surf_colin_blaster_69000 reaches -31295 on
+# X. With 16384 this filter chopped that map's origin stream into fragments, and
+# 66 of its 141 demos could not be extracted at all -- the DP could only chain
+# 8-38% of ticks, and where it did find a long chain the implied speed was
+# nonsense because it was stitching across the gaps.
+#
+# Widening it is free: re-running ten surf_demise demos at 65536 gives results
+# byte-identical to 16384, because this only ever threw out floats that are
+# nowhere near a coordinate. Keep in sync with WR_WORLD_LIMIT in wr_common.h.
+WORLD_LIMIT = 65536.0
 
 # Largest plausible movement between consecutive ticks, in world units. The
 # fastest runs on disk peak near 4900 u/s, which is ~74 units at a 0.015 s tick;
@@ -408,6 +418,32 @@ def scan_candidates(buf, start_byte=0):
     return out
 
 
+# A per-demo deadline.
+#
+# The dynamic program below is quadratic in the worst case, and some demos are
+# genuinely slow -- 68 s each on surf_colin_blaster_69000 against 0.7 s on a
+# normal map. That is not a hang, but it looks exactly like one: the extractor
+# rattles through four demos and then sits on the fifth. So there is now a limit,
+# it is reported as an ordinary failure with the reason given, and the failure
+# record means it is not paid twice.
+_deadline = [0.0, 0.0]      # [absolute give-up time, the limit that produced it]
+
+
+def set_deadline(seconds):
+    if seconds and seconds > 0:
+        _deadline[0] = time.time() + seconds
+        _deadline[1] = seconds
+    else:
+        _deadline[0] = 0.0
+        _deadline[1] = 0.0
+
+
+def check_deadline(where):
+    if _deadline[0] and time.time() > _deadline[0]:
+        raise MtvError("gave up after %.0f s in %s -- pass --timeout 0 for no "
+                       "limit, or a larger value" % (_deadline[1], where))
+
+
 def longest_smooth_chain(cands, keys, banned, gap_max):
     """Longest physically-smooth chain of candidates, by dynamic programming.
 
@@ -426,6 +462,8 @@ def longest_smooth_chain(cands, keys, banned, gap_max):
     step = [None] * n
 
     for i in range(n):
+        if (i & 0xFFF) == 0:
+            check_deadline("the chain search")
         bi = ks[i]
         xi, yi, zi = pos[i]
         si = step[i]
@@ -691,6 +729,7 @@ def extract_path(body, h):
     identified = None       # structurally confirmed as the origin stream
     attempts = []
     for _ in range(MAX_IDENTIFY_ROUNDS):
+        check_deadline("chain identification")
         chain = longest_smooth_chain(cands, keys, banned, gap_max)
         if len(chain) < MIN_CHAIN:
             break
@@ -971,6 +1010,14 @@ def write_wrpath(out_path, h, points, markers, src_sha1, flags):
     struct.pack_into("<B", head, 0xF8, h.get("gamemode", 0))
     struct.pack_into("<B", head, 0xF9, h.get("track_type", 0))
     struct.pack_into("<B", head, 0xFA, h.get("track_num", 0))
+    # Which extractor wrote this. Bumping EXTRACTOR_REVISION therefore does not
+    # only retry the recorded failures -- it also marks everything already
+    # written as out of date, so a fix that changes what gets extracted actually
+    # reaches the files that were extracted wrongly. Without this the 75
+    # surf_colin_blaster_69000 runs produced under the old +-16384 world limit
+    # would have been skipped forever as "already done", which is exactly what
+    # they looked like: present, and mostly wrong.
+    struct.pack_into("<I", head, 0xFC, EXTRACTOR_REVISION)
 
     body = bytearray()
     for i, (x, y, z, vx, vy, vz) in enumerate(points):
@@ -1061,6 +1108,7 @@ def cmd_list(args):
 def process_one(path, args):
     name = os.path.basename(path)
     sha1 = os.path.splitext(name)[0]
+    set_deadline(getattr(args, "timeout", 0))
     try:
         data = open(path, "rb").read()
         h = parse_mtv_header(data, path)
@@ -1175,9 +1223,78 @@ def _size_of(path):
         return -1
 
 
+def _job_count(requested):
+    """How many worker processes to use. 0 means "decide for me"."""
+    if requested and requested > 0:
+        return int(requested)
+    cpus = os.cpu_count() or 2
+    # Two cores held back on purpose. The in-game button starts this at
+    # below-normal priority precisely so it does not fight the game for CPU, and
+    # child processes inherit that priority class -- but priority does not help
+    # if every core is occupied.
+    return max(1, cpus - 2)
+
+
+def _process_one_job(item):
+    """Worker entry point. Must be module level so it can be pickled."""
+    path, demo_map, args = item
+    kind, name, msg, extra = process_one(path, args)
+    return (path, demo_map, kind, name, msg, extra)
+
+
+def _run_all(targets, args):
+    """Yield a result per target, in whatever order they finish.
+
+    Each demo is completely independent -- separate file in, separate file out --
+    so this is about as parallel as work gets. It matters because the cost per
+    demo is wildly uneven: 0.7 s on a normal map, up to a minute on a bad one,
+    which serially reads as "it did four quickly and then stopped".
+    """
+    jobs = _job_count(getattr(args, "jobs", 0))
+    if jobs <= 1 or len(targets) < 2:
+        for path, demo_map in targets:
+            kind, name, msg, extra = process_one(path, args)
+            yield (path, demo_map, kind, name, msg, extra)
+        return
+
+    try:
+        from concurrent.futures import ProcessPoolExecutor
+    except ImportError:
+        jobs = 1
+
+    if jobs <= 1:
+        for path, demo_map in targets:
+            kind, name, msg, extra = process_one(path, args)
+            yield (path, demo_map, kind, name, msg, extra)
+        return
+
+    print("%d worker%s" % (jobs, "" if jobs == 1 else "s"))
+    items = [(path, demo_map, args) for path, demo_map in targets]
+    with ProcessPoolExecutor(max_workers=jobs) as pool:
+        for result in pool.map(_process_one_job, items, chunksize=1):
+            yield result
+
+
+def wrpath_revision(path):
+    """Which extractor revision wrote this .wrpath, or -1 if unreadable.
+
+    Files written before this field existed read as 0, which is never equal to a
+    real revision, so they are correctly treated as out of date.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(WRPATH_HEADER)
+        if len(head) < 0x100:
+            return -1
+        return struct.unpack_from("<I", head, 0xFC)[0]
+    except OSError:
+        return -1
+
+
 def cmd_extract(args):
     already = 0
     known_bad = 0
+    stale = 0
     if args.file:
         targets = [(args.file, peek_map(args.file) or "")]
     else:
@@ -1187,10 +1304,13 @@ def cmd_extract(args):
             m = peek_map(path) or ""
             if args.map and m.lower() != args.map.lower():
                 continue
-            if args.skip_existing and m and os.path.exists(
-                    wrpath_for(args.out, path, m)):
-                already += 1
-                continue
+            if args.skip_existing and m:
+                out = wrpath_for(args.out, path, m)
+                if os.path.exists(out):
+                    if wrpath_revision(out) == EXTRACTOR_REVISION:
+                        already += 1
+                        continue
+                    stale += 1      # written by an older extractor; redo it
             # Demos that failed before, at this revision, with this exact file
             # size. A re-download that changed the file is not the same demo and
             # gets another go.
@@ -1205,6 +1325,8 @@ def cmd_extract(args):
             targets.append((path, m))
     if already:
         print("%d already extracted, skipping them" % already)
+    if stale:
+        print("%d were extracted by an older version and are being redone" % stale)
     if known_bad:
         print("%d failed before and are being skipped (--retry-failed to try "
               "them again)" % known_bad)
@@ -1215,14 +1337,15 @@ def cmd_extract(args):
     now_failed = {}
     now_ok = {}
 
+    if args.limit:
+        targets = targets[:args.limit]
+
     done = ok = skipped = failed = lowconf = 0
     cov = []
     t0 = time.time()
-    for path, demo_map in targets:
-        if args.limit and done >= args.limit:
-            break
+    total = len(targets)
+    for path, demo_map, kind, name, msg, extra in _run_all(targets, args):
         done += 1
-        kind, name, msg, extra = process_one(path, args)
         base = os.path.splitext(name)[0]
         if demo_map:
             seen_maps.add(demo_map)
@@ -1230,12 +1353,15 @@ def cmd_extract(args):
                 now_failed.setdefault(demo_map, {})[base] = (_size_of(path), msg)
             elif kind == "ok":
                 now_ok.setdefault(demo_map, set()).add(base)
+        # A running count, because the panel shows this live and "4 of 66" is the
+        # difference between "working" and "stuck".
+        pre = "[%d/%d]" % (done, total)
         if kind == "error":
             failed += 1
-            print("  FAIL %-44s %s" % (name[:44], msg))
+            print("%s FAIL %-44s %s" % (pre, name[:44], msg))
         elif kind == "skip":
             skipped += 1
-            print("  SKIP %-44s %s" % (name[:44], msg))
+            print("%s SKIP %-44s %s" % (pre, name[:44], msg))
         else:
             h, info = extra
             ok += 1
@@ -1247,8 +1373,8 @@ def cmd_extract(args):
                 lowconf += 1
             mk = ("%d%s" % (info["markers"], "" if info["markers_ok"] else "!")) \
                 if info["markers"] else "-"
-            print("  %-4s %-44s %-9s %5d pts %5.1f%%  err %7.4f  mk %-4s %.1fs"
-                  % ("OK" if not info.get("flagged") else "OK?",
+            print("%s %-4s %-44s %-9s %5d pts %5.1f%%  err %7.4f  mk %-4s %.1fs"
+                  % (pre, "OK" if not info.get("flagged") else "OK?",
                      name[:44], fmt_time(h["run_time"]), info["samples"],
                      100 * info["coverage"], info["match_error"], mk,
                      info["scan_seconds"]))
@@ -1297,6 +1423,13 @@ def main(argv):
     ap.add_argument("--retry-failed", action="store_true",
                     help="with --skip-existing, try the recorded failures "
                          "again anyway")
+    ap.add_argument("--jobs", type=int, default=0,
+                    help="worker processes; 0 (default) uses all cores but two, "
+                         "1 runs serially")
+    ap.add_argument("--timeout", type=float, default=180.0,
+                    help="give up on a single demo after this many seconds "
+                         "(0 for no limit). It is recorded as an ordinary "
+                         "failure, so it is not paid for twice")
     args = ap.parse_args(argv)
 
     if not os.path.isdir(args.game):

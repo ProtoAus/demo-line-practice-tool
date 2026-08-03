@@ -274,12 +274,26 @@ demo's size:
 Three things keep the record from going stale on its own:
 
 - The size is checked as well as the name, so a re-downloaded demo gets another go.
-- The record carries `EXTRACTOR_REVISION`. Bumping it when the extraction logic changes
-  invalidates every record automatically, so improving the extractor retries everything it
-  used to give up on without anyone deleting a file.
+- The record carries `EXTRACTOR_REVISION`, which is also stamped into every `.wrpath` at
+  offset `0xFC`. Bumping it when the extraction logic changes retries every recorded failure
+  **and** marks everything already written as out of date — so a fix that changes what gets
+  extracted actually reaches the files that were extracted wrongly, rather than skipping them
+  forever as "already done".
 - Any demo that later succeeds is dropped from the record.
 
 `--retry-failed`, or the button beside Extract, tries them anyway.
+
+### Speed
+
+Each demo is completely independent — one file in, one file out — so extraction runs across
+processes. `--jobs` defaults to all cores but two: the in-game button starts the script at
+below-normal priority so it loses any fight with the game, but priority does not help if every
+core is busy. `--jobs 1` forces serial.
+
+There is also a `--timeout`, 180 s per demo by default. The dynamic program is quadratic in the
+worst case and some demos genuinely take a minute; serially that reads as "it did four quickly
+and then stopped". A demo that hits the limit is recorded as an ordinary failure, so it is not
+paid for twice.
 
 **1. Generate paths for a map**, if you would rather use a terminal. From this folder:
 
@@ -393,14 +407,22 @@ known-good single-stage demos and testing the stitched points against that geome
   are reported as `FAIL`, never silently written.
 - Short stage runs that start near the world origin can be indistinguishable from the
   velocity stream by magnitude alone. These are reported as failures with the reason given.
-- **Some maps are simply much worse.** `surf_colin_blaster_69000` is the worst measured: of
-  141 demos, 66 failed, and of the 75 written only 17 passed the max-speed check. Median
-  coverage was 30.1 % against 96.8 % on `surf_demise`. The 58 flagged ones are drawn with a
-  `!` in the Runs tab and should be treated as suspect rather than merely incomplete — the
-  median max-speed error across them is 36 u/s, where a confirmed chain matches to about
-  0.01. It also took 68 s per demo there versus 0.7 s on a normal map. Re-measured since: the
-  66 failures are deterministic, cost 220 s to reproduce, and are now recorded and skipped —
-  see [Demos that cannot be extracted](#demos-that-cannot-be-extracted).
+- ~~**Some maps are simply much worse.**~~ **Fixed, and it was our bug.** `surf_colin_blaster_69000`
+  was the worst measured by far: 66 of 141 demos failed, and of the 75 written only 17 passed
+  the max-speed check, at a median coverage of 30.1 % against 96.8 % on `surf_demise`. The
+  cause was `WORLD_LIMIT`, the filter that decides whether three floats could be a coordinate.
+  It was ±16384, the figure every Source reference quotes — and that map runs out to **−31295**.
+  Most of the origin stream was being discarded before the search ever saw it. At ±65536:
+
+  | | before | after |
+  | --- | --- | --- |
+  | extracted | 75 of 141 | 130 of 141 |
+  | median coverage | 30.1 % | 83.9 % |
+
+  Re-running ten `surf_demise` demos at the wider limit gives byte-identical results, so this
+  only ever threw away real data. The same constant in the DLL meant that map had **no lines
+  and no energy readout at all** whenever the player was past 16384 — the oracle rejected the
+  real camera matrix every frame.
 - Split markers are only drawn when the anchoring passed its confidence check. Wrong
   markers are worse than no markers.
 

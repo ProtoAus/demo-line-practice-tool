@@ -5,7 +5,7 @@
 // does should be obvious from reading it.
 //
 // Source's world axes, for reference while reading the maths elsewhere:
-//   +X forward, +Y left, +Z up, units are inches-ish, world limit +-16384.
+//   +X forward, +Y left, +Z up, units are inches-ish.
 
 #ifndef WR_COMMON_H
 #define WR_COMMON_H
@@ -19,7 +19,21 @@
 #include <windows.h>
 #include <stdint.h>
 
-#define WRLINES_VERSION "0.1.0"
+#define WRLINES_VERSION "0.2.0"
+
+// How far from the origin a real world coordinate can be.
+//
+// NOT the 16384 that every Source reference quotes. Strata's maps are bigger:
+// measured from the demos themselves, surf_colin_blaster_69000 reaches -31295
+// on X. While the player was out past 16384 the matrix oracle rejected the real
+// matrix every single frame, so that map had no lines and no energy readout at
+// all, whatever was ticked.
+//
+// Keep in sync with WORLD_LIMIT in wrpath_extract.py, which filters candidate
+// coordinates out of the demo netstream with the same number. That one is a
+// real filter and mattered even more: with 16384 the origin stream on that map
+// was chopped into fragments, and 66 of its 141 demos could not be extracted.
+#define WR_WORLD_LIMIT 65536.0f
 
 // ---------------------------------------------------------------------------
 // Maths

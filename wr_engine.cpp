@@ -342,11 +342,24 @@ bool WrValidateW2S(const VMatrix &m, char *note, int noteLen)
     if (fabsf(mAspect - aspect) > aspect * 0.10f)
         return false;
 
+    // World bounds. 65536, not the 16384 that every Source reference quotes.
+    //
+    // Strata's maps are bigger than stock Source's. Measured from the demos
+    // themselves, surf_colin_blaster_69000 runs out to -31295 on X, and while
+    // the player was out there this test rejected the real matrix every frame:
+    // no lines, no energy readout, nothing, on that map only, no matter what was
+    // ticked. It read exactly like the tool being broken for one map.
+    //
+    // Widening it costs almost nothing, because this was never the check doing
+    // the work -- the orthonormal basis, the aspect ratio against the actual
+    // backbuffer, and a reprojection landing within 1% of screen centre are what
+    // identify the matrix. This one only exists to throw out floats that are
+    // nowhere near a coordinate.
     Vec3 origin;
     if (!WrSolveCameraOrigin(m, &origin))
         return false;
-    if (fabsf(origin.x) > 16384.0f || fabsf(origin.y) > 16384.0f ||
-        fabsf(origin.z) > 16384.0f)
+    if (fabsf(origin.x) > WR_WORLD_LIMIT || fabsf(origin.y) > WR_WORLD_LIMIT ||
+        fabsf(origin.z) > WR_WORLD_LIMIT)
         return false;
     // A projection matrix with no view transform folded in solves to exactly
     // (0,0,0). Real players are not standing there.
