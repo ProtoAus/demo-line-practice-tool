@@ -14,6 +14,9 @@
 #include "wr_energy.h"
 #include "wr_limit.h"
 #include "wr_extract.h"
+#include "wr_timer.h"
+#include "wr_savelocs.h"
+#include "wr_stress.h"
 #include "wr_hook.h"
 #include "wr_log.h"
 
@@ -653,6 +656,30 @@ static void DrawDisplayTab(void)
     ImGui::TextDisabled("Markers are only drawn for runs whose splits could be");
     ImGui::TextDisabled("anchored to the path with confidence.");
 
+    ImGui::SeparatorText("Where you are going");
+    ImGui::Checkbox("Draw a velocity vector", &g_render.drawVelocity);
+    ImGui::SameLine();
+    HelpMarker("From your midsection, along the way you are actually moving, "
+               "reaching as far as you will travel in the next quarter second. "
+               "Length is time rather than an arbitrary scale, so the tip lands "
+               "on the surface you are about to meet.");
+    ImGui::Checkbox("Colour lines by strafing efficiency",
+                    &g_render.colourByEfficiency);
+    ImGui::SameLine();
+    HelpMarker("Green where a line is gaining energy close to the fastest air "
+               "strafing can physically manage, red where it is throwing energy "
+               "away.\n\n"
+               "This is NOT a turn-rate meter. Turning faster than air "
+               "acceleration alone could manage happens in 10 to 24 percent of "
+               "the samples in every world record measured, because the ramp "
+               "does the turning -- a metric built on that would light up on "
+               "perfect play. What is measured here is the consequence: how "
+               "much of the available energy the strafing actually captured. "
+               "Median on the surf_demise world record is 0.53; on the two "
+               "slowest runs in the same set, 0.01.\n\n"
+               "Boosters add energy for free, so anything past three times the "
+               "ceiling is drawn neutral rather than as perfect play.");
+
     ImGui::SeparatorText("Your own path");
     bool live = WrLiveEnabled();
     if (ImGui::Checkbox("Record my path", &live))
@@ -878,14 +905,71 @@ static void DrawEnergyTab(void)
                              ImVec2(0.0f, 60.0f));
     }
 
+    // --- the anchor ---------------------------------------------------------
+    ImGui::SeparatorText("Anchor");
+    WrAnchorSource src = WrEnergyAnchorSource();
+    if (src == WR_ANCHOR_RUN_START)
+        ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f),
+                           "the start of the run you are chasing");
+    else if (src == WR_ANCHOR_MANUAL)
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "set by hand");
+    else
+        ImGui::TextDisabled("none yet -- enable a run, or set one here");
+    ImGui::SameLine();
+    HelpMarker("Everything on this tab is measured from the anchor, and it never "
+               "moves on its own.\n\n"
+               "It used to: the reference was re-armed whenever a ground test "
+               "passed, and that test passes at the APEX OF EVERY JUMP -- "
+               "vertical speed sits near zero there for about a quarter of a "
+               "second. So the zero point silently re-based itself at the top of "
+               "every arc and stepped again on landing. The number was not "
+               "noisy; its origin was moving.\n\n"
+               "Anchoring at the run's own first point also makes the clock "
+               "below exact, because their time and yours then start in the "
+               "same place.");
+
+    if (ImGui::Button("Anchor here"))
+        WrEnergyRearm();
+    ImGui::SameLine();
     if (ImGui::Button("Reset"))
         WrEnergyReset();
     ImGui::SameLine();
-    if (ImGui::Button("Measure from here"))
-        WrEnergyRearm();
+    ImGui::Checkbox("Follow the run's start", &g_energy.anchorToRunStart);
+
+    // --- the clock ----------------------------------------------------------
+    ImGui::SeparatorText("Time");
+    const WrRun *tref = WrEnergyReferenceRun();
+    float ours = 0.0f, theirs = 0.0f, delta = 0.0f;
+    if (WrTimerDelta(tref, &ours, &theirs, &delta))
+    {
+        char a[32], b[32];
+        FormatTime(ours, a, sizeof(a));
+        FormatTime(theirs, b, sizeof(b));
+        ImGui::Text("you %s    them %s", a, b);
+        ImGui::TextColored(delta <= 0.0f ? ImVec4(0.5f, 1.0f, 0.5f, 1.0f)
+                                         : ImVec4(1.0f, 0.6f, 0.6f, 1.0f),
+                           "%+.2f s", delta);
+    }
+    else
+    {
+        if (WrTimerRunning())
+        {
+            char a[32];
+            FormatTime(WrTimerElapsed(), a, sizeof(a));
+            ImGui::Text("you %s", a);
+        }
+        ImGui::TextDisabled("%s", WrTimerWhyNot(tref));
+    }
+    ImGui::TextDisabled("%s", WrSavelocStatus());
     ImGui::SameLine();
-    HelpMarker("Re-arms the reference at your current height instead of waiting "
-               "for the next time you touch ground.");
+    HelpMarker("Momentum's save-locs record where you were but not how long it "
+               "took to get there -- the file has a \"time\" field and it is "
+               "-1 in every one of the 3213 entries on this machine.\n\n"
+               "So WrLines keeps its own note, in wrlines_data\savelocs, keyed "
+               "on position rather than on the save-loc's index (indices "
+               "renumber when you delete one). Load a save-loc and the clock "
+               "goes back to what it said when you made it.\n\n"
+               "Nothing is ever written into the game install.");
 
     // --- the comparison -----------------------------------------------------
     ImGui::SeparatorText("Comparison");
@@ -943,6 +1027,20 @@ static void DrawEnergyTab(void)
                "to a line's beginning: if the gap sits at a constant offset, "
                "this is the knob that nulls it.");
     ImGui::SliderFloat("Gravity", &g_energy.gravity, 200.0f, 1600.0f, "%.0f");
+    ImGui::SeparatorText("Steadiness");
+    ImGui::SliderFloat("Smoothing", &g_energy.smoothSeconds, 0.05f, 1.0f, "%.2f s");
+    ImGui::SameLine();
+    HelpMarker("How long the headline figure takes to settle. The signal itself "
+               "cannot rise faster than about 37 units a second -- that is the "
+               "physical ceiling on what air strafing can add -- so a third of a "
+               "second of filtering costs at most a dozen units of lag and "
+               "removes almost all of the jitter.");
+    ImGui::SliderFloat("Arrow window", &g_energy.trendSeconds, 0.3f, 2.0f, "%.2f s");
+    ImGui::SliderFloat("Round to", &g_energy.quantiseStep, 0.0f, 25.0f, "%.0f");
+    ImGui::SameLine();
+    HelpMarker("Rounds the displayed figure, with hysteresis, so the last digit "
+               "stops churning. Zero shows the raw value.");
+    ImGui::SliderFloat("Corner block size", &g_energy.overlayScale, 0.6f, 3.0f, "%.2fx");
     ImGui::TextDisabled("sv_gravity. 800 is the Source default; change it only if");
     ImGui::TextDisabled("the map or gamemode does.");
     if (ImGui::Button("Reset energy settings"))

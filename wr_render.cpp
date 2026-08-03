@@ -24,6 +24,8 @@
 #include "wr_path.h"
 #include "wr_steam.h"
 #include "wr_energy.h"
+#include "wr_imgui.h"
+#include "wr_stress.h"
 #include "wr_hook.h"
 #include "wr_log.h"
 
@@ -75,6 +77,8 @@ void WrRenderDefaults(void)
     g_render.maxTags = 12;
     g_render.drawDipSpeeds = true;
     g_render.maxDipsPerRun = 24;
+    g_render.drawVelocity = true;
+    g_render.colourByEfficiency = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -278,9 +282,13 @@ static unsigned int SpeedColour(float speed)
 // already store true velocity, so they pass 1. The live recorder stores a raw
 // per-sample delta instead, which is not a speed at all, so it passes 0 to mean
 // "no usable speed here" and colour-by-speed falls back to the flat colour.
+// Defined below, with the rest of the energy drawing.
+static unsigned int EfficiencyColour(float eta);
+
 static void EmitPath(ImDrawList *dl, const WrPoint *pts, int count,
                      const int *breaks, int breakCount,
-                     unsigned int baseColour, float velScale)
+                     unsigned int baseColour, float velScale,
+                     const signed char *eff)
 {
     if (count < 2)
         return;
@@ -435,7 +443,17 @@ static void EmitPath(ImDrawList *dl, const WrPoint *pts, int count,
 
         unsigned int colour;
         int bucket;
-        if (g_render.colourBySpeed && velScale > 0.0f)
+        if (g_render.colourByEfficiency && eff)
+        {
+            float eta = WrEtaFromByte(eff[i]);
+            int cBucket = (int)((eta * 0.5f + 0.5f) * (COLOUR_BUCKETS - 1) + 0.5f);
+            if (cBucket < 0) cBucket = 0;
+            if (cBucket >= COLOUR_BUCKETS) cBucket = COLOUR_BUCKETS - 1;
+            float q = ((float)cBucket / (COLOUR_BUCKETS - 1)) * 2.0f - 1.0f;
+            colour = WithAlpha(EfficiencyColour(q), a01);
+            bucket = fBucket * COLOUR_BUCKETS + cBucket;
+        }
+        else if (g_render.colourBySpeed && velScale > 0.0f)
         {
             float speed = WrLength(pts[i].vel) * velScale;
             float t = WrClampF((speed - g_render.speedMin) /
@@ -536,8 +554,10 @@ static void EmitDips(ImDrawList *dl, const WrRun *run)
                     WithAlpha(run->colour, 0.9f), 1.5f);
 
         ImVec2 tp(s.x + 4.0f, s.y - 16.0f);
-        dl->AddText(ImVec2(tp.x + 1.0f, tp.y + 1.0f), 0xC0000000u, label);
-        dl->AddText(tp, WithAlpha(run->colour, 1.0f), label);
+        float ls = 0.0f;
+        ImFont *lf = WrFontFor(14.0f * g_render.tagScale, &ls);
+        dl->AddText(lf, ls, ImVec2(tp.x + 1.0f, tp.y + 1.0f), 0xC0000000u, label);
+        dl->AddText(lf, ls, tp, WithAlpha(run->colour, 1.0f), label);
         drawn++;
     }
 }
@@ -578,8 +598,10 @@ static void EmitMarkers(ImDrawList *dl, const WrRun *run)
             _snprintf_s(label, sizeof(label), _TRUNCATE, "%.2f", secs);
 
         ImVec2 tp(s.x + r + 3.0f, s.y - 7.0f);
-        dl->AddText(ImVec2(tp.x + 1.0f, tp.y + 1.0f), 0xC0000000u, label);
-        dl->AddText(tp, WithAlpha(run->colour, 1.0f), label);
+        float ls = 0.0f;
+        ImFont *lf = WrFontFor(14.0f * g_render.tagScale, &ls);
+        dl->AddText(lf, ls, ImVec2(tp.x + 1.0f, tp.y + 1.0f), 0xC0000000u, label);
+        dl->AddText(lf, ls, tp, WithAlpha(run->colour, 1.0f), label);
     }
 }
 
@@ -758,7 +780,9 @@ static void EmitTag(ImDrawList *dl, WrRun *run)
     float scale = g_render.tagScale;
     float icon = 22.0f * scale;
     float pad = 4.0f * scale;
-    ImVec2 text = ImGui::CalcTextSize(name);
+    float tagSize = 0.0f;
+    ImFont *tagFont = WrFontFor(14.0f * g_render.tagScale, &tagSize);
+    ImVec2 text = tagFont->CalcTextSizeA(tagSize, FLT_MAX, 0.0f, name);
     float w = icon + pad * 3.0f + text.x;
     float h = (icon > text.y ? icon : text.y) + pad * 2.0f;
 
@@ -804,8 +828,8 @@ static void EmitTag(ImDrawList *dl, WrRun *run)
                             icon * 0.42f, WithAlpha(run->colour, 1.0f), 14);
 
     ImVec2 tp(ic.x + icon + pad, r.y0 + (h - text.y) * 0.5f);
-    dl->AddText(ImVec2(tp.x + 1.0f, tp.y + 1.0f), 0xC0000000u, name);
-    dl->AddText(tp, 0xFFFFFFFFu, name);
+    dl->AddText(tagFont, tagSize, ImVec2(tp.x + 1.0f, tp.y + 1.0f), 0xC0000000u, name);
+    dl->AddText(tagFont, tagSize, tp, 0xFFFFFFFFu, name);
 }
 
 // ---------------------------------------------------------------------------
@@ -898,23 +922,33 @@ static void EmitEnergyHud(ImDrawList *dl)
         }
     }
 
-    ImFont *font = ImGui::GetFont();
-    float base = ImGui::GetFontSize();
-    float sBig = base * 1.7f * g_energy.hudScale;
-    float sSub = base * 1.0f * g_energy.hudScale;
+    // Baked sizes, never scaled ones. Asking for 66 pixels from a 13-pixel atlas
+    // is what made this blurry; WrFontFor returns the nearest size that actually
+    // exists and the size to draw it at. See wr_imgui.cpp.
+    float sBig = 0.0f, sSub = 0.0f;
+    ImFont *fBig = WrFontFor(22.0f * g_energy.hudScale, &sBig);
+    ImFont *fSub = WrFontFor(14.0f * g_energy.hudScale, &sSub);
 
-    ImVec2 mBig = font->CalcTextSizeA(sBig, FLT_MAX, 0.0f, big);
-    ImVec2 mSub = font->CalcTextSizeA(sSub, FLT_MAX, 0.0f, sub);
-    ImVec2 mCmp = haveCmp ? font->CalcTextSizeA(sSub, FLT_MAX, 0.0f, cmp)
+    ImVec2 mBig = fBig->CalcTextSizeA(sBig, FLT_MAX, 0.0f, big);
+    ImVec2 mSub = fSub->CalcTextSizeA(sSub, FLT_MAX, 0.0f, sub);
+    ImVec2 mCmp = haveCmp ? fSub->CalcTextSizeA(sSub, FLT_MAX, 0.0f, cmp)
                           : ImVec2(0.0f, 0.0f);
 
-    float w = mBig.x;
-    if (mSub.x > w) w = mSub.x;
-    if (mCmp.x > w) w = mCmp.x;
+    // Lay out on a WORST-CASE width, not on this frame's text.
+    //
+    // The block used to be measured from whatever it currently said. Its widest
+    // line therefore changed as the numbers changed, and since a right-aligned
+    // block is positioned by subtracting its width, the whole thing slid
+    // sideways several times a second. Reserving room for the widest string any
+    // of these lines can produce makes the position constant.
+    ImVec2 wBig = fBig->CalcTextSizeA(sBig, FLT_MAX, 0.0f, "-99999 v");
+    ImVec2 wSub = fSub->CalcTextSizeA(sSub, FLT_MAX, 0.0f, "-99999 u/s");
+
+    float w = wBig.x;
+    if (wSub.x > w) w = wSub.x;
+    if (mCmp.x > w) w = mCmp.x;     // the name is not ours to bound
     float h = mBig.y + mSub.y + (haveCmp ? mCmp.y : 0.0f);
 
-    // Negative offset puts the block on the other side of the crosshair, and
-    // right-aligning it there keeps it from drifting away as the numbers widen.
     bool rightAlign = (g_energy.hudOffsetX < 0.0f);
     float x = g_sw * 0.5f + g_energy.hudOffsetX - (rightAlign ? w : 0.0f);
     float y = g_sh * 0.5f + g_energy.hudOffsetY - h * 0.5f;
@@ -938,11 +972,109 @@ static void EmitEnergyHud(ImDrawList *dl)
 
     for (int i = 0; i < n; i++)
     {
+        ImFont *f = (i == 0) ? fBig : fSub;
         float tx = rightAlign ? (x + w - rows[i].width) : x;
-        dl->AddText(font, rows[i].size, ImVec2(tx + 1.0f, ty + 1.0f), 0xC0000000u,
+        dl->AddText(f, rows[i].size, ImVec2(tx + 1.0f, ty + 1.0f), 0xC0000000u,
                     rows[i].s);
-        dl->AddText(font, rows[i].size, ImVec2(tx, ty), rows[i].col, rows[i].s);
+        dl->AddText(f, rows[i].size, ImVec2(tx, ty), rows[i].col, rows[i].s);
         ty += (i == 0) ? mBig.y : mSub.y;
+    }
+}
+
+// Where you will be in a quarter of a second if nothing changes.
+//
+// Length maps to TIME, not to a bare scale factor. `speed * seconds` has a
+// meaning the player can act on -- the tip lands on the surface they are about
+// to meet -- whereas `speed * k` has no interpretation and every k is arbitrary.
+//
+// Measured across 76,897 sampled points on 17 maps, speeds run p50 2216, p90
+// 3467, p99 4543 u/s, so a quarter second is 550-1140 units: long enough to
+// reach the next ramp, short enough not to cross the level.
+#define VECTOR_SECONDS 0.25f
+#define VECTOR_MIN 64.0f
+#define VECTOR_MAX 1200.0f
+
+// Green where energy is being added near the physical ceiling, red where it is
+// being thrown away, grey in between and for free flight.
+//
+// The thresholds come from the data, not from taste: median efficiency on the
+// surf_demise world record is +0.531, and on the two slowest runs in the same
+// set (55.9 s and 57.8 s) it is +0.010 and +0.003. A factor of fifty separates a
+// record from a bad run, and it all lives in the positive band -- so that is
+// where the resolution goes.
+static unsigned int EfficiencyColour(float eta)
+{
+    float r, g, b;
+    if (eta >= 0.0f)
+    {
+        float u = WrClampF(eta / 0.6f, 0.0f, 1.0f);     // 0.6 is already excellent
+        r = 0.65f * (1.0f - u);
+        g = 0.65f + 0.35f * u;
+        b = 0.65f * (1.0f - u);
+    }
+    else
+    {
+        float u = WrClampF(-eta / 0.5f, 0.0f, 1.0f);
+        r = 0.65f + 0.35f * u;
+        g = 0.65f * (1.0f - u);
+        b = 0.65f * (1.0f - u) * 0.4f;
+    }
+    unsigned int ri = (unsigned int)(WrClampF(r, 0.0f, 1.0f) * 255.0f);
+    unsigned int gi = (unsigned int)(WrClampF(g, 0.0f, 1.0f) * 255.0f);
+    unsigned int bi = (unsigned int)(WrClampF(b, 0.0f, 1.0f) * 255.0f);
+    return 0xFF000000u | (bi << 16) | (gi << 8) | ri;   // ImGui packs ABGR
+}
+
+static void EmitVelocityVector(ImDrawList *dl)
+{
+    if (!g_render.drawVelocity)
+        return;
+
+    Vec3 v;
+    if (!WrEnergyVelocity(&v))
+        return;
+    float speed = WrLength(v);
+    if (speed < 1.0f)
+        return;
+
+    // From the midsection rather than the eye. The camera is eyeHeight above the
+    // feet and a standing Source player is 72 tall, so the middle is about 36 up.
+    Vec3 base = g_cam;
+    base.z -= (g_energy.eyeHeight - 36.0f);
+
+    float len = WrClampF(speed * VECTOR_SECONDS, VECTOR_MIN, VECTOR_MAX);
+    Vec3 dir = WrScale(v, 1.0f / speed);
+    Vec3 tip = WrAdd(base, WrScale(dir, len));
+
+    // Colour it by the same efficiency ramp the lines use, so the vector and the
+    // record line you are chasing are directly comparable.
+    float ceiling = WrAirPowerCeiling(g_energy.gravity, 0.015f);
+    unsigned int col = EfficiencyColour(WrEfficiency(WrEnergyPower(), ceiling));
+
+    Vec3 a = base, b = tip;
+    ImVec2 pa, pb;
+    if (!ClipToNear(&a, &b) || !Project(a, &pa) || !Project(b, &pb))
+        return;
+    dl->AddLine(pa, pb, col, g_render.thickness * 1.4f);
+
+    // The head is built in WORLD space, so it stays attached to the vector and
+    // shrinks with distance. Built in screen space it would read as a separate
+    // object stuck to the camera.
+    // dir x up, by hand -- wr_common.h has no cross product and this is the
+    // only place that wants one.
+    Vec3 side = WrVec(dir.y * 1.0f - 0.0f, 0.0f - dir.x * 1.0f, 0.0f);
+    if (WrLength(side) > 0.1f)
+    {
+        float hl = len * 0.18f;
+        for (int s = -1; s <= 1; s += 2)
+        {
+            Vec3 back = WrAdd(WrScale(dir, -0.9f),
+                              WrScale(WrNormalize(side), 0.42f * (float)s));
+            Vec3 h0 = tip, h1 = WrAdd(tip, WrScale(WrNormalize(back), hl));
+            ImVec2 q0, q1;
+            if (ClipToNear(&h0, &h1) && Project(h0, &q0) && Project(h1, &q1))
+                dl->AddLine(q0, q1, col, g_render.thickness * 1.4f);
+        }
     }
 }
 
@@ -984,18 +1116,29 @@ static void EmitEnergyOverlay(ImDrawList *dl)
     }
 
     // Box it so the numbers survive a bright skybox.
-    float pad = 6.0f;
-    float lh = ImGui::GetTextLineHeightWithSpacing();
-    float w = 0.0f;
+    //
+    // The width is reserved from the LONGEST STRING THESE LINES CAN PRODUCE, not
+    // from what they say this frame. In a bottom-right or top-right corner the
+    // origin is `screen - width`, so a width that changed with the digits moved
+    // the entire block several times a second and made it unreadable. With the
+    // monospaced face and a fixed reservation the block is nailed down.
+    float size = 0.0f;
+    ImFont *font = WrFontFor(15.0f * g_energy.overlayScale, &size);
+    float pad = 10.0f * g_energy.overlayScale;
+    float lh = size * 1.35f;
+
+    static const char *kWidest = "since start  -99999  (-99999)";
+    float w = font->CalcTextSizeA(size, FLT_MAX, 0.0f, kWidest).x;
     for (int i = 0; i < n; i++)
     {
-        float lw = ImGui::CalcTextSize(lines[i]).x;
+        // A player name can be longer than anything we can predict.
+        float lw = font->CalcTextSizeA(size, FLT_MAX, 0.0f, lines[i]).x;
         if (lw > w) w = lw;
     }
     float h = lh * n + pad * 2.0f;
     w += pad * 2.0f;
 
-    float m = 14.0f;
+    float m = 18.0f;
     float x = (g_energy.overlayCorner & 1) ? (g_sw - w - m) : m;
     float y = (g_energy.overlayCorner & 2) ? (g_sh - h - m) : m;
 
@@ -1003,8 +1146,8 @@ static void EmitEnergyOverlay(ImDrawList *dl)
     for (int i = 0; i < n; i++)
     {
         ImVec2 p(x + pad, y + pad + lh * i);
-        dl->AddText(ImVec2(p.x + 1.0f, p.y + 1.0f), 0xC0000000u, lines[i]);
-        dl->AddText(p, cols[i], lines[i]);
+        dl->AddText(font, size, ImVec2(p.x + 1.0f, p.y + 1.0f), 0xC0000000u, lines[i]);
+        dl->AddText(font, size, p, cols[i], lines[i]);
     }
 }
 
@@ -1031,6 +1174,16 @@ void WrRenderWorld(void)
     // a staged map a run belongs to.
     WrUpdateNearest(g_cam);
 
+    // Anchor to the reference run's first point, once, so that its clock and
+    // ours start at the same place -- see wr_timer.h. Only ever taken when
+    // nothing has anchored yet, so a manual anchor is never overwritten.
+    if (g_energy.anchorToRunStart && WrEnergyAnchorSource() == WR_ANCHOR_NONE)
+    {
+        const WrRun *ref = WrEnergyReferenceRun();
+        if (ref && ref->pointCount >= 2)
+            WrEnergyAnchorToFeet(ref->points[0].pos);
+    }
+
     int bw = 0, bh = 0;
     WrBackbufferSize(&bw, &bh);
     if (bw <= 0 || bh <= 0)
@@ -1052,7 +1205,7 @@ void WrRenderWorld(void)
         if (!run || !run->enabled || run->pointCount < 2)
             continue;
         EmitPath(dl, run->points, run->pointCount, run->breaks, run->breakCount,
-                 run->colour, 1.0f);
+                 run->colour, 1.0f, run->eff);
         EmitDips(dl, run);
         EmitMarkers(dl, run);
         if (g_render.drawTags)
@@ -1067,6 +1220,7 @@ void WrRenderWorld(void)
     }
 
     EmitEnergyOverlay(dl);
+    EmitVelocityVector(dl);
     EmitEnergyHud(dl);
 
     if (g_render.drawLive)
@@ -1076,7 +1230,7 @@ void WrRenderWorld(void)
         // No break list: WrLiveRecord restarts the buffer on any move over 512
         // units, so the live trail cannot contain a teleport by construction.
         if (n >= 2)
-            EmitPath(dl, live, n, NULL, 0, g_render.liveColour, 0.0f);
+            EmitPath(dl, live, n, NULL, 0, g_render.liveColour, 0.0f, NULL);
     }
 
     QueryPerformanceCounter(&t1);

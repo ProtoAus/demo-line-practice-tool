@@ -1,6 +1,9 @@
 // wr_path.cpp  --  see wr_path.h.
 
 #include "wr_path.h"
+#include "wr_stress.h"
+#include "wr_energy.h"
+#include "wr_engine.h"
 #include "wr_log.h"
 
 #include <stdio.h>
@@ -87,6 +90,8 @@ static void FreeRuns(void)
             free(g_runs[i].breaks);
         if (g_runs[i].dips)
             free(g_runs[i].dips);
+        if (g_runs[i].eff)
+            free(g_runs[i].eff);
     }
     memset(g_runs, 0, sizeof(g_runs));
     g_runCount = 0;
@@ -177,6 +182,10 @@ static void FindDips(WrRun *run)
         }
     }
 }
+
+// Defined below, next to the rest of the per-run analysis.
+static void CheckTimes(WrRun *run);
+static void FindEfficiency(WrRun *run);
 
 static bool LoadOne(const char *path, WrRun *run)
 {
@@ -349,6 +358,8 @@ static bool LoadOne(const char *path, WrRun *run)
     }
 
     FindDips(run);
+    CheckTimes(run);        // after breaks: a break makes the clock untrustworthy
+    FindEfficiency(run);    // after breaks: never differences across a teleport
 
     // No energy array. It would only ever be read one element at a time -- the
     // point nearest the camera -- and caching it here would go silently stale
@@ -377,53 +388,171 @@ const char *WrTrackName(const WrRun *run)
     }
 }
 
+// The stored per-point time is not a clock, and it has to be made into one.
+//
+// wrpath_extract.py writes t = index * tick_interval. That is only elapsed time
+// if every tick was recovered, and extraction never recovers every tick -- so
+// the stored clock runs at the wrong rate, by a different amount in every run.
+// Measured against each run's own recorded duration across a real library:
+// surf_demise 0.96-1.00x, surf_tensor2 up to 1.87x, surf_colin_blaster_69000
+// from 0.36x to 10.32x. A time comparison built on the raw value would have
+// been silently wrong by a factor of ten on the map being practised.
+//
+// Rescaling so the last point lands on the recorded duration makes both ends
+// exact. The middle is only as good as the assumption that the missing ticks
+// are spread evenly, which is why anything far from 1.0 is marked untrusted
+// rather than quietly used.
+#define TIME_SCALE_TRUST 0.10f      // how far from 1.0 is still believable
+
+// Decide whether this run's stored times can be used as a clock. A TEST, not a
+// correction -- see the comment on timeScale in wr_path.h. Rescaling would
+// stretch a clock whose rate is already right.
+static void CheckTimes(WrRun *run)
+{
+    run->timeScale = 1.0f;
+    run->timingTrusted = false;
+    if (run->pointCount < 2 || run->runTime <= 0.0f)
+        return;
+
+    float last = run->points[run->pointCount - 1].t;
+    if (!(last > 1e-3f))
+        return;
+
+    run->timeScale = (float)run->runTime / last;
+    float off = run->timeScale - 1.0f;
+    if (off < 0.0f) off = -off;
+
+    // A teleport join skips an unknown duration, so any run with a break has a
+    // clock with an unknown gap in it whatever the endpoints say.
+    run->timingTrusted = (off <= TIME_SCALE_TRUST) &&
+                         run->breakCount == 0 &&
+                         !(run->flags & WRPATH_FLAG_LOW_CONFIDENCE);
+}
+
+// Per-point air-strafing efficiency: how much of the energy air acceleration
+// could physically have added was actually added. See wr_stress.h, especially
+// for why this is not a turn-rate metric.
+#define EFF_WINDOW 4                // points either side; ~120 ms at 66 tick
+
+static void FindEfficiency(WrRun *run)
+{
+    run->eff = NULL;
+    if (run->pointCount < EFF_WINDOW * 2 + 1)
+        return;
+    run->eff = (signed char *)calloc((size_t)run->pointCount, 1);
+    if (!run->eff)
+        return;
+
+    float ceiling = WrAirPowerCeiling(g_energy.gravity, run->tickInterval);
+    float dt = run->tickInterval * (float)(EFF_WINDOW * 2);
+    if (!(dt > 1e-5f))
+        return;
+
+    // A centred difference, so the figure belongs to the point it is drawn at
+    // rather than trailing it by half a window.
+    for (int i = EFF_WINDOW; i + EFF_WINDOW < run->pointCount; i++)
+    {
+        int a = i - EFF_WINDOW, b = i + EFF_WINDOW;
+
+        // Never across a teleport: the join skips an unknown duration, and the
+        // height either side of it is unrelated.
+        bool spans = false;
+        for (int k = 0; k < run->breakCount; k++)
+            if (run->breaks[k] >= a && run->breaks[k] < b)
+            {
+                spans = true;
+                break;
+            }
+        if (spans)
+            continue;
+
+        float ea = WrEnergyOf(run->points[a].pos, run->points[a].vel);
+        float eb = WrEnergyOf(run->points[b].pos, run->points[b].vel);
+        run->eff[i] = WrEtaToByte(WrEfficiency((eb - ea) / dt, ceiling));
+    }
+}
+
 // Distance from the camera to the nearest point of each run.
 //
 // Sampled, not exhaustive: 64 evenly spaced points is more than enough to answer
 // "is this run anywhere near me", and it keeps this at a few thousand distance
 // tests per frame regardless of how many runs are loaded.
+// How many points the refine pass may examine, whatever the run's length.
+//
+// The coarse pass samples 64 points and then refined the whole bracket around
+// the winner -- which is pointCount/64 wide, so on a 38 751-point run that was
+// 1211 extra distance tests. Sixty-four of them find the minimum of a smooth
+// path to well inside a unit; the rest were spent proving it.
+#define REFINE_BUDGET 64
+
+// How many disabled runs to re-measure per frame.
+//
+// This used to run over every loaded run, every frame, enabled or not, and the
+// comment claimed 64 samples per run. With the refine bracket it was closer to
+// 1275 for a long run, so 256 loaded runs cost roughly 326 000 distance tests
+// per frame to keep a column up to date that nobody is reading mid-surf.
+//
+// Enabled runs still update every frame -- the energy and time comparisons read
+// nearestIndex and must be exact. The rest take turns.
+#define NEAREST_PER_FRAME 4
+
+static void MeasureNearest(WrRun *r, const Vec3 &cam)
+{
+    if (r->pointCount < 2)
+    {
+        r->nearestDist = -1.0f;
+        r->nearestIndex = -1;
+        return;
+    }
+    int step = r->pointCount / 64;
+    if (step < 1)
+        step = 1;
+    float best = 1e18f;
+    int bestIdx = 0;
+    for (int p = 0; p < r->pointCount; p += step)
+    {
+        float d = WrDistSqr(r->points[p].pos, cam);
+        if (d < best)
+        {
+            best = d;
+            bestIdx = p;
+        }
+    }
+    // Refine within the sampled bracket, so the energy read off this index is
+    // the run's energy where you actually are rather than up to 64 points away.
+    int rstep = (step * 2 + REFINE_BUDGET - 1) / REFINE_BUDGET;
+    if (rstep < 1)
+        rstep = 1;
+    int lo = bestIdx - step, hi = bestIdx + step;
+    if (lo < 0) lo = 0;
+    if (hi > r->pointCount - 1) hi = r->pointCount - 1;
+    for (int p = lo; p <= hi; p += rstep)
+    {
+        float d = WrDistSqr(r->points[p].pos, cam);
+        if (d < best)
+        {
+            best = d;
+            bestIdx = p;
+        }
+    }
+    r->nearestDist = sqrtf(best);
+    r->nearestIndex = bestIdx;
+}
+
 void WrUpdateNearest(const Vec3 &cam)
 {
+    static int cursor = 0;
+
     for (int i = 0; i < g_runCount; i++)
+        if (g_runs[i].enabled)
+            MeasureNearest(&g_runs[i], cam);
+
+    for (int n = 0; n < NEAREST_PER_FRAME && g_runCount > 0; n++)
     {
-        WrRun *r = &g_runs[i];
-        if (r->pointCount < 2)
-        {
-            r->nearestDist = -1.0f;
-            r->nearestIndex = -1;
-            continue;
-        }
-        int step = r->pointCount / 64;
-        if (step < 1)
-            step = 1;
-        float best = 1e18f;
-        int bestIdx = 0;
-        for (int p = 0; p < r->pointCount; p += step)
-        {
-            float d = WrDistSqr(r->points[p].pos, cam);
-            if (d < best)
-            {
-                best = d;
-                bestIdx = p;
-            }
-        }
-        // Refine within the sampled bracket, so the energy read off this index
-        // is the run's energy where you actually are rather than up to 64
-        // points away from it.
-        int lo = bestIdx - step, hi = bestIdx + step;
-        if (lo < 0) lo = 0;
-        if (hi > r->pointCount - 1) hi = r->pointCount - 1;
-        for (int p = lo; p <= hi; p++)
-        {
-            float d = WrDistSqr(r->points[p].pos, cam);
-            if (d < best)
-            {
-                best = d;
-                bestIdx = p;
-            }
-        }
-        r->nearestDist = sqrtf(best);
-        r->nearestIndex = bestIdx;
+        cursor = (cursor + 1) % g_runCount;
+        WrRun *r = &g_runs[cursor];
+        if (!r->enabled)
+            MeasureNearest(r, cam);
     }
 
     // The first time distances are known after a load, turn on the fastest run
@@ -441,6 +570,11 @@ void WrUpdateNearest(const Vec3 &cam)
     if (g_autoEnablePending && g_runCount > 0)
     {
         g_autoEnablePending = false;
+        // This one frame measures everything: picking the best run near you is
+        // exactly the decision that needs every run's distance at once, and the
+        // round-robin above has only touched a handful of them so far.
+        for (int i = 0; i < g_runCount; i++)
+            MeasureNearest(&g_runs[i], cam);
         WrEnableBestNearby(1, AUTO_ENABLE_RADIUS);
         int on = 0;
         for (int i = 0; i < g_runCount; i++)

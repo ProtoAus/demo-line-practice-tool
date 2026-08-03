@@ -30,6 +30,14 @@ struct WrRenderSettings
     // Horizontal speed at the bottom of each ramp.
     bool drawDipSpeeds;
     int maxDipsPerRun;
+
+    // Where you will be in a quarter of a second, drawn from your midsection.
+    bool drawVelocity;
+
+    // Colour lines by how much of the physically available energy the strafing
+    // actually captured. See wr_stress.h -- this is NOT a turn-rate metric, and
+    // the reason why is measured.
+    bool colourByEfficiency;
 };
 
 extern WrRenderSettings g_render;

@@ -15,6 +15,95 @@
 static ImGuiContext *g_ctx = NULL;
 static bool g_backendsReady = false;
 
+// ---------------------------------------------------------------------------
+// Fonts
+// ---------------------------------------------------------------------------
+//
+// Nothing loaded a font before, so ImGui fell back to AddFontDefault(): the
+// embedded ProggyClean bitmap face, baked once at 13 pixels with no
+// oversampling. The crosshair readout then asked for 13 * 1.7 * hudScale, i.e.
+// up to 66 pixels, and ImDrawList::AddText happily scaled the 13-pixel glyphs
+// through a bilinear sampler. That is the reported blur, and no amount of
+// filtering fixes it -- there simply are no pixels there to magnify.
+//
+// So the sizes are BAKED. Text is only ever drawn at a size that exists in the
+// atlas, never scaled to it.
+//
+// Consolas rather than the built-in face for a second reason that matters just
+// as much: it is monospaced. The readout is numbers that change every frame, and
+// with a proportional face the measured width of the block changes with them --
+// which is why the corner block visibly slid around. Fixed-width digits make the
+// layout constant by construction.
+
+static const float kFontSizes[] = {
+    13.0f, 16.0f, 20.0f, 24.0f, 30.0f, 38.0f, 48.0f, 60.0f
+};
+#define WR_FONT_COUNT (int)(sizeof(kFontSizes) / sizeof(kFontSizes[0]))
+
+static ImFont *g_fonts[WR_FONT_COUNT];
+static int g_fontCount = 0;
+static bool g_monospace = false;
+
+static void LoadFonts(ImGuiIO &io)
+{
+    // The system face. Present on every Windows since Vista; if it is somehow
+    // missing we fall through to the built-in one rather than fail to start.
+    static const char *kPath = "C:\\Windows\\Fonts\\consola.ttf";
+
+    ImFontConfig cfg;
+    cfg.OversampleH = 2;        // 1 is what made the default face mushy
+    cfg.OversampleV = 1;
+    cfg.PixelSnapH = false;
+
+    for (int i = 0; i < WR_FONT_COUNT; i++)
+    {
+        ImFont *f = io.Fonts->AddFontFromFileTTF(kPath, kFontSizes[i], &cfg);
+        if (!f)
+            break;
+        g_fonts[g_fontCount++] = f;
+    }
+
+    if (g_fontCount == WR_FONT_COUNT)
+    {
+        g_monospace = true;
+        WrLogf("fonts: Consolas baked at %d sizes, %.0f-%.0f px", g_fontCount,
+               kFontSizes[0], kFontSizes[WR_FONT_COUNT - 1]);
+        return;
+    }
+
+    // Partial success is worse than none -- the size ladder would have holes.
+    io.Fonts->Clear();
+    g_fontCount = 0;
+    g_monospace = false;
+    g_fonts[g_fontCount++] = io.Fonts->AddFontDefault();
+    WrLogf("[!] fonts: could not load %s; falling back to the built-in 13 px "
+           "face. Large text will be scaled and will look soft.", kPath);
+}
+
+ImFont *WrFontFor(float wantPixels, float *actual)
+{
+    if (g_fontCount <= 0)
+    {
+        if (actual) *actual = ImGui::GetFontSize();
+        return ImGui::GetFont();
+    }
+
+    // Nearest baked size, never an interpolation between two of them.
+    int best = 0;
+    float bestErr = 1e30f;
+    for (int i = 0; i < g_fontCount; i++)
+    {
+        float err = kFontSizes[i] - wantPixels;
+        if (err < 0.0f) err = -err;
+        if (err < bestErr) { bestErr = err; best = i; }
+    }
+    if (actual)
+        *actual = g_monospace ? kFontSizes[best] : wantPixels;
+    return g_fonts[best];
+}
+
+bool WrFontIsMonospace(void) { return g_monospace; }
+
 // Defined in dllmain.cpp. Called from Present before the draw decision, not from
 // here -- it has to run on frames where nothing is drawn at all.
 void WrIdleTick(void);
@@ -38,6 +127,8 @@ bool WrImGuiInit(HWND hwnd, ID3D11Device *device, ID3D11DeviceContext *context)
     // middle of the screen and nothing would be draggable.
     io.MouseDrawCursor = true;
     io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+
+    LoadFonts(io);
 
     ImGui::StyleColorsDark();
     ImGuiStyle &style = ImGui::GetStyle();

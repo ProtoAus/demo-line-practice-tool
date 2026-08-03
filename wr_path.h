@@ -112,6 +112,27 @@ struct WrRun
     int *dips;
     int dipCount;
 
+    // Per-point air-strafing efficiency, as a signed byte over [-1, +1]:
+    // dE/dt divided by the most air acceleration could physically add. See
+    // wr_stress.h -- in particular for why this is NOT a turn-rate metric.
+    // Computed once at load at full resolution, like breaks and dips, so the
+    // renderer only ever does a lookup.
+    signed char *eff;
+
+    // Whether this run's stored per-point times can be used as a clock.
+    //
+    // The extractor writes t = index * tick_interval. The RATE of that is right
+    // -- checked against demo markers over 115 runs, median slope 1.0000 -- but
+    // it only stays right while no ticks are missed, and a teleport join skips
+    // an unknown duration. Comparing the last point's time against the run's own
+    // recorded duration catches the bad ones: 0.96-1.00x on surf_demise,
+    // 0.36x-10.32x on surf_colin_blaster_69000.
+    //
+    // Deliberately a TEST, not a correction. Rescaling to force the endpoints to
+    // match would stretch a clock whose rate is already correct.
+    float timeScale;
+    bool timingTrusted;
+
     WrMarker markers[WR_MAX_MARKERS];
     int markerCount;
 

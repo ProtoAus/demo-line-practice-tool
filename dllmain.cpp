@@ -24,6 +24,8 @@
 #include "wr_energy.h"
 #include "wr_limit.h"
 #include "wr_extract.h"
+#include "wr_timer.h"
+#include "wr_savelocs.h"
 
 #include "imgui.h"
 
@@ -55,6 +57,7 @@ void WrIdleTick(void)
         WrUiOnMapChanged(map);
         WrLiveClear();
         WrEnergyReset();
+        WrTimerReset();
         WrExtractOnMapChanged(map);
     }
 
@@ -82,8 +85,22 @@ void WrIdleTick(void)
     Vec3 cam;
     if (WrCameraOrigin(&cam))
     {
-        WrLiveRecord(cam);
+        // The live trail is recorded at the FEET, not the eye. Demo runs store
+        // the player origin, so recording the camera put our own line about 64
+        // units above a demo line of the identical trajectory -- close enough to
+        // look deliberate and wrong enough to be useless for comparison.
+        Vec3 feet = cam;
+        feet.z -= g_energy.eyeHeight;
+        WrLiveRecord(feet);
+
+        // The energy sampler keeps the raw camera. Its anchor is a camera height
+        // too, so the offset cancels there and must not be applied twice.
         WrEnergySample(cam, dt);
+        WrEnergyTickArrow(dt);
+
+        WrTimerTick(cam, dt);
+        WrSavelocRefresh(map);
+        WrSavelocTick(cam, WrTimerElapsed(), WrTimerRunning());
     }
 
     // Advance a couple of pending Steam avatar lookups. Does nothing unless a

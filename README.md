@@ -464,6 +464,76 @@ known-good single-stage demos and testing the stitched points against that geome
 - Split markers are only drawn when the anchoring passed its confidence check. Wrong
   markers are worse than no markers.
 
+
+### The energy readout was re-basing itself mid-air
+
+Reported as "it flickers at ramp ends, and dropping from a platform makes the number jump". It
+was not noise. The height everything was measured from was re-armed every frame a ground test
+passed, and that test — vertical speed under 30 for three frames inside a six-unit band — is
+satisfied **at the apex of every arc**. At g=800 the vertical speed passes through zero slowly
+enough to hold the window for about a quarter of a second, so the zero point silently re-based
+itself at the top of every jump and stepped again by the full height difference on landing.
+
+The fix is an **anchor** that is set once and never re-armed by anything the player does. In
+free flight energy is conserved, so against a fixed anchor a whole jump must read as a flat
+line — which is exactly what `tests/test_energy.cpp` now asserts, driving the real estimator
+chain with a ballistic arc plus view bob:
+
+```
+relative energy over the whole arc: 549.6 .. 556.5 (spread 7.0)
+```
+
+against a theoretical 551 for that launch. The first version of that test read a spread of 88,
+and chasing it down found a second bug worth more than the first: the velocity was measured
+over a window but paired with the position at the window's *end*, so the two terms of
+`E = z + v²/2g` referred to instants 20 ms apart. Under gravity that is a systematic error, not
+noise — a ballistic arc appeared to lose 46 units of energy while falling. Pairing both at the
+window's midpoint makes E exact under constant acceleration.
+
+Everything is filtered in **seconds** now rather than in frames. Every filter used to be a
+frame count, so the readout behaved like a different instrument at 60 fps than at 300 — and the
+frame rate moves with how many lines are drawn, so turning lines on changed how the number
+moved. Measured at 60, 200 and 500 fps the chain now agrees to within 0.1 units.
+
+### Strafing efficiency, and the metric that had to be thrown away
+
+The obvious way to show "you turned too fast" is to colour the line by how fast the velocity is
+turning. **The data says that fires on perfect play.** Air acceleration can turn a velocity by
+at most `wishspeed/|v|` radians per tick — 57°/s at 2000 u/s — but a surf ramp turns it too,
+through the surface normal, and far faster. Fraction of samples exceeding what air accel alone
+could manage:
+
+| run | |
+| --- | --- |
+| `surf_demise` world record | 10 % |
+| `surf_vacant` world record | ~20 % |
+| `surf_666` (43.575 s) | 24 % |
+
+So the line is coloured by something measurable instead. Per tick, air strafing adds at most
+`ws² − c²` of energy, maximised at `c = 0`, giving a hard ceiling of
+
+```
+P_max = ws² / (2·g·tick) = 900 / (2·800·0.015) = 37.5 energy units per second
+```
+
+independent of speed. Checked against twelve record-class runs on three maps, the 99th
+percentile of measured `dE/dt` lands between **+38.18 and +38.88** against that theory of 37.50.
+Efficiency is `(dE/dt) / P_max`, and it discriminates enormously: median on the `surf_demise`
+world record is **+0.531**, and on the two slowest runs in the same set **+0.010** and **+0.003**.
+
+Boosters add energy for free — real runs contain `dE/dt` spikes of +726, +3116, +9039 and
++13142 units/s, up to 350× the ceiling — so anything past 3× is drawn neutral rather than as
+perfect play.
+
+### Save-loc times
+
+`momentum\savedlocs.txt` is plain KeyValues with a `time` field per save-loc. It is `"-1"` in
+**all 3213 entries across 260 maps** — the field exists and is never populated. So WrLines keeps
+its own note in `wrlines_data\savelocs\`, keyed on position rather than index because indices
+renumber when a save-loc is deleted. Load a save-loc and the clock returns to what it said when
+you made it. The game's file is opened read-only and shared; nothing is ever written into the
+game install.
+
 ---
 
 ## Energy, and what is exact

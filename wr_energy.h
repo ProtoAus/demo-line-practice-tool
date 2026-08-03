@@ -18,9 +18,7 @@
 //
 // Absolute E is the wrong thing to put on screen. Standing still on a start pad
 // 1888 units above the map origin it reads 1888, which is true and useless. So
-// the reference is the height of the last ground you were settled on -- on a
-// surf map that is the start pad, because you never touch ground again -- and
-// what gets displayed is
+// it is displayed against an ANCHOR -- a height chosen once and then left alone:
 //
 //     Erel = z - z_ref + |v|^2 / (2 * g)      how high above that ground I could still get
 //     v_eq = sqrt(2 * g * Erel)               the same energy, as a speed
@@ -32,9 +30,28 @@
 // the reference. Below the reference Erel goes negative and v_eq carries the
 // sign rather than clamping, because falling into a pit is a real loss.
 //
-// The eye offset cancels in Erel: z and z_ref are both camera heights. It does
-// NOT cancel in the you-versus-run gap, where their z is the player origin --
-// hence eyeHeight below.
+// THE ANCHOR MUST NOT MOVE, AND THAT WAS THE BUG
+//
+// The reference used to be "the last ground you were settled on", re-armed every
+// frame that a ground heuristic said you were on it. That heuristic was
+// |vertical speed| < 30 held for three frames inside a six-unit band -- which is
+// satisfied at the APEX OF EVERY ARC. At g=800 the vertical speed passes through
+// zero slowly enough that the window holds for around a quarter of a second, so
+// the zero point silently re-based itself at the top of every jump and every
+// ramp, and stepped again by the whole height difference on landing.
+//
+// The number was not noisy. Its origin was moving. So the anchor is now set
+// once -- from the start of the run you are comparing against, or by hand -- and
+// is never re-armed by anything the player does. Nothing about the world can
+// move it; only a map change clears it.
+//
+// In free flight E is CONSERVED, so against a fixed anchor the number should sit
+// still through a whole jump and drift down only as real energy is lost. That is
+// what makes it readable, and it is what tests\test_energy.cpp asserts.
+//
+// The eye offset cancels in Erel when the anchor is a camera height. It does NOT
+// cancel against a run's first point, which is a player origin at the feet, nor
+// in the you-versus-run gap -- hence eyeHeight below, added in both places.
 //
 // WHAT IS APPROXIMATE HERE, AND WHY
 //
@@ -71,7 +88,28 @@ struct WrEnergySettings
 
     bool compareToRun;      // show the reference run's energy at your position
     float compareRadius;    // don't compare against a run this far from you
-    float eyeHeight;        // camera above feet; only affects the run comparison
+    float eyeHeight;        // camera above feet
+
+    float overlayScale;     // the corner block had no scale control at all
+
+    // How hard the readout is filtered, in seconds. Exposed because "readable"
+    // is a matter of taste and the right answer differs between watching a ramp
+    // and standing still reading numbers.
+    float smoothSeconds;    // the headline figure
+    float trendSeconds;     // window the arrow judges over
+    float quantiseStep;     // round the displayed figure to this
+
+    // Anchor the readout to the start of the run being compared against, so its
+    // clock and yours start in the same place. Off means only manual anchors.
+    bool anchorToRunStart;
+};
+
+// Where the anchor came from, for the UI to say plainly.
+enum WrAnchorSource
+{
+    WR_ANCHOR_NONE = 0,
+    WR_ANCHOR_RUN_START,
+    WR_ANCHOR_MANUAL
 };
 
 extern WrEnergySettings g_energy;
@@ -81,12 +119,23 @@ void WrEnergyDefaults(void);
 // Feed the camera position once per frame. dt is the frame time in seconds.
 void WrEnergySample(const Vec3 &pos, float dt);
 
+// Advance the arrow's hysteresis. Separate from sampling because whether an
+// arrow is shown is a display decision, not a measurement.
+void WrEnergyTickArrow(float dt);
+
 // Forget the run so far. Called on map change and from the Reset button.
 void WrEnergyReset(void);
 
-// Re-arm the reference height at the current position, for when you want to
-// measure from here rather than from the last ground.
+// Anchor here, by hand. The camera z is used directly, since the reference and
+// the live figure are then both eye heights and the offset cancels.
 void WrEnergyRearm(void);
+
+// Anchor to a world position that is a PLAYER ORIGIN (a run's first point), not
+// a camera. eyeHeight is added so it is comparable with our own eye height.
+void WrEnergyAnchorToFeet(const Vec3 &feet);
+
+WrAnchorSource WrEnergyAnchorSource(void);
+bool WrEnergyAnchorPos(Vec3 *out);   // false when there is no anchor
 
 // Convert a position and velocity into an absolute energy height.
 float WrEnergyOf(const Vec3 &pos, const Vec3 &vel);
@@ -105,6 +154,25 @@ float WrEnergyTrend(void);          // signed change over the last ~0.4 s
 int WrEnergyTrendDir(void);
 float WrEnergySpeed(void);          // smoothed |v|, units/second
 float WrEnergyHorizontalSpeed(void);
+bool WrEnergyVelocity(Vec3 *out);   // smoothed velocity, for the world vector
+
+// How fast you are turning, in degrees per second.
+//
+// Two different measurements, and the difference matters. The VIEW rate is
+// exact: it is the angle between successive camera forward vectors, i.e.
+// literally how fast the mouse is moving. The VELOCITY rate is where your
+// momentum is turning, which is what a demo line can also be measured for --
+// see wr_stress.h.
+// dE/dt in energy units per second, over a rolling window. Divided by
+// WrAirPowerCeiling this is the efficiency figure -- how much of the energy air
+// strafing could physically have added was actually added. Read it as a rolling
+// average, never as a per-frame verdict: the residual noise is comparable to the
+// largest genuine excursion over the window.
+float WrEnergyPower(void);
+
+float WrEnergyViewTurnRate(void);
+float WrEnergyVelTurnRate(void);
+float WrEnergySpeedRate(void);      // d|v|/dt, units per second per second
 float WrEnergySinceGround(void);    // vs the last flat ground you jumped from
 float WrEnergySinceStart(void);
 float WrEnergyPeak(void);           // peak relative energy

@@ -21,4 +21,15 @@ void WrImGuiFrame(void);
 void WrImGuiInvalidateDeviceObjects(void);
 void WrImGuiCreateDeviceObjects(void);
 
+// The baked font nearest `wantPixels`, and the size it should actually be drawn
+// at. Text must be drawn at a size the atlas holds: asking AddText for 66 pixels
+// from a 13-pixel atlas is what made the readout blurry, and no sampler setting
+// fixes glyphs that were never rasterised at that size.
+struct ImFont;
+ImFont *WrFontFor(float wantPixels, float *actual);
+
+// True when the real (monospaced) face loaded. Layout that depends on digits
+// being fixed-width has to know, because the fallback face is proportional.
+bool WrFontIsMonospace(void);
+
 #endif // WR_IMGUI_H
