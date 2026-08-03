@@ -94,6 +94,43 @@ Press **INSERT** in game. Tick runs in the Runs tab. **ESC** closes the panel.
 - **It does not decode the demo netstream properly.** See below — the extractor is a
   pattern-matcher, and it tells you when it is unsure rather than guessing quietly.
 
+## Frame cap
+
+There is a frame limiter in the **Frame cap** tab, off by default. It exists so you do not
+have to run a second overlay purely for a cap — which turned out to cost more than the cap was
+worth, because two tools drawing into the same swapchain is a fight neither wins.
+
+It reads the refresh rate of whichever monitor the game window is on and defaults to 3 Hz below
+it, the usual variable-refresh recommendation. The wait is a high-resolution waitable timer for
+the bulk of the frame and a short busy-wait for the tail.
+
+Measured on a harness that drives the real limiter with simulated frame work, 600 frames per
+row:
+
+| | target | mean | σ | worst deviation | spin |
+| --- | --- | --- | --- | --- | --- |
+| 160 fps, 0.35 ms spin (default) | 6.250 ms | 6.250 | 0.085 | **0.216 ms** | 1.3 % |
+| 160 fps, timer only, no spin | 6.250 ms | 6.250 | 0.247 | 0.453 ms | 0 % |
+| 160 fps, 1.0 ms spin | 6.250 ms | 6.250 | 0.003 | 0.060 ms | 9.4 % |
+| 240 fps, 0.35 ms spin | 4.167 ms | 4.166 | 0.083 | 0.241 ms | 1.8 % |
+
+The spin window earns its keep — without it the worst deviation doubles — and widening it past
+the default buys accuracy nobody can see for seven times the CPU.
+
+Two behaviours worth knowing about:
+
+- **The schedule is absolute, and its catch-up is bounded.** Targets advance from the previous
+  target, so ordinary jitter cancels instead of accumulating. But after a real hitch the
+  schedule is in debt by more than a frame, and repaying that at once fires a burst of frames
+  arriving far too early — on a VRR display that is a second visible spike, not a fix for the
+  first. An injected 14 ms hitch produced a 4.0 ms deviation on the following frames before
+  this was bounded, and 0.2 ms after.
+- **It cannot invent performance.** A cap above what the machine sustains does nothing; the tab
+  detects that and says so rather than showing a target it is not meeting.
+
+None of it is derived from any other limiter's source. Frame pacing is standard technique, and
+reproducing a GPL-licensed implementation would have relicensed this MIT project by accident.
+
 ### Living with other overlays
 
 SpecialK, RTSS and the Steam overlay all hook `Present` too, and a second hook in that chain

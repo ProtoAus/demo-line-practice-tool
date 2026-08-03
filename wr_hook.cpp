@@ -29,6 +29,7 @@
 #include "wr_log.h"
 #include "wr_imgui.h"
 #include "wr_render.h"
+#include "wr_limit.h"
 
 // Defined in dllmain.cpp: per-frame bookkeeping that must run even on frames we
 // do not draw. Declared here rather than pulled in through a header so this
@@ -382,10 +383,20 @@ static bool AcquireDeviceFrom(IDXGISwapChain *sc)
     return g_window != NULL;
 }
 
+// Every real present goes through here, so the frame pacing happens in exactly
+// one place and cannot be bypassed by one of the early exits below.
+static inline HRESULT PacedPresent(IDXGISwapChain *sc, UINT interval, UINT flags)
+{
+    WrLimitTick();
+    return g_origPresent(sc, interval, flags);
+}
+
 static HRESULT WINAPI HookedPresent(IDXGISwapChain *sc, UINT interval, UINT flags)
 {
     // DXGI_PRESENT_TEST is a visibility probe, not a real frame: doing work here
-    // is wasted and can confuse the flip-model presenter.
+    // is wasted and can confuse the flip-model presenter. It must not be paced
+    // either -- it is not a frame, and waiting on one would be waiting on
+    // nothing.
     if (flags & DXGI_PRESENT_TEST)
         return g_origPresent(sc, interval, flags);
 
@@ -402,7 +413,7 @@ static HRESULT WINAPI HookedPresent(IDXGISwapChain *sc, UINT interval, UINT flag
     }
 
     if (!g_renderReady)
-        return g_origPresent(sc, interval, flags);
+        return PacedPresent(sc, interval, flags);
 
     // The panel can be opened before the window is known, in which case
     // WrSetMenuOpen had nothing to subclass. Catch up here.
@@ -426,7 +437,7 @@ static HRESULT WINAPI HookedPresent(IDXGISwapChain *sc, UINT interval, UINT flag
     if (!WrHasAnythingToDraw())
     {
         g_framesSkipped++;
-        return g_origPresent(sc, interval, flags);
+        return PacedPresent(sc, interval, flags);
     }
 
     if (!g_rtv)
@@ -460,7 +471,7 @@ static HRESULT WINAPI HookedPresent(IDXGISwapChain *sc, UINT interval, UINT flag
             prevDsv->Release();
     }
 
-    return g_origPresent(sc, interval, flags);
+    return PacedPresent(sc, interval, flags);
 }
 
 static HRESULT WINAPI HookedResizeBuffers(IDXGISwapChain *sc, UINT bufferCount,

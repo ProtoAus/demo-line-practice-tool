@@ -22,6 +22,7 @@
 #include "wr_ui.h"
 #include "wr_steam.h"
 #include "wr_energy.h"
+#include "wr_limit.h"
 
 #include "imgui.h"
 
@@ -102,6 +103,7 @@ static DWORD WINAPI InitThread(LPVOID)
     WrLogInit();
     WrRenderDefaults();
     WrEnergyDefaults();
+    WrLimitDefaults();
 
     if (!WrProbeInit())
         WrLogf("[!] probe layer unavailable -- engine access will not be attempted");

@@ -12,6 +12,7 @@
 #include "wr_scan.h"
 #include "wr_steam.h"
 #include "wr_energy.h"
+#include "wr_limit.h"
 #include "wr_hook.h"
 #include "wr_log.h"
 
@@ -429,6 +430,91 @@ static void DrawDisplayTab(void)
     ImGui::Spacing();
     if (ImGui::Button("Reset to defaults"))
         WrRenderDefaults();
+}
+
+static void DrawFrameCapTab(void)
+{
+    ImGui::TextWrapped(
+        "A frame cap, so you do not need a second overlay running just for one. "
+        "Two tools drawing into the same swapchain is a fight neither wins -- "
+        "and the other one usually cannot even be detected, because it replaces "
+        "the swapchain with its own object rather than hooking Present.");
+
+    ImGui::SeparatorText("Cap");
+    ImGui::Checkbox("Limit the frame rate", &g_limit.enabled);
+
+    ImGui::Checkbox("Follow the display's refresh rate", &g_limit.autoTarget);
+    if (g_limit.autoTarget)
+    {
+        if (WrLimitRefreshHz() > 1.0f)
+            ImGui::Text("display    %.0f Hz", WrLimitRefreshHz());
+        else
+            ImGui::TextDisabled("display    unknown yet (needs a frame to look)");
+        ImGui::SliderFloat("Headroom", &g_limit.headroomHz, 0.0f, 15.0f, "%.0f Hz");
+        ImGui::SameLine();
+        HelpMarker("Subtracted from the refresh rate. On a variable-refresh "
+                   "display you want the cap a little under the panel's ceiling "
+                   "so a late frame never reaches it and drops out of the VRR "
+                   "window. Three is the usual recommendation.");
+    }
+    else
+    {
+        ImGui::SliderFloat("Target", &g_limit.targetFps, 30.0f, 480.0f, "%.0f fps");
+    }
+    ImGui::Text("capping at %.1f fps  (%.3f ms)", WrLimitTargetFps(),
+                1000.0f / WrLimitTargetFps());
+
+    ImGui::SeparatorText("Measured");
+    float ms = WrLimitFrameMs();
+    ImGui::Text("frame time %.3f ms   (%.1f fps)", ms, ms > 0.0f ? 1000.0f / ms : 0.0f);
+    if (g_limit.enabled)
+    {
+        ImGui::Text("worst wobble %.3f ms over the last 120 frames", WrLimitJitterMs());
+        ImGui::SameLine();
+        HelpMarker("Largest deviation from the target interval, not an average "
+                   "-- an average would hide exactly the spikes that read as "
+                   "judder. Under about 0.2 ms is imperceptible.");
+        ImGui::Text("spinning   %.1f%% of each frame", WrLimitSpinPercent());
+        if (WrLimitCpuBound())
+        {
+            ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f),
+                               "Frames are arriving later than the cap asks for.");
+            ImGui::TextWrapped(
+                "The cap is not what is limiting you here -- the game or the GPU "
+                "is. Lower the target until this goes away, or leave it; the "
+                "limiter is not making anything worse, it just has nothing to do.");
+        }
+    }
+    else
+    {
+        ImGui::TextDisabled("Cap is off. Frame time above is still live.");
+    }
+
+    ImGui::SeparatorText("Accuracy");
+    ImGui::SliderFloat("Spin window", &g_limit.spinMs, 0.0f, 2.0f, "%.2f ms");
+    ImGui::SameLine();
+    HelpMarker("The wait is a high-resolution timer for the bulk of the frame "
+               "and a busy-wait for the last fraction of a millisecond. The "
+               "timer alone lands within about half a millisecond, which at 160 "
+               "fps is 8% of a frame and visibly uneven. The spin closes that "
+               "for a few percent of one core. Set it to 0 to never spin -- "
+               "cheaper, looser.");
+    if (ImGui::Button("Reset frame cap settings"))
+        WrLimitDefaults();
+
+    ImGui::SeparatorText("Worth knowing");
+    ImGui::TextWrapped(
+        "This paces when frames are handed to the display. It cannot make a "
+        "frame that took 20 ms of GPU work arrive sooner, so a cap above what "
+        "the machine sustains does nothing at all.");
+    ImGui::TextWrapped(
+        "If the game's own vsync is on, Present already blocks on the vertical "
+        "blank and this sits on top of it. That is the normal variable-refresh "
+        "setup -- vsync on, capped a few Hz below the panel -- and works fine.");
+    ImGui::TextWrapped(
+        "None of this is derived from any other limiter's code. Frame pacing is "
+        "standard technique, and copying a GPL-licensed implementation would "
+        "have relicensed this whole project by accident.");
 }
 
 static void DrawEnergyTab(void)
@@ -854,6 +940,7 @@ void WrUiDraw(void)
             if (ImGui::BeginTabItem("Runs"))       { DrawRunsTab();        ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem("Display"))    { DrawDisplayTab();     ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem("Energy"))     { DrawEnergyTab();      ImGui::EndTabItem(); }
+            if (ImGui::BeginTabItem("Frame cap"))  { DrawFrameCapTab();    ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem("Diagnostics")){ DrawDiagnosticsTab(); ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem("About"))      { DrawAboutTab();       ImGui::EndTabItem(); }
             ImGui::EndTabBar();
