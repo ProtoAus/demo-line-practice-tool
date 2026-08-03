@@ -59,7 +59,7 @@ set "IMSRC=%IMSRC% %IM%\backends\imgui_impl_dx11.cpp %IM%\backends\imgui_impl_wi
 
 set "SRC=dllmain.cpp wr_log.cpp wr_pe.cpp wr_probe.cpp wr_engine.cpp wr_scan.cpp"
 set "SRC=%SRC% wr_hook.cpp wr_imgui.cpp wr_render.cpp wr_path.cpp wr_ui.cpp"
-set "SRC=%SRC% wr_steam.cpp wr_energy.cpp wr_limit.cpp"
+set "SRC=%SRC% wr_steam.cpp wr_energy.cpp wr_limit.cpp wr_extract.cpp"
 
 set "DEFS=/DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS"
 set "DEFS=%DEFS% /DIMGUI_USER_CONFIG=\"../wr_imconfig.h\""

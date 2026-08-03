@@ -13,6 +13,7 @@
 #include "wr_steam.h"
 #include "wr_energy.h"
 #include "wr_limit.h"
+#include "wr_extract.h"
 #include "wr_hook.h"
 #include "wr_log.h"
 
@@ -218,6 +219,70 @@ static void DrawRunsTab(void)
         }
     }
 
+    // --- extraction ---------------------------------------------------------
+    ImGui::Separator();
+    {
+        int loadDone = 0, loadTotal = 0;
+        if (WrPathLoading(&loadDone, &loadTotal))
+        {
+            ImGui::Text("loading runs %d / %d", loadDone, loadTotal);
+            ImGui::SameLine();
+            HelpMarker("Spread over frames on purpose. Reading a .wrpath costs a "
+                       "few milliseconds, and doing 125 of them in one go inside "
+                       "Present would stall the game for most of a second every "
+                       "time you loaded a map.");
+        }
+
+        int total = 0, done = 0, fresh = 0;
+        bool haveCounts = WrExtractCounts(&total, &done, &fresh);
+        bool running = WrExtractRunning();
+
+        if (running)
+            ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.0f, 1.0f), "extracting...");
+        else if (!haveCounts)
+            ImGui::TextDisabled("counting demos for this map...");
+        else if (total == 0)
+            ImGui::TextDisabled("no demos downloaded for this map");
+        else if (fresh > 0)
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
+                               "%d demo%s for this map, %d extracted, %d new",
+                               total, total == 1 ? "" : "s", done, fresh);
+        else
+            ImGui::Text("%d demo%s for this map, all extracted", total,
+                        total == 1 ? "" : "s");
+
+        if (running)
+            ImGui::BeginDisabled();
+        if (ImGui::Button(fresh > 0 ? "Extract new demos" : "Re-run extractor"))
+            WrExtractRun();
+        if (running)
+            ImGui::EndDisabled();
+        ImGui::SameLine();
+        HelpMarker("Launches wrpath_extract.py in the background, at below-normal "
+                   "priority so it does not fight the game for CPU. It only "
+                   "processes demos that have no .wrpath yet, so pressing it "
+                   "again costs seconds.\n\n"
+                   "This starts a separate python process. It is never run "
+                   "automatically -- only when you press this.");
+
+        int nLines = WrExtractLineCount();
+        if (nLines > 0)
+        {
+            if (ImGui::BeginChild("extractlog", ImVec2(0.0f, 120.0f),
+                                  ImGuiChildFlags_Borders,
+                                  ImGuiWindowFlags_HorizontalScrollbar))
+            {
+                for (int i = 0; i < nLines; i++)
+                    ImGui::TextUnformatted(WrExtractLine(i));
+                if (running)
+                    ImGui::SetScrollHereY(1.0f);
+            }
+            ImGui::EndChild();
+        }
+        if (!WrExtractRunning() && !haveCounts)
+            ImGui::TextDisabled("%s", WrExtractInterpreter());
+    }
+
     ImGui::Separator();
 
     // Staged maps are the normal case, and they break the obvious behaviour.
@@ -240,6 +305,15 @@ static void DrawRunsTab(void)
         {
             WrRun *r = WrRunAt(i);
             if (r) r->enabled = (i < 3);
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("All"))
+    {
+        for (int i = 0; i < WrRunCount(); i++)
+        {
+            WrRun *r = WrRunAt(i);
+            if (r) r->enabled = true;
         }
     }
     ImGui::SameLine();
@@ -443,24 +517,45 @@ static void DrawFrameCapTab(void)
     ImGui::SeparatorText("Cap");
     ImGui::Checkbox("Limit the frame rate", &g_limit.enabled);
 
-    ImGui::Checkbox("Follow the display's refresh rate", &g_limit.autoTarget);
-    if (g_limit.autoTarget)
-    {
-        if (WrLimitRefreshHz() > 1.0f)
-            ImGui::Text("display    %.0f Hz", WrLimitRefreshHz());
-        else
-            ImGui::TextDisabled("display    unknown yet (needs a frame to look)");
-        ImGui::SliderFloat("Headroom", &g_limit.headroomHz, 0.0f, 15.0f, "%.0f Hz");
-        ImGui::SameLine();
-        HelpMarker("Subtracted from the refresh rate. On a variable-refresh "
-                   "display you want the cap a little under the panel's ceiling "
-                   "so a late frame never reaches it and drops out of the VRR "
-                   "window. Three is the usual recommendation.");
-    }
+    // Both modes stay visible, so the number in force is always readable.
+    int mode = g_limit.autoTarget ? 0 : 1;
+    ImGui::RadioButton("Follow the display", &mode, 0);
+    ImGui::SameLine();
+    ImGui::RadioButton("Custom", &mode, 1);
+    g_limit.autoTarget = (mode == 0);
+
+    if (!g_limit.autoTarget) ImGui::BeginDisabled();
+    if (WrLimitRefreshHz() > 1.0f)
+        ImGui::Text("display    %.0f Hz", WrLimitRefreshHz());
     else
+        ImGui::TextDisabled("display    unknown yet (needs a frame to look)");
+    ImGui::SliderFloat("Headroom", &g_limit.headroomHz, 0.0f, 15.0f, "%.0f Hz");
+    ImGui::SameLine();
+    HelpMarker("Subtracted from the refresh rate. On a variable-refresh display "
+               "you want the cap a little under the panel's ceiling so a late "
+               "frame never reaches it and drops out of the VRR window. Three is "
+               "the usual recommendation.");
+    if (!g_limit.autoTarget) ImGui::EndDisabled();
+
+    if (g_limit.autoTarget) ImGui::BeginDisabled();
+    int custom = (int)(g_limit.targetFps + 0.5f);
+    if (ImGui::InputInt("Target fps", &custom, 1, 10))
+        g_limit.targetFps = WrClampF((float)custom, WR_LIMIT_MIN_FPS, WR_LIMIT_MAX_FPS);
+    // How people actually pick a cap, rather than dragging for it.
+    static const int presets[] = { 60, 120, 144, 165, 240, 300, 360 };
+    for (int i = 0; i < (int)(sizeof(presets) / sizeof(presets[0])); i++)
     {
-        ImGui::SliderFloat("Target", &g_limit.targetFps, 30.0f, 480.0f, "%.0f fps");
+        if (i) ImGui::SameLine();
+        char lbl[16];
+        _snprintf_s(lbl, sizeof(lbl), _TRUNCATE, "%d", presets[i]);
+        if (ImGui::SmallButton(lbl))
+        {
+            g_limit.targetFps = (float)presets[i];
+            g_limit.autoTarget = false;
+        }
     }
+    if (g_limit.autoTarget) ImGui::EndDisabled();
+
     ImGui::Text("capping at %.1f fps  (%.3f ms)", WrLimitTargetFps(),
                 1000.0f / WrLimitTargetFps());
 
@@ -840,6 +935,30 @@ static void DrawDiagnosticsTab(void)
                "every frame. If another overlay's frame limiter is still "
                "unhappy, turning the energy readout off in the Energy tab makes "
                "Present a complete passthrough.");
+
+    // --- is a world actually being rendered ----------------------------------
+    ImGui::SeparatorText("World");
+    float frozen = WrScanFrozenSeconds();
+    float *frozenLimit = WrScanFrozenLimit();
+    if (frozen > *frozenLimit)
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
+                           "frozen for %.1f s -- treating this as \"not in a map\", "
+                           "drawing nothing", frozen);
+    else if (frozen > 0.05f)
+        ImGui::Text("live  (unchanged for %.2f s)", frozen);
+    else
+        ImGui::Text("live");
+    ImGui::SetNextItemWidth(160.0f);
+    ImGui::SliderFloat("Freeze cutoff", frozenLimit, 0.3f, 10.0f, "%.1f s");
+    ImGui::SameLine();
+    HelpMarker("Disconnecting to the main menu does not clear the camera matrix "
+               "or stop it looking valid -- it just stops being written. Without "
+               "this the whole route stayed drawn over the menu, frozen in "
+               "place.\n\n"
+               "Standing perfectly still in a map produces an identical matrix "
+               "too, so the lines can pause while you are genuinely in the "
+               "world. They come back the moment you move. Raise this if that "
+               "bothers you.");
 
     // --- who else is in the Present chain ------------------------------------
     ImGui::SeparatorText("Other overlays");

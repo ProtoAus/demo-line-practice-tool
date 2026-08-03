@@ -443,9 +443,81 @@ static int CompareByTime(const void *a, const void *b)
     return 0;
 }
 
+// Loading is spread over frames rather than done in one go.
+//
+// WrPathLoadMap runs inside Present, and a .wrpath costs a few milliseconds to
+// read, CRC, and scan for teleports and dips. With 64 runs that was a barely
+// noticeable hitch; the busiest map on disk has 125 demos, and at 256 the
+// one-shot version would stall the render thread for the better part of a
+// second every time you loaded a map.
+//
+// So the file list is collected up front -- cheap, one directory walk -- and the
+// files themselves are loaded a few per frame. The run store is usable the whole
+// time; the list simply fills in over the next second.
+#define LOAD_PER_FRAME 4
+
+static char (*g_pending)[MAX_PATH] = NULL;
+static int g_pendingCount = 0;
+static int g_pendingNext = 0;
+static int g_pendingFailed = 0;
+
+static void FinishLoad(void)
+{
+    qsort(g_runs, (size_t)g_runCount, sizeof(WrRun), CompareByTime);
+    for (int i = 0; i < g_runCount; i++)
+    {
+        g_runs[i].colour = PaletteColour(i);
+        g_runs[i].enabled = (i == 0);       // best run on by default
+    }
+
+    WrLogf("loaded %d run%s for \"%s\"%s", g_runCount, g_runCount == 1 ? "" : "s",
+           g_loadedMap, g_pendingFailed ? " (some files rejected)" : "");
+    if (g_pendingFailed)
+        WrLogf("[!] %d .wrpath file%s rejected -- see lines above", g_pendingFailed,
+               g_pendingFailed == 1 ? "" : "s");
+
+    free(g_pending);
+    g_pending = NULL;
+    g_pendingCount = g_pendingNext = g_pendingFailed = 0;
+}
+
+void WrPathLoadTick(void)
+{
+    if (!g_pending)
+        return;
+    for (int n = 0; n < LOAD_PER_FRAME && g_pendingNext < g_pendingCount; n++)
+    {
+        if (g_runCount >= WR_MAX_RUNS)
+        {
+            WrLogf("[!] %s has more than %d runs; the rest are ignored",
+                   g_loadedMap, WR_MAX_RUNS);
+            g_pendingNext = g_pendingCount;
+            break;
+        }
+        if (LoadOne(g_pending[g_pendingNext], &g_runs[g_runCount]))
+            g_runCount++;
+        else
+            g_pendingFailed++;
+        g_pendingNext++;
+    }
+    if (g_pendingNext >= g_pendingCount)
+        FinishLoad();
+}
+
+bool WrPathLoading(int *done, int *total)
+{
+    if (done) *done = g_pendingNext;
+    if (total) *total = g_pendingCount;
+    return g_pending != NULL;
+}
+
 void WrPathLoadMap(const char *map)
 {
     FreeRuns();
+    free(g_pending);
+    g_pending = NULL;
+    g_pendingCount = g_pendingNext = g_pendingFailed = 0;
+
     g_loadedMap[0] = '\0';
     if (!map || !*map)
         return;
@@ -465,34 +537,26 @@ void WrPathLoadMap(const char *map)
         return;
     }
 
-    int failed = 0;
+    g_pending = (char (*)[MAX_PATH])malloc(sizeof(*g_pending) * WR_MAX_RUNS);
+    if (!g_pending)
+    {
+        FindClose(h);
+        return;
+    }
+
     do {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
             continue;
-        if (g_runCount >= WR_MAX_RUNS)
+        if (g_pendingCount >= WR_MAX_RUNS)
             break;
-        char full[MAX_PATH];
-        _snprintf_s(full, sizeof(full), _TRUNCATE, "%s\\%s", base, fd.cFileName);
-        if (LoadOne(full, &g_runs[g_runCount]))
-            g_runCount++;
-        else
-            failed++;
+        _snprintf_s(g_pending[g_pendingCount], MAX_PATH, _TRUNCATE, "%s\\%s",
+                    base, fd.cFileName);
+        g_pendingCount++;
     } while (FindNextFileA(h, &fd));
     FindClose(h);
 
-    qsort(g_runs, (size_t)g_runCount, sizeof(WrRun), CompareByTime);
-
-    for (int i = 0; i < g_runCount; i++)
-    {
-        g_runs[i].colour = PaletteColour(i);
-        g_runs[i].enabled = (i == 0);       // best run on by default
-    }
-
-    WrLogf("loaded %d run%s for \"%s\"%s", g_runCount, g_runCount == 1 ? "" : "s",
-           map, failed ? " (some files rejected)" : "");
-    if (failed)
-        WrLogf("[!] %d .wrpath file%s rejected -- see lines above", failed,
-               failed == 1 ? "" : "s");
+    if (g_pendingCount == 0)
+        FinishLoad();
 }
 
 int WrRunCount(void) { return g_runCount; }

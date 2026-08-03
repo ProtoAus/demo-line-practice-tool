@@ -12,7 +12,15 @@
 
 #include "wr_common.h"
 
-#define WR_MAX_RUNS 64
+// 256, not 64, and not 2000.
+//
+// Measured across a 4095-demo library covering 475 maps: the busiest map has
+// 221 demos, the next 141, and only two maps exceed 128. Sixty-four truncated
+// several maps outright. Two thousand would be a five-megabyte static array and,
+// if ever filled, about 150 MB of point data for maps that do not exist.
+//
+// 256 clears the largest real map with room and costs 665 KB of static array.
+#define WR_MAX_RUNS 256
 #define WR_MAX_MARKERS 64
 #define WR_LIVE_POINTS 32768
 
@@ -117,6 +125,11 @@ struct WrRun
 // Load every .wrpath under wrlines_data\paths\<map>\. Replaces whatever was
 // loaded before. Safe to call with an empty/unknown map name (clears the store).
 void WrPathLoadMap(const char *map);
+
+// Loads a few of them per frame; call once per frame. Doing all 256 at once
+// inside Present would stall the render thread for most of a second.
+void WrPathLoadTick(void);
+bool WrPathLoading(int *done, int *total);
 
 int WrRunCount(void);
 WrRun *WrRunAt(int i);

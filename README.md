@@ -67,6 +67,12 @@ Press **INSERT** in game. Tick runs in the Runs tab. **ESC** closes the panel.
 - Records **your own path** live, so you can see your line next to theirs.
 - Distance culling, distance fade, screen-space decimation and per-run point budgets, so
   eight full runs on screen cost a fraction of a millisecond.
+- Holds up to **256 runs** per map. Measured across a 4095-demo library covering 475 maps,
+  the busiest has 221 — so that is the whole of the largest map at once, and the files are
+  loaded a few per frame so a big map does not stall on load.
+- Stops drawing when you leave a map. Disconnecting does not clear the camera matrix or stop
+  it looking valid — it just stops being written — so without this the whole route stayed
+  drawn over the main menu, frozen in place.
 
 ## What it deliberately doesn't do
 
@@ -221,7 +227,26 @@ pip install zstandard        # optional; without it those demos are skipped, not
 
 ## Use it
 
-**1. Generate paths for a map.** From this folder:
+### Extracting from inside the game
+
+The Runs tab counts the demos you have downloaded for the map you are standing in, how many
+are already extracted, and how many are new — then offers a button to run the extractor
+without leaving the game. Output streams into the panel and the lines appear when it finishes.
+
+The count is exact rather than a guess, and cheap: a demo's map name lives at offset `0x10` of
+the `MMTV` header, and the extractor names its output after the source file's basename, so
+"is this demo for this map, and has it been done" is one 80-byte read plus one file-exists
+check. Measured on a 4095-demo library across 475 maps, that reads every file correctly.
+
+It runs **only when you press the button** — starting a python process off a map change would
+launch a program behind your back and then compete with the game for CPU while you play. The
+process runs at below-normal priority, and `--skip-existing` means pressing it a second time
+costs seconds rather than minutes.
+
+Needs `py.exe` or `python.exe` on `PATH`; the panel says which it found, or that it found
+neither.
+
+**1. Generate paths for a map**, if you would rather use a terminal. From this folder:
 
 ```
 python wrpath_extract.py --list                        # what demos you have

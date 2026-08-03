@@ -1082,15 +1082,36 @@ def process_one(path, args):
     return ("ok", name, "", (h, info))
 
 
+def wrpath_for(out_dir, demo_path, map_name):
+    """Where process_one would write this demo's output.
+
+    Cheap on purpose: process_one names the file after the source basename (the
+    variable is called sha1 but it is os.path.splitext(name)[0]), so the answer
+    needs only the map name, which peek_map reads from the first 0x50 bytes.
+    That is what makes --skip-existing worth having -- it skips before the full
+    read and the decompression, not after.
+    """
+    base = os.path.splitext(os.path.basename(demo_path))[0]
+    return os.path.join(out_dir, map_name, base + ".wrpath")
+
+
 def cmd_extract(args):
+    already = 0
     if args.file:
         targets = [args.file]
     else:
         targets = []
         for _tree, path in iter_demos(args.game):
-            if args.map and (peek_map(path) or "").lower() != args.map.lower():
+            m = peek_map(path) or ""
+            if args.map and m.lower() != args.map.lower():
+                continue
+            if args.skip_existing and m and os.path.exists(
+                    wrpath_for(args.out, path, m)):
+                already += 1
                 continue
             targets.append(path)
+    if already:
+        print("%d already extracted, skipping them" % already)
 
     done = ok = skipped = failed = lowconf = 0
     cov = []
@@ -1146,6 +1167,9 @@ def main(argv):
     ap.add_argument("--verify", action="store_true",
                     help="extract and report, but write nothing")
     ap.add_argument("--limit", type=int, default=0, help="stop after N demos")
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="skip demos that already have a .wrpath; makes "
+                         "re-running a map cost seconds instead of minutes")
     args = ap.parse_args(argv)
 
     if not os.path.isdir(args.game):

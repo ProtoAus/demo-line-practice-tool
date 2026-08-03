@@ -149,9 +149,9 @@ float WrLimitTargetFps(void)
         if (g_refreshHz <= 1.0f)
             return g_limit.targetFps;       // refresh unknown; use the manual value
         float t = g_refreshHz - g_limit.headroomHz;
-        return t < 10.0f ? 10.0f : t;
+        return t < WR_LIMIT_MIN_FPS ? WR_LIMIT_MIN_FPS : t;
     }
-    return WrClampF(g_limit.targetFps, 10.0f, 1000.0f);
+    return WrClampF(g_limit.targetFps, WR_LIMIT_MIN_FPS, WR_LIMIT_MAX_FPS);
 }
 
 // Record the interval between this present and the previous one, and how far it

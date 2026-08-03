@@ -61,4 +61,11 @@ int WrScanUpdatingCount(void);   // candidates seen changing frame to frame
 float WrScanTravel(void);        // units the chosen camera has moved
 double WrScanMegabytes(void);
 
+// How long the chosen matrix has been byte-identical, and the threshold past
+// which we conclude the world is not being rendered at all -- disconnecting to
+// the main menu leaves the last in-game camera sitting in memory, valid and
+// motionless, and drawing a route through it puts the whole map over the menu.
+float WrScanFrozenSeconds(void);
+float *WrScanFrozenLimit(void);  // settable from the UI
+
 #endif // WR_SCAN_H

@@ -41,6 +41,12 @@
 
 #include "wr_common.h"
 
+// Wide enough for anything real at either end: 30 for a deliberately slow cap,
+// 1000 because some competitive players run uncapped-but-bounded on 500 Hz-class
+// panels and there is no reason to stop them.
+#define WR_LIMIT_MIN_FPS 30.0f
+#define WR_LIMIT_MAX_FPS 1000.0f
+
 struct WrLimitSettings
 {
     bool enabled;

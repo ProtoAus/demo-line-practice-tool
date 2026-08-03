@@ -109,6 +109,7 @@ struct Candidate
     bool haveOrigin;
     float travel;
     int jumps;              // frames the origin moved implausibly far
+    bool changedThisFrame;  // did the bytes differ from last time we looked
     char note[128];
 };
 
@@ -160,6 +161,11 @@ static long long g_lastAcceptTicks = 0;
 static int g_heldFrames = 0;        // consecutive frames drawing a held matrix
 static int g_roundRobin = 0;        // where the slow re-check left off
 
+// How long the chosen matrix has been byte-identical. See WrScanTick.
+static long long g_frozenSince = 0;
+static float g_frozenSeconds = 0.0f;
+static float g_frozenLimit = 1.5f;
+
 // The performance counter frequency is a constant for the life of the process.
 static long long QpcFreq(void)
 {
@@ -171,6 +177,13 @@ static long long QpcFreq(void)
         f = q.QuadPart ? q.QuadPart : 1;
     }
     return f;
+}
+
+static inline long long Now(void)
+{
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return t.QuadPart;
 }
 
 static bool AcceptForFrame(const VMatrix &m);
@@ -569,6 +582,8 @@ void WrScanRestart(void)
     g_lastAcceptTicks = 0;
     g_heldFrames = 0;
     g_roundRobin = 0;
+    g_frozenSince = 0;
+    g_frozenSeconds = 0.0f;
     g_note[0] = '\0';
     InterlockedExchange64(&g_bytes, 0);
     InterlockedExchange(&g_phase, 0);
@@ -591,10 +606,12 @@ static bool ValidateCandidate(Candidate *c, VMatrix *out)
     if (!WrValidateW2S(m, c->note, sizeof(c->note)))
         return false;
 
-    if (c->haveLast && memcmp(&c->last, &m, sizeof(m)) != 0)
+    bool changed = (!c->haveLast || memcmp(&c->last, &m, sizeof(m)) != 0);
+    if (c->haveLast && changed)
         c->changes++;
     c->last = m;
     c->haveLast = true;
+    c->changedThisFrame = changed;
 
     // Track how the camera this matrix describes behaves over time. Smooth
     // travel means it is following the player; teleport-sized steps every frame
@@ -756,7 +773,36 @@ void WrScanTick(void)
         {
             c->hits++;
             c->consecutiveMisses = 0;
-            if (AcceptForFrame(m))
+
+            // --- have we left the map? ---------------------------------------
+            //
+            // Disconnecting to the main menu does not clear this memory or make
+            // it stop looking like a view matrix. It simply stops being written,
+            // so the last in-game camera sits there: structurally valid, and
+            // trivially past the continuity gate because it has not moved. The
+            // result was the whole route still drawn over the menu, frozen.
+            //
+            // Byte-identical for a sustained stretch is the tell. Timed rather
+            // than counted in frames so the behaviour does not change with the
+            // frame rate.
+            long long tick = Now();
+            if (c->changedThisFrame || g_frozenSince == 0)
+                g_frozenSince = tick;
+            g_frozenSeconds = (float)((double)(tick - g_frozenSince) / (double)QpcFreq());
+
+            if (g_frozenSeconds > g_frozenLimit)
+            {
+                // Standing perfectly still in a map produces an identical matrix
+                // too, so this can fire while genuinely in the world. It costs a
+                // paused line that returns on the first movement, which is a far
+                // better failure than drawing a dead camera's route over a menu.
+                if (g_matrixValid)
+                    WrLogf("scan: matrix unchanged for %.1fs -- treating as "
+                           "\"not in a map\" and drawing nothing", g_frozenSeconds);
+                g_matrixValid = false;
+                strcpy_s(g_note, sizeof(g_note), "frozen (not in a map?)");
+            }
+            else if (AcceptForFrame(m))
             {
                 g_matrix = m;
                 g_matrixValid = true;
@@ -966,6 +1012,9 @@ double WrScanMegabytes(void)
 {
     return InterlockedCompareExchange64(&g_bytes, 0, 0) / (1024.0 * 1024.0);
 }
+
+float WrScanFrozenSeconds(void) { return g_frozenSeconds; }
+float *WrScanFrozenLimit(void) { return &g_frozenLimit; }
 
 int WrScanUpdatingCount(void)
 {

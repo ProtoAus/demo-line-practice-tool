@@ -23,6 +23,7 @@
 #include "wr_steam.h"
 #include "wr_energy.h"
 #include "wr_limit.h"
+#include "wr_extract.h"
 
 #include "imgui.h"
 
@@ -54,7 +55,12 @@ void WrIdleTick(void)
         WrUiOnMapChanged(map);
         WrLiveClear();
         WrEnergyReset();
+        WrExtractOnMapChanged(map);
     }
+
+    // Feeds the run store a few files per frame, so a 125-run map does not stall
+    // the render thread on load.
+    WrPathLoadTick();
 
     // Our own frame time. ImGui's io.DeltaTime is not available here: on an idle
     // frame there is no ImGui frame at all, and using it would make the energy
@@ -83,6 +89,20 @@ void WrIdleTick(void)
     // Advance a couple of pending Steam avatar lookups. Does nothing unless a
     // tag asked for one, which only happens while drawing.
     WrSteamTick();
+
+    // The extractor writes .wrpath files from another process, so once it has
+    // finished the store on this side is out of date.
+    if (WrExtractTakeFinished())
+    {
+        const char *m = WrPathLoadedMap();
+        if (m && *m)
+        {
+            char keep[72];
+            strcpy_s(keep, sizeof(keep), m);
+            WrPathLoadMap(keep);
+            WrExtractOnMapChanged(keep);
+        }
+    }
 }
 
 static DWORD WINAPI HotkeyThread(LPVOID)
