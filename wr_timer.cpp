@@ -51,6 +51,10 @@ void WrTimerTick(const Vec3 &cam, float dt)
     Vec3 anchor;
     bool haveAnchor = WrEnergyAnchorPos(&anchor);
 
+    // Consumed every frame, whether or not it is acted on, so it can never go
+    // stale and fire a run later.
+    bool restart = WrEnergyTakeRestart();
+
     // A teleport. Either it landed on a save-loc we have a time for, in which
     // case the clock goes back to what it said when that save-loc was made, or
     // it did not and the clock is left alone -- deliberately, because guessing
@@ -59,10 +63,24 @@ void WrTimerTick(const Vec3 &cam, float dt)
     {
         float restored = 0.0f;
         if (WrSavelocTimeAt(cam, &restored))
+        {
+            // A save-loc is a more specific answer than "you are near the
+            // start", so it wins over the restart below when both match.
             WrTimerSet(restored, "loaded a save-loc");
+            restart = false;
+        }
     }
     g_last = cam;
     g_haveLast = true;
+
+    if (restart)
+    {
+        // A fail trigger, or the restart key. That is a new attempt rather than
+        // a continuation, so the clock goes back to zero and re-arms -- it will
+        // start again by itself when you leave the pad.
+        g_running = false;
+        g_elapsed = 0.0f;
+    }
 
     if (!haveAnchor)
     {

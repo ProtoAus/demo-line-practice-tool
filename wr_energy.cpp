@@ -43,6 +43,15 @@ WrEnergySettings g_energy;
 #define MAX_SANE_SPEED 10000.0f
 #define TELEPORT_UNITS 400.0f
 
+// A teleport that lands you back at the anchor is a RESTART -- a fail trigger
+// fired, or the restart key was pressed. WrLines reads no game state beyond the
+// camera, so this is the only way either of those can be noticed at all.
+//
+// Loose, because a start zone is a volume and the anchor is one recorded point
+// inside it: the run's first sample can easily be a couple of hundred units from
+// where the game respawns you.
+#define RESTART_UNITS 384.0f
+
 #define HISTORY 240
 #define HISTORY_HZ 20
 
@@ -57,6 +66,8 @@ static float g_clock = 0.0f;
 static bool g_valid = false;
 static Vec3 g_vel;
 static Vec3 g_lastPos;
+static bool g_havePos = false;      // g_lastPos holds a real position
+static bool g_restart = false;      // a teleport landed back at the anchor
 static float g_speed = 0.0f;
 static float g_now = 0.0f;          // absolute, instantaneous
 static float g_nowSmooth = 0.0f;    // absolute, filtered -- what gets displayed
@@ -142,6 +153,8 @@ void WrEnergyReset(void)
     WrArrowReset(&g_arrow);
 
     g_valid = false;
+    g_havePos = false;
+    g_restart = false;
     g_speed = 0.0f;
     g_peak = 0.0f;
     g_haveStart = false;
@@ -202,6 +215,49 @@ bool WrEnergyAnchorPos(Vec3 *out)
     return true;
 }
 
+// A teleport is a discontinuity, not movement. Everything carrying state across
+// frames is DROPPED rather than filtered: a filter run across a discontinuity
+// produces a number that was never true at either end, and here that would be a
+// three-tenths-of-a-second glide from the energy you had when you failed down to
+// the energy you have back on the pad.
+static void Teleported(const Vec3 &pos)
+{
+    WrVelReset(&g_win);
+    WrEmaReset(&g_velX); WrEmaReset(&g_velY); WrEmaReset(&g_velZ);
+    WrEmaReset(&g_speedEma); WrEmaReset(&g_energyEma); WrEmaReset(&g_accelEma);
+    WrEmaReset(&g_velTurnEma);
+    WrTrendReset(&g_trend);
+    WrArrowReset(&g_arrow);
+
+    g_settledFor = 0.0f;
+    g_onGround = false;
+    g_haveVelDir = false;
+    g_haveShown = false;
+    g_historyCount = 0;
+
+    if (!g_haveRef)
+        return;
+
+    // Horizontally only. g_refPos is a player origin for a run-start anchor and
+    // a camera position for a manual one, so a vertical term would mean two
+    // different things -- the same asymmetry WrTimerTick works around.
+    float dx = pos.x - g_refPos.x, dy = pos.y - g_refPos.y;
+    if (sqrtf(dx * dx + dy * dy) >= RESTART_UNITS)
+        return;
+
+    g_restart = true;
+    g_haveStart = false;    // re-seeds from the first sample of the new attempt
+    g_peak = 0.0f;
+    WrLogf("energy: teleported back to the anchor, treating it as a restart");
+}
+
+bool WrEnergyTakeRestart(void)
+{
+    bool r = g_restart;
+    g_restart = false;
+    return r;
+}
+
 void WrEnergySample(const Vec3 &pos, float dt)
 {
     if (!WrSaneVec(pos) || !(dt > 0.0f) || dt > 0.5f)
@@ -209,14 +265,30 @@ void WrEnergySample(const Vec3 &pos, float dt)
 
     g_clock += dt;
 
-    // A teleport is not movement. Drop the window rather than report a velocity
-    // of tens of thousands of units per second.
-    if (g_valid && WrDist(g_lastPos, pos) > TELEPORT_UNITS)
-    {
-        WrVelReset(&g_win);
-        g_settledFor = 0.0f;
-        g_haveVelDir = false;
-    }
+    // Where you were last frame, recorded BEFORE any of the early returns below,
+    // and that ordering is the whole fix.
+    //
+    // This used to be written only on the success path at the bottom of the
+    // function, which made a fail trigger freeze the readout permanently. The
+    // sequence: you fail, the teleport is detected, the velocity window is
+    // emptied; the window then holds a single sample, so WrVelEstimate returns
+    // false; the function returns early without recording where you now are. The
+    // next frame therefore compares your new position against the PRE-teleport
+    // one, sees a jump over 400 units again, and empties the window again --
+    // every frame, for the rest of the map.
+    //
+    // The visible symptom was the number sticking at whatever it read the
+    // instant you failed. Since you usually fail at the bottom of the map while
+    // the anchor is the start pad, that stuck value was a large negative one,
+    // and nothing but the Reset button cleared it -- Reset works only because it
+    // clears the flag this test used to be gated on.
+    bool havePrev = g_havePos;
+    Vec3 prev = g_lastPos;
+    g_lastPos = pos;
+    g_havePos = true;
+
+    if (havePrev && WrDist(prev, pos) > TELEPORT_UNITS)
+        Teleported(pos);
 
     WrVelPush(&g_win, pos.x, pos.y, pos.z, dt);
 
@@ -247,7 +319,6 @@ void WrEnergySample(const Vec3 &pos, float dt)
     g_speed = WrEmaStep(&g_speedEma, instSpeed, dt, SPEED_TAU);
 
     g_valid = true;
-    g_lastPos = pos;
 
     // The RAW window velocity paired with the window's MIDPOINT height, not the
     // smoothed velocity paired with the current height. Both then refer to the

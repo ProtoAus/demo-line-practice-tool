@@ -11,14 +11,31 @@
 // exactly that -- then runs the old re-arming policy over the same trajectory to
 // show what it did.
 //
-// Build:  cl /nologo /EHsc /I.. tests\test_energy.cpp /Fe:tests\test_energy.exe
+// The last section drives the REAL sampler rather than a copy of the chain,
+// because the second reported defect did not live in the filters at all: it was
+// the order of two statements in WrEnergySample. See "a fail trigger" below.
+//
+// Build:  tests\build.bat        (or see the command in that file)
 // Run:    tests\test_energy.exe
 
 #include "wr_smooth.h"
 #include "wr_stress.h"
+#include "wr_energy.h"
+#include "wr_engine.h"
 
 #include <stdio.h>
 #include <math.h>
+
+// wr_energy.cpp reaches outside itself for exactly one thing -- the camera
+// forward vector, for the view turn rate -- so it is stubbed here rather than
+// dragging the whole memory scanner into a unit test. Everything else it needs
+// (WrLength, WrDist, WrSaneVec, WrLogf) is in wr_log.cpp, which links cleanly:
+// WrLogf is a no-op until WrLogInit runs, so the test writes no log file.
+bool WrCameraForward(Vec3 *out)
+{
+    if (out) *out = WrVec(1.0f, 0.0f, 0.0f);
+    return true;
+}
 
 static int g_failures = 0;
 
@@ -275,6 +292,81 @@ int main(void)
         Check(WrTurnRateDeg(2000.0f, 0.0f, 1900.0f, 600.0f, 0.015f) > cap2000,
               "a turn a real ramp produces exceeds it, so exceeding it is not "
               "in itself a mistake");
+    }
+
+    // -----------------------------------------------------------------------
+    // From here on the REAL sampler runs, not a copy of it.
+    // -----------------------------------------------------------------------
+
+    printf("\na fail trigger does not freeze the readout\n");
+    {
+        // Reported as "every time you hit a fail trigger it saves your value and
+        // stops updating, and hitting the restart key doesn't reset it".
+        //
+        // It was not the filters. WrEnergySample recorded your last position at
+        // the BOTTOM of the function, past an early return taken while the
+        // velocity window refills -- so the frame after a teleport still held
+        // the pre-teleport position, detected the same teleport again, and
+        // emptied the window again. For the rest of the map.
+        WrEnergyDefaults();
+        WrEnergyReset();
+
+        const float dt = 1.0f / 200.0f;
+        const float padZ = 2000.0f;
+
+        for (int i = 0; i < 100; i++)
+            WrEnergySample(WrVec(0.0f, 0.0f, padZ), dt);
+        // Anchored at the feet, as WrRenderWorld does from a run's first point.
+        WrEnergyAnchorToFeet(WrVec(0.0f, 0.0f, padZ - 64.0f));
+
+        // Down the map: 2000 u/s of drop against only 300 u/s across, so the
+        // height lost is not bought back by speed and the figure goes properly
+        // negative -- which is what makes a frozen value obvious.
+        for (int i = 0; i < 400; i++)
+        {
+            float t = i * dt;
+            WrEnergySample(WrVec(300.0f * t, 0.0f, padZ - 2000.0f * t), dt);
+        }
+        float atFail = WrEnergyRelative();
+
+        // The trigger fires: back on the pad in a single frame.
+        for (int i = 0; i < 400; i++)
+            WrEnergySample(WrVec(0.0f, 0.0f, padZ), dt);
+        float afterFail = WrEnergyRelative();
+
+        printf("     %.0f at the moment of the fail, %.0f two seconds after the "
+               "respawn\n", atFail, afterFail);
+        Check(fabsf(atFail) > 500.0f,
+              "the value at the fail really is far from zero");
+        Check(fabsf(afterFail) < 20.0f,
+              "and back on the pad it reads zero again, rather than sticking");
+        Check(WrEnergyTakeRestart(), "the respawn was reported as a restart");
+        Check(!WrEnergyTakeRestart(), "and reading that clears it");
+    }
+
+    printf("\na teleport away from the anchor is a save-loc, not a restart\n");
+    {
+        WrEnergyDefaults();
+        WrEnergyReset();
+
+        const float dt = 1.0f / 200.0f;
+        const float padZ = 2000.0f;
+        const float locZ = 900.0f;
+
+        for (int i = 0; i < 100; i++)
+            WrEnergySample(WrVec(0.0f, 0.0f, padZ), dt);
+        WrEnergyAnchorToFeet(WrVec(0.0f, 0.0f, padZ - 64.0f));
+
+        // Loading a save-loc 8000 units across the map and 1100 units down.
+        for (int i = 0; i < 400; i++)
+            WrEnergySample(WrVec(8000.0f, 0.0f, locZ), dt);
+
+        float rel = WrEnergyRelative();
+        printf("     %.0f, against %.0f of height lost\n", rel, locZ - padZ);
+        Check(!WrEnergyTakeRestart(),
+              "no restart, so a save-loc load keeps its clock");
+        Check(fabsf(rel - (locZ - padZ)) < 20.0f,
+              "and the readout follows to where you now are");
     }
 
     printf("\n%s\n\n", g_failures ? "SOME CHECKS FAILED" : "all checks passed");

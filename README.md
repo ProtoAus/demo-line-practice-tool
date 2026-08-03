@@ -495,6 +495,55 @@ frame count, so the readout behaved like a different instrument at 60 fps than a
 frame rate moves with how many lines are drawn, so turning lines on changed how the number
 moved. Measured at 60, 200 and 500 fps the chain now agrees to within 0.1 units.
 
+### A fail trigger used to latch the readout off permanently
+
+Reported next: "every time you hit a fail trigger it saves your value and stops updating, and
+hitting the restart key doesn't reset it". That one was not in the filters at all — it was the
+**order of two statements**.
+
+The live velocity is differenced from camera positions, so a teleport has to be detected and the
+window dropped, or a 5000-unit jump in one frame reads as a million units per second. Detecting
+it was fine. Recovering from it was not:
+
+1. the teleport is detected, and the velocity window is emptied
+2. the window now holds one sample, so the estimator has nothing to divide by and returns false
+3. the sampler returns early — **before** recording where the player now is
+4. the next frame therefore compares against the *pre-teleport* position, sees a jump over 400
+   units again, and empties the window again
+
+Every frame, for the rest of the map. The displayed figure stayed at whatever it read the
+instant you failed, and since you fail at the bottom of a map while the anchor is the start pad,
+that stuck value was a large negative one — the reported "it drops to −6000". Only the Reset
+button cleared it, and only because Reset clears the flag the teleport test was gated on. The
+same latch also froze the velocity vector and the live line's efficiency colouring.
+
+The last position is now recorded before every early return, and a teleport is treated as a
+discontinuity: the filters are *dropped* rather than run across it, since a 0.3 s average that
+spans a teleport is a number that was never true at either end. A teleport that lands back at
+the anchor is taken as a **restart** — a fail trigger, or the restart key — and zeroes the run
+clock and the peak. That is the only restart signal the tool has; it reads the camera and
+nothing else, so it cannot see a trigger fire or a key press.
+
+`tests/test_energy.cpp` links the real `wr_energy.cpp` for this, not a copy of the chain. Put
+the old statement order back and it fails in exactly the reported way:
+
+```
+a fail trigger does not freeze the readout
+     -800 at the moment of the fail, -800 two seconds after the respawn
+```
+
+### Falling does not add energy, and that is the point
+
+Also reported: "I thought falling from the start zone would add a bunch of energy but it
+doesn't — it only changes when my horizontal speed changes." Correct, by construction. Falling
+converts height into speed at exactly the rate `E = z + v²/2g` is defined to hold constant, so a
+clean drop reads flat. Negative is not height dropped; it is energy that ended up in neither
+height nor speed — bad ramp entries, wall clips, friction.
+
+Which means the number cannot be made to "slowly rise" while you play well: on a descending surf
+map `E_rel` falls for everyone. The figure that rises when you are doing well is the **gap**
+against the run you are chasing. The panel now says so instead of implying otherwise.
+
 ### Strafing efficiency, and the metric that had to be thrown away
 
 The obvious way to show "you turned too fast" is to colour the line by how fast the velocity is
@@ -786,9 +835,9 @@ wr_extract          counting unextracted demos, running the extractor
 wr_matrixlife.h     when a chosen matrix has died -- pure logic, tested
 wr_pacing.h         when the next frame may be presented -- pure logic, tested
 wr_ui               the panel
-tests\              standalone harnesses, built by hand:
-                    cl /nologo /EHsc /I.. tests\test_matrixlife.cpp
-                    cl /nologo /EHsc /I.. tests\test_pacing.cpp
+tests\              standalone harnesses -- tests\build.bat builds and runs all
+                    three. test_energy links the real wr_energy.cpp, because the
+                    teleport latch was in that file rather than in the headers.
 ```
 
 Everything the tool writes lives under `wrlines_data\`, next to the DLL:

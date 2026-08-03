@@ -853,20 +853,27 @@ static void DrawEnergyTab(void)
 {
     ImGui::TextWrapped(
         "Energy is how high you could still get if you redirected everything "
-        "you have straight up, measured from the last ground you were standing "
-        "on:  E = height above it + v squared / 2g.  Standing still it reads 0. "
-        "It says what horizontal speed alone cannot -- whether trading height "
-        "for speed on a ramp actually gained you anything.");
+        "you have straight up, measured from the anchor:  E = height above the "
+        "anchor + v squared / 2g.  Standing on the anchor it reads 0. It says "
+        "what horizontal speed alone cannot -- whether trading height for speed "
+        "on a ramp actually gained you anything.");
     ImGui::TextWrapped(
         "The second figure is the same energy written as a speed, so it reads in "
         "the units you are used to.");
     ImGui::TextWrapped(
-        "The map's own shape cancels out. Drop 18000 units down a surf map and "
-        "convert every unit of it into speed and this still reads 0 -- what is "
-        "left is what you WASTED getting there. So on a descending map everyone "
-        "reads negative; that is friction and imperfect ramp entries, not you "
-        "doing badly. What matters is being less negative than the run you are "
-        "chasing, which is what the gap below is for.");
+        "Negative is energy you have WASTED, not height you have dropped. "
+        "Falling converts height into speed at exactly the rate this figure is "
+        "defined to hold constant, so a clean drop off the start pad does not "
+        "move it at all -- it reads about 0 the whole way down, and that is the "
+        "metric working rather than failing. What makes it move is speed "
+        "changing by more or less than the height change accounts for: air "
+        "strafing adds, a bad ramp entry or a wall takes away.");
+    ImGui::TextWrapped(
+        "Which is also why the map's own shape cancels out. Drop 18000 units "
+        "down a surf map, convert every unit of it into speed, and this still "
+        "reads 0. On a descending map everyone ends up negative, so the figure "
+        "to watch is not this one climbing -- it is the GAP against the run you "
+        "are chasing, below.");
     ImGui::TextDisabled(
         "Measured: across 51 surf_demise records, run time against this figure "
         "at the finish correlates -0.976. The fastest run wastes the least.");
@@ -885,9 +892,11 @@ static void DrawEnergyTab(void)
         ImGui::Text("peak energy   %.0f", WrEnergyPeak());
         if (WrEnergyHaveRef())
             ImGui::Text("measured from z %.0f%s", WrEnergyRefZ(),
-                        WrEnergyOnGround() ? "   (on it now)" : "");
+                        WrEnergyOnGround() ? "   (on ground now)" : "");
         else
-            ImGui::TextDisabled("measured from where you are -- no ground seen yet");
+            ImGui::TextDisabled(
+                "no anchor -- measured from where you are, so it reads 0 by "
+                "construction. Enable a run, or press Anchor here.");
         if (WrEnergyHaveGround())
             ImGui::Text("last jump     z %.0f   (since: %+.0f)",
                         WrEnergyGroundZ(), WrEnergySinceGround());
@@ -926,7 +935,12 @@ static void DrawEnergyTab(void)
                "noisy; its origin was moving.\n\n"
                "Anchoring at the run's own first point also makes the clock "
                "below exact, because their time and yours then start in the "
-               "same place.");
+               "same place.\n\n"
+               "A teleport back to the anchor -- a fail trigger, or the restart "
+               "key -- is treated as a new attempt: the clock returns to zero "
+               "and the peak is forgotten. The anchor itself stays put. This is "
+               "the only way WrLines can see a restart at all, since it reads "
+               "the camera and nothing else.");
 
     if (ImGui::Button("Anchor here"))
         WrEnergyRearm();

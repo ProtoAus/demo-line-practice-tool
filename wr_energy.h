@@ -49,6 +49,29 @@
 // still through a whole jump and drift down only as real energy is lost. That is
 // what makes it readable, and it is what tests\test_energy.cpp asserts.
 //
+// It also means the number does NOT rise as you fall off the start pad, and that
+// is the metric working rather than failing. Falling trades height for speed at
+// exactly the rate E is defined to hold constant. E moves when energy is really
+// gained or lost -- air strafing adds it, a ramp or a wall takes it -- so in
+// practice it moves when your speed changes by more or less than the height
+// change accounts for. The figure that rises when you are doing well is the GAP
+// against the run you are chasing, not E itself.
+//
+// A TELEPORT IS A DISCONTINUITY, AND IT USED TO BE A TRAP
+//
+// The velocity here is differenced from camera positions, so a teleport has to
+// be detected and the window dropped. Detecting it is easy; recovering from it
+// was not. The last position was recorded at the BOTTOM of the sampler, past an
+// early return that fires while the window refills -- so after a teleport the
+// next frame still compared against the pre-teleport position, detected the same
+// teleport again, and emptied the window again. Every frame. Permanently.
+//
+// The readout froze at whatever it said the instant you hit a fail trigger, and
+// because you fail at the bottom of a map while the anchor is the start pad, it
+// froze at a large negative number. Nothing recovered it but the Reset button.
+// The last position is now recorded before every early return, and a teleport
+// that lands back at the anchor is treated as a fresh attempt.
+//
 // The eye offset cancels in Erel when the anchor is a camera height. It does NOT
 // cancel against a run's first point, which is a player origin at the feet, nor
 // in the you-versus-run gap -- hence eyeHeight below, added in both places.
@@ -136,6 +159,14 @@ void WrEnergyAnchorToFeet(const Vec3 &feet);
 
 WrAnchorSource WrEnergyAnchorSource(void);
 bool WrEnergyAnchorPos(Vec3 *out);   // false when there is no anchor
+
+// True once after a teleport that landed back at the anchor -- a fail trigger,
+// or the restart key. Reading it clears it, so exactly one caller may consume
+// it; that caller is WrTimerTick, which zeroes the clock for the new attempt.
+//
+// This is the only restart signal the tool has. WrLines reads the camera and
+// nothing else, so it cannot see a trigger fire, a key press, or a zone enter.
+bool WrEnergyTakeRestart(void);
 
 // Convert a position and velocity into an absolute energy height.
 float WrEnergyOf(const Vec3 &pos, const Vec3 &vel);

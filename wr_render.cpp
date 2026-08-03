@@ -897,13 +897,27 @@ static void EmitEnergyHud(ImDrawList *dl)
     float rel = WrEnergyRelative();
     int dir = WrEnergyTrendDir();
 
-    const char *arrow = (dir > 0) ? " ^" : (dir < 0 ? " v" : "");
-    _snprintf_s(big, sizeof(big), _TRUNCATE, "%.0f%s", rel, arrow);
-    _snprintf_s(sub, sizeof(sub), _TRUNCATE, "%.0f u/s", WrEnergyEquivSpeed());
-
     unsigned int bigCol = 0xFFFFFFFFu;
-    if (dir > 0)      bigCol = 0xFF80FF80u;   // ABGR
-    else if (dir < 0) bigCol = 0xFF8080FFu;
+    if (!WrEnergyHaveRef())
+    {
+        // Say so rather than print the number. With no anchor the reference is
+        // wherever you are standing, so the relative figure is zero by
+        // construction -- which looks exactly like a working readout that
+        // thinks you have no energy, and is what "it doesn't detect the start"
+        // looks like from the outside.
+        dir = 0;
+        bigCol = 0xFF909090u;
+        _snprintf_s(big, sizeof(big), _TRUNCATE, "--");
+        _snprintf_s(sub, sizeof(sub), _TRUNCATE, "no anchor");
+    }
+    else
+    {
+        const char *arrow = (dir > 0) ? " ^" : (dir < 0 ? " v" : "");
+        _snprintf_s(big, sizeof(big), _TRUNCATE, "%.0f%s", rel, arrow);
+        _snprintf_s(sub, sizeof(sub), _TRUNCATE, "%.0f u/s", WrEnergyEquivSpeed());
+        if (dir > 0)      bigCol = 0xFF80FF80u;   // ABGR
+        else if (dir < 0) bigCol = 0xFF8080FFu;
+    }
 
     bool haveCmp = false;
     unsigned int cmpCol = 0xFFFFFFFFu;
