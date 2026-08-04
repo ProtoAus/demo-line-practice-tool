@@ -93,6 +93,8 @@ static Vec3 g_vel;
 static Vec3 g_lastPos;
 static bool g_havePos = false;      // g_lastPos holds a real position
 static bool g_restart = false;      // a teleport landed back at the anchor
+static bool g_teleported = false;   // any teleport, consumed once
+static Vec3 g_teleportAt;           // where it landed
 static float g_speed = 0.0f;
 static float g_now = 0.0f;          // absolute, instantaneous
 static float g_nowSmooth = 0.0f;    // absolute, filtered -- what gets displayed
@@ -270,6 +272,11 @@ bool WrEnergyAnchorPos(Vec3 *out)
 // the energy you have back on the pad.
 static void Teleported(const Vec3 &pos)
 {
+    // Published so there is exactly one teleport detector in the tool. The run
+    // clock used to keep its own, and the two disagreed on a slow load.
+    g_teleported = true;
+    g_teleportAt = pos;
+
     WrVelReset(&g_win);
     WrEmaReset(&g_velX); WrEmaReset(&g_velY); WrEmaReset(&g_velZ);
     WrEmaReset(&g_speedEma); WrEmaReset(&g_energyEma); WrEmaReset(&g_accelEma);
@@ -341,6 +348,15 @@ bool WrEnergyTakeRestart(void)
 }
 
 bool WrEnergyHeld(void) { return g_held; }
+
+bool WrEnergyTakeTeleport(Vec3 *landedAt)
+{
+    bool t = g_teleported;
+    g_teleported = false;
+    if (t && landedAt)
+        *landedAt = g_teleportAt;
+    return t;
+}
 
 void WrEnergySample(const Vec3 &pos, float dt)
 {

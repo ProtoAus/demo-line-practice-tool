@@ -225,6 +225,15 @@ bool WrEnergyTakeRestart(void);
 // nothing -- if the camera is not moving there is nothing to measure.
 bool WrEnergyHeld(void);
 
+// True once after ANY teleport, with where it landed. Same consume-once contract
+// as WrEnergyTakeRestart, and the same reason for living here: WrLines has one
+// camera history, so it has one teleport detector. The run clock used to keep a
+// second one, and the two disagreed on exactly the frame that mattered -- a load
+// slow enough to produce a frame over half a second made the timer throw its
+// last position away while the sampler kept its, so only one of them saw the
+// teleport, and a slow load is what loading actually looks like.
+bool WrEnergyTakeTeleport(Vec3 *landedAt);
+
 // --- the budget ---------------------------------------------------------------
 
 // False when there is nothing to measure from. The three numbers are quantised

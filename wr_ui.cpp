@@ -1141,16 +1141,117 @@ static void DrawEnergyTab(void)
         }
         ImGui::TextDisabled("%s", WrTimerWhyNot(tref));
     }
+    if (ImGui::Button(WrTimerRunning() ? "Stop" : "Start"))
+    {
+        if (WrTimerRunning()) WrTimerStop(); else WrTimerStart();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Zero"))
+        WrTimerZero();
+    ImGui::SameLine();
+    if (WrTimerManual())
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "started by hand");
+    else if (WrTimerRunning())
+        ImGui::TextDisabled("running from the anchor");
+    else
+        ImGui::TextDisabled("leave the anchor, or press Start");
+
+    // --- save-locs ----------------------------------------------------------
+    ImGui::SeparatorText("Save-locs");
     ImGui::TextDisabled("%s", WrSavelocStatus());
     ImGui::SameLine();
     HelpMarker("Momentum's save-locs record where you were but not how long it "
                "took to get there -- the file has a \"time\" field and it is "
                "-1 in every one of the 3213 entries on this machine.\n\n"
-               "So WrLines keeps its own note, in wrlines_data\\savelocs, keyed "
-               "on position rather than on the save-loc's index (indices "
-               "renumber when you delete one). Load a save-loc and the clock "
-               "goes back to what it said when you made it.\n\n"
+               "So WrLines keeps its own note, in wrlines_data\\savelocs. Load a "
+               "save-loc and the clock goes back to what it said when you made "
+               "it, so you can practise a map a section at a time and keep a "
+               "running total.\n\n"
+               "A time is recorded when a save-loc is CREATED. The first version "
+               "of this stamped the nearest untimed save-loc you were standing "
+               "near, which meant walking past one timed it -- that produced 111 "
+               "stamps on this machine and left surf_hades2 with twenty entries "
+               "at the spawn, each written by a different lap. Times from before "
+               "that fix are marked with a ? because a good one cannot be told "
+               "from a bad one; forget them and re-drive the route.\n\n"
                "Nothing is ever written into the game install.");
+
+    {
+        float age = 0.0f;
+        const char *recent = WrSavelocRecent(&age);
+        if (recent && recent[0] && age < 4.0f)
+            ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "%s", recent);
+    }
+
+    int nLocs = WrSavelocCount();
+    if (nLocs > 0)
+    {
+        if (ImGui::BeginTable("##savelocs", 4,
+                              ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders |
+                              ImGuiTableFlags_ScrollY,
+                              ImVec2(0.0f, 150.0f)))
+        {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 30.0f);
+            ImGui::TableSetupColumn("time", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+            ImGui::TableSetupColumn("split", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+            ImGui::TableSetupColumn("where", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableHeadersRow();
+
+            float prevTime = -1.0f;
+            for (int i = 0; i < nLocs; i++)
+            {
+                WrSavelocRow row;
+                if (!WrSavelocAt(i, &row))
+                    continue;
+                ImGui::TableNextRow();
+                ImGui::PushID(i);
+
+                ImGui::TableNextColumn();
+                ImGui::Text("%d", i + 1);
+
+                ImGui::TableNextColumn();
+                if (row.seconds >= 0.0f)
+                {
+                    char t[32];
+                    FormatTime(row.seconds, t, sizeof(t));
+                    if (row.suspect)
+                        ImGui::TextDisabled("%s ?", t);
+                    else
+                        ImGui::Text("%s", t);
+                }
+                else
+                {
+                    ImGui::TextDisabled("--");
+                }
+
+                // Splits, so a chain of save-locs reads as a route rather than
+                // as a column of absolute times.
+                ImGui::TableNextColumn();
+                if (row.seconds >= 0.0f && prevTime >= 0.0f &&
+                    row.seconds > prevTime)
+                    ImGui::TextDisabled("+%.2f", row.seconds - prevTime);
+                else
+                    ImGui::TextDisabled(" ");
+                if (row.seconds >= 0.0f)
+                    prevTime = row.seconds;
+
+                ImGui::TableNextColumn();
+                ImGui::TextDisabled("%.0f %.0f %.0f", row.pos.x, row.pos.y,
+                                    row.pos.z);
+                if (row.seconds >= 0.0f)
+                {
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("forget"))
+                        WrSavelocForget(i);
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+        if (WrSavelocTimedCount() > 0 && ImGui::Button("Forget all times here"))
+            WrSavelocForgetAll();
+    }
 
     // --- the comparison -----------------------------------------------------
     ImGui::SeparatorText("Comparison");

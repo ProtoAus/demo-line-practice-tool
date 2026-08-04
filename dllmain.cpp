@@ -101,6 +101,13 @@ void WrIdleTick(void)
         WrEnergySample(cam, dt);
         WrEnergyTickArrow(dt);
 
+        // Save-locs BEFORE the clock, and that ordering is a fix rather than a
+        // preference. The other way round, loading an untimed save-loc restored
+        // nothing and then stamped that save-loc with the PRE-load clock,
+        // permanently -- which is how entries reading 0.000 got onto disk, after
+        // which they restored as 0.000 for ever. It is handed the clock as it
+        // stands now, which is what a save-loc created this frame deserves.
+        WrSavelocRefresh(map, WrTimerElapsed(), WrTimerRunning());
         WrTimerTick(cam, dt);
 
         // Not while held: a paused demo would otherwise stamp the same point
@@ -115,8 +122,6 @@ void WrIdleTick(void)
                 vel = WrVec(0.0f, 0.0f, 0.0f);
             WrLiveRecord(feet, vel, WrTimerElapsed());
         }
-        WrSavelocRefresh(map);
-        WrSavelocTick(cam, WrTimerElapsed(), WrTimerRunning());
     }
 
     // Advance a couple of pending Steam avatar lookups. Does nothing unless a

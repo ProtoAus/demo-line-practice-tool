@@ -16,10 +16,17 @@
 #define MATCH_RADIUS 24.0f
 #define MATCH_VERTICAL 96.0f
 
+// Sidecar format version. 1 had no header line and keyed on position alone; its
+// times were also written by the proximity bug, so they load as `suspect`.
+#define SIDECAR_VERSION 2
+#define SIDECAR_TAG "wrlines-savelocs"
+
 struct Saveloc
 {
     Vec3 pos;
     float ourTime;      // seconds, or -1 when we have never timed it
+    int ordinal;        // among entries sharing this position, in file order
+    bool suspect;       // time came from a v1 sidecar
 };
 
 static CRITICAL_SECTION g_cs;
@@ -34,7 +41,17 @@ static char g_status[160] = "not looked yet";
 static long long g_mtime = 0;
 static volatile LONG g_busy = 0;
 static HANDLE g_thread = NULL;
-static float g_elapsed = 0.0f;
+
+// The run clock as it stood when a change to the game's file was noticed. This
+// is what a newly created save-loc is stamped with, and capturing it here rather
+// than when the read finishes is the point: the read is on a background thread
+// and takes as long as it takes.
+static float g_stampClock = -1.0f;
+static bool g_stampValid = false;
+
+// Something worth showing on screen for a moment.
+static char g_recent[96] = {0};
+static float g_recentAge = 1e9f;
 
 static void EnsureCs(void)
 {
@@ -157,6 +174,26 @@ static bool ParseGameFile(const char *map, Saveloc *out, int maxOut, int *count)
 // Our sidecar
 // ---------------------------------------------------------------------------
 
+// Number each entry among those sharing its position, in file order. Without
+// this two save-locs at the same respawn point are indistinguishable, and the
+// nearest-wins search below always picks whichever came first.
+static void AssignOrdinals(Saveloc *locs, int count)
+{
+    for (int i = 0; i < count; i++)
+    {
+        int n = 0;
+        for (int j = 0; j < i; j++)
+        {
+            float dx = locs[j].pos.x - locs[i].pos.x;
+            float dy = locs[j].pos.y - locs[i].pos.y;
+            float dz = locs[j].pos.z - locs[i].pos.z;
+            if (dx * dx + dy * dy + dz * dz < 1.0f)
+                n++;
+        }
+        locs[i].ordinal = n;
+    }
+}
+
 static void LoadSidecar(const char *map, Saveloc *locs, int count, int *timed)
 {
     *timed = 0;
@@ -164,30 +201,60 @@ static void LoadSidecar(const char *map, Saveloc *locs, int count, int *timed)
     if (fopen_s(&f, SidecarPath(map), "r") != 0 || !f)
         return;
 
+    int version = 1;        // no tag line means the original format
     char line[256];
     while (fgets(line, sizeof(line), f))
     {
-        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r')
+        if (line[0] == '\n' || line[0] == '\r')
             continue;
+        if (line[0] == '#')
+        {
+            int v = 0;
+            if (sscanf_s(line, "# " SIDECAR_TAG " %d", &v) == 1 && v > 0)
+                version = v;
+            continue;
+        }
+
         float x, y, z, t;
-        if (sscanf_s(line, "%f %f %f %f", &x, &y, &z, &t) != 4)
+        int ord = 0;
+        if (version >= 2)
+        {
+            if (sscanf_s(line, "%f %f %f %d %f", &x, &y, &z, &ord, &t) != 5)
+                continue;
+        }
+        else if (sscanf_s(line, "%f %f %f %f", &x, &y, &z, &t) != 4)
+        {
             continue;
+        }
+
         for (int i = 0; i < count; i++)
         {
+            if (locs[i].ourTime >= 0.0f)
+                continue;
             float dx = locs[i].pos.x - x, dy = locs[i].pos.y - y;
             float dz = locs[i].pos.z - z;
-            if (dx * dx + dy * dy + dz * dz < 1.0f)
-            {
-                locs[i].ourTime = t;
-                (*timed)++;
-                break;
-            }
+            if (dx * dx + dy * dy + dz * dz >= 1.0f)
+                continue;
+            // In v2 the ordinal disambiguates a shared position. In v1 there is
+            // none, so the first untimed match takes it -- which is the
+            // ambiguity that version exists to record.
+            if (version >= 2 && locs[i].ordinal != ord)
+                continue;
+            locs[i].ourTime = t;
+            locs[i].suspect = (version < SIDECAR_VERSION);
+            (*timed)++;
+            break;
         }
     }
     fclose(f);
 }
 
-static void SaveSidecar(const char *map)
+// Takes a snapshot rather than reading the shared array. It used to be called
+// after LeaveCriticalSection and read g_locs/g_count/g_map directly, while the
+// background reader could be memcpy-ing over all three -- and it does file I/O,
+// so holding the lock across it instead would put a synchronous disk write
+// inside Present with a background thread waiting on it.
+static void SaveSidecar(const char *map, const Saveloc *locs, int count)
 {
     char dir[MAX_PATH];
     strcpy_s(dir, sizeof(dir), WrDataPath("savelocs"));
@@ -196,16 +263,42 @@ static void SaveSidecar(const char *map)
     FILE *f = NULL;
     if (fopen_s(&f, SidecarPath(map), "w") != 0 || !f)
         return;
+    fprintf(f, "# " SIDECAR_TAG " %d\n", SIDECAR_VERSION);
     fprintf(f, "# WrLines: our own elapsed time at each of this map's save-locs.\n");
     fprintf(f, "# Momentum's savedlocs.txt has a \"time\" field but never fills\n");
-    fprintf(f, "# it in, so this is where ours lives. Keyed on position, because\n");
-    fprintf(f, "# save-loc indices renumber when one is deleted.\n");
-    fprintf(f, "# x y z seconds\n");
-    for (int i = 0; i < g_count; i++)
-        if (g_locs[i].ourTime >= 0.0f)
-            fprintf(f, "%.1f %.1f %.1f %.3f\n", g_locs[i].pos.x, g_locs[i].pos.y,
-                    g_locs[i].pos.z, g_locs[i].ourTime);
+    fprintf(f, "# it in, so this is where ours lives. Keyed on position (indices\n");
+    fprintf(f, "# renumber when one is deleted) plus an ordinal, because several\n");
+    fprintf(f, "# save-locs commonly share a respawn point.\n");
+    fprintf(f, "# x y z ordinal seconds\n");
+    for (int i = 0; i < count; i++)
+    {
+        // Zero is refused. The clock only starts once you leave the anchor, so
+        // 0.000 can only mean it was stamped before the clock ran -- and every
+        // 0.000 already on disk came from exactly that bug, then restored itself
+        // for ever afterwards.
+        if (locs[i].ourTime <= 0.0f)
+            continue;
+        fprintf(f, "%.1f %.1f %.1f %d %.3f\n", locs[i].pos.x, locs[i].pos.y,
+                locs[i].pos.z, locs[i].ordinal, locs[i].ourTime);
+    }
     fclose(f);
+}
+
+// Copy out under the lock, write outside it.
+static void FlushSidecar(void)
+{
+    static Saveloc snap[MAX_SAVELOCS];
+    char map[72];
+    int n;
+
+    EnterCriticalSection(&g_cs);
+    n = g_count;
+    memcpy(snap, g_locs, sizeof(Saveloc) * (size_t)n);
+    strcpy_s(map, sizeof(map), g_map);
+    LeaveCriticalSection(&g_cs);
+
+    if (map[0])
+        SaveSidecar(map, snap, n);
 }
 
 // ---------------------------------------------------------------------------
@@ -225,30 +318,63 @@ static DWORD WINAPI ReadThread(LPVOID)
 
     int timed = 0;
     if (ok)
+    {
+        AssignOrdinals(found, n);
         LoadSidecar(map, found, n, &timed);
+    }
 
+    bool dirty = false;
     EnterCriticalSection(&g_cs);
     if (ok)
     {
+        bool firstForMap = (g_count == 0 && g_timed == 0);
+
         // Carry forward times for save-locs that are still there, so a re-read
-        // triggered by the user making a new one does not lose the others.
+        // triggered by the user making a new one does not lose the others, and
+        // note which entries matched nothing we already knew.
         for (int i = 0; i < n; i++)
         {
             if (found[i].ourTime >= 0.0f)
                 continue;
+            bool matched = false;
             for (int j = 0; j < g_count; j++)
             {
-                if (g_locs[j].ourTime < 0.0f)
-                    continue;
                 float dx = g_locs[j].pos.x - found[i].pos.x;
                 float dy = g_locs[j].pos.y - found[i].pos.y;
                 float dz = g_locs[j].pos.z - found[i].pos.z;
-                if (dx * dx + dy * dy + dz * dz < 1.0f)
+                if (dx * dx + dy * dy + dz * dz >= 1.0f)
+                    continue;
+                if (g_locs[j].ordinal != found[i].ordinal)
+                    continue;
+                matched = true;
+                if (g_locs[j].ourTime >= 0.0f)
                 {
                     found[i].ourTime = g_locs[j].ourTime;
+                    found[i].suspect = g_locs[j].suspect;
                     timed++;
-                    break;
                 }
+                break;
+            }
+
+            // THIS is a save-loc that was just made: the game's file changed,
+            // and the re-read turned up an entry that matches nothing we held.
+            // Not "the player is standing near an untimed one", which is what
+            // this used to test and which fires every time you walk past.
+            //
+            // Suppressed on the first read for a map, where "new" only means
+            // "we have not looked here before".
+            if (!matched && !firstForMap && g_stampValid && g_stampClock > 0.0f)
+            {
+                found[i].ourTime = g_stampClock;
+                found[i].suspect = false;
+                timed++;
+                dirty = true;
+                WrLogf("saveloc: a NEW save-loc at (%.0f %.0f %.0f) stamped with "
+                       "%.2fs", found[i].pos.x, found[i].pos.y, found[i].pos.z,
+                       g_stampClock);
+                _snprintf_s(g_recent, sizeof(g_recent), _TRUNCATE,
+                            "save-loc saved at %.2fs", g_stampClock);
+                g_recentAge = 0.0f;
             }
         }
 
@@ -268,13 +394,18 @@ static DWORD WINAPI ReadThread(LPVOID)
     }
     LeaveCriticalSection(&g_cs);
 
+    if (dirty)
+        FlushSidecar();
+
     InterlockedExchange(&g_busy, 0);
     return 0;
 }
 
-void WrSavelocRefresh(const char *map)
+void WrSavelocRefresh(const char *map, float elapsed, bool running)
 {
     EnsureCs();
+    if (g_recentAge < 1e8f)
+        g_recentAge += 1.0f / 200.0f;   // aged approximately; display only
     if (!map || !*map || !WrGameDir()[0])
         return;
 
@@ -296,6 +427,12 @@ void WrSavelocRefresh(const char *map)
         return;
     g_mtime = mtime;
 
+    // Captured HERE, not when the read finishes. The read is on a background
+    // thread and takes as long as it takes; the clock that belongs to a new
+    // save-loc is the one at the instant the file changed.
+    g_stampClock = elapsed;
+    g_stampValid = running && !mapChanged;
+
     if (InterlockedCompareExchange(&g_busy, 1, 0) != 0)
         return;
     if (g_thread)
@@ -306,46 +443,6 @@ void WrSavelocRefresh(const char *map)
     g_thread = CreateThread(NULL, 0, ReadThread, NULL, 0, NULL);
     if (!g_thread)
         InterlockedExchange(&g_busy, 0);
-}
-
-// Stamp a save-loc that has no time yet and that the player is standing on.
-//
-// That is what "the user just made a save-loc" looks like from out here: the
-// file's timestamp changed, the re-read turned up an entry we have never timed,
-// and the player is at it. There is no need to know which command they typed.
-void WrSavelocTick(const Vec3 &cam, float elapsed, bool running)
-{
-    if (!g_csReady || !running)
-        return;
-    g_elapsed = elapsed;
-
-    EnterCriticalSection(&g_cs);
-    int best = -1;
-    float bestD = MATCH_RADIUS * MATCH_RADIUS;
-    for (int i = 0; i < g_count; i++)
-    {
-        if (g_locs[i].ourTime >= 0.0f)
-            continue;                   // already timed; leave it alone
-        float dz = g_locs[i].pos.z - cam.z;
-        if (dz > MATCH_VERTICAL || dz < -MATCH_VERTICAL)
-            continue;
-        float dx = g_locs[i].pos.x - cam.x, dy = g_locs[i].pos.y - cam.y;
-        float d = dx * dx + dy * dy;
-        if (d < bestD) { bestD = d; best = i; }
-    }
-    bool dirty = false;
-    if (best >= 0)
-    {
-        g_locs[best].ourTime = elapsed;
-        g_timed++;
-        dirty = true;
-        WrLogf("saveloc: stamped the one at (%.0f %.0f %.0f) with %.2fs",
-               g_locs[best].pos.x, g_locs[best].pos.y, g_locs[best].pos.z,
-               elapsed);
-    }
-    LeaveCriticalSection(&g_cs);
-    if (dirty)
-        SaveSidecar(g_map);
 }
 
 bool WrSavelocTimeAt(const Vec3 &pos, float *seconds)
@@ -378,5 +475,72 @@ bool WrSavelocTimeAt(const Vec3 &pos, float *seconds)
 int WrSavelocCount(void) { return g_count; }
 int WrSavelocTimedCount(void) { return g_timed; }
 const char *WrSavelocStatus(void) { return g_status; }
+
+bool WrSavelocAt(int index, WrSavelocRow *out)
+{
+    if (!g_csReady)
+        return false;
+    bool ok = false;
+    EnterCriticalSection(&g_cs);
+    if (index >= 0 && index < g_count)
+    {
+        if (out)
+        {
+            out->pos = g_locs[index].pos;
+            out->seconds = g_locs[index].ourTime;
+            out->suspect = g_locs[index].suspect;
+        }
+        ok = true;
+    }
+    LeaveCriticalSection(&g_cs);
+    return ok;
+}
+
+void WrSavelocForget(int index)
+{
+    if (!g_csReady)
+        return;
+    bool dirty = false;
+    EnterCriticalSection(&g_cs);
+    if (index >= 0 && index < g_count && g_locs[index].ourTime >= 0.0f)
+    {
+        g_locs[index].ourTime = -1.0f;
+        g_locs[index].suspect = false;
+        if (g_timed > 0) g_timed--;
+        dirty = true;
+    }
+    LeaveCriticalSection(&g_cs);
+    if (dirty)
+        FlushSidecar();
+}
+
+void WrSavelocForgetAll(void)
+{
+    if (!g_csReady)
+        return;
+    EnterCriticalSection(&g_cs);
+    for (int i = 0; i < g_count; i++)
+    {
+        g_locs[i].ourTime = -1.0f;
+        g_locs[i].suspect = false;
+    }
+    g_timed = 0;
+    LeaveCriticalSection(&g_cs);
+    FlushSidecar();
+    WrLogf("saveloc: every time for this map forgotten, on request");
+}
+
+const char *WrSavelocRecent(float *ageSeconds)
+{
+    if (ageSeconds) *ageSeconds = g_recentAge;
+    return g_recent;
+}
+
+void WrSavelocNoteRestore(float seconds)
+{
+    _snprintf_s(g_recent, sizeof(g_recent), _TRUNCATE,
+                "clock restored to %.2fs", seconds);
+    g_recentAge = 0.0f;
+}
 
 void WrSavelocShutdown(void) {}

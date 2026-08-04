@@ -40,6 +40,15 @@ float WrTimerElapsed(void);
 // Force the clock, for a save-loc load or a manual set.
 void WrTimerSet(float seconds, const char *why);
 
+// Run the clock without an anchor. This exists because "no anchor" used to mean
+// "no clock at all", which silently disabled save-loc timing for anyone who was
+// not chasing a loaded run -- and made practising a map by chaining save-locs
+// impossible, which is the thing people actually want it for.
+void WrTimerStart(void);
+void WrTimerStop(void);
+void WrTimerZero(void);
+bool WrTimerManual(void);
+
 // Your time against the reference run's time at the point of its line nearest
 // you. Returns false when there is nothing honest to compare:
 //
