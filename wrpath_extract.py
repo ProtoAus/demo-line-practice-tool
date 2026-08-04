@@ -1599,8 +1599,8 @@ def cmd_fetch(args):
     have = _have_hashes(args.game)
     print("map %s (id %d), track %d/%d, want the top %d"
           % (name, map_id, args.track_type, args.track_num, limit))
-    print("%d demos already on disk; only what is missing will be fetched"
-          % len(have))
+    print("%d demos on disk across every map; each run below is checked against "
+          "all of them by hash" % len(have))
 
     def get(url):
         req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
@@ -1610,6 +1610,7 @@ def cmd_fetch(args):
     # One page at a time, never in parallel.
     wanted = []
     skip = 0
+    total = None
     while len(wanted) < limit:
         take = min(FETCH_PAGE, limit - len(wanted))
         url = ("%s/maps/%d/leaderboard?gamemode=%d&trackType=%d&trackNum=%d"
@@ -1624,13 +1625,26 @@ def cmd_fetch(args):
             print("[!] leaderboard request failed: %s" % e)
             return 1
         rows = page.get("data") or []
+        if total is None:
+            total = page.get("totalCount")
+            # The number people actually want to know, and the reason the map
+            # list cannot answer it: this costs a request, per map, per track.
+            if isinstance(total, int):
+                print("the leaderboard holds %d run%s for this track"
+                      % (total, "" if total == 1 else "s"))
         if not rows:
             break
         wanted.extend(rows)
         skip += len(rows)
-        if skip >= (page.get("totalCount") or 0):
+        if skip >= (total or 0):
             break
         time.sleep(FETCH_DELAY)
+
+    if not wanted:
+        print("no runs on this track. If the map has stages or bonuses, the "
+              "main track can be empty while the stages are not -- try "
+              "--track-type 1 --track-num 1.")
+        return 0
 
     todo = [r for r in wanted
             if isinstance(r.get("replayHash"), str)
@@ -1638,13 +1652,18 @@ def cmd_fetch(args):
             and r.get("downloadURL")]
     print("%d of the top %d are already here; %d to fetch"
           % (len(wanted) - len(todo), len(wanted), len(todo)))
-    if not todo:
-        return 0
+
+    # In a browse, list the whole page and mark what is already here, so this
+    # doubles as "show me the leaderboard" rather than only "show me the gap".
     if args.dry_run:
-        for r in todo:
-            print("  would fetch rank %s  %.3fs  %s" %
-                  (r.get("rank"), (r.get("time") or 0.0),
-                   (r.get("user") or {}).get("alias", "?")))
+        for r in wanted:
+            h = r.get("replayHash")
+            mark = "have" if (isinstance(h, str) and h.lower() in have) else "  --"
+            print("  %s  rank %-5s %8.3fs  %s"
+                  % (mark, r.get("rank"), (r.get("time") or 0.0),
+                     (r.get("user") or {}).get("alias", "?")))
+        return 0
+    if not todo:
         return 0
 
     os.makedirs(dest, exist_ok=True)
@@ -1673,7 +1692,30 @@ def cmd_fetch(args):
     return 0
 
 
+def _readable_stdout():
+    """Never die on a player's name.
+
+    Python picks stdout's encoding from the locale, and when the DLL launches
+    this the locale is cp1252 -- so the first alias with a character outside it
+    raised UnicodeEncodeError and took the whole download with it, mid-fetch,
+    after the demos before it had already been written. Momentum is an
+    international game; this was not an edge case, it was a matter of time.
+
+    Two things had to be true. Printing a name must never be able to fail, and
+    it must not fail *quietly* either -- so anything unrepresentable becomes a
+    replacement character rather than being dropped. The panel's font only has
+    Latin glyphs anyway, so an unfamiliar alias renders as boxes there; the
+    demo still downloads under its hash, which is the part that matters.
+    """
+    for s in (sys.stdout, sys.stderr):
+        try:
+            s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass    # Python < 3.7, or a stream that does not support it
+
+
 def main(argv):
+    _readable_stdout()
     ap = argparse.ArgumentParser(
         description="Extract run paths from Momentum Mod .mtv demos.")
     ap.add_argument("--game", default=DEFAULT_GAME, help="game install directory")
