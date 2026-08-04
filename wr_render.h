@@ -33,6 +33,9 @@ struct WrRenderSettings
     bool drawDipSpeeds;         // the toggle for ramp-bottom labels as a whole
     int maxDipsPerRun;
     unsigned int dipLabel;      // WR_LABEL_* mask
+    bool drawPeaks;             // the same, at the tops
+    int maxPeaksPerRun;
+    unsigned int peakLabel;     // WR_LABEL_* mask
     unsigned int markerLabel;   // WR_LABEL_* mask
     int maxMarkersPerRun;
     int maxLabelsPerFrame;      // across every run; labels crowd faster than lines

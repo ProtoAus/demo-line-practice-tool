@@ -112,6 +112,17 @@ struct WrRun
     int *dips;
     int dipCount;
 
+    // Tops: where the path stops climbing and starts descending. The mirror of
+    // dips and found the same way, which is why they are exact here and merely
+    // approximate live -- a stored run's vz is a clean central difference of
+    // dense samples, and yours is a camera differenced over 40 ms.
+    //
+    // A bottom says what a line carried THROUGH a ramp; a top says what it
+    // bought with it. Reading only one of the two tells you a surfer lost speed
+    // without telling you whether they got height for it.
+    int *peaks;
+    int peakCount;
+
     // Per-point air-strafing efficiency, as a signed byte over [-1, +1]:
     // dE/dt divided by the most air acceleration could physically add. See
     // wr_stress.h -- in particular for why this is NOT a turn-rate metric.
@@ -138,6 +149,11 @@ struct WrRun
 
     float speedMin, speedMax;   // for colour-by-speed
     float pathLength;
+
+    // Energy against distance and time, for the Graphs tab. Built on demand
+    // rather than at load -- see wr_profile.h for why this one array is cached
+    // when the per-point energy deliberately is not.
+    struct WrProfile *profile;
 
     bool enabled;
     unsigned int colour;        // ImGui packed ABGR

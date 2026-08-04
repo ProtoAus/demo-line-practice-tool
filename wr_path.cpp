@@ -1,6 +1,7 @@
 // wr_path.cpp  --  see wr_path.h.
 
 #include "wr_path.h"
+#include "wr_profile.h"
 #include "wr_stress.h"
 #include "wr_energy.h"
 #include "wr_engine.h"
@@ -90,8 +91,11 @@ static void FreeRuns(void)
             free(g_runs[i].breaks);
         if (g_runs[i].dips)
             free(g_runs[i].dips);
+        if (g_runs[i].peaks)
+            free(g_runs[i].peaks);
         if (g_runs[i].eff)
             free(g_runs[i].eff);
+        WrProfileFree(&g_runs[i]);
     }
     memset(g_runs, 0, sizeof(g_runs));
     g_runCount = 0;
@@ -179,6 +183,79 @@ static void FindDips(WrRun *run)
         else
         {
             run->dipCount = n;
+        }
+    }
+}
+
+// Tops: where the path stops climbing and starts falling. An exact mirror of
+// FindDips, down to the hysteresis, so a top and a bottom are found by the same
+// rule and a run cannot have plausible bottoms and implausible tops.
+//
+// Note which climb the threshold applies to. A dip needs a real DESCENT before
+// it; a peak needs a real CLIMB. Reusing WR_DIP_MIN_DROP for both is deliberate
+// -- it is a "this is a feature, not a wobble" height and the number that keeps
+// a flat section from vanishing under labels does not care about direction.
+static void FindPeaks(WrRun *run)
+{
+    run->peaks = NULL;
+    run->peakCount = 0;
+    if (run->pointCount < 8)
+        return;
+
+    for (int pass = 0; pass < 2; pass++)
+    {
+        int n = 0;
+        int last = -WR_DIP_MIN_GAP;
+        float lowZ = run->points[0].pos.z;       // lowest point since falling
+        float peakZ = run->points[0].pos.z;      // highest since we started up
+        bool rising = false;
+
+        for (int i = 1; i < run->pointCount; i++)
+        {
+            float z = run->points[i].pos.z;
+            float vz = run->points[i].vel.z;
+
+            if (vz > 0.0f)
+            {
+                if (!rising)
+                {
+                    rising = true;
+                    peakZ = z;
+                }
+                if (z > peakZ)
+                    peakZ = z;
+                if (z < lowZ)
+                    lowZ = z;
+            }
+            else if (rising)
+            {
+                if ((peakZ - lowZ) >= WR_DIP_MIN_DROP && (i - last) >= WR_DIP_MIN_GAP)
+                {
+                    if (pass == 1 && run->peaks)
+                        run->peaks[n] = i;
+                    n++;
+                    last = i;
+                }
+                rising = false;
+                lowZ = z;
+            }
+            else if (z < lowZ)
+            {
+                lowZ = z;
+            }
+        }
+
+        if (pass == 0)
+        {
+            if (n == 0)
+                return;
+            run->peaks = (int *)malloc(sizeof(int) * n);
+            if (!run->peaks)
+                return;
+        }
+        else
+        {
+            run->peakCount = n;
         }
     }
 }
@@ -358,6 +435,7 @@ static bool LoadOne(const char *path, WrRun *run)
     }
 
     FindDips(run);
+    FindPeaks(run);
     CheckTimes(run);        // after breaks: a break makes the clock untrustworthy
     FindEfficiency(run);    // after breaks: never differences across a teleport
 
@@ -758,7 +836,7 @@ int WrRunEnabledCount(void)
     return n;
 }
 
-void WrPathShutdown(void) { FreeRuns(); }
+void WrPathShutdown(void) { FreeRuns(); WrProfileShutdown(); }
 
 // ---------------------------------------------------------------------------
 // Available maps (whatever the extractor has produced)

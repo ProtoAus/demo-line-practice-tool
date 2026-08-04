@@ -85,6 +85,14 @@ void WrRenderDefaults(void)
     g_render.drawDipSpeeds = true;
     g_render.maxDipsPerRun = 24;
     g_render.dipLabel = WR_LABEL_SPEED;
+
+    // Tops default OFF, unlike bottoms. Every arc has one of each, so turning
+    // both on doubles the numbers on screen, and the bottom is the one that
+    // answers "did this line carry its speed". A top is what you turn on when
+    // you are asking a narrower question.
+    g_render.drawPeaks = false;
+    g_render.maxPeaksPerRun = 24;
+    g_render.peakLabel = WR_LABEL_ENERGY;
     g_render.markerLabel = WR_LABEL_TIME;
     g_render.maxMarkersPerRun = 24;
     // A label is far bigger than a line segment and cannot be decimated, so the
@@ -683,22 +691,33 @@ static bool DrawLabel(ImDrawList *dl, ImVec2 at, const char *text,
     return true;
 }
 
-// Numbers at the bottom of each ramp -- where the line stops falling and starts
-// climbing. Drawn in the run's own colour so a number can be traced back to a
-// line when several are on screen.
-static void EmitDips(ImDrawList *dl, const WrRun *run)
+// Numbers at the turning points of a line: the bottom of each ramp, where it
+// stops falling and starts climbing, and the top of each arc, where it stops
+// climbing and starts falling. Drawn in the run's own colour so a number can be
+// traced back to a line when several are on screen.
+//
+// One function for both because they differ in exactly two things -- which
+// index list to walk, and which way the tick points -- and having written them
+// separately once, the second copy immediately drifted.
+static void EmitTurns(ImDrawList *dl, const WrRun *run, bool tops)
 {
-    if (!g_render.drawDipSpeeds || !g_render.dipLabel)
+    bool on = tops ? g_render.drawPeaks : g_render.drawDipSpeeds;
+    unsigned int what = tops ? g_render.peakLabel : g_render.dipLabel;
+    const int *list = tops ? run->peaks : run->dips;
+    int listCount = tops ? run->peakCount : run->dipCount;
+    int budget = tops ? g_render.maxPeaksPerRun : g_render.maxDipsPerRun;
+
+    if (!on || !what)
         return;
-    if (!run->dips || run->dipCount <= 0)
+    if (!list || listCount <= 0)
         return;
 
     const float maxDistSqr = g_render.maxDrawDistance * g_render.maxDrawDistance;
     int drawn = 0;
 
-    for (int i = 0; i < run->dipCount && drawn < g_render.maxDipsPerRun; i++)
+    for (int i = 0; i < listCount && drawn < budget; i++)
     {
-        int idx = run->dips[i];
+        int idx = list[i];
         if (idx < 0 || idx >= run->pointCount)
             continue;
 
@@ -716,17 +735,21 @@ static void EmitDips(ImDrawList *dl, const WrRun *run)
         // offered on runs whose recovered timing survived the trust test --
         // 0.36x to 10.32x on the worst map measured. See CheckTimes.
         char label[128];
-        BuildLabel(label, sizeof(label), g_render.dipLabel, p,
+        BuildLabel(label, sizeof(label), what, p,
                    p->t * run->timeScale, run->timingTrusted);
         if (!label[0])
             continue;
 
         // A short tick so the number is clearly attached to this point on the
-        // line rather than floating near it.
-        ImVec2 tp(s.x + 4.0f, s.y - 16.0f);
+        // line rather than floating near it, and pointing the way the label
+        // sits: down from a top, up from a bottom. Without that the two kinds
+        // of number are indistinguishable once several are on screen, which is
+        // the whole reason for having both.
+        float side = tops ? 1.0f : -1.0f;
+        ImVec2 tp(s.x + 4.0f, tops ? s.y + 9.0f : s.y - 16.0f);
         if (!DrawLabel(dl, tp, label, WithAlpha(run->colour, 1.0f)))
             continue;
-        dl->AddLine(ImVec2(s.x, s.y), ImVec2(s.x, s.y - 7.0f),
+        dl->AddLine(ImVec2(s.x, s.y), ImVec2(s.x, s.y + 7.0f * side),
                     WithAlpha(run->colour, 0.9f), 1.5f);
         drawn++;
     }
@@ -1666,7 +1689,8 @@ void WrRenderWorld(void)
             continue;
         EmitPath(dl, run->points, run->pointCount, run->breaks, run->breakCount,
                  run->colour, 1.0f, run->eff);
-        EmitDips(dl, run);
+        EmitTurns(dl, run, false);
+        EmitTurns(dl, run, true);
         EmitMarkers(dl, run);
         if (g_render.drawTags)
         {
