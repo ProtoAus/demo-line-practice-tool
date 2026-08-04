@@ -1266,7 +1266,7 @@ static void DrawGraphsTab(void)
             continue;
         }
         const WrProfile *p = WrProfileFor(r);
-        if (!p)
+        if (!p || !p->b || p->n < 2)
         {
             // Still building. Counted here rather than from WrProfilePending,
             // which counts every enabled run -- including the ones past the
@@ -1290,7 +1290,7 @@ static void DrawGraphsTab(void)
     if (g_gLive)
     {
         const WrProfile *lp = WrProfileLive();
-        if (lp && nSeries <= G_MAX_SERIES)
+        if (lp && lp->b && lp->n >= 2 && nSeries <= G_MAX_SERIES)
         {
             series[nSeries].p = lp;
             series[nSeries].run = NULL;
