@@ -52,18 +52,64 @@
 // +0.010 and +0.003. Across 51 surf_demise runs, corr(run time, mean eta) is
 // -0.787.
 //
-// WHERE IT MISLEADS, AND IT DOES
+// THE CEILING IS ON GAIN ONLY, AND THE FIRST VERSION GOT THAT BACKWARDS
+//
+// P_max bounds how fast energy can be ADDED. Nothing bounds how fast it can be
+// taken away: a ramp collision clips the velocity into the surface plane and can
+// remove as much as the geometry likes. So the rejection test has to be
+// one-sided, and the first version of this file made it symmetric. Measured over
+// 865,026 samples from 342 stored runs:
+//
+//     eta > +3     9,675 samples    1.12%   really is a booster
+//     eta < -3   162,601 samples   18.80%   really is a ramp entry
+//
+// 94.4% of the rejections were negative, and those samples carry 94.6% OF ALL
+// ENERGY LOST IN THE WHOLE LIBRARY. Every hard ramp entry -- the most
+// informative thing on a surf line, and the reason this file exists -- was being
+// collapsed to exactly 0.0 and drawn as "nothing is happening". The reported
+// symptom was that the colours made no sense.
+//
+// So only the positive sentinel survives, and it now reports itself as NO DATA
+// rather than sharing a value with free flight.
+//
+// WHERE IT STILL MISLEADS
 //
 //   Map boosters and triggers add energy for free -- dE/dt maxima of +726,
 //   +3116, +9039 and +13142 units/s appear in real runs, up to 350x the ceiling.
-//   Anything past 3x is not the player and is drawn neutral.
+//   Past 3x it is not the player, and it is drawn as a gap rather than as
+//   perfect play.
 //
-//   A ramp collision removes energy with no turning at all, so a red patch on a
-//   ramp entry means a bad entry, not over-turning.
+//   A ramp collision removes energy with no turning at all, so red on a ramp
+//   entry means a bad entry, not over-turning. Every entry costs something, so
+//   short red flecks between long green stretches are what a good run looks
+//   like.
 //
 //   Free flight is eta = 0 exactly. That is correct, not a failure.
 //
 //   On the ground it means nothing at all.
+//
+// THE DEADSTRAFE PERIOD, AND WHY IT DOES NOT MOVE THE CEILING HERE
+//
+// Source's CategorizePosition sets m_surfaceFriction to 0.25 while the player is
+// airborne with 0 < vz <= 140 over a surface too steep to stand on, and
+// AirAccelerate multiplies its accelspeed by that friction. The KZ community
+// calls the result a deadstrafe period. It is real, but it only bites if it
+// pushes accelspeed BELOW the wishspeed cap, and accelspeed is computed from the
+// UNCAPPED wishspeed:
+//
+//     accelspeed = sv_airaccelerate * maxspeed * tick * surfaceFriction
+//
+//     CS:GO KZ    accel  12:   46.9 -> 11.7   below 30, so the cap stops binding
+//     surf        accel 150:  562.5 -> 140.6  still far above 30: no change
+//
+// The crossover is around sv_airaccelerate 32 at 250 maxspeed and a 66.7 tick.
+// Confirmed in the data: p95 of dE/dt is 38.07 across 69,916 samples inside the
+// window and 37.99 across 795,096 outside it, both landing on the theoretical
+// 37.50. If the quarter bit here the in-window figure would sit near 30.3.
+//
+// That measurement shows the achievable GAIN is not reduced. It cannot show
+// whether the friction was set, because at these settings both branches predict
+// the same ceiling -- but the achievable gain is the only thing this file uses.
 
 #ifndef WR_STRESS_H
 #define WR_STRESS_H
@@ -73,27 +119,74 @@
 // sv_air_max_wishspeed. The one Source constant this rests on.
 #define WR_AIR_WISHSPEED 30.0f
 
-// The most energy air strafing can add, in energy units per second. See above.
-static inline float WrAirPowerCeiling(float gravity, float tickInterval)
+// Defaults for the two cvars the ceiling depends on. Nothing here reads cvars,
+// so these are settings; surf servers run 150, and stock Source is 10.
+#define WR_AIR_ACCEL_DEFAULT 150.0f
+#define WR_MAXSPEED_DEFAULT 250.0f
+
+// The most energy air strafing can add, in energy units per second.
+//
+// Two regimes, and which one you are in decides whether the deadstrafe period
+// above matters at all. With c = dot(v, wishdir) and a = min(accelspeed, ws-c),
+// the per-tick gain in |v|^2 is 2ac + a^2, maximised over c at:
+//
+//     ws^2               when accelspeed >= ws   -- the wishspeed cap binds
+//     A*(2*ws - A)       otherwise               -- acceleration binds
+//
+// Pass surfaceFriction 0.25 to ask what the deadstrafe period would do.
+static inline float WrAirPowerCeilingEx(float gravity, float tickInterval,
+                                        float airAccel, float maxSpeed,
+                                        float surfaceFriction)
 {
     if (gravity < 1.0f) gravity = 1.0f;
     if (tickInterval < 1e-4f) tickInterval = 0.015f;
-    return (WR_AIR_WISHSPEED * WR_AIR_WISHSPEED) /
-           (2.0f * gravity * tickInterval);
+    if (airAccel < 0.0f) airAccel = 0.0f;
+    if (maxSpeed < 0.0f) maxSpeed = 0.0f;
+    if (surfaceFriction < 0.0f) surfaceFriction = 0.0f;
+
+    const float ws = WR_AIR_WISHSPEED;
+    float a = airAccel * maxSpeed * tickInterval * surfaceFriction;
+    float dv2 = (a >= ws) ? (ws * ws) : (a * (2.0f * ws - a));
+    return dv2 / (2.0f * gravity * tickInterval);
 }
 
-// Past this much of the ceiling, it was not the player -- it was a booster.
+// The common case: full surface friction at the default cvars.
+static inline float WrAirPowerCeiling(float gravity, float tickInterval)
+{
+    return WrAirPowerCeilingEx(gravity, tickInterval, WR_AIR_ACCEL_DEFAULT,
+                               WR_MAXSPEED_DEFAULT, 1.0f);
+}
+
+// Past this much of the ceiling on the GAIN side, it was not the player -- it
+// was a booster. There is deliberately no matching limit on the loss side; see
+// the header. Losing at 350x the ceiling is a wall, and a wall is worth drawing.
 #define WR_ETA_NOT_PLAYER 3.0f
 
-// Efficiency against the ceiling, clamped to [-1, 1] for display. Values beyond
-// WR_ETA_NOT_PLAYER return exactly 0 and should be drawn neutral.
+// A point with no usable reading: a booster, a window spanning a teleport, or
+// the ends of a run where the centred difference has nothing to difference.
+// -128 is free -- WrEtaToByte clamps to +-127, so it can never be produced by a
+// real measurement.
+#define WR_ETA_NO_DATA ((signed char)-128)
+
+// True when dE/dt is too large to have come from a player strafing.
+static inline bool WrEtaIsNoData(float dEnergyPerSecond, float ceiling)
+{
+    if (ceiling <= 1e-6f)
+        return true;
+    return (dEnergyPerSecond / ceiling) > WR_ETA_NOT_PLAYER;
+}
+
+// Efficiency against the ceiling, clamped to [-1, 1] for display. A booster
+// returns 0, but callers that can distinguish should ask WrEtaIsNoData first --
+// 0 also means free flight, and drawing the two the same is what made this
+// unreadable.
 static inline float WrEfficiency(float dEnergyPerSecond, float ceiling)
 {
     if (ceiling <= 1e-6f)
         return 0.0f;
     float eta = dEnergyPerSecond / ceiling;
-    if (eta > WR_ETA_NOT_PLAYER || eta < -WR_ETA_NOT_PLAYER)
-        return 0.0f;                    // a trigger, not a player
+    if (eta > WR_ETA_NOT_PLAYER)
+        return 0.0f;                    // a booster, not a player
     if (eta > 1.0f) eta = 1.0f;
     if (eta < -1.0f) eta = -1.0f;
     return eta;
@@ -111,6 +204,39 @@ static inline signed char WrEtaToByte(float eta)
 static inline float WrEtaFromByte(signed char b)
 {
     return (float)b / 127.0f;
+}
+
+// ---------------------------------------------------------------------------
+// Bucketing, so that neutral is drawable
+// ---------------------------------------------------------------------------
+//
+// The renderer batches by colour, so eta has to be quantised before it becomes
+// one. This lived inside the draw loop with an EVEN bucket count over a
+// symmetric range, which has no bucket at zero: eta 0 landed on +0.067 and drew
+// as a faintly green grey, while the velocity vector -- not bucketed -- drew the
+// same eta as true neutral. The two indicators disagreed at the one value a
+// player sees most. Out here it can be round-tripped in a test.
+//
+// n must be ODD for a centre bucket to exist. WrEtaBucket(0, n) == n/2 and
+// WrEtaFromBucket(n/2, n) == 0 exactly.
+
+static inline int WrEtaBucket(float eta, int n)
+{
+    if (n < 3) n = 3;
+    if (eta > 1.0f) eta = 1.0f;
+    if (eta < -1.0f) eta = -1.0f;
+    int b = (int)((eta * 0.5f + 0.5f) * (float)(n - 1) + 0.5f);
+    if (b < 0) b = 0;
+    if (b >= n) b = n - 1;
+    return b;
+}
+
+static inline float WrEtaFromBucket(int b, int n)
+{
+    if (n < 3) n = 3;
+    if (b < 0) b = 0;
+    if (b >= n) b = n - 1;
+    return ((float)b / (float)(n - 1)) * 2.0f - 1.0f;
 }
 
 // ---------------------------------------------------------------------------

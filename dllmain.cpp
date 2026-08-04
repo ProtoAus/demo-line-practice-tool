@@ -91,14 +91,22 @@ void WrIdleTick(void)
         // look deliberate and wrong enough to be useless for comparison.
         Vec3 feet = cam;
         feet.z -= g_energy.eyeHeight;
-        WrLiveRecord(feet);
 
         // The energy sampler keeps the raw camera. Its anchor is a camera height
         // too, so the offset cancels there and must not be applied twice.
+        //
+        // It runs BEFORE the recorder now, because the recorder wants the
+        // velocity this frame's sample produces. A frame of lag here would put
+        // the wrong speed on the point it is attached to.
         WrEnergySample(cam, dt);
         WrEnergyTickArrow(dt);
 
         WrTimerTick(cam, dt);
+
+        Vec3 vel;
+        if (!WrEnergyVelocity(&vel))
+            vel = WrVec(0.0f, 0.0f, 0.0f);
+        WrLiveRecord(feet, vel, WrTimerElapsed());
         WrSavelocRefresh(map);
         WrSavelocTick(cam, WrTimerElapsed(), WrTimerRunning());
     }
@@ -125,12 +133,26 @@ void WrIdleTick(void)
 static DWORD WINAPI HotkeyThread(LPVOID)
 {
     bool down = false;
+    bool cycleDown = false;
     for (;;)
     {
         bool now = (GetAsyncKeyState(TOGGLE_KEY) & 0x8000) != 0;
         if (now && !down)
             WrSetMenuOpen(!WrMenuOpen());
         down = now;
+
+        // Cycling the crosshair readout has to work WITHOUT opening the panel,
+        // because the whole point of it is to be changed mid-run. The key is
+        // settable (and clearable) from the Energy tab, since we cannot know
+        // what the player has bound: this reads the key, it does not swallow it,
+        // so a collision means the game acts on it too rather than anything
+        // being broken.
+        int cycleKey = WrUiHudCycleKey();
+        bool cycNow = cycleKey && (GetAsyncKeyState(cycleKey) & 0x8000) != 0;
+        if (cycNow && !cycleDown)
+            WrEnergyCycleHudMode();
+        cycleDown = cycNow;
+
         Sleep(30);
     }
 }

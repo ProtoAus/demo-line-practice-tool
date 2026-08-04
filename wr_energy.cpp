@@ -3,6 +3,7 @@
 #include "wr_energy.h"
 #include "wr_smooth.h"
 #include "wr_stress.h"
+#include "wr_budget.h"
 #include "wr_engine.h"
 #include "wr_log.h"
 
@@ -55,11 +56,19 @@ WrEnergySettings g_energy;
 #define HISTORY 240
 #define HISTORY_HZ 20
 
+// Below this much height spent, banked/spent is a ratio of two small noisy
+// numbers and swings wildly. Costs about two seconds at the top of a map: the
+// surf_demise world record has spent 833 units by 5% of the way through.
+#define CARRIED_MIN_SPEND 500.0f
+
 static WrVelWindow g_win;
 static WrEma g_velX, g_velY, g_velZ;
 static WrEma g_speedEma, g_energyEma, g_viewTurnEma, g_velTurnEma, g_accelEma;
+static WrEma g_zEma;                // the height alone, so K can be separated
 static WrTrendWindow g_trend;
 static WrArrow g_arrow;
+static WrSwing g_swing;
+static bool g_spliced = false;
 
 static float g_clock = 0.0f;
 
@@ -101,6 +110,11 @@ static float g_viewTurn = 0.0f, g_velTurn = 0.0f, g_speedRate = 0.0f;
 // Displayed value, quantised with hysteresis so the last digit stops churning.
 static float g_shown = 0.0f;
 static bool g_haveShown = false;
+static float g_zSmooth = 0.0f;
+static float g_shownSpent = 0.0f;
+static bool g_haveShownSpent = false;
+static float g_shownCarried = 0.0f;
+static bool g_haveShownCarried = false;
 
 static float g_history[HISTORY];
 static float g_historyRel[HISTORY];
@@ -132,6 +146,14 @@ void WrEnergyDefaults(void)
     g_energy.trendSeconds = 0.75f;
     g_energy.quantiseStep = 5.0f;
     g_energy.anchorToRunStart = true;
+    g_energy.hudMode = WR_HUD_NET;
+    g_energy.airAccelerate = WR_AIR_ACCEL_DEFAULT;
+    g_energy.maxSpeed = WR_MAXSPEED_DEFAULT;
+}
+
+void WrEnergyCycleHudMode(void)
+{
+    g_energy.hudMode = (g_energy.hudMode + 1) % WR_HUD_MODE_COUNT;
 }
 
 float WrEnergyOf(const Vec3 &pos, const Vec3 &vel)
@@ -147,10 +169,14 @@ void WrEnergyReset(void)
 {
     WrVelReset(&g_win);
     WrEmaReset(&g_velX); WrEmaReset(&g_velY); WrEmaReset(&g_velZ);
-    WrEmaReset(&g_speedEma); WrEmaReset(&g_energyEma);
+    WrEmaReset(&g_speedEma); WrEmaReset(&g_energyEma); WrEmaReset(&g_zEma);
     WrEmaReset(&g_viewTurnEma); WrEmaReset(&g_velTurnEma); WrEmaReset(&g_accelEma);
     WrTrendReset(&g_trend);
     WrArrowReset(&g_arrow);
+    WrSwingReset(&g_swing, WR_SWING_HYSTERESIS);
+    g_spliced = false;
+    g_haveShownSpent = false;
+    g_haveShownCarried = false;
 
     g_valid = false;
     g_havePos = false;
@@ -225,14 +251,23 @@ static void Teleported(const Vec3 &pos)
     WrVelReset(&g_win);
     WrEmaReset(&g_velX); WrEmaReset(&g_velY); WrEmaReset(&g_velZ);
     WrEmaReset(&g_speedEma); WrEmaReset(&g_energyEma); WrEmaReset(&g_accelEma);
-    WrEmaReset(&g_velTurnEma);
+    WrEmaReset(&g_velTurnEma); WrEmaReset(&g_zEma);
     WrTrendReset(&g_trend);
     WrArrowReset(&g_arrow);
+
+    // The accumulators are SEEDED at the far end, not stepped across the gap. A
+    // save-loc load a thousand units down the map is not a thousand units of
+    // energy thrown away, and stepping would record exactly that -- the harness
+    // runs both and shows the difference.
+    g_swing.have = false;       // re-seeds from the first sample over there
+    g_spliced = true;
 
     g_settledFor = 0.0f;
     g_onGround = false;
     g_haveVelDir = false;
     g_haveShown = false;
+    g_haveShownSpent = false;
+    g_haveShownCarried = false;
     g_historyCount = 0;
 
     if (!g_haveRef)
@@ -248,6 +283,9 @@ static void Teleported(const Vec3 &pos)
     g_restart = true;
     g_haveStart = false;    // re-seeds from the first sample of the new attempt
     g_peak = 0.0f;
+    // A new attempt gets new totals, the same way the clock goes back to zero.
+    WrSwingReset(&g_swing, WR_SWING_HYSTERESIS);
+    g_spliced = false;
     WrLogf("energy: teleported back to the anchor, treating it as a restart");
 }
 
@@ -331,6 +369,14 @@ void WrEnergySample(const Vec3 &pos, float dt)
     // so the arrow, the peak and the plot all agree with what is on screen.
     g_nowSmooth = WrEmaStep(&g_energyEma, g_now, dt, g_energy.smoothSeconds);
     WrTrendPush(&g_trend, g_nowSmooth, dt);
+
+    // The height alone, through the SAME filter and from the SAME instant --
+    // mid.z, not pos.z. Because an EMA is linear, subtracting it from the
+    // filtered energy gives exactly the filtered kinetic term, so the budget
+    // numbers agree with the headline figure rather than nearly agreeing.
+    g_zSmooth = WrEmaStep(&g_zEma, mid.z, dt, g_energy.smoothSeconds);
+
+    WrSwingStep(&g_swing, g_nowSmooth);
 
     // --- turn rates ---------------------------------------------------------
     //
@@ -508,6 +554,58 @@ float WrEnergySinceStart(void)
     return g_haveStart ? (g_nowSmooth - g_start) : 0.0f;
 }
 float WrEnergyPeak(void) { return g_peak; }
+
+bool WrEnergyBudgetNow(WrEnergyBudget *out)
+{
+    if (!g_valid || !g_haveRef)
+        return false;
+    if (!out)
+        return true;
+
+    // `wasted` is taken as the NEGATED headline figure rather than computed
+    // again, so the two can never disagree on screen by a rounding step -- they
+    // are the same number. `banked` is then derived, which makes all three add
+    // up exactly whatever the quantiser does.
+    float rawSpent = g_refZ - g_zSmooth;
+    g_shownSpent = WrQuantise(g_shownSpent, rawSpent, g_energy.quantiseStep,
+                              &g_haveShownSpent);
+
+    out->spent = g_shownSpent;
+    out->wasted = -WrEnergyRelative();
+    out->banked = out->spent - out->wasted;
+
+    out->carriedValid = (rawSpent > CARRIED_MIN_SPEND);
+    if (out->carriedValid)
+    {
+        float raw = (out->banked / rawSpent) * 100.0f;
+        // A whole percent, with the same hysteresis the other figures get.
+        g_shownCarried = WrQuantise(g_shownCarried, raw, 1.0f,
+                                    &g_haveShownCarried);
+        out->carried = g_shownCarried;
+    }
+    else
+    {
+        out->carried = 0.0f;
+        g_haveShownCarried = false;
+    }
+    return true;
+}
+
+float WrEnergyGained(void)
+{
+    float g = 0.0f;
+    WrSwingTotals(&g_swing, &g, NULL);
+    return g;
+}
+
+float WrEnergyLost(void)
+{
+    float l = 0.0f;
+    WrSwingTotals(&g_swing, NULL, &l);
+    return l;
+}
+
+bool WrEnergyBudgetSpliced(void) { return g_spliced; }
 bool WrEnergyOnGround(void) { return g_onGround; }
 bool WrEnergyHaveRef(void) { return g_haveRef; }
 float WrEnergyRefZ(void) { return g_haveRef ? g_refZ : 0.0f; }

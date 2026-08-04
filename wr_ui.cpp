@@ -31,6 +31,13 @@
 
 static char g_uiMap[72] = {0};
 
+// Which key cycles the crosshair readout. Read by the hotkey thread; a plain
+// int, written only from the panel, so no synchronisation is needed beyond the
+// atomicity of an aligned 32-bit store.
+static int g_hudCycleKey = VK_END;
+
+int WrUiHudCycleKey(void) { return g_hudCycleKey; }
+
 // "Near me" means within this many units of the camera. 4096 comfortably covers
 // one stage of a surf map without reaching into the next one.
 static float s_nearRadius = 4096.0f;
@@ -603,6 +610,34 @@ static void DrawRunsTab(void)
                            WrRunEnabledCount(), g_render.maxRunsDrawn);
 }
 
+// One row of checkboxes choosing what a label says. The `on` flag stays separate
+// from the content mask so that turning a site off and back on remembers what it
+// was showing.
+static void LabelPicker(const char *title, unsigned int *mask, bool *on)
+{
+    ImGui::PushID(title);
+    ImGui::Checkbox(title, on);
+    if (*on)
+    {
+        static const struct { unsigned int bit; const char *name; } kBits[4] = {
+            { WR_LABEL_SPEED,  "speed" },
+            { WR_LABEL_ENERGY, "energy" },
+            { WR_LABEL_TIME,   "time" },
+            { WR_LABEL_DELTA,  "vs you" },
+        };
+        ImGui::Indent();
+        for (int i = 0; i < 4; i++)
+        {
+            bool set = (*mask & kBits[i].bit) != 0;
+            if (i) ImGui::SameLine();
+            if (ImGui::Checkbox(kBits[i].name, &set))
+                *mask = set ? (*mask | kBits[i].bit) : (*mask & ~kBits[i].bit);
+        }
+        ImGui::Unindent();
+    }
+    ImGui::PopID();
+}
+
 static void DrawDisplayTab(void)
 {
     ImGui::SeparatorText("Line");
@@ -644,16 +679,28 @@ static void DrawDisplayTab(void)
                            "%d runs enabled, %d tags shown -- the rest are unlabelled.",
                            WrRunEnabledCount(), g_render.maxTags);
 
-    ImGui::SeparatorText("Ramp speeds");
-    ImGui::Checkbox("Speed at ramp bottoms", &g_render.drawDipSpeeds);
-    ImGui::SliderInt("Max per run", &g_render.maxDipsPerRun, 1, 100);
-    ImGui::TextDisabled("Horizontal speed where a line stops falling and climbs");
-    ImGui::TextDisabled("again, in that run's own colour.");
-
-    ImGui::SeparatorText("Split markers");
-    ImGui::Checkbox("Draw split markers", &g_render.drawMarkers);
+    ImGui::SeparatorText("Numbers on the line");
+    LabelPicker("At ramp bottoms", &g_render.dipLabel, &g_render.drawDipSpeeds);
+    ImGui::SliderInt("Max ramps per run", &g_render.maxDipsPerRun, 1, 100);
+    ImGui::Spacing();
+    LabelPicker("At checkpoints", &g_render.markerLabel, &g_render.drawMarkers);
     ImGui::SliderFloat("Marker size", &g_render.markerRadius, 2.0f, 16.0f, "%.1f px");
-    ImGui::TextDisabled("Markers are only drawn for runs whose splits could be");
+    ImGui::SliderInt("Max checkpoints per run", &g_render.maxMarkersPerRun, 1, 64);
+    ImGui::Spacing();
+    ImGui::SliderInt("Labels on screen", &g_render.maxLabelsPerFrame, 4, 200);
+    ImGui::SameLine();
+    HelpMarker("Numbers reserve their rectangle and skip if something is already "
+               "there, so they never print on top of each other or of a name "
+               "tag. Whatever does not fit is dropped rather than stacked -- "
+               "Diagnostics shows how many were drawn.\n\n"
+               "Time at a ramp bottom is only offered on runs whose recovered "
+               "timing passed the trust test: point times are derived from the "
+               "sample index, and on the worst map measured that runs from 0.36x "
+               "to 10.32x. A checkpoint's split is measured by the game itself, "
+               "so it is always shown.\n\n"
+               "Your delta appears only where your own recorded path has "
+               "actually been, and says nothing anywhere else.");
+    ImGui::TextDisabled("Checkpoints are only drawn for runs whose splits could be");
     ImGui::TextDisabled("anchored to the path with confidence.");
 
     ImGui::SeparatorText("Where you are going");
@@ -662,23 +709,54 @@ static void DrawDisplayTab(void)
     HelpMarker("From your midsection, along the way you are actually moving, "
                "reaching as far as you will travel in the next quarter second. "
                "Length is time rather than an arbitrary scale, so the tip lands "
-               "on the surface you are about to meet.");
+               "on the surface you are about to meet.\n\n"
+               "Its colour is the same rise/fall signal as the arrow beside your "
+               "crosshair, so the two can never disagree. It used to be live "
+               "strafing efficiency, and that was measuring noise: on a path "
+               "where energy is exactly constant it saturated red or green 14% "
+               "of the time at 2000 u/s and 36% at 3200.");
+
+    ImGui::SeparatorText("Strafing efficiency");
     ImGui::Checkbox("Colour lines by strafing efficiency",
                     &g_render.colourByEfficiency);
     ImGui::SameLine();
-    HelpMarker("Green where a line is gaining energy close to the fastest air "
-               "strafing can physically manage, red where it is throwing energy "
-               "away.\n\n"
-               "This is NOT a turn-rate meter. Turning faster than air "
-               "acceleration alone could manage happens in 10 to 24 percent of "
-               "the samples in every world record measured, because the ramp "
-               "does the turning -- a metric built on that would light up on "
-               "perfect play. What is measured here is the consequence: how "
-               "much of the available energy the strafing actually captured. "
-               "Median on the surf_demise world record is 0.53; on the two "
-               "slowest runs in the same set, 0.01.\n\n"
-               "Boosters add energy for free, so anything past three times the "
-               "ceiling is drawn neutral rather than as perfect play.");
+    HelpMarker(
+        "GREEN means energy is being added. RED means energy is being "
+        "destroyed. The run's own colour, dimmed, means nothing is happening.\n\n"
+        "It is not a score, and it is not a turn-rate meter.\n\n"
+        "GREEN -- strafing is converting mouse movement into speed, near the "
+        "fastest physics allows. Air acceleration can add at most 37 energy "
+        "units per second, the same at 500 u/s as at 3500, and full colour is "
+        "60% of that.\n\n"
+        "DIM -- free flight. Falling, or riding a ramp without gaining. Nothing "
+        "is wrong and nothing is being won. Measured on surf_demise: the world "
+        "record is dim for 6% of its length, the slowest run for 34%. A line "
+        "that is mostly dim means the player is barely strafing.\n\n"
+        "RED -- energy left the system: a ramp entry, a wall clip, a landing. "
+        "EVERY ramp entry costs some, even a perfect one, so red flecks between "
+        "green stretches is what a good run looks like -- the world record is "
+        "41% red. Red is NOT 'you turned too far'. Turning faster than air "
+        "acceleration alone could manage happens in 10 to 24% of every world "
+        "record measured, because the ramp does the turning.\n\n"
+        "FADED -- no reading at all. A booster fired (they add energy for free "
+        "and would otherwise look like perfect strafing), or the line teleports "
+        "nearby. About 0.6% of points.");
+
+    if (g_render.colourByEfficiency)
+    {
+        if (g_render.colourBySpeed)
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
+                               "Efficiency wins, so colour by speed is ignored.");
+        ImGui::Checkbox("Show the key on screen", &g_render.effLegend);
+        ImGui::SameLine();
+        ImGui::Checkbox("Blue/orange instead", &g_render.effColourblind);
+        ImGui::SliderFloat("Full colour at", &g_render.effSaturation,
+                           0.2f, 1.0f, "eta %.2f");
+        ImGui::SliderFloat("Dim below", &g_render.effNeutralBand,
+                           0.0f, 0.5f, "eta %.2f");
+        ImGui::TextDisabled("Measured over 137,006 samples on 50 surf_demise runs:");
+        ImGui::TextDisabled("median eta +0.17, p75 +0.67. 11%% sit inside the dim band.");
+    }
 
     ImGui::SeparatorText("Your own path");
     bool live = WrLiveEnabled();
@@ -914,6 +992,95 @@ static void DrawEnergyTab(void)
                              ImVec2(0.0f, 60.0f));
     }
 
+    // --- the budget ---------------------------------------------------------
+    ImGui::SeparatorText("Budget");
+    WrEnergyBudget bud;
+    if (!WrEnergyBudgetNow(&bud))
+    {
+        ImGui::TextDisabled("Needs an anchor to measure from.");
+    }
+    else
+    {
+        ImGui::Text("spent   %8.0f   height cashed in since the anchor", bud.spent);
+        ImGui::Text("banked  %8.0f   what you still have, as a height", bud.banked);
+        ImGui::Text("wasted  %8.0f   the difference", bud.wasted);
+        if (bud.carriedValid)
+            ImGui::TextColored(bud.carried >= 80.0f
+                                   ? ImVec4(0.4f, 1.0f, 0.4f, 1.0f)
+                                   : ImVec4(1.0f, 1.0f, 1.0f, 1.0f),
+                               "carried %7.0f%%  of the drop kept as speed",
+                               bud.carried);
+        else
+            ImGui::TextDisabled("carried       --   (needs 500 units of drop first)");
+        ImGui::SameLine();
+        HelpMarker(
+            "The same information as the energy figure above, with the big "
+            "numbers going up instead of down.\n\n"
+            "It is an identity, not a second measurement. With K = v^2/2g and "
+            "H the height you have dropped, K - K_start = H + energy, so what "
+            "you are carrying is exactly what you spent plus what you netted. "
+            "'wasted' is the energy figure with its sign flipped -- the same "
+            "number, to the last digit.\n\n"
+            "Over 100% is not a bug. It means air strafing put in more than the "
+            "map gave you, which happens wherever a map climbs -- the fastest "
+            "surf_utopia run finishes at 293%.\n\n"
+            "'spent' is not clamped to only go up, because maps go up too: "
+            "measured median backtrack from the running maximum is 1,465 units "
+            "on surf_demise and 31,160 on surf_vacant. Clamping would hide that "
+            "and break the identity.\n\n"
+            "Measured on 51 surf_demise records, 'carried' at the finish "
+            "correlates -0.978 with run time.");
+
+        ImGui::Text("gained  %8.0f   lost %.0f", WrEnergyGained(), WrEnergyLost());
+        ImGui::SameLine();
+        HelpMarker(
+            "Gross energy added and thrown away, counted separately -- the "
+            "number that only rises when your strafing works.\n\n"
+            "A swing is banked only once the figure has come back by 50 units, "
+            "so an excursion smaller than that contributes exactly zero. That "
+            "matters more than it sounds: simply adding up every rise reads in "
+            "the THOUSANDS on a path where energy is exactly constant, and it "
+            "reads the same at 60 fps as at 500, so a frame-rate check calls "
+            "that noise stable. tests\\test_energy.cpp runs both.\n\n"
+            "Read it as a threshold, not a score. Median gained across 50 "
+            "surf_demise runs, by quartile of run time: 2596, 979, 316, 197. "
+            "Half the runs on that map gain under 500 in total, and every one "
+            "of those is slower than 38.7 s.");
+        if (WrEnergyBudgetSpliced())
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
+                               "totals span a save-loc load");
+    }
+
+    ImGui::Spacing();
+    const char *kModes[WR_HUD_MODE_COUNT] = {
+        "net energy", "carried %", "spent / banked", "gained / lost"
+    };
+    if (g_energy.hudMode < 0 || g_energy.hudMode >= WR_HUD_MODE_COUNT)
+        g_energy.hudMode = 0;
+    ImGui::Combo("Crosshair shows", &g_energy.hudMode, kModes,
+                 WR_HUD_MODE_COUNT);
+
+    static const struct { int vk; const char *name; } kKeys[] = {
+        { 0, "none" }, { VK_END, "End" }, { VK_HOME, "Home" },
+        { VK_NEXT, "Page Down" }, { VK_PRIOR, "Page Up" },
+        { VK_DELETE, "Delete" }, { VK_F9, "F9" }, { VK_F10, "F10" },
+    };
+    const int kKeyCount = (int)(sizeof(kKeys) / sizeof(kKeys[0]));
+    int sel = 0;
+    for (int i = 0; i < kKeyCount; i++)
+        if (kKeys[i].vk == g_hudCycleKey) { sel = i; break; }
+    const char *names[8];
+    for (int i = 0; i < kKeyCount; i++) names[i] = kKeys[i].name;
+    if (ImGui::Combo("Cycle key", &sel, names, kKeyCount))
+        g_hudCycleKey = kKeys[sel].vk;
+    ImGui::SameLine();
+    HelpMarker("Switches the crosshair readout without opening this panel, "
+               "which is the only way it is useful mid-run.\n\n"
+               "It is a list rather than a fixed key because WrLines cannot see "
+               "what you have bound. The key is read, not swallowed -- if it "
+               "collides with something, the game still acts on it, so set this "
+               "to none and use the box above instead.");
+
     // --- the anchor ---------------------------------------------------------
     ImGui::SeparatorText("Anchor");
     WrAnchorSource src = WrEnergyAnchorSource();
@@ -979,7 +1146,7 @@ static void DrawEnergyTab(void)
     HelpMarker("Momentum's save-locs record where you were but not how long it "
                "took to get there -- the file has a \"time\" field and it is "
                "-1 in every one of the 3213 entries on this machine.\n\n"
-               "So WrLines keeps its own note, in wrlines_data\savelocs, keyed "
+               "So WrLines keeps its own note, in wrlines_data\\savelocs, keyed "
                "on position rather than on the save-loc's index (indices "
                "renumber when you delete one). Load a save-loc and the clock "
                "goes back to what it said when you made it.\n\n"
@@ -1041,6 +1208,41 @@ static void DrawEnergyTab(void)
                "to a line's beginning: if the gap sits at a constant offset, "
                "this is the knob that nulls it.");
     ImGui::SliderFloat("Gravity", &g_energy.gravity, 200.0f, 1600.0f, "%.0f");
+    ImGui::SliderFloat("Air accelerate", &g_energy.airAccelerate, 5.0f, 1000.0f,
+                       "%.0f");
+    ImGui::SliderFloat("Max speed", &g_energy.maxSpeed, 100.0f, 500.0f, "%.0f");
+    ImGui::SameLine();
+    HelpMarker(
+        "sv_airaccelerate and sv_maxspeed. Settings, not reads -- WrLines "
+        "touches no cvars. They set the ceiling the efficiency colours are "
+        "measured against.\n\n"
+        "They also decide whether Source's deadstrafe period matters to you. "
+        "CategorizePosition quarters your surface friction while you are "
+        "airborne rising slower than 140 u/s over a ramp, and AirAccelerate "
+        "multiplies by it -- but that only bites if it drops the acceleration "
+        "below the 30 u/s wishspeed cap. At air accelerate 150 the quartered "
+        "value is still 141, so nothing changes; at CS:GO's 12 it falls to 12 "
+        "and the ceiling drops by a third. The crossover is around 32.\n\n"
+        "Checked against the demos on disk: the 95th percentile of energy gain "
+        "is 38.07 units/s across 69,916 samples inside that window and 37.99 "
+        "across 795,096 outside it. No depression, exactly as the arithmetic "
+        "predicts for these settings.");
+    {
+        float tick = 0.015f;
+        float full = WrAirPowerCeilingEx(g_energy.gravity, tick,
+                                         g_energy.airAccelerate,
+                                         g_energy.maxSpeed, 1.0f);
+        float dead = WrAirPowerCeilingEx(g_energy.gravity, tick,
+                                         g_energy.airAccelerate,
+                                         g_energy.maxSpeed, 0.25f);
+        if (dead < full - 0.05f)
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
+                               "ceiling %.1f/s, but %.1f/s while rising slowly "
+                               "over a ramp", full, dead);
+        else
+            ImGui::TextDisabled("ceiling %.1f energy/s; the deadstrafe period "
+                                "does not reduce it here", full);
+    }
     ImGui::SeparatorText("Steadiness");
     ImGui::SliderFloat("Smoothing", &g_energy.smoothSeconds, 0.05f, 1.0f, "%.2f s");
     ImGui::SameLine();

@@ -439,9 +439,15 @@ static void FindEfficiency(WrRun *run)
     run->eff = NULL;
     if (run->pointCount < EFF_WINDOW * 2 + 1)
         return;
-    run->eff = (signed char *)calloc((size_t)run->pointCount, 1);
+    run->eff = (signed char *)malloc((size_t)run->pointCount);
     if (!run->eff)
         return;
+
+    // NO DATA, not neutral. This was calloc'd, so the EFF_WINDOW points at each
+    // end and every window spanning a teleport read as "eta 0" -- the same value
+    // as free flight. A gap in the measurement and a player coasting are not the
+    // same thing and must not draw the same.
+    memset(run->eff, WR_ETA_NO_DATA, (size_t)run->pointCount);
 
     float ceiling = WrAirPowerCeiling(g_energy.gravity, run->tickInterval);
     float dt = run->tickInterval * (float)(EFF_WINDOW * 2);
@@ -468,7 +474,14 @@ static void FindEfficiency(WrRun *run)
 
         float ea = WrEnergyOf(run->points[a].pos, run->points[a].vel);
         float eb = WrEnergyOf(run->points[b].pos, run->points[b].vel);
-        run->eff[i] = WrEtaToByte(WrEfficiency((eb - ea) / dt, ceiling));
+        float power = (eb - ea) / dt;
+
+        // A booster stays no-data. Only the GAIN side is rejected: losing faster
+        // than the ceiling is a ramp entry or a wall, which is 18.8% of all
+        // samples and 94.6% of all energy lost, and is the thing worth seeing.
+        if (WrEtaIsNoData(power, ceiling))
+            continue;
+        run->eff[i] = WrEtaToByte(WrEfficiency(power, ceiling));
     }
 }
 
@@ -829,16 +842,59 @@ const WrPoint *WrLivePoints(int *count)
     return g_live;
 }
 
-void WrLiveRecord(const Vec3 &pos)
+// Linear, but strided coarse-then-refine like MeasureNearest, because this is
+// asked once per drawn label rather than once per frame and the buffer holds
+// 32768 points.
+const WrPoint *WrLiveNearest(const Vec3 &pos, float radius)
+{
+    if (g_liveCount < 1)
+        return NULL;
+
+    int step = g_liveCount / 256;
+    if (step < 1) step = 1;
+
+    int best = -1;
+    float bestSqr = radius * radius;
+    for (int i = 0; i < g_liveCount; i += step)
+    {
+        float d = WrDistSqr(g_live[i].pos, pos);
+        if (d < bestSqr) { bestSqr = d; best = i; }
+    }
+    if (best < 0)
+        return NULL;
+
+    int lo = best - step, hi = best + step;
+    if (lo < 0) lo = 0;
+    if (hi >= g_liveCount) hi = g_liveCount - 1;
+    for (int i = lo; i <= hi; i++)
+    {
+        float d = WrDistSqr(g_live[i].pos, pos);
+        if (d < bestSqr) { bestSqr = d; best = i; }
+    }
+    return &g_live[best];
+}
+
+// The velocity and the clock are passed in rather than derived here.
+//
+// This used to store the raw position DELTA in `vel` and cumulative DISTANCE in
+// `t`, neither of which is what the field names say, and that made your own line
+// the only one that could not be asked "how fast was I here, and when?". The
+// energy sampler has already computed a smoothed velocity from the same camera
+// this is being fed, and the timer already has the elapsed run time, so both are
+// free -- and it is what lets a label on somebody else's line say how you
+// compare at that point.
+void WrLiveRecord(const Vec3 &pos, const Vec3 &vel, float elapsed)
 {
     if (!g_liveOn || !WrSaneVec(pos))
         return;
 
+    Vec3 v = WrSaneVec(vel) ? vel : WrVec(0.0f, 0.0f, 0.0f);
+
     if (g_liveCount == 0)
     {
         g_live[0].pos = pos;
-        g_live[0].vel = WrVec(0.0f, 0.0f, 0.0f);
-        g_live[0].t = 0.0f;
+        g_live[0].vel = v;
+        g_live[0].t = elapsed;
         g_liveCount = 1;
         return;
     }
@@ -852,8 +908,8 @@ void WrLiveRecord(const Vec3 &pos)
     {
         g_liveCount = 0;
         g_live[0].pos = pos;
-        g_live[0].vel = WrVec(0.0f, 0.0f, 0.0f);
-        g_live[0].t = 0.0f;
+        g_live[0].vel = v;
+        g_live[0].t = elapsed;
         g_liveCount = 1;
         return;
     }
@@ -871,9 +927,8 @@ void WrLiveRecord(const Vec3 &pos)
         last = &g_live[g_liveCount - 1];
     }
 
-    Vec3 d = WrSub(pos, last->pos);
     g_live[g_liveCount].pos = pos;
-    g_live[g_liveCount].vel = d;    // per-sample delta; scaled at draw time
-    g_live[g_liveCount].t = last->t + moved;
+    g_live[g_liveCount].vel = v;
+    g_live[g_liveCount].t = elapsed;
     g_liveCount++;
 }

@@ -168,13 +168,19 @@ void WrUpdateNearest(const Vec3 &cam);
 // almost always what "show me the route" means on a staged map.
 void WrEnableBestNearby(int count, float radius);
 
-// Live self-recording. Feed it the camera position each frame; it stores a point
-// whenever the camera has moved far enough or turned sharply enough.
-void WrLiveRecord(const Vec3 &pos);
+// Live self-recording. Feed it the player's FEET each frame, along with the
+// smoothed velocity and the run clock, so a live point carries the same three
+// things a demo point does and can be compared against one directly.
+void WrLiveRecord(const Vec3 &pos, const Vec3 &vel, float elapsed);
 void WrLiveClear(void);
 bool WrLiveEnabled(void);
 void WrLiveSetEnabled(bool on);
 const WrPoint *WrLivePoints(int *count);
+
+// The live point nearest a world position, within `radius`. NULL if you have not
+// been there -- which is exactly what a "how do I compare here" label needs, so
+// it can say nothing rather than guess.
+const WrPoint *WrLiveNearest(const Vec3 &pos, float radius);
 
 // Which maps have extracted paths on disk, for the manual picker.
 void WrScanAvailableMaps(void);

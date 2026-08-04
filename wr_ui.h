@@ -10,4 +10,9 @@ void WrUiDraw(void);
 // Called when the loaded map changes so the Runs tab can reload.
 void WrUiOnMapChanged(const char *map);
 
+// Virtual-key code that cycles the crosshair readout, or 0 for none. Polled by
+// the hotkey thread; chosen in the Energy tab because we cannot know what the
+// player has already bound.
+int WrUiHudCycleKey(void);
+
 #endif // WR_UI_H

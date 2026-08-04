@@ -515,7 +515,7 @@ Every frame, for the rest of the map. The displayed figure stayed at whatever it
 instant you failed, and since you fail at the bottom of a map while the anchor is the start pad,
 that stuck value was a large negative one — the reported "it drops to −6000". Only the Reset
 button cleared it, and only because Reset clears the flag the teleport test was gated on. The
-same latch also froze the velocity vector and the live line's efficiency colouring.
+same latch also froze the velocity vector.
 
 The last position is now recorded before every early return, and a teleport is treated as a
 discontinuity: the filters are *dropped* rather than run across it, since a 0.3 s average that
@@ -540,9 +540,90 @@ converts height into speed at exactly the rate `E = z + v²/2g` is defined to ho
 clean drop reads flat. Negative is not height dropped; it is energy that ended up in neither
 height nor speed — bad ramp entries, wall clips, friction.
 
-Which means the number cannot be made to "slowly rise" while you play well: on a descending surf
-map `E_rel` falls for everyone. The figure that rises when you are doing well is the **gap**
-against the run you are chasing. The panel now says so instead of implying otherwise.
+Which means `E_rel` itself cannot be made to "slowly rise" while you play well: on a descending
+surf map it falls for everyone.
+
+### The budget: the same information with the big numbers going up
+
+The follow-up ask was "a mode that counts all units from the start zone — counting all the gain,
+including the fall". That works, and it needs no new measurement, because it is an identity.
+With `K = |v|²/2g` and `H = z_anchor − z`:
+
+```
+E_rel = (z − z_anchor) + (K − K_anchor)     ⇒     K − K_anchor = H + E_rel
+```
+
+What you are carrying is exactly what you spent plus what you netted. So:
+
+```
+spent   H = z_anchor − z      height cashed in       rises as you descend
+banked  K = |v|²/2g           still in your speed    rises as you speed up
+wasted  H − K                 the difference         = −E_rel, to the last digit
+carried K/H                   the headline, a %
+```
+
+Implementation is one extra EMA on the window-midpoint *height* beside the one on energy. Since
+an EMA is linear, subtracting it gives exactly the filtered kinetic term, so `spent − banked`
+equals the negated headline figure rather than nearly equalling it — the harness asserts a worst
+disagreement of **0.0000 units** over a scripted drop, and reads `carried` at exactly **100 %**
+through a clean fall from rest.
+
+`carried` works *mid-run*, not only at the finish. On `surf_demise`:
+
+| run | 5 % | 25 % | 50 % | 75 % | finish |
+| --- | --- | --- | --- | --- | --- |
+| WR 37.17 s | 120 % | 104 % | 101 % | 95 % | **88 %** |
+| 57.84 s | 97 % | 79 % | 50 % | 26 % | 34 % |
+
+Over 100 % is not a bug — it means air strafing put in more than the map gave you, and the
+fastest `surf_utopia` run finishes at **293 %**. `H` is deliberately not clamped monotone:
+measured median backtrack from its running maximum is 1,465 units on `surf_demise` and **31,160
+on `surf_vacant`**, and clamping would break the identity to hide that.
+
+### Counting only the gains, without counting the noise
+
+The gross figure — total energy your strafing added, ignoring the losses — is the one that only
+ever rises. The obvious way to compute it is a trap:
+
+```
+gained += max(0, E_now − E_prev)
+```
+
+Rectifying a noisy derivative accumulates the noise. On a trajectory where energy is *exactly*
+constant, that sum reads **6,600–12,800 units over a minute** against a real world record's
+~3,700. And the natural test passes anyway: a rectified EMA's noise floor is `T·σ/(τ√2π)`, which
+contains no `dt` at all, so 60 fps and 500 fps agree about a number that is entirely noise.
+
+So legs are banked only once the signal reverses by `h` — an excursion smaller than `h`
+contributes *exactly* zero, and the leg count is bounded by the signal rather than by the sample
+count. `h` was swept rather than picked. Worst case over six speed/frame-rate combinations on
+the null trajectory, against the cost to a real world record:
+
+| `h` | null trajectory (true 0) | surf_demise WR |
+| --- | --- | --- |
+| 25 | 4253 | 4365 |
+| 50 | 4.4 | 4189 |
+| **150** | **0.0** | **3720** |
+| rectifier | 12801 | — |
+
+`h = 50` looks fine and is not: rebuild the binary with unrelated code changed and it moves
+between 0 and 203, because the excursions sit right on the threshold and which ones confirm
+turns on the last bits of a float. `h = 150` costs 15 % of a real signal and reads exactly zero.
+
+It also *discriminates better*, because what the larger threshold rejects in a slow run is mostly
+noise-scale wobble. Median `gained` across 50 clean `surf_demise` runs, in quartiles by time:
+
+| | Q1 37.2–38.0 s | Q2 38.1–39.0 s | Q3 39.0–40.9 s | Q4 41.0–57.8 s |
+| --- | --- | --- | --- | --- |
+| `h = 50` | 2596 | 979 | 316 | 197 |
+| `h = 150` | **2338** | **793** | **72** | **14** |
+
+A factor of 167 end to end against 13. The plain correlation with run time is only −0.325, and
+that is not a contradiction — the relationship collapses over the first two seconds and is flat
+after, so a linear coefficient understates it badly. Read it as a threshold: 30 of the 50 runs
+gain under 500 in total, and every one of those is slower than 37.8 s.
+
+### Strafing efficiency, and the metric that had to be thrown away
 
 ### Strafing efficiency, and the metric that had to be thrown away
 
@@ -571,8 +652,99 @@ Efficiency is `(dE/dt) / P_max`, and it discriminates enormously: median on the 
 world record is **+0.531**, and on the two slowest runs in the same set **+0.010** and **+0.003**.
 
 Boosters add energy for free — real runs contain `dE/dt` spikes of +726, +3116, +9039 and
-+13142 units/s, up to 350× the ceiling — so anything past 3× is drawn neutral rather than as
-perfect play.
++13142 units/s, up to 350× the ceiling — so anything past 3× on the **gain** side is drawn as a
+gap rather than as perfect play.
+
+### The rejection was symmetric, and that hid almost everything worth seeing
+
+Reported next: *"can you describe why it goes red or green like I'm 12? the colours don't make
+any sense."* They didn't, and it was not only the explanation.
+
+The `3×` rejection above was applied to *both* signs, returning exactly `0.0` — the same value as
+free flight. But the ceiling is on **gain** only. Nothing bounds how fast energy can be taken
+away, because a ramp collision clips the velocity into the surface plane and can remove as much
+as the geometry likes. Measured over 865,026 samples from 342 stored runs:
+
+| | samples | share |
+| --- | --- | --- |
+| `eta > +3` — a booster, as documented | 9,675 | 1.12 % |
+| `eta < −3` — undocumented, drawn identically | 162,601 | **18.80 %** |
+
+**94.4 % of the rejections were negative, and those samples carry 94.6 % of all energy lost in the
+whole library.** Every hard ramp entry — the most informative thing on a surf line, and the reason
+the mode exists — was being painted as "nothing is happening".
+
+Three smaller faults compounded it. The bucket count was **even** over a symmetric range, so
+there was no bucket at zero and free flight drew as a faintly green grey while the velocity
+vector drew the same value as true neutral. Saturation was asymmetric (red at −0.5, green at
++0.6). And the per-point array was `calloc`d, so the ends of a run and every teleport-spanning
+window read "neutral" when the truth was "no reading".
+
+With the rejection one-sided and a real neutral band, on `surf_demise`:
+
+| run | gaining | losing | nothing happening | no reading |
+| --- | --- | --- | --- | --- |
+| WR 37.2 s | 50.9 % | 41.3 % | **6.0 %** | 1.8 % |
+| median 39.0 s | 56.7 % | 35.6 % | 7.2 % | 0.5 % |
+| slowest 57.8 s | 30.6 % | 35.1 % | **34.1 %** | 0.2 % |
+
+The discriminator is the neutral share, not the red one: **a world record is dim for 6 % of its
+length and the slowest run for 34 %.** A line that is mostly dim means the player is barely
+strafing. A world record is 41 % red, because every ramp entry costs something.
+
+Neutral now keeps the run's own colour, dimmed, instead of going grey — colouring by efficiency
+used to replace the line colour outright over its whole length, so turning the mode on destroyed
+every cue about whose line was whose. There is also an on-screen key, which no colour scheme in
+this tool had before.
+
+### The velocity vector was reading noise
+
+Its colour came from live efficiency: a 0.30 s difference of a 0.30 s average of a
+camera-differenced velocity. On a trajectory where energy is exactly constant, with the position
+noise implied by the module's own stated "few percent" velocity error:
+
+| speed | p05..p95 of `dE/dt` | as eta | fraction saturating the ramp |
+| --- | --- | --- | --- |
+| 2000 u/s | ±25.5 | ±0.68 | **14 %** |
+| 3200 u/s | ±40 | ±1.07 | **36 %** |
+
+Full green needed 6.75 energy units over the window — smaller than the 12-unit dead band the same
+module refuses to call "rising", and larger than the 5-unit step it rounds the number to for
+display. It is coloured by the 0.75 s trend now, the same signal as the arrow beside the
+crosshair, so the two can no longer disagree.
+
+### The deadstrafe period, and why it does not apply here
+
+Source's `CategorizePosition` quarters `m_surfaceFriction` while a player is airborne rising
+slower than +140 u/s over a surface too steep to stand on, and `AirAccelerate` multiplies its
+acceleration by that friction. The KZ community calls the result a deadstrafe period. It is real.
+
+It only bites if it drops the acceleration below the 30 u/s wishspeed cap, and the acceleration
+is computed from the **uncapped** wishspeed:
+
+```
+accelspeed = sv_airaccelerate × maxspeed × tick × surfaceFriction
+```
+
+| config | normal | quartered | ceiling | bites? |
+| --- | --- | --- | --- | --- |
+| Momentum surf, airaccel 150 | 562.5 | **140.6** | 37.50 → 37.50 | **no** |
+| CS:GO KZ, airaccel 12 | 46.9 | 11.7 | 36.00 → 22.63 | yes |
+| CS:S bhop, airaccel 10 | 37.5 | 9.4 | 37.50 → 19.78 | yes |
+
+The crossover is around `sv_airaccelerate 32` at 250 maxspeed on a 66.7 tick. Confirmed against
+the demos — p95 of `dE/dt` split on vertical speed:
+
+```
+rising 0 < vz ≤ 140 :  69,916 samples    p95  38.07   (±4 window: 37.30)
+everything else     : 795,096 samples    p95  37.99   (±4 window: 37.12)
+```
+
+No depression inside the window, and both land on the theoretical 37.50. Honest limit: this shows
+the achievable *gain* is not reduced. It cannot show whether the friction was set at all, because
+at these settings both branches predict the same ceiling — but the achievable gain is the only
+thing the tool uses. The ceiling takes `sv_airaccelerate` and `sv_maxspeed` as settings now, and
+the Energy tab says whether the quarter would bite at whatever they are set to.
 
 ### Save-loc times
 
@@ -594,12 +766,12 @@ mechanical energy, so reading the record's energy at your position needs no alig
 lookup.
 
 Absolute `E` is the wrong thing to put on screen, though. Standing still on a pad 1888 units up
-it reads 1888, which is true and useless. So what you see is measured from **the last ground you
-were standing on** — on a surf map that is the start pad, because you never touch ground again:
+it reads 1888, which is true and useless. So what you see is measured from **the anchor** — the
+start of the run you are chasing, or a point you set by hand:
 
 ```
-E_rel = (your height − that ground) + |v|² / 2g     0 when you are standing still on it
-v_eq  = sqrt(2g · E_rel)                            the same figure written as a speed
+E_rel = (your height − the anchor) + |v|² / 2g     0 when you are standing still on it
+v_eq  = sqrt(2g · E_rel)                           the same figure written as a speed
 ```
 
 **The map's shape cancels out of `E_rel` exactly.** Drop 18 000 units down a surf map and convert
@@ -619,15 +791,15 @@ that wasted the least energy:
 | 37.710 s | −3027 |
 | 37.890 s | −3240 |
 
-The reference is the last ground you were **settled on**, not specifically one you jumped from:
-walking off a ledge has to arm it too. The camera has to be vertically steady for a few frames,
-so a ramp — where vertical speed is large and constant — never counts as ground. A separate
-"since jump" figure in the Energy tab does still require a jump-sized upward exit.
+The reference is an **anchor**: set once from the start of the run you are chasing, or by hand,
+and never re-armed by anything you do. It used to arm itself from a ground test, which is the
+defect described above. A separate "since jump" figure in the Energy tab still uses ground
+detection, and that is all ground detection is used for now.
 
 | | |
 | --- | --- |
-| Loaded runs | **exact.** `.wrpath` stores a real velocity per point |
-| You, live | **approximate.** It only knows where the camera is, so your velocity is differenced from camera motion over a few frames and smoothed |
+| Loaded runs | **good to about 0.1 %.** `.wrpath` stores a velocity per point, but it is a central finite difference of positions rather than the engine's own vector — the netstream carries velocity floats and not at an offset that is reliable across runs. Checked against the exact velocities the demo records at its own checkpoints: 4.2–4.8 u/s out at ~3900 u/s |
+| You, live | **approximate.** It only knows where the camera is, so your velocity is differenced from camera motion over a fixed 40 ms window and smoothed |
 
 Single-frame differencing at 200 fps turns a two-unit view bob into a 400 u/s spike, hence the
 baseline and the smoothing; expect a few percent of error and slight lag on sharp changes.
@@ -834,6 +1006,8 @@ wr_limit            the frame cap
 wr_extract          counting unextracted demos, running the extractor
 wr_matrixlife.h     when a chosen matrix has died -- pure logic, tested
 wr_pacing.h         when the next frame may be presented -- pure logic, tested
+wr_budget.h         gross gain/loss without counting noise -- pure logic, tested
+wr_stress.h         the air-strafing ceiling and efficiency -- pure logic, tested
 wr_ui               the panel
 tests\              standalone harnesses -- tests\build.bat builds and runs all
                     three. test_energy links the real wr_energy.cpp, because the

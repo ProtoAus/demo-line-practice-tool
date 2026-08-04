@@ -20,6 +20,7 @@
 
 #include "wr_smooth.h"
 #include "wr_stress.h"
+#include "wr_budget.h"
 #include "wr_energy.h"
 #include "wr_engine.h"
 
@@ -275,6 +276,35 @@ int main(void)
         signed char b = WrEtaToByte(0.531f);   // the surf_demise WR median
         Check(fabsf(WrEtaFromByte(b) - 0.531f) < 0.01f,
               "the stored byte round-trips to within 0.01");
+
+        // The rejection is one-sided. Losing at ten times the ceiling is a ramp
+        // entry or a wall, not a trigger, and it used to be collapsed to the
+        // same 0.0 as free flight -- 18.8% of all samples and 94.6% of all
+        // energy lost in the library.
+        Check(WrEfficiency(-400.0f, p) == -1.0f,
+              "losing at ten times the ceiling reads as fully losing");
+        Check(!WrEtaIsNoData(-400.0f, p), "and is not treated as missing data");
+        Check(WrEtaIsNoData(9039.0f, p), "while a booster still is");
+
+        // An EVEN bucket count over a symmetric range has no bucket at zero, so
+        // free flight drew as a faintly green grey.
+        Check(WrEtaFromBucket(WrEtaBucket(0.0f, 17), 17) == 0.0f,
+              "an odd bucket count round-trips eta 0 to exactly 0");
+        Check(WrEtaFromBucket(WrEtaBucket(0.0f, 16), 16) != 0.0f,
+              "an even one does not, which is what it used to be");
+
+        // The deadstrafe period: sv_airaccelerate decides whether it matters.
+        float full150 = WrAirPowerCeilingEx(800.0f, 0.015f, 150.0f, 250.0f, 1.0f);
+        float dead150 = WrAirPowerCeilingEx(800.0f, 0.015f, 150.0f, 250.0f, 0.25f);
+        float full12 = WrAirPowerCeilingEx(800.0f, 0.015625f, 12.0f, 250.0f, 1.0f);
+        float dead12 = WrAirPowerCeilingEx(800.0f, 0.015625f, 12.0f, 250.0f, 0.25f);
+        printf("     quarter surface friction: airaccel 150 %.2f -> %.2f, "
+               "airaccel 12 %.2f -> %.2f\n", full150, dead150, full12, dead12);
+        Check(fabsf(full150 - dead150) < 0.01f,
+              "at airaccel 150 the deadstrafe period does not lower the ceiling");
+        Check(dead12 < full12 * 0.7f,
+              "at airaccel 12 it lowers it by a third, as the KZ community "
+              "reports");
     }
 
     printf("\nturn rate alone would fire on perfect play, which is why it is not\n"
@@ -292,6 +322,131 @@ int main(void)
         Check(WrTurnRateDeg(2000.0f, 0.0f, 1900.0f, 600.0f, 0.015f) > cap2000,
               "a turn a real ramp produces exceeds it, so exceeding it is not "
               "in itself a mistake");
+    }
+
+    printf("\nthe gain accumulator reads zero when nothing is happening\n");
+    {
+        // The null test, and it is the one with teeth. A straight line at
+        // constant height and constant speed has exactly constant energy, so
+        // anything the accumulator reports is noise it failed to reject.
+        const float speeds[2] = { 2000.0f, 3200.0f };
+        const float rates[3] = { 60.0f, 200.0f, 500.0f };
+        const float hs[3] = { 25.0f, 50.0f, WR_SWING_HYSTERESIS };
+        const float NOISE = 2.0f;       // units of camera position wobble
+        float worstSwing = 0.0f, worstNaive = 0.0f, bestNaive = 1e9f;
+        float worstAt[3] = { 0.0f, 0.0f, 0.0f };
+
+        printf("     %19s %10s %10s %10s %11s\n", "", "h=25", "h=50",
+               "h=shipped", "rectifier");
+        for (int s = 0; s < 2; s++)
+        {
+            for (int r = 0; r < 3; r++)
+            {
+                float dt = 1.0f / rates[r];
+                Chain c;
+                ChainInit(&c, 0.0f);
+                WrSwing sw[3];
+                for (int k = 0; k < 3; k++)
+                    WrSwingReset(&sw[k], hs[k]);
+                g_seed = 4242;
+
+                float naive = 0.0f, prev = 0.0f;
+                bool havePrev = false;
+                for (float t = 0.0f; t < 60.0f; t += dt)
+                {
+                    float x = speeds[s] * t;
+                    float e = ChainStep(&c, x + NOISE * Noise(),
+                                        NOISE * Noise(), 1000.0f + NOISE * Noise(),
+                                        dt, 0);
+                    if (e > 1e8f || t < 1.0f)
+                        continue;
+                    for (int k = 0; k < 3; k++)
+                        WrSwingStep(&sw[k], e);
+                    if (havePrev && e > prev)
+                        naive += e - prev;      // the trap, for comparison
+                    prev = e;
+                    havePrev = true;
+                }
+                float g[3];
+                for (int k = 0; k < 3; k++)
+                {
+                    g[k] = 0.0f;
+                    WrSwingTotals(&sw[k], &g[k], NULL);
+                    if (g[k] > worstAt[k]) worstAt[k] = g[k];
+                }
+                printf("     %5.0f u/s @ %3.0f fps %10.1f %10.1f %10.1f %11.1f\n",
+                       speeds[s], rates[r], g[0], g[1], g[2], naive);
+                if (g[2] > worstSwing) worstSwing = g[2];
+                if (naive > worstNaive) worstNaive = naive;
+                if (naive < bestNaive) bestNaive = naive;
+            }
+        }
+        printf("     worst case: h=25 %.0f, h=50 %.0f, shipped %.0f, rectifier %.0f\n",
+               worstAt[0], worstAt[1], worstAt[2], worstNaive);
+        Check(worstSwing < 60.0f,
+              "the swing accumulator stays near zero on a null trajectory");
+        Check(worstNaive > 1000.0f,
+              "while rectifying every sample invents thousands of units");
+        // The point of this one: the obvious test does not catch the obvious
+        // bug. A rectified EMA's noise floor is T*sigma/(tau*sqrt(2pi)), which
+        // has no dt in it, so 60 fps and 500 fps agree about a number that is
+        // entirely noise.
+        Check(worstNaive < bestNaive * 3.0f,
+              "and a frame-rate test would have called that noise stable");
+    }
+
+    printf("\nthe accumulator against a signal it is supposed to see\n");
+    {
+        // Eight swings of +500 then -250, driven straight in: 4000 up, 2000
+        // down, net +2000. Both legs are comfortably past the threshold, so all
+        // of it must be banked.
+        WrSwing sw;
+        WrSwingReset(&sw, WR_SWING_HYSTERESIS);
+        float e = 0.0f;
+        WrSwingStep(&sw, e);
+        for (int i = 0; i < 8; i++)
+        {
+            for (int k = 0; k < 25; k++) { e += 20.0f; WrSwingStep(&sw, e); }
+            for (int k = 0; k < 25; k++) { e -= 10.0f; WrSwingStep(&sw, e); }
+        }
+        float g = 0.0f, l = 0.0f;
+        WrSwingTotals(&sw, &g, &l);
+        printf("     gained %.0f  lost %.0f  net %.0f  (true +4000 / -2000 / +2000)\n",
+               g, l, g - l);
+        Check(fabsf(g - 4000.0f) < 60.0f, "banks the rises");
+        Check(fabsf(l - 2000.0f) < 60.0f, "and the falls");
+        Check(fabsf((g - l) - e) < 0.01f,
+              "gained minus lost is the net change, exactly");
+    }
+
+    printf("\na teleport is seeded, not stepped\n");
+    {
+        // Run the identical trajectory twice: once seeding the discontinuity,
+        // once stepping straight through it, so the difference is visible
+        // rather than asserted.
+        float lSeed = 0.0f, lStep = 0.0f;
+        for (int mode = 0; mode < 2; mode++)
+        {
+            WrSwing sw;
+            WrSwingReset(&sw, WR_SWING_HYSTERESIS);
+            for (int i = 0; i < 50; i++)
+                WrSwingStep(&sw, (float)i * 10.0f);     // climb to 490
+
+            // A save-loc load 1100 units down the map.
+            if (mode == 0) WrSwingSeed(&sw, -1100.0f);
+            else           WrSwingStep(&sw, -1100.0f);
+            for (int i = 1; i < 50; i++)
+                WrSwingStep(&sw, -1100.0f + (float)i * 10.0f);
+
+            float g = 0.0f, l = 0.0f;
+            WrSwingTotals(&sw, &g, &l);
+            (mode == 0 ? lSeed : lStep) = l;
+        }
+        printf("     lost: %.0f seeding the load, %.0f stepping through it\n",
+               lSeed, lStep);
+        Check(lSeed < 50.0f, "seeding banks nothing for the teleport itself");
+        Check(lStep > 1000.0f,
+              "where stepping through it would charge the player the whole drop");
     }
 
     // -----------------------------------------------------------------------
@@ -342,6 +497,99 @@ int main(void)
               "and back on the pad it reads zero again, rather than sticking");
         Check(WrEnergyTakeRestart(), "the respawn was reported as a restart");
         Check(!WrEnergyTakeRestart(), "and reading that clears it");
+    }
+
+    printf("\nthe three budget numbers add up, on every frame\n");
+    {
+        // If this ever fails, the readout is lying: spent - banked IS the
+        // negated headline figure, by construction rather than by coincidence.
+        WrEnergyDefaults();
+        WrEnergyReset();
+
+        const float dt = 1.0f / 200.0f;
+        const float padZ = 3000.0f;
+        for (int i = 0; i < 100; i++)
+            WrEnergySample(WrVec(0.0f, 0.0f, padZ), dt);
+        WrEnergyAnchorToFeet(WrVec(0.0f, 0.0f, padZ - 64.0f));
+
+        float worst = 0.0f, lowCarried = 1e9f, highCarried = -1e9f;
+        for (int i = 0; i < 500; i++)
+        {
+            float t = i * dt;
+            // A clean vertical drop off the pad, from rest: height traded for
+            // speed and nothing else, so it must spend and bank the same amount.
+            float z = padZ - 0.5f * 800.0f * t * t;
+            WrEnergySample(WrVec(0.0f, 0.0f, z), dt);
+            if (t < 0.9f)
+                continue;
+            WrEnergyBudget b;
+            if (!WrEnergyBudgetNow(&b))
+                continue;
+            float err = fabsf((b.spent - b.banked) + WrEnergyRelative());
+            if (err > worst) worst = err;
+            if (b.carriedValid)
+            {
+                if (b.carried < lowCarried) lowCarried = b.carried;
+                if (b.carried > highCarried) highCarried = b.carried;
+            }
+        }
+        printf("     worst disagreement %.4f units; carried ran %.0f%%..%.0f%% "
+               "through a clean drop from rest\n", worst, lowCarried, highCarried);
+        Check(worst < 1.0f, "spent - banked is the negated net figure, exactly");
+        Check(lowCarried > 95.0f && highCarried < 105.0f,
+              "and a clean fall keeps everything it spends");
+    }
+
+    printf("\nstarting with speed reads over 100%%, and that is not a bug\n");
+    {
+        // The same drop, entered carrying 600 u/s. That 225 units of energy was
+        // never taken from the anchor's height, so the ratio is legitimately
+        // above 1 -- the same reason the fastest surf_utopia run finishes at
+        // 293%. Anything that clamped it would be hiding real energy.
+        WrEnergyDefaults();
+        WrEnergyReset();
+        const float dt = 1.0f / 200.0f;
+        const float padZ = 3000.0f;
+        for (int i = 0; i < 100; i++)
+            WrEnergySample(WrVec(600.0f * i * dt, 0.0f, padZ), dt);
+        WrEnergyAnchorToFeet(WrVec(600.0f * 100 * dt, 0.0f, padZ - 64.0f));
+
+        float base = 600.0f * 100 * dt;
+        WrEnergyBudget b;
+        b.carried = 0.0f;
+        for (int i = 0; i < 500; i++)
+        {
+            float t = i * dt;
+            WrEnergySample(WrVec(base + 600.0f * t, 0.0f,
+                                 padZ - 0.5f * 800.0f * t * t), dt);
+            WrEnergyBudgetNow(&b);
+        }
+        printf("     carried %.0f%% after spending %.0f units of height\n",
+               b.carried, b.spent);
+        Check(b.carriedValid && b.carried > 105.0f,
+              "over 100% when you brought speed with you");
+    }
+
+    printf("\nclimbing above the anchor is not clamped\n");
+    {
+        WrEnergyDefaults();
+        WrEnergyReset();
+        const float dt = 1.0f / 200.0f;
+        for (int i = 0; i < 100; i++)
+            WrEnergySample(WrVec(0.0f, 0.0f, 1000.0f), dt);
+        WrEnergyAnchorToFeet(WrVec(0.0f, 0.0f, 1000.0f - 64.0f));
+
+        // Straight up 800 units. Measured median backtrack of the height spent,
+        // from its running maximum, is 1465 units on surf_demise and 31160 on
+        // surf_vacant, so this is not an edge case.
+        for (int i = 0; i < 400; i++)
+            WrEnergySample(WrVec(0.0f, 0.0f, 1000.0f + (float)i * 2.0f), dt);
+        WrEnergyBudget b;
+        bool ok = WrEnergyBudgetNow(&b);
+        printf("     spent %.0f, banked %.0f, wasted %.0f\n",
+               b.spent, b.banked, b.wasted);
+        Check(ok && b.spent < -100.0f, "spent goes negative above the anchor");
+        Check(!b.carriedValid, "and the ratio is withheld rather than inverted");
     }
 
     printf("\na teleport away from the anchor is a save-loc, not a restart\n");

@@ -125,6 +125,53 @@ struct WrEnergySettings
     // Anchor the readout to the start of the run being compared against, so its
     // clock and yours start in the same place. Off means only manual anchors.
     bool anchorToRunStart;
+
+    // Which pair of numbers the crosshair readout is showing. The block stays
+    // three lines in every mode -- the modes change what the lines mean rather
+    // than adding any, because a compact readout is the whole point of it.
+    int hudMode;            // WrHudMode
+
+    // The two cvars the air-strafing ceiling depends on. Settings, not reads:
+    // nothing here touches a cvar. See wr_stress.h for what they change.
+    float airAccelerate;    // sv_airaccelerate, 150 on surf servers
+    float maxSpeed;         // sv_maxspeed
+};
+
+enum WrHudMode
+{
+    WR_HUD_NET = 0,     // relative energy and the same figure as a speed
+    WR_HUD_CARRIED,     // the share of the height you spent that is still speed
+    WR_HUD_BUDGET,      // spent / banked / wasted
+    WR_HUD_GAINED,      // gross gained and gross lost since the anchor
+    WR_HUD_MODE_COUNT
+};
+
+// Where the energy went, as three numbers that add up.
+//
+// The net figure falls for everyone on a descending map, which reads as failure
+// when it means "the map goes down". These say the same thing with the big
+// numbers rising:
+//
+//     spent   the height you have cashed in since the anchor
+//     banked  what you still have, written as a height  (= |v|^2/2g)
+//     wasted  the difference -- and exactly the negated net figure
+//     carried banked/spent, a percentage: how much of the drop you kept
+//
+// It is an identity, not a new measurement: E_rel = (z - z_a) + (K - K_a), so
+// K - K_a = H + E_rel with H = z_a - z. Nothing here can drift or accumulate.
+//
+// `carried` above 100% is not an error. It means air strafing put in more than
+// the map gave you, which happens on maps that climb -- the fastest surf_utopia
+// run finishes at 293%. H is deliberately NOT clamped monotone: measured median
+// backtrack from the running maximum is 1,465 units on surf_demise and 31,160
+// on surf_vacant, and clamping would break the identity to hide it.
+struct WrEnergyBudget
+{
+    float spent;
+    float banked;
+    float wasted;
+    float carried;          // banked / spent
+    bool carriedValid;      // false until enough height has been spent
 };
 
 // Where the anchor came from, for the UI to say plainly.
@@ -167,6 +214,26 @@ bool WrEnergyAnchorPos(Vec3 *out);   // false when there is no anchor
 // This is the only restart signal the tool has. WrLines reads the camera and
 // nothing else, so it cannot see a trigger fire, a key press, or a zone enter.
 bool WrEnergyTakeRestart(void);
+
+// --- the budget ---------------------------------------------------------------
+
+// False when there is nothing to measure from. The three numbers are quantised
+// so they agree with each other and with the net readout exactly on screen.
+bool WrEnergyBudgetNow(WrEnergyBudget *out);
+
+// Gross energy added and gross energy thrown away since the anchor, banked only
+// once a swing has reversed by WR_SWING_HYSTERESIS. See wr_budget.h for why the
+// obvious per-sample version reads in the thousands on a trajectory where
+// nothing at all is happening.
+float WrEnergyGained(void);
+float WrEnergyLost(void);
+
+// True when a teleport has crossed the accumulators since the last restart, so
+// the totals cover more than one continuous attempt. Shown rather than hidden.
+bool WrEnergyBudgetSpliced(void);
+
+// Cycle the crosshair readout. Bound to a key so it can be changed mid-run.
+void WrEnergyCycleHudMode(void);
 
 // Convert a position and velocity into an absolute energy height.
 float WrEnergyOf(const Vec3 &pos, const Vec3 &vel);

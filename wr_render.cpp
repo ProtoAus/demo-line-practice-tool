@@ -44,6 +44,13 @@ WrRenderSettings g_render;
 // few extra polyline flushes on a path that spans the whole fade band.
 #define ALPHA_BUCKETS 12
 #define COLOUR_BUCKETS 16
+// ODD, deliberately. An even count over a symmetric range has no bucket at zero,
+// so eta 0 -- free flight, the value a player sees most -- landed on +0.067 and
+// drew as a faintly green grey, while the velocity vector drew the same eta as
+// true neutral. See WrEtaBucket in wr_stress.h.
+#define EFF_BUCKETS 17
+#define EFF_NO_DATA_CLASS EFF_BUCKETS       // one more class, for "no reading"
+#define EFF_CLASSES (EFF_BUCKETS + 1)
 #define OFFSCREEN_BREAK 8
 
 static ImVec2 g_batch[MAX_BATCH];
@@ -77,8 +84,23 @@ void WrRenderDefaults(void)
     g_render.maxTags = 12;
     g_render.drawDipSpeeds = true;
     g_render.maxDipsPerRun = 24;
+    g_render.dipLabel = WR_LABEL_SPEED;
+    g_render.markerLabel = WR_LABEL_TIME;
+    g_render.maxMarkersPerRun = 24;
+    // A label is far bigger than a line segment and cannot be decimated, so the
+    // budget that matters is a global one. Eight runs with four-line labels at
+    // every checkpoint is unreadable long before it is slow.
+    g_render.maxLabelsPerFrame = 40;
     g_render.drawVelocity = true;
     g_render.colourByEfficiency = false;
+    // Symmetric. Measured p60 of in-band eta is +0.589, and once the loss side
+    // stopped being discarded it carries more mass than the gain side, not less.
+    g_render.effSaturation = 0.60f;
+    g_render.effNeutralBand = 0.12f;
+    g_render.effNeutralMix = 0.70f;
+    g_render.effNoDataAlpha = 0.35f;
+    g_render.effColourblind = false;
+    g_render.effLegend = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -283,7 +305,7 @@ static unsigned int SpeedColour(float speed)
 // per-sample delta instead, which is not a speed at all, so it passes 0 to mean
 // "no usable speed here" and colour-by-speed falls back to the flat colour.
 // Defined below, with the rest of the energy drawing.
-static unsigned int EfficiencyColour(float eta);
+static unsigned int EfficiencyColour(float eta, unsigned int runColour);
 
 static void EmitPath(ImDrawList *dl, const WrPoint *pts, int count,
                      const int *breaks, int breakCount,
@@ -445,13 +467,24 @@ static void EmitPath(ImDrawList *dl, const WrPoint *pts, int count,
         int bucket;
         if (g_render.colourByEfficiency && eff)
         {
-            float eta = WrEtaFromByte(eff[i]);
-            int cBucket = (int)((eta * 0.5f + 0.5f) * (COLOUR_BUCKETS - 1) + 0.5f);
-            if (cBucket < 0) cBucket = 0;
-            if (cBucket >= COLOUR_BUCKETS) cBucket = COLOUR_BUCKETS - 1;
-            float q = ((float)cBucket / (COLOUR_BUCKETS - 1)) * 2.0f - 1.0f;
-            colour = WithAlpha(EfficiencyColour(q), a01);
-            bucket = fBucket * COLOUR_BUCKETS + cBucket;
+            signed char e = eff[i];
+            if (e == WR_ETA_NO_DATA)
+            {
+                // Not neutral. A booster, a gap across a teleport, or the ends
+                // of the run where a centred difference has nothing to work
+                // with. Faded, in the run's own colour, so it reads as an
+                // absence rather than as free flight.
+                colour = WithAlpha(baseColour, a01 * g_render.effNoDataAlpha);
+                bucket = fBucket * EFF_CLASSES + EFF_NO_DATA_CLASS;
+            }
+            else
+            {
+                int cBucket = WrEtaBucket(WrEtaFromByte(e), EFF_BUCKETS);
+                colour = WithAlpha(
+                    EfficiencyColour(WrEtaFromBucket(cBucket, EFF_BUCKETS),
+                                     baseColour), a01);
+                bucket = fBucket * EFF_CLASSES + cBucket;
+            }
         }
         else if (g_render.colourBySpeed && velScale > 0.0f)
         {
@@ -514,15 +547,149 @@ static void EmitPath(ImDrawList *dl, const WrPoint *pts, int count,
         FlushBatch(dl, lastColour, g_render.thickness);
 }
 
-// Horizontal speed at the bottom of each ramp.
+// ---------------------------------------------------------------------------
+// Labels on the line, and keeping them apart
+// ---------------------------------------------------------------------------
 //
-// Only the XY component, because that is what a surfer is trying to carry
-// through the dip -- the vertical part is about to be traded for height anyway.
-// Drawn in the run's own colour so a number can be traced back to a line when
-// several are on screen.
+// A rectangle reservation shared by ramp-bottom numbers, checkpoint numbers and
+// player tags. It used to belong to the tags alone, so a tag would never cover
+// another tag but numbers covered everything including each other -- which was
+// survivable when a ramp label was one number and is not once it can be four
+// lines at every checkpoint of eight runs.
+//
+// Numbers register BEFORE tags, deliberately. A number is attached to a specific
+// point on a line and means nothing anywhere else; a name has a whole line to
+// slide along and six nudges to do it with.
+
+#define WR_MAX_TAG_RECTS 128
+#define WR_TAG_NUDGES 6
+
+struct TagRect { float x0, y0, x1, y1; };
+static TagRect g_tagRects[WR_MAX_TAG_RECTS];
+static int g_tagRectCount = 0;
+static int g_statTags = 0;
+static int g_statLabels = 0;
+
+static bool TagOverlaps(const TagRect &r)
+{
+    for (int i = 0; i < g_tagRectCount; i++)
+    {
+        const TagRect &o = g_tagRects[i];
+        if (r.x0 < o.x1 && r.x1 > o.x0 && r.y0 < o.y1 && r.y1 > o.y0)
+            return true;
+    }
+    return false;
+}
+
+static bool ReserveRect(const TagRect &r)
+{
+    if (g_tagRectCount >= WR_MAX_TAG_RECTS || TagOverlaps(r))
+        return false;
+    g_tagRects[g_tagRectCount++] = r;
+    return true;
+}
+
+// Build a label from whatever the user has asked for. `theirs` is the run point
+// the label belongs to; `t` its time, negative when there is no trustworthy one.
+//
+// Every line is optional and the whole thing may come out empty, which is not a
+// failure -- it is what "show me nothing here" looks like.
+static void BuildLabel(char *out, size_t cap, unsigned int what,
+                       const WrPoint *theirs, float t, bool timeTrusted)
+{
+    out[0] = '\0';
+    size_t used = 0;
+    char part[64];
+
+    #define APPEND(...)                                                        \
+        do {                                                                   \
+            _snprintf_s(part, sizeof(part), _TRUNCATE, __VA_ARGS__);           \
+            if (used) { _snprintf_s(out + used, cap - used, _TRUNCATE, "\n");  \
+                        used = strlen(out); }                                  \
+            _snprintf_s(out + used, cap - used, _TRUNCATE, "%s", part);        \
+            used = strlen(out);                                                \
+        } while (0)
+
+    if (what & WR_LABEL_SPEED)
+    {
+        // Horizontal only: that is what a surfer is trying to carry through a
+        // dip, and the vertical part is about to be traded for height anyway.
+        float sp = sqrtf(theirs->vel.x * theirs->vel.x +
+                         theirs->vel.y * theirs->vel.y);
+        APPEND("%.0f", sp);
+    }
+
+    if (what & WR_LABEL_ENERGY)
+    {
+        float e = WrEnergyOf(theirs->pos, theirs->vel);
+        if (WrEnergyHaveRef())
+            e -= WrEnergyRefZ() - g_energy.eyeHeight;   // their points are feet
+        APPEND("E %.0f", e);
+    }
+
+    if ((what & WR_LABEL_TIME) && t >= 0.0f && timeTrusted)
+    {
+        int mins = (int)(t / 60.0f);
+        float secs = t - mins * 60.0f;
+        if (mins > 0) APPEND("%d:%05.2f", mins, secs);
+        else          APPEND("%.2f", secs);
+    }
+
+    if (what & WR_LABEL_DELTA)
+    {
+        // Yours minus theirs, from your own recorded line -- so it appears only
+        // once you have actually been here, and says nothing until then rather
+        // than guessing.
+        const WrPoint *mine = WrLiveNearest(theirs->pos, 256.0f);
+        if (mine)
+        {
+            float mySp = sqrtf(mine->vel.x * mine->vel.x +
+                               mine->vel.y * mine->vel.y);
+            float theirSp = sqrtf(theirs->vel.x * theirs->vel.x +
+                                  theirs->vel.y * theirs->vel.y);
+            if (t >= 0.0f && timeTrusted && mine->t > 0.0f)
+                APPEND("%+.0f  %+.2fs", mySp - theirSp, mine->t - t);
+            else
+                APPEND("%+.0f", mySp - theirSp);
+        }
+    }
+    #undef APPEND
+}
+
+// Draw a built label at a screen point, reserving room for it. Returns false if
+// it was dropped -- out of budget, or something is already there.
+static bool DrawLabel(ImDrawList *dl, ImVec2 at, const char *text,
+                      unsigned int colour)
+{
+    if (!text || !text[0])
+        return false;
+    if (g_statLabels >= g_render.maxLabelsPerFrame)
+        return false;
+
+    float ls = 0.0f;
+    ImFont *lf = WrFontFor(14.0f * g_render.tagScale, &ls);
+    ImVec2 m = lf->CalcTextSizeA(ls, FLT_MAX, 0.0f, text);
+
+    TagRect r;
+    r.x0 = at.x; r.y0 = at.y;
+    r.x1 = at.x + m.x + 2.0f; r.y1 = at.y + m.y + 2.0f;
+    if (!ReserveRect(r))
+        return false;
+
+    dl->AddText(lf, ls, ImVec2(at.x + 1.0f, at.y + 1.0f), 0xC0000000u, text);
+    dl->AddText(lf, ls, at, colour, text);
+    g_statLabels++;
+    return true;
+}
+
+// Numbers at the bottom of each ramp -- where the line stops falling and starts
+// climbing. Drawn in the run's own colour so a number can be traced back to a
+// line when several are on screen.
 static void EmitDips(ImDrawList *dl, const WrRun *run)
 {
-    if (!g_render.drawDipSpeeds || !run->dips || run->dipCount <= 0)
+    if (!g_render.drawDipSpeeds || !g_render.dipLabel)
+        return;
+    if (!run->dips || run->dipCount <= 0)
         return;
 
     const float maxDistSqr = g_render.maxDrawDistance * g_render.maxDrawDistance;
@@ -544,20 +711,22 @@ static void EmitDips(ImDrawList *dl, const WrRun *run)
         if (s.x < 0.0f || s.x > g_sw || s.y < 0.0f || s.y > g_sh)
             continue;
 
-        float speed = sqrtf(p->vel.x * p->vel.x + p->vel.y * p->vel.y);
-        char label[32];
-        _snprintf_s(label, sizeof(label), _TRUNCATE, "%.0f", speed);
+        // A dip's time is index-derived rather than measured, so it is only
+        // offered on runs whose recovered timing survived the trust test --
+        // 0.36x to 10.32x on the worst map measured. See CheckTimes.
+        char label[128];
+        BuildLabel(label, sizeof(label), g_render.dipLabel, p,
+                   p->t * run->timeScale, run->timingTrusted);
+        if (!label[0])
+            continue;
 
         // A short tick so the number is clearly attached to this point on the
         // line rather than floating near it.
+        ImVec2 tp(s.x + 4.0f, s.y - 16.0f);
+        if (!DrawLabel(dl, tp, label, WithAlpha(run->colour, 1.0f)))
+            continue;
         dl->AddLine(ImVec2(s.x, s.y), ImVec2(s.x, s.y - 7.0f),
                     WithAlpha(run->colour, 0.9f), 1.5f);
-
-        ImVec2 tp(s.x + 4.0f, s.y - 16.0f);
-        float ls = 0.0f;
-        ImFont *lf = WrFontFor(14.0f * g_render.tagScale, &ls);
-        dl->AddText(lf, ls, ImVec2(tp.x + 1.0f, tp.y + 1.0f), 0xC0000000u, label);
-        dl->AddText(lf, ls, tp, WithAlpha(run->colour, 1.0f), label);
         drawn++;
     }
 }
@@ -569,7 +738,8 @@ static void EmitMarkers(ImDrawList *dl, const WrRun *run)
     if (!(run->flags & WRPATH_FLAG_MARKERS_OK))
         return;     // anchoring was not trusted; better nothing than wrong
 
-    for (int i = 0; i < run->markerCount; i++)
+    int drawn = 0;
+    for (int i = 0; i < run->markerCount && drawn < g_render.maxMarkersPerRun; i++)
     {
         const WrMarker *mk = &run->markers[i];
         if (mk->pointIndex >= (unsigned int)run->pointCount)
@@ -588,20 +758,29 @@ static void EmitMarkers(ImDrawList *dl, const WrRun *run)
         dl->AddCircleFilled(s, r, WithAlpha(run->colour, 0.95f), 16);
         // Dark ring so the marker survives a bright surf texture behind it.
         dl->AddCircle(s, r, 0xE0000000u, 16, 1.5f);
+        drawn++;
 
-        char label[64];
-        int mins = (int)(mk->timeReached / 60.0);
-        double secs = mk->timeReached - mins * 60.0;
-        if (mins > 0)
-            _snprintf_s(label, sizeof(label), _TRUNCATE, "%d:%05.2f", mins, secs);
-        else
-            _snprintf_s(label, sizeof(label), _TRUNCATE, "%.2f", secs);
+        if (!g_render.markerLabel)
+            continue;
+
+        // A checkpoint carries the exact engine velocity it was crossed with,
+        // straight out of the demo's own stats -- better than anything the path
+        // can be differenced for, and it was parsed and then never read until
+        // now. Its split time is measured rather than index-derived, so unlike a
+        // ramp label this one is trustworthy whatever CheckTimes decided.
+        WrPoint at;
+        at.pos = p;
+        at.vel = mk->vel;
+        at.t = (float)mk->timeReached;
+
+        char label[128];
+        BuildLabel(label, sizeof(label), g_render.markerLabel, &at,
+                   (float)mk->timeReached, true);
+        if (!label[0])
+            continue;
 
         ImVec2 tp(s.x + r + 3.0f, s.y - 7.0f);
-        float ls = 0.0f;
-        ImFont *lf = WrFontFor(14.0f * g_render.tagScale, &ls);
-        dl->AddText(lf, ls, ImVec2(tp.x + 1.0f, tp.y + 1.0f), 0xC0000000u, label);
-        dl->AddText(lf, ls, tp, WithAlpha(run->colour, 1.0f), label);
+        DrawLabel(dl, tp, label, WithAlpha(run->colour, 1.0f));
     }
 }
 
@@ -615,24 +794,8 @@ static void EmitMarkers(ImDrawList *dl, const WrRun *run)
 // the time. Pinning them to a fixed distance ahead means each tag sits further
 // along its own line, so forty runs fan out instead of stacking.
 
-#define WR_MAX_TAG_RECTS 64
-#define WR_TAG_NUDGES 6
-
-struct TagRect { float x0, y0, x1, y1; };
-static TagRect g_tagRects[WR_MAX_TAG_RECTS];
-static int g_tagRectCount = 0;
-static int g_statTags = 0;
-
-static bool TagOverlaps(const TagRect &r)
-{
-    for (int i = 0; i < g_tagRectCount; i++)
-    {
-        const TagRect &o = g_tagRects[i];
-        if (r.x0 < o.x1 && r.x1 > o.x0 && r.y0 < o.y1 && r.y1 > o.y0)
-            return true;
-    }
-    return false;
-}
+// The rectangle reservation these share with the line labels is up with
+// EmitDips, since that is where the first thing to register lives.
 
 // How far the anchor may move in one frame before we stop easing and just put
 // it there. A genuine branch change should not slide across the map.
@@ -897,7 +1060,16 @@ static void EmitEnergyHud(ImDrawList *dl)
     float rel = WrEnergyRelative();
     int dir = WrEnergyTrendDir();
 
+    // The worst case each mode's two lines can produce. Reserved rather than
+    // measured from this frame's text -- see the comment at the layout below,
+    // which is the defect this exists to prevent.
+    const char *wideBig = "-99999 v";
+    const char *wideSub = "-99999 u/s";
+
     unsigned int bigCol = 0xFFFFFFFFu;
+    WrEnergyBudget bud;
+    bool haveBudget = WrEnergyBudgetNow(&bud);
+
     if (!WrEnergyHaveRef())
     {
         // Say so rather than print the number. With no anchor the reference is
@@ -912,11 +1084,54 @@ static void EmitEnergyHud(ImDrawList *dl)
     }
     else
     {
+        // Every mode keeps the block at the same three lines and the same
+        // colouring rule -- the arrow's rise/fall signal -- so switching modes
+        // never changes what a colour means, only which numbers are shown.
         const char *arrow = (dir > 0) ? " ^" : (dir < 0 ? " v" : "");
-        _snprintf_s(big, sizeof(big), _TRUNCATE, "%.0f%s", rel, arrow);
-        _snprintf_s(sub, sizeof(sub), _TRUNCATE, "%.0f u/s", WrEnergyEquivSpeed());
         if (dir > 0)      bigCol = 0xFF80FF80u;   // ABGR
         else if (dir < 0) bigCol = 0xFF8080FFu;
+
+        switch (g_energy.hudMode)
+        {
+        case WR_HUD_CARRIED:
+            if (haveBudget && bud.carriedValid)
+                _snprintf_s(big, sizeof(big), _TRUNCATE, "%.0f%%%s", bud.carried,
+                            arrow);
+            else
+                _snprintf_s(big, sizeof(big), _TRUNCATE, "--%s", arrow);
+            _snprintf_s(sub, sizeof(sub), _TRUNCATE, "sp %.0f  bk %.0f",
+                        haveBudget ? bud.spent : 0.0f,
+                        haveBudget ? bud.banked : 0.0f);
+            wideBig = "-999% v";
+            wideSub = "sp -99999  bk -99999";
+            break;
+
+        case WR_HUD_BUDGET:
+            _snprintf_s(big, sizeof(big), _TRUNCATE, "sp %.0f%s",
+                        haveBudget ? bud.spent : 0.0f, arrow);
+            _snprintf_s(sub, sizeof(sub), _TRUNCATE, "bk %.0f  lost %.0f",
+                        haveBudget ? bud.banked : 0.0f,
+                        haveBudget ? bud.wasted : 0.0f);
+            wideBig = "sp -99999 v";
+            wideSub = "bk -99999  lost -99999";
+            break;
+
+        case WR_HUD_GAINED:
+            _snprintf_s(big, sizeof(big), _TRUNCATE, "+%.0f%s", WrEnergyGained(),
+                        arrow);
+            _snprintf_s(sub, sizeof(sub), _TRUNCATE, "lost %.0f%s",
+                        WrEnergyLost(),
+                        WrEnergyBudgetSpliced() ? "  spliced" : "");
+            wideBig = "+99999 v";
+            wideSub = "lost 99999  spliced";
+            break;
+
+        default:
+            _snprintf_s(big, sizeof(big), _TRUNCATE, "%.0f%s", rel, arrow);
+            _snprintf_s(sub, sizeof(sub), _TRUNCATE, "%.0f u/s",
+                        WrEnergyEquivSpeed());
+            break;
+        }
     }
 
     bool haveCmp = false;
@@ -955,8 +1170,11 @@ static void EmitEnergyHud(ImDrawList *dl)
     // block is positioned by subtracting its width, the whole thing slid
     // sideways several times a second. Reserving room for the widest string any
     // of these lines can produce makes the position constant.
-    ImVec2 wBig = fBig->CalcTextSizeA(sBig, FLT_MAX, 0.0f, "-99999 v");
-    ImVec2 wSub = fSub->CalcTextSizeA(sSub, FLT_MAX, 0.0f, "-99999 u/s");
+    // Per mode, since each shows different numbers. The block does step when you
+    // deliberately switch modes, which is fine -- what must never happen is it
+    // moving while the digits change.
+    ImVec2 wBig = fBig->CalcTextSizeA(sBig, FLT_MAX, 0.0f, wideBig);
+    ImVec2 wSub = fSub->CalcTextSizeA(sSub, FLT_MAX, 0.0f, wideSub);
 
     float w = wBig.x;
     if (wSub.x > w) w = wSub.x;
@@ -1009,34 +1227,71 @@ static void EmitEnergyHud(ImDrawList *dl)
 #define VECTOR_MAX 1200.0f
 
 // Green where energy is being added near the physical ceiling, red where it is
-// being thrown away, grey in between and for free flight.
+// being thrown away, and the run's OWN colour where nothing is happening.
 //
-// The thresholds come from the data, not from taste: median efficiency on the
-// surf_demise world record is +0.531, and on the two slowest runs in the same
-// set (55.9 s and 57.8 s) it is +0.010 and +0.003. A factor of fifty separates a
-// record from a bad run, and it all lives in the positive band -- so that is
-// where the resolution goes.
-static unsigned int EfficiencyColour(float eta)
+// Three things changed here after the first version was reported as making no
+// sense, and only one of them was cosmetic.
+//
+// Neutral keeps the run's colour. Colouring by efficiency used to replace the
+// line colour outright over its whole length, so turning the mode on destroyed
+// every cue about whose line was whose -- and since a slow run sits near eta 0
+// for a third of its length, the mode looked broken on exactly the runs a
+// learner loads. Pulling neutral most of the way to grey keeps it obviously
+// unsaturated while leaving the identity readable.
+//
+// The ramp is SYMMETRIC. It saturated at +0.6 but -0.5, which had no measured
+// support in either direction once the loss side stopped being thrown away.
+//
+// And "no reading" is drawn as a faded version of the run's colour rather than
+// as neutral. A booster, a gap across a teleport and the unmeasurable ends of a
+// run are not free flight.
+static unsigned int MixColour(unsigned int c, float r, float g, float b, float t)
 {
-    float r, g, b;
-    if (eta >= 0.0f)
+    float cr = (float)(c & 0xFF) / 255.0f;
+    float cg = (float)((c >> 8) & 0xFF) / 255.0f;
+    float cb = (float)((c >> 16) & 0xFF) / 255.0f;
+    float mr = cr + (r - cr) * t;
+    float mg = cg + (g - cg) * t;
+    float mb = cb + (b - cb) * t;
+    unsigned int ri = (unsigned int)(WrClampF(mr, 0.0f, 1.0f) * 255.0f);
+    unsigned int gi = (unsigned int)(WrClampF(mg, 0.0f, 1.0f) * 255.0f);
+    unsigned int bi = (unsigned int)(WrClampF(mb, 0.0f, 1.0f) * 255.0f);
+    return 0xFF000000u | (bi << 16) | (gi << 8) | ri;   // ImGui packs ABGR
+}
+
+static unsigned int EfficiencyColour(float eta, unsigned int runColour)
+{
+    float band = WrClampF(g_render.effNeutralBand, 0.0f, 0.9f);
+    float sat = g_render.effSaturation;
+    if (sat < band + 0.05f)
+        sat = band + 0.05f;
+
+    // Neutral: the run's colour, pulled most of the way to grey.
+    float a = (eta < 0.0f) ? -eta : eta;
+    if (a <= band)
+        return MixColour(runColour, 0.5f, 0.5f, 0.5f, g_render.effNeutralMix);
+
+    float u = WrClampF((a - band) / (sat - band), 0.0f, 1.0f);
+
+    // Red/green is the worst possible pair for the ~8% of men with deuteranomaly,
+    // so there is an alternative. Blue/orange survives every common form.
+    float gr, gg, gb, lr, lg, lb;
+    if (g_render.effColourblind)
     {
-        float u = WrClampF(eta / 0.6f, 0.0f, 1.0f);     // 0.6 is already excellent
-        r = 0.65f * (1.0f - u);
-        g = 0.65f + 0.35f * u;
-        b = 0.65f * (1.0f - u);
+        gr = 0.20f; gg = 0.55f; gb = 1.00f;     // gaining: blue
+        lr = 1.00f; lg = 0.55f; lb = 0.10f;     // losing:  orange
     }
     else
     {
-        float u = WrClampF(-eta / 0.5f, 0.0f, 1.0f);
-        r = 0.65f + 0.35f * u;
-        g = 0.65f * (1.0f - u);
-        b = 0.65f * (1.0f - u) * 0.4f;
+        gr = 0.10f; gg = 1.00f; gb = 0.10f;
+        lr = 1.00f; lg = 0.13f; lb = 0.10f;
     }
-    unsigned int ri = (unsigned int)(WrClampF(r, 0.0f, 1.0f) * 255.0f);
-    unsigned int gi = (unsigned int)(WrClampF(g, 0.0f, 1.0f) * 255.0f);
-    unsigned int bi = (unsigned int)(WrClampF(b, 0.0f, 1.0f) * 255.0f);
-    return 0xFF000000u | (bi << 16) | (gi << 8) | ri;   // ImGui packs ABGR
+
+    unsigned int neutral =
+        MixColour(runColour, 0.5f, 0.5f, 0.5f, g_render.effNeutralMix);
+    if (eta > 0.0f)
+        return MixColour(neutral, gr, gg, gb, u);
+    return MixColour(neutral, lr, lg, lb, u);
 }
 
 static void EmitVelocityVector(ImDrawList *dl)
@@ -1060,10 +1315,23 @@ static void EmitVelocityVector(ImDrawList *dl)
     Vec3 dir = WrScale(v, 1.0f / speed);
     Vec3 tip = WrAdd(base, WrScale(dir, len));
 
-    // Colour it by the same efficiency ramp the lines use, so the vector and the
-    // record line you are chasing are directly comparable.
-    float ceiling = WrAirPowerCeiling(g_energy.gravity, 0.015f);
-    unsigned int col = EfficiencyColour(WrEfficiency(WrEnergyPower(), ceiling));
+    // Coloured by the SAME signal as the arrow beside the crosshair -- energy
+    // rising, steady, or falling -- and deliberately not by live efficiency.
+    //
+    // It used to be live efficiency, and that was measuring noise. The input is
+    // a 0.30 s difference of a 0.30 s average of a camera-differenced velocity;
+    // on a trajectory where energy is exactly constant it swings +-25 units/s at
+    // 2000 u/s and +-40 at 3200, which saturates this ramp 14% and 36% of the
+    // time respectively. Full colour needed a swing of 6.75 energy units -- less
+    // than the 12-unit dead band the arrow already refuses to trust, and larger
+    // than the 5-unit step the same number is rounded to for display.
+    //
+    // The 0.75 s trend sits safely above that noise, and using it means the
+    // vector and the arrow can no longer disagree with each other.
+    int trend = WrEnergyTrendDir();
+    float vecEta = (trend > 0) ? g_render.effSaturation
+                               : (trend < 0 ? -g_render.effSaturation : 0.0f);
+    unsigned int col = EfficiencyColour(vecEta, 0xFFB0B0B0u);
 
     Vec3 a = base, b = tip;
     ImVec2 pa, pb;
@@ -1092,13 +1360,81 @@ static void EmitVelocityVector(ImDrawList *dl)
     }
 }
 
+// The key for the efficiency colours.
+//
+// There was none, anywhere, for any colour scheme in this tool -- and the
+// reported problem with this one was not that the mapping was wrong but that
+// nothing on screen said what it meant. A tooltip two tabs deep in a panel you
+// close before you play is not an answer.
+//
+// It goes in the corner OPPOSITE the energy overlay, so the two cannot collide
+// whichever corner that has been moved to.
+static void EmitEfficiencyLegend(ImDrawList *dl)
+{
+    if (!g_render.colourByEfficiency || !g_render.effLegend)
+        return;
+
+    float size = 0.0f;
+    ImFont *font = WrFontFor(14.0f * g_render.tagScale, &size);
+    float pad = 9.0f * g_render.tagScale;
+    float lh = size * 1.35f;
+    float sw = size * 1.6f;         // swatch width
+
+    struct Row { float eta; bool noData; const char *text; };
+    static const Row kRows[4] = {
+        { 1.0f,  false, "gaining -- strafing is adding energy" },
+        { 0.0f,  false, "nothing happening -- free flight" },
+        { -1.0f, false, "losing -- a ramp entry, a wall, a landing" },
+        { 0.0f,  true,  "no reading -- a booster, or a gap" },
+    };
+    static const char *kFoot = "full colour = 37 energy/s, all air strafing can add";
+
+    float w = font->CalcTextSizeA(size, FLT_MAX, 0.0f, kFoot).x;
+    for (int i = 0; i < 4; i++)
+    {
+        float lw = sw + pad + font->CalcTextSizeA(size, FLT_MAX, 0.0f,
+                                                  kRows[i].text).x;
+        if (lw > w) w = lw;
+    }
+    float h = lh * 5.0f + pad * 2.0f;
+    w += pad * 2.0f;
+
+    // Opposite corner to the overlay, in both axes.
+    float m = 18.0f;
+    int corner = (~g_energy.overlayCorner) & 3;
+    float x = (corner & 1) ? (g_sw - w - m) : m;
+    float y = (corner & 2) ? (g_sh - h - m) : m;
+
+    dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h), 0xA0000000u, 5.0f);
+
+    // A neutral grey stands in for "some run's colour" -- the swatches show what
+    // the ramp does, and every enabled run has a different base.
+    for (int i = 0; i < 4; i++)
+    {
+        float ry = y + pad + lh * i;
+        unsigned int c = kRows[i].noData
+            ? WithAlpha(0xFFB0B0B0u, g_render.effNoDataAlpha)
+            : EfficiencyColour(kRows[i].eta * g_render.effSaturation,
+                               0xFFB0B0B0u);
+        dl->AddRectFilled(ImVec2(x + pad, ry + size * 0.15f),
+                          ImVec2(x + pad + sw, ry + size * 0.95f), c, 2.0f);
+        ImVec2 p(x + pad + sw + pad, ry);
+        dl->AddText(font, size, ImVec2(p.x + 1.0f, p.y + 1.0f), 0xC0000000u,
+                    kRows[i].text);
+        dl->AddText(font, size, p, 0xFFE0E0E0u, kRows[i].text);
+    }
+    ImVec2 fp(x + pad, y + pad + lh * 4.0f);
+    dl->AddText(font, size, ImVec2(fp.x + 1.0f, fp.y + 1.0f), 0xC0000000u, kFoot);
+    dl->AddText(font, size, fp, 0xFF909090u, kFoot);
+}
+
 static void EmitEnergyOverlay(ImDrawList *dl)
 {
     if (!g_energy.showOverlay || !WrEnergyValid())
         return;
 
-    char lines[6][96];
-    unsigned int cols[6];
+    char lines[10][96];
+    unsigned int cols[10];
     int n = 0;
 
     _snprintf_s(lines[n], sizeof(lines[0]), _TRUNCATE, "energy  %.0f  (%.0f u/s)",
@@ -1108,6 +1444,32 @@ static void EmitEnergyOverlay(ImDrawList *dl)
     _snprintf_s(lines[n], sizeof(lines[0]), _TRUNCATE, "speed   %.0f  (h %.0f)",
                 WrEnergySpeed(), WrEnergyHorizontalSpeed());
     cols[n++] = 0xFFCCCCCCu;
+
+    // The same three numbers the HUD can show, always visible here since the
+    // corner block is the one you read while standing still.
+    WrEnergyBudget bud;
+    if (WrEnergyBudgetNow(&bud))
+    {
+        _snprintf_s(lines[n], sizeof(lines[0]), _TRUNCATE,
+                    "spent %.0f  kept %.0f", bud.spent, bud.banked);
+        cols[n++] = 0xFFCCCCCCu;
+
+        if (bud.carriedValid)
+            _snprintf_s(lines[n], sizeof(lines[0]), _TRUNCATE,
+                        "carried %.0f%%  wasted %.0f", bud.carried, bud.wasted);
+        else
+            _snprintf_s(lines[n], sizeof(lines[0]), _TRUNCATE,
+                        "carried --  wasted %.0f", bud.wasted);
+        // Green when most of the drop survived as speed. 100% is not the target
+        // -- it is the physical ceiling for a map that only descends.
+        cols[n++] = (bud.carriedValid && bud.carried >= 80.0f) ? 0xFF66FF66u
+                                                               : 0xFFCCCCCCu;
+    }
+
+    _snprintf_s(lines[n], sizeof(lines[0]), _TRUNCATE, "gained +%.0f  lost %.0f%s",
+                WrEnergyGained(), WrEnergyLost(),
+                WrEnergyBudgetSpliced() ? "  (spliced)" : "");
+    cols[n++] = 0xFFAAAAAAu;
 
     if (WrEnergyHaveGround())
     {
@@ -1141,7 +1503,7 @@ static void EmitEnergyOverlay(ImDrawList *dl)
     float pad = 10.0f * g_energy.overlayScale;
     float lh = size * 1.35f;
 
-    static const char *kWidest = "since start  -99999  (-99999)";
+    static const char *kWidest = "carried -999%  wasted -99999  (spliced)";
     float w = font->CalcTextSizeA(size, FLT_MAX, 0.0f, kWidest).x;
     for (int i = 0; i < n; i++)
     {
@@ -1177,6 +1539,7 @@ void WrRenderWorld(void)
     g_batchCount = 0;
     g_tagRectCount = 0;
     g_statTags = 0;
+    g_statLabels = 0;
 
     VMatrix m;
     if (!WrWorldToScreen(&m))
@@ -1234,6 +1597,7 @@ void WrRenderWorld(void)
     }
 
     EmitEnergyOverlay(dl);
+    EmitEfficiencyLegend(dl);
     EmitVelocityVector(dl);
     EmitEnergyHud(dl);
 
@@ -1243,8 +1607,12 @@ void WrRenderWorld(void)
         const WrPoint *live = WrLivePoints(&n);
         // No break list: WrLiveRecord restarts the buffer on any move over 512
         // units, so the live trail cannot contain a teleport by construction.
+        //
+        // velScale is 1.0 now, not 0: live points carry a real velocity since
+        // WrLiveRecord started being handed one, so colour-by-speed works on
+        // your own line as well as on everybody else's.
         if (n >= 2)
-            EmitPath(dl, live, n, NULL, 0, g_render.liveColour, 0.0f, NULL);
+            EmitPath(dl, live, n, NULL, 0, g_render.liveColour, 1.0f, NULL);
     }
 
     QueryPerformanceCounter(&t1);
