@@ -640,6 +640,44 @@ static void LabelPicker(const char *title, unsigned int *mask, bool *on)
     ImGui::PopID();
 }
 
+// Two stacked panes sharing whatever height is left.
+//
+// The Runs tab has always sized its list this way; everywhere else was a fixed
+// pixel height, so maximising the window drew the same 320-pixel table with
+// most of a screen of nothing underneath it. Returns the height for the TOP
+// pane, and the bottom one is then drawn with a height of 0, which ImGui reads
+// as "take what is left" for both a child and a scrolling table.
+//
+// `reserve` is room for anything between or after them -- a SeparatorText, a
+// caption -- and the two floors keep a short window usable rather than
+// collapsing one pane to its header.
+static float SplitHeight(float reserve, float frac, float topFloor,
+                         float bottomFloor)
+{
+    float body = ImGui::GetContentRegionAvail().y - reserve;
+    float top = body * frac;
+    if (top > body - bottomFloor)
+        top = body - bottomFloor;
+    if (top < topFloor)
+        top = topFloor;
+    return top;
+}
+
+// One pane taking the rest, with a floor. Used where the parent may already be
+// scrolling, in which case what is "left" can be nothing at all and a bare
+// fill would collapse to a sliver.
+static float FillHeight(float reserve, float floorH)
+{
+    float h = ImGui::GetContentRegionAvail().y - reserve;
+    return h < floorH ? floorH : h;
+}
+
+// The vertical space one SeparatorText costs, near enough to reserve for.
+static float SeparatorHeight(void)
+{
+    return ImGui::GetTextLineHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y;
+}
+
 static bool StrIContains(const char *hay, const char *needle)
 {
     if (!needle || !*needle)
@@ -746,11 +784,19 @@ static void DrawMapsTab(void)
     ImGui::TextDisabled("Neither is the server's count -- that costs a request "
                         "per map, so it is on the browse button.");
 
+    // The table and the output share what is left of the window, rather than
+    // both being a fixed box with the rest of a maximised panel wasted under
+    // them. Browsing a leaderboard 200 places deep is the case that wants the
+    // room, so the output gets the larger share whenever it is showing.
+    bool showOut = WrExtractRunning() || WrExtractLineCount() > 0;
+    float tableH = showOut ? SplitHeight(SeparatorHeight(), 0.45f, 120.0f, 120.0f)
+                           : 0.0f;
+
     const char *here = WrLevelName();
     if (ImGui::BeginTable("##maps", 5,
                           ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders |
                           ImGuiTableFlags_ScrollY | ImGuiTableFlags_Sortable,
-                          ImVec2(0.0f, 320.0f)))
+                          ImVec2(0.0f, tableH)))
     {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("map", ImGuiTableColumnFlags_WidthStretch);
@@ -829,10 +875,15 @@ static void DrawMapsTab(void)
         ImGui::EndTable();
     }
 
-    if (WrExtractRunning() || WrExtractLineCount() > 0)
+    if (showOut)
     {
         ImGui::SeparatorText("Output");
-        if (ImGui::BeginChild("##fetchout", ImVec2(0.0f, 120.0f), true))
+        // Zero height: the last pane takes whatever the table did not. Also a
+        // horizontal scrollbar, because a leaderboard line is wider than a
+        // narrow panel and wrapping a fixed-column listing makes it unreadable.
+        if (ImGui::BeginChild("##fetchout", ImVec2(0.0f, 0.0f),
+                              ImGuiChildFlags_Borders,
+                              ImGuiWindowFlags_HorizontalScrollbar))
         {
             for (int i = 0; i < WrExtractLineCount(); i++)
                 ImGui::TextUnformatted(WrExtractLine(i));
@@ -1340,11 +1391,16 @@ static void DrawGraphsTab(void)
     eLo -= pad;
 
     // --- canvas -------------------------------------------------------------
+    // The plot takes two thirds of what is left and the legend the rest, so a
+    // maximised window buys a bigger curve rather than a bigger margin. There
+    // is no upper clamp on purpose: a taller plot is the whole reason to
+    // enlarge the panel, since vertical resolution is what separates a gentle
+    // sag from a cliff.
     const float kLeft = 56.0f, kBottom = 20.0f, kTop = 8.0f, kRight = 10.0f;
+    float caption = ImGui::GetTextLineHeightWithSpacing() * 2.0f +
+                    ImGui::GetStyle().ItemSpacing.y;
     ImVec2 avail = ImGui::GetContentRegionAvail();
-    float ch = avail.y - 116.0f;            // leave room for the legend
-    if (ch < 140.0f) ch = 140.0f;
-    if (ch > 420.0f) ch = 420.0f;
+    float ch = SplitHeight(caption, 0.66f, 140.0f, 80.0f);
     ImVec2 c0 = ImGui::GetCursorScreenPos();
     ImVec2 size(avail.x > 240.0f ? avail.x : 240.0f, ch);
     ImGui::InvisibleButton("##plot", size);
@@ -1522,9 +1578,16 @@ static void DrawGraphsTab(void)
     dl->PopClipRect();
 
     // --- legend -------------------------------------------------------------
+    //
+    // The caption goes above the table rather than below it, so the table can
+    // be the last thing in the tab and take whatever height is left.
+    ImGui::TextDisabled("Down triangles are ramp bottoms, up are tops. \"end\" is "
+                        "where the curve finishes: how much");
+    ImGui::TextDisabled("energy that run had thrown away by the time it got there.");
+
     if (ImGui::BeginTable("##legend", 4, ImGuiTableFlags_RowBg |
                                          ImGuiTableFlags_ScrollY,
-                          ImVec2(0.0f, 96.0f)))
+                          ImVec2(0.0f, 0.0f)))
     {
         ImGui::TableSetupColumn("who", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableSetupColumn("track", ImGuiTableColumnFlags_WidthFixed, 62.0f);
@@ -1562,9 +1625,6 @@ static void DrawGraphsTab(void)
         }
         ImGui::EndTable();
     }
-    ImGui::TextDisabled("Down triangles are ramp bottoms, up are tops. \"end\" is "
-                        "where the curve finishes: how much");
-    ImGui::TextDisabled("energy that run had thrown away by the time it got there.");
 
     #undef GPX
     #undef GPY
@@ -2423,8 +2483,11 @@ static void DrawDiagnosticsTab(void)
         "same lookup a scoreboard does. Turn it off and the tags fall back to "
         "the name stored in the .wrpath and a coloured dot.");
 
+    // Last thing in the tab, so it takes the rest -- but with a floor, because
+    // this tab is long enough to scroll and what is "left" can then be nothing.
     ImGui::SeparatorText("Log");
-    if (ImGui::BeginChild("log", ImVec2(0.0f, 180.0f), ImGuiChildFlags_Borders,
+    if (ImGui::BeginChild("log", ImVec2(0.0f, FillHeight(0.0f, 180.0f)),
+                          ImGuiChildFlags_Borders,
                           ImGuiWindowFlags_HorizontalScrollbar))
     {
         int n = WrLogCount();
