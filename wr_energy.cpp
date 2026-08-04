@@ -70,6 +70,22 @@ static WrArrow g_arrow;
 static WrSwing g_swing;
 static bool g_spliced = false;
 
+// After a discontinuity, how long the output filter is given to converge before
+// the gain/loss accumulator is allowed to bank anything. Three time constants is
+// 95% converged.
+#define SETTLE_TAUS 3.0f
+static float g_settleFor = 0.0f;
+
+// How long the camera must be bit-identical before the readout is held. Two
+// frames at any rate would do -- a moving camera never repeats a float -- but a
+// little more than that costs nothing and cannot be tripped by a single
+// duplicated update.
+#define HOLD_SECONDS 0.05f
+static float g_stillFor = 0.0f;
+static bool g_held = false;
+static bool g_haveReading = false;  // a real velocity has been measured since
+                                    // the last reset or teleport
+
 static float g_clock = 0.0f;
 
 static bool g_valid = false;
@@ -105,6 +121,7 @@ static Vec3 g_lastFwd;
 static bool g_haveVelDir = false;
 static Vec3 g_lastVelDir;
 static float g_lastSpeedForRate = 0.0f;
+static bool g_haveLastSpeed = false;
 static float g_viewTurn = 0.0f, g_velTurn = 0.0f, g_speedRate = 0.0f;
 
 // Displayed value, quantised with hysteresis so the last digit stops churning.
@@ -174,12 +191,16 @@ void WrEnergyReset(void)
     WrTrendReset(&g_trend);
     WrArrowReset(&g_arrow);
     WrSwingReset(&g_swing, WR_SWING_HYSTERESIS);
+    g_settleFor = 0.0f;
     g_spliced = false;
     g_haveShownSpent = false;
     g_haveShownCarried = false;
 
     g_valid = false;
     g_havePos = false;
+    g_haveReading = false;
+    g_stillFor = 0.0f;
+    g_held = false;
     g_restart = false;
     g_speed = 0.0f;
     g_peak = 0.0f;
@@ -192,6 +213,7 @@ void WrEnergyReset(void)
     g_historyCount = 0;
     g_clock = 0.0f;
     g_haveFwd = false;
+    g_haveLastSpeed = false;
     g_haveVelDir = false;
     g_haveShown = false;
     g_viewTurn = g_velTurn = g_speedRate = 0.0f;
@@ -259,7 +281,16 @@ static void Teleported(const Vec3 &pos)
     // save-loc load a thousand units down the map is not a thousand units of
     // energy thrown away, and stepping would record exactly that -- the harness
     // runs both and shows the difference.
-    g_swing.have = false;       // re-seeds from the first sample over there
+    //
+    // Seeding once at the first post-teleport sample is not enough either. That
+    // sample is the output of a filter that has just been reset, so it carries
+    // whatever error the first real window happened to have; as the filter then
+    // converges towards the truth, the difference gets banked as a genuine gain
+    // or loss. Measured at 550 units of phantom gain on a scripted save-loc
+    // load. So the pivot is dragged along with the value until the filter has
+    // settled, and only then does it start banking.
+    g_swing.have = false;
+    g_settleFor = SETTLE_TAUS * g_energy.smoothSeconds;
     g_spliced = true;
 
     g_settledFor = 0.0f;
@@ -269,6 +300,19 @@ static void Teleported(const Vec3 &pos)
     g_haveShownSpent = false;
     g_haveShownCarried = false;
     g_historyCount = 0;
+
+    // These were missed the first time round, and each produced a spike of its
+    // own on the frame after a teleport: an acceleration differenced against the
+    // speed you had before the jump, and a view turn rate differenced against
+    // the angle you were facing before it. Cleared as "no previous value" rather
+    // than as zero -- differencing against a zero you never had is the same bug
+    // with a different sign.
+    g_haveLastSpeed = false;
+    g_haveFwd = false;
+    g_haveReading = false;      // nothing here yet to hold
+    g_stillFor = 0.0f;
+    g_held = false;
+    g_speedRate = g_viewTurn = g_velTurn = 0.0f;
 
     if (!g_haveRef)
         return;
@@ -296,12 +340,12 @@ bool WrEnergyTakeRestart(void)
     return r;
 }
 
+bool WrEnergyHeld(void) { return g_held; }
+
 void WrEnergySample(const Vec3 &pos, float dt)
 {
     if (!WrSaneVec(pos) || !(dt > 0.0f) || dt > 0.5f)
         return;
-
-    g_clock += dt;
 
     // Where you were last frame, recorded BEFORE any of the early returns below,
     // and that ordering is the whole fix.
@@ -324,6 +368,55 @@ void WrEnergySample(const Vec3 &pos, float dt)
     Vec3 prev = g_lastPos;
     g_lastPos = pos;
     g_havePos = true;
+
+    // AN UNCHANGED CAMERA IS NOT A SAMPLE.
+    //
+    // Watching a demo, pausing it stops the camera dead while frames keep being
+    // presented. Feeding those frames in reads as "the player instantaneously
+    // stopped", so the whole kinetic term -- thousands of units at surf speed --
+    // drains out of the readout over the next third of a second, the arrow
+    // latches to falling, and the swing accumulator banks a leg on the pause and
+    // another on the unpause. That is the reported "the numbers freak out when
+    // you pause".
+    //
+    // Bit-identical is the test, not "nearly still". A camera that is being
+    // written every tick never repeats a float exactly; one that is not being
+    // written repeats it forever. Standing still in game reads as held too,
+    // which costs nothing -- if the camera is not moving there is genuinely
+    // nothing to measure, and the held value is the correct one.
+    //
+    // Nothing at all advances here, including the ring's own clock. That is what
+    // makes the resume seamless rather than a step: the window's newest sample
+    // is still the pre-pause one, so when movement resumes the next difference
+    // spans real positions over a real interval with the pause simply excised.
+    // The return is unconditional, and the timer only decides when to SAY so.
+    // Waiting even a few frames before skipping does not work: the velocity
+    // window is 40 ms, so eight identical frames at 200 fps fill it completely
+    // and the reading has already collapsed by the time any threshold fires.
+    // Measured on a scripted pause, arming over 50 ms lost 435 of 3595 units
+    // before the hold engaged.
+    //
+    // Skipping a lone repeated frame is right in its own terms anyway -- at a
+    // frame rate above the tick rate the camera genuinely has nothing new to
+    // say on some frames, and that is not a pause.
+    // Gated on already having a reading to hold, and that is not a detail. With
+    // no reading yet -- at spawn, or having just landed somewhere from a
+    // save-loc -- skipping repeats would stop the window ever filling, so a
+    // player standing perfectly still would never get a readout at all. In that
+    // state the repeats are pushed, the window fills with identical positions,
+    // and the honest answer falls out: zero velocity, energy is height alone.
+    if (g_haveReading && havePrev &&
+        pos.x == prev.x && pos.y == prev.y && pos.z == prev.z)
+    {
+        g_stillFor += dt;
+        if (g_stillFor >= HOLD_SECONDS)
+            g_held = true;
+        return;
+    }
+    g_stillFor = 0.0f;
+    g_held = false;
+
+    g_clock += dt;
 
     if (havePrev && WrDist(prev, pos) > TELEPORT_UNITS)
         Teleported(pos);
@@ -357,6 +450,7 @@ void WrEnergySample(const Vec3 &pos, float dt)
     g_speed = WrEmaStep(&g_speedEma, instSpeed, dt, SPEED_TAU);
 
     g_valid = true;
+    g_haveReading = true;
 
     // The RAW window velocity paired with the window's MIDPOINT height, not the
     // smoothed velocity paired with the current height. Both then refer to the
@@ -376,7 +470,18 @@ void WrEnergySample(const Vec3 &pos, float dt)
     // numbers agree with the headline figure rather than nearly agreeing.
     g_zSmooth = WrEmaStep(&g_zEma, mid.z, dt, g_energy.smoothSeconds);
 
-    WrSwingStep(&g_swing, g_nowSmooth);
+    // While the filter is still converging on a fresh value, drag the pivot
+    // along instead of measuring against it. Banking nothing is the correct
+    // answer for a stretch of time the player did not actually play.
+    if (g_settleFor > 0.0f)
+    {
+        g_settleFor -= dt;
+        WrSwingSeed(&g_swing, g_nowSmooth);
+    }
+    else
+    {
+        WrSwingStep(&g_swing, g_nowSmooth);
+    }
 
     // --- turn rates ---------------------------------------------------------
     //
@@ -413,12 +518,13 @@ void WrEnergySample(const Vec3 &pos, float dt)
         g_lastVelDir = dir;
         g_haveVelDir = true;
     }
-    if (dt > 1e-5f)
+    if (dt > 1e-5f && g_haveLastSpeed)
     {
         g_speedRate = WrEmaStep(&g_accelEma, (instSpeed - g_lastSpeedForRate) / dt,
                                 dt, ACCEL_TAU);
     }
     g_lastSpeedForRate = instSpeed;
+    g_haveLastSpeed = true;
 
     // --- ground -------------------------------------------------------------
     //

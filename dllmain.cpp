@@ -103,10 +103,18 @@ void WrIdleTick(void)
 
         WrTimerTick(cam, dt);
 
-        Vec3 vel;
-        if (!WrEnergyVelocity(&vel))
-            vel = WrVec(0.0f, 0.0f, 0.0f);
-        WrLiveRecord(feet, vel, WrTimerElapsed());
+        // Not while held: a paused demo would otherwise stamp the same point
+        // over and over with a clock that is not advancing. WrLiveRecord already
+        // ignores moves under two units, so this is belt and braces -- but it
+        // also keeps the recorder from being handed a velocity that is being
+        // deliberately frozen.
+        if (!WrEnergyHeld())
+        {
+            Vec3 vel;
+            if (!WrEnergyVelocity(&vel))
+                vel = WrVec(0.0f, 0.0f, 0.0f);
+            WrLiveRecord(feet, vel, WrTimerElapsed());
+        }
         WrSavelocRefresh(map);
         WrSavelocTick(cam, WrTimerElapsed(), WrTimerRunning());
     }

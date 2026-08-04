@@ -106,8 +106,13 @@ static inline void WrVelPush(WrVelWindow *w, float x, float y, float z, float dt
         w->count++;
 }
 
+// How much of the requested window must actually be spanned before an estimate
+// is reported at all. Below 1.0 so that a frame rate whose dt does not divide
+// the window evenly is not made to wait an extra frame.
+#define WR_VEL_MIN_SPAN 0.75f
+
 // The oldest sample at least `window` seconds old, or the oldest we have.
-// Returns false until there is enough span to divide by.
+// Returns false until the window is genuinely spanned -- see the gate below.
 //
 // It also hands back the position at the MIDDLE of the window, and that is not a
 // convenience -- it is what makes the energy figure correct while accelerating.
@@ -142,6 +147,28 @@ static inline bool WrVelEstimate(const WrVelWindow *w, float window,
 
     float span = tNew - w->t[pick];
     if (span <= 1e-5f)
+        return false;
+
+    // REFUSE A PARTIAL WINDOW. This is not defensive tidying -- it is the whole
+    // fix for a reported defect.
+    //
+    // Whenever the window has just been emptied (a teleport, a save-loc load, a
+    // map change) it holds one sample, then two. Without this gate the very next
+    // frame reports a velocity differenced over a SINGLE FRAME -- 5 ms at 200
+    // fps, against a window designed to be 40 -- and the caller's filters have
+    // just been reset too, so an unseeded EMA returns that value verbatim rather
+    // than filtering it. The entire readout was therefore decided by one 5 ms
+    // position difference. A 20-unit camera step in that 5 ms reads as 4000 u/s,
+    // which is 10,000 energy units, and it then decayed away over the following
+    // third of a second: the reported "loading a save-loc shows a crazy value
+    // and takes half a second to come down".
+    //
+    // Reporting nothing until there is a real window to measure over costs 40 ms
+    // of held display and removes the spike entirely.
+    //
+    // The ring-full case is the honest exception: past about 3000 fps the ring
+    // cannot hold a whole window, and a slightly short baseline beats no readout.
+    if (span < window * WR_VEL_MIN_SPAN && w->count < WR_VEL_RING)
         return false;
 
     float inv = 1.0f / span;

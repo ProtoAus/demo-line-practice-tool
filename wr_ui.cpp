@@ -1228,7 +1228,12 @@ static void DrawEnergyTab(void)
         "across 795,096 outside it. No depression, exactly as the arithmetic "
         "predicts for these settings.");
     {
-        float tick = 0.015f;
+        // The tick is NOT a constant. 482 of the 503 demos on disk are 0.015,
+        // but all 21 bhop_futile runs are 0.01 -- so take it from the run being
+        // compared against when there is one, and only fall back to the common
+        // value when there is not.
+        const WrRun *tr = WrEnergyReferenceRun();
+        float tick = (tr && tr->tickInterval > 1e-4f) ? tr->tickInterval : 0.015f;
         float full = WrAirPowerCeilingEx(g_energy.gravity, tick,
                                          g_energy.airAccelerate,
                                          g_energy.maxSpeed, 1.0f);
@@ -1237,11 +1242,13 @@ static void DrawEnergyTab(void)
                                          g_energy.maxSpeed, 0.25f);
         if (dead < full - 0.05f)
             ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
-                               "ceiling %.1f/s, but %.1f/s while rising slowly "
-                               "over a ramp", full, dead);
+                               "ceiling %.1f/s at %.0f tick, but %.1f/s while "
+                               "rising slowly over a ramp", full, 1.0f / tick,
+                               dead);
         else
-            ImGui::TextDisabled("ceiling %.1f energy/s; the deadstrafe period "
-                                "does not reduce it here", full);
+            ImGui::TextDisabled("ceiling %.1f energy/s at %.0f tick; the "
+                                "deadstrafe period does not reduce it here",
+                                full, 1.0f / tick);
     }
     ImGui::SeparatorText("Steadiness");
     ImGui::SliderFloat("Smoothing", &g_energy.smoothSeconds, 0.05f, 1.0f, "%.2f s");

@@ -38,6 +38,11 @@ bool WrCameraForward(Vec3 *out)
     return true;
 }
 
+// Mirrors SETTLE_TAUS in wr_energy.cpp -- how many time constants the output
+// filter is given to converge after a discontinuity before the gain/loss
+// accumulator starts banking again.
+#define SETTLE_TAUS 3.0f
+
 static int g_failures = 0;
 
 static void Check(bool ok, const char *what)
@@ -497,6 +502,174 @@ int main(void)
               "and back on the pad it reads zero again, rather than sticking");
         Check(WrEnergyTakeRestart(), "the respawn was reported as a restart");
         Check(!WrEnergyTakeRestart(), "and reading that clears it");
+    }
+
+    printf("\na paused camera holds the readout instead of draining it\n");
+    {
+        // Reported while watching demos: "when you pause, the numbers start to
+        // freak out and rise or fall". Feeding a stopped camera in reads as the
+        // player having instantaneously stopped dead, so the entire kinetic
+        // term drains out over the output filter's time constant.
+        WrEnergyDefaults();
+        WrEnergyReset();
+
+        const float dt = 1.0f / 200.0f;
+        const float z0 = 2000.0f, speed = 2400.0f;
+        for (int i = 0; i < 100; i++)
+            WrEnergySample(WrVec(0.0f, 0.0f, z0), dt);
+        WrEnergyAnchorToFeet(WrVec(0.0f, 0.0f, z0 - 64.0f));
+
+        // Fly flat and fast until the reading is settled. `frozen` must be the
+        // LAST position actually fed, not the next one along, or the pause does
+        // not begin until a frame later.
+        float t = 0.0f;
+        Vec3 frozen = WrVec(0.0f, 0.0f, z0);
+        for (int i = 0; i < 400; i++, t += dt)
+        {
+            frozen = WrVec(speed * t, 0.0f, z0);
+            WrEnergySample(frozen, dt);
+        }
+
+        float before = WrEnergyRelative();
+        float gBefore = WrEnergyGained(), lBefore = WrEnergyLost();
+
+        // Pause: the identical position, for three seconds of frames.
+        float lo = 1e9f, hi = -1e9f;
+        for (int i = 0; i < 600; i++)
+        {
+            WrEnergySample(frozen, dt);
+            float r = WrEnergyRelative();
+            if (r < lo) lo = r;
+            if (r > hi) hi = r;
+        }
+        printf("     before %.0f, over a 3 s pause %.0f..%.0f, held=%s\n",
+               before, lo, hi, WrEnergyHeld() ? "yes" : "no");
+        Check(WrEnergyHeld(), "the hold engages");
+        Check(fabsf(hi - before) < 1.0f && fabsf(lo - before) < 1.0f,
+              "and the figure does not move at all across the pause");
+        Check(WrEnergyGained() == gBefore && WrEnergyLost() == lBefore,
+              "the accumulators bank nothing for time nobody played");
+
+        // Resume from where it stopped, at the same speed.
+        float worstStep = 0.0f;
+        float prev = before;
+        for (int i = 0; i < 200; i++, t += dt)
+        {
+            WrEnergySample(WrVec(speed * t, 0.0f, z0), dt);
+            float r = WrEnergyRelative();
+            float step = fabsf(r - prev);
+            if (step > worstStep) worstStep = step;
+            prev = r;
+        }
+        printf("     worst single-frame step on resume %.1f, settled at %.0f\n",
+               worstStep, prev);
+        Check(!WrEnergyHeld(), "and releases as soon as the camera moves");
+        // The ring's own clock does not advance during the hold, so the first
+        // difference after it spans real positions over a real interval with
+        // the pause simply excised. If that were not true this would step by
+        // the whole kinetic term.
+        Check(worstStep < 20.0f, "with no step, because the pause is excised");
+        Check(fabsf(prev - before) < 20.0f, "and the same value it paused at");
+    }
+
+    printf("\na moving camera is never held, however slowly it moves\n");
+    {
+        WrEnergyDefaults();
+        WrEnergyReset();
+        const float dt = 1.0f / 200.0f;
+        g_seed = 5150;
+        bool everHeld = false;
+        for (int i = 0; i < 1200; i++)
+        {
+            // Barely moving, but moving: sub-unit drift plus bob, which is what
+            // a live camera does when the player is standing still.
+            float t = i * dt;
+            WrEnergySample(WrVec(0.4f * t, 0.0f,
+                                 1000.0f + 1.2f * sinf(t * 12.0f * 6.28318f) +
+                                 0.3f * Noise()), dt);
+            if (WrEnergyHeld()) everHeld = true;
+        }
+        Check(!everHeld, "bit-identical is the test, so a live camera never holds");
+    }
+
+    printf("\na save-loc load into motion does not spike\n");
+    {
+        // The reported defect: "loading a saved location shows some crazy value
+        // and takes 0.25-0.5s to drop to the correct one".
+        //
+        // The existing teleport test lands the player STANDING STILL, which is
+        // why this survived it. The real case lands you mid-flight at speed, and
+        // the frame after the window is emptied the estimator used to report a
+        // velocity differenced over a single frame -- 5 ms against a 40 ms
+        // window -- straight into filters that had just been reset, so it was
+        // returned unfiltered.
+        WrEnergyDefaults();
+        WrEnergyReset();
+
+        const float dt = 1.0f / 200.0f;
+        const float padZ = 4000.0f;
+        for (int i = 0; i < 100; i++)
+            WrEnergySample(WrVec(0.0f, 0.0f, padZ), dt);
+        WrEnergyAnchorToFeet(WrVec(0.0f, 0.0f, padZ - 64.0f));
+        for (int i = 0; i < 200; i++)
+            WrEnergySample(WrVec(0.0f, 0.0f, padZ), dt);
+
+        // The load: 9000 units across the map, 2500 down, arriving at 2200 u/s.
+        // Run it twice -- a clean arrival, and one where the view is still
+        // settling for the first few frames, which is what decides how long the
+        // filter takes to converge.
+        const float baseX = 9000.0f, locZ = padZ - 2500.0f, speed = 2200.0f;
+        float truth = (locZ - padZ) + (speed * speed) / (2.0f * 800.0f);
+        const float jitters[2] = { 0.0f, 8.0f };
+
+        for (int j = 0; j < 2; j++)
+        {
+            WrEnergyReset();
+            for (int i = 0; i < 100; i++)
+                WrEnergySample(WrVec(0.0f, 0.0f, padZ), dt);
+            WrEnergyAnchorToFeet(WrVec(0.0f, 0.0f, padZ - 64.0f));
+            for (int i = 0; i < 200; i++)
+                WrEnergySample(WrVec(0.0f, 0.0f, padZ), dt);
+            g_seed = 31337;
+
+            float worst = -1e9f, settle = -1.0f;
+            for (int i = 0; i < 500; i++)
+            {
+                float t = i * dt;
+                float jit = (i < 3) ? jitters[j] * Noise() : 0.0f;
+                WrEnergySample(WrVec(baseX + speed * t + jit, 0.0f,
+                                     locZ + jit * 0.5f), dt);
+                float rel = WrEnergyRelative();
+                if (rel > worst) worst = rel;
+                if (settle < 0.0f && fabsf(rel - truth) < 60.0f) settle = t;
+            }
+            float g = WrEnergyGained(), l = WrEnergyLost();
+            printf("     %s arrival: true %.0f, worst shown %.0f, settled %.0f ms, "
+                   "gained %.0f lost %.0f\n", j ? "jittery" : "clean  ",
+                   truth, worst, settle * 1000.0f, g, l);
+
+            // The defect was an overshoot of thousands. Nothing about a save-loc
+            // load should ever read as MORE energy than the player actually has.
+            Check(worst < truth + 200.0f, j
+                  ? "a jittery arrival still never overshoots"
+                  : "a clean arrival never overshoots");
+            // A clean arrival is right as soon as there is a window to measure
+            // over -- one window, 40 ms, and no filter lag at all, because the
+            // filter seeds from a value that is already correct.
+            //
+            // A jittery one cannot be: its first window genuinely does measure a
+            // wrong velocity, so the figure converges at the output filter's own
+            // time constant. Three taus is 0.9 s and that is the filter working,
+            // not failing. Real save-loc loads set the position exactly; the 8
+            // units of wobble here is an invented worst case.
+            Check(settle >= 0.0f &&
+                  settle < (j ? SETTLE_TAUS * 0.30f + 0.1f : 0.10f), j
+                  ? "and converges at the filter's time constant, no slower"
+                  : "and is right within one window, with no filter lag");
+            Check(g < 100.0f && l < 100.0f, j
+                  ? "and banks nothing, even settling from a bad first window"
+                  : "and banks nothing as gain or loss");
+        }
     }
 
     printf("\nthe three budget numbers add up, on every frame\n");

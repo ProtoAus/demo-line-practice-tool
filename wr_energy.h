@@ -215,6 +215,16 @@ bool WrEnergyAnchorPos(Vec3 *out);   // false when there is no anchor
 // nothing else, so it cannot see a trigger fire, a key press, or a zone enter.
 bool WrEnergyTakeRestart(void);
 
+// True while the camera is not being written at all -- a paused demo, or the
+// game not simulating. Everything is frozen at its last real value rather than
+// draining toward zero, and the run clock stops with it.
+//
+// The test is bit-identical position, which is stronger than it looks: a camera
+// being updated every tick never repeats a float exactly, and one that is not
+// repeats it forever. A player standing still reads as held too, and that costs
+// nothing -- if the camera is not moving there is nothing to measure.
+bool WrEnergyHeld(void);
+
 // --- the budget ---------------------------------------------------------------
 
 // False when there is nothing to measure from. The three numbers are quantised

@@ -306,6 +306,7 @@ static unsigned int SpeedColour(float speed)
 // "no usable speed here" and colour-by-speed falls back to the flat colour.
 // Defined below, with the rest of the energy drawing.
 static unsigned int EfficiencyColour(float eta, unsigned int runColour);
+static unsigned int MixColour(unsigned int c, float r, float g, float b, float t);
 
 static void EmitPath(ImDrawList *dl, const WrPoint *pts, int count,
                      const int *breaks, int breakCount,
@@ -1202,14 +1203,32 @@ static void EmitEnergyHud(ImDrawList *dl)
         rows[n].s = cmp; rows[n].size = sSub; rows[n].width = mCmp.x; rows[n].col = cmpCol; n++;
     }
 
+    // Held reads as dimmed, never as blank and never as hidden. A readout that
+    // silently stops is indistinguishable from one that is stuck, which is the
+    // exact complaint the fail-trigger latch produced.
+    bool held = WrEnergyHeld();
+
     for (int i = 0; i < n; i++)
     {
         ImFont *f = (i == 0) ? fBig : fSub;
         float tx = rightAlign ? (x + w - rows[i].width) : x;
+        unsigned int col = held ? MixColour(rows[i].col, 0.45f, 0.45f, 0.45f, 0.55f)
+                                : rows[i].col;
         dl->AddText(f, rows[i].size, ImVec2(tx + 1.0f, ty + 1.0f), 0xC0000000u,
                     rows[i].s);
-        dl->AddText(f, rows[i].size, ImVec2(tx, ty), rows[i].col, rows[i].s);
+        dl->AddText(f, rows[i].size, ImVec2(tx, ty), col, rows[i].s);
         ty += (i == 0) ? mBig.y : mSub.y;
+    }
+
+    if (held)
+    {
+        // Two bars, drawn from the block's own metrics so they scale with it.
+        float bh = mSub.y * 0.7f, bw = bh * 0.28f;
+        float bx = rightAlign ? (x - bw * 3.4f) : (x + w + bw * 1.4f);
+        float by = y + (h - bh) * 0.5f;
+        dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + bh), 0xC0B0B0B0u);
+        dl->AddRectFilled(ImVec2(bx + bw * 1.7f, by),
+                          ImVec2(bx + bw * 2.7f, by + bh), 0xC0B0B0B0u);
     }
 }
 

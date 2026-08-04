@@ -103,6 +103,14 @@ void WrTimerTick(const Vec3 &cam, float dt)
         return;
     }
 
+    // A paused demo must not accumulate time, or the you-versus-them delta is
+    // wrong by however long you sat looking at it. A player standing perfectly
+    // still mid-run reads the same way and their clock stops too, which is
+    // wrong -- but standing still mid-surf is not a thing that happens, and the
+    // alternative is the demo case being wrong every single time.
+    if (WrEnergyHeld())
+        return;
+
     g_elapsed += dt;
 }
 
