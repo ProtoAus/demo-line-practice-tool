@@ -1137,6 +1137,8 @@ static void EmitEnergyHud(ImDrawList *dl)
 
     bool haveCmp = false;
     unsigned int cmpCol = 0xFFFFFFFFu;
+    float barFrac = 0.0f;       // -1..+1, how far the bar leans
+    bool barOver = false;       // the gap is off the end of the scale
     if (g_energy.compareToRun)
     {
         const WrRun *ref = WrEnergyReferenceRun();
@@ -1149,6 +1151,28 @@ static void EmitEnergyHud(ImDrawList *dl)
             _snprintf_s(cmp, sizeof(cmp), _TRUNCATE, "%+.0f vs %s", gap, who);
             cmpCol = gap >= 0.0f ? 0xFF66FF66u : 0xFF6666FFu;
             haveCmp = true;
+
+            // The bar can measure either quantity. Energy is the default
+            // because it discriminates better: across 28,243 matched samples a
+            // slower run has more energy than the fastest one at 15.6% of
+            // points but more horizontal speed at 20.4%.
+            float value = gap, scale = g_energy.barMaxEnergy;
+            if (g_energy.barMode == WR_BAR_SPEED)
+            {
+                const WrPoint *p = &ref->points[ref->nearestIndex];
+                float theirSpeed = sqrtf(p->vel.x * p->vel.x +
+                                         p->vel.y * p->vel.y);
+                value = WrEnergyHorizontalSpeed() - theirSpeed;
+                scale = g_energy.barMaxSpeed;
+                _snprintf_s(cmp, sizeof(cmp), _TRUNCATE, "%+.0f u/s vs %s",
+                            value, who);
+                cmpCol = value >= 0.0f ? 0xFF66FF66u : 0xFF6666FFu;
+            }
+            if (scale < 1.0f)
+                scale = 1.0f;
+            barFrac = value / scale;
+            barOver = (barFrac > 1.0f || barFrac < -1.0f);
+            barFrac = WrClampF(barFrac, -1.0f, 1.0f);
         }
     }
 
@@ -1177,10 +1201,13 @@ static void EmitEnergyHud(ImDrawList *dl)
     ImVec2 wBig = fBig->CalcTextSizeA(sBig, FLT_MAX, 0.0f, wideBig);
     ImVec2 wSub = fSub->CalcTextSizeA(sSub, FLT_MAX, 0.0f, wideSub);
 
+    bool drawBar = haveCmp && g_energy.showBar;
+    float barH = drawBar ? (g_energy.barHeight * g_energy.hudScale + 4.0f) : 0.0f;
+
     float w = wBig.x;
     if (wSub.x > w) w = wSub.x;
     if (mCmp.x > w) w = mCmp.x;     // the name is not ours to bound
-    float h = mBig.y + mSub.y + (haveCmp ? mCmp.y : 0.0f);
+    float h = mBig.y + mSub.y + (haveCmp ? mCmp.y : 0.0f) + barH;
 
     bool rightAlign = (g_energy.hudOffsetX < 0.0f);
     float x = g_sw * 0.5f + g_energy.hudOffsetX - (rightAlign ? w : 0.0f);
@@ -1218,6 +1245,43 @@ static void EmitEnergyHud(ImDrawList *dl)
                     rows[i].s);
         dl->AddText(f, rows[i].size, ImVec2(tx, ty), col, rows[i].s);
         ty += (i == 0) ? mBig.y : mSub.y;
+    }
+
+    // The leaning bar. Centre-zero, filling toward whoever is ahead.
+    //
+    // Width is exactly the block's reserved width, so it can never change the
+    // block's horizontal extent or move the text sideways -- the same invariant
+    // the worst-case string reservation above exists to protect. The height is
+    // added to `h` once, on toggle, not as the value changes.
+    if (drawBar)
+    {
+        float by = y + h - barH + 2.0f;
+        float bh = g_energy.barHeight * g_energy.hudScale;
+        float cx = x + w * 0.5f;
+
+        dl->AddRectFilled(ImVec2(x, by), ImVec2(x + w, by + bh), 0x50000000u,
+                          2.0f);
+        float ex = cx + barFrac * w * 0.5f;
+        float x0 = (ex < cx) ? ex : cx, x1 = (ex < cx) ? cx : ex;
+        unsigned int bc = held ? MixColour(cmpCol, 0.45f, 0.45f, 0.45f, 0.55f)
+                               : cmpCol;
+        dl->AddRectFilled(ImVec2(x0, by), ImVec2(x1, by + bh), bc, 2.0f);
+        // Centre tick, drawn last so the fill never hides where zero is.
+        dl->AddRectFilled(ImVec2(cx - 0.5f, by - 1.0f),
+                          ImVec2(cx + 0.5f, by + bh + 1.0f), 0xFFB0B0B0u);
+
+        // A pinned bar and a merely-large one look identical, and the gap runs
+        // to 42,000 units at the 99th percentile because boosters exist. So an
+        // overflow says so with an arrowhead past the end rather than silently
+        // sitting at full deflection.
+        if (barOver)
+        {
+            float t = bh * 0.6f;
+            float tipX = (barFrac > 0.0f) ? (x + w + t) : (x - t);
+            float baseX = (barFrac > 0.0f) ? (x + w) : x;
+            dl->AddTriangleFilled(ImVec2(baseX, by), ImVec2(baseX, by + bh),
+                                  ImVec2(tipX, by + bh * 0.5f), bc);
+        }
     }
 
     if (held)

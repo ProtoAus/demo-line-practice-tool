@@ -168,6 +168,16 @@ void WrEnergyDefaults(void)
     g_energy.hudMode = WR_HUD_NET;
     g_energy.airAccelerate = WR_AIR_ACCEL_DEFAULT;
     g_energy.maxSpeed = WR_MAXSPEED_DEFAULT;
+
+    g_energy.showBar = true;
+    g_energy.barMode = WR_BAR_ENERGY;
+    // Measured across 28,243 matched samples on every map with at least ten
+    // clean main-track runs: |energy gap| against the fastest run has a 90th
+    // percentile of 701, |speed gap| one of 207. So the bar fills at about the
+    // gap you see one time in ten, and the rest of the range is legible.
+    g_energy.barMaxEnergy = 700.0f;
+    g_energy.barMaxSpeed = 200.0f;
+    g_energy.barHeight = 6.0f;
 }
 
 void WrEnergyCycleHudMode(void)

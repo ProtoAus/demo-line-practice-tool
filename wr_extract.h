@@ -53,6 +53,11 @@ bool WrExtractCounts(int *forThisMap, int *alreadyDone, int *notYetDone,
 void WrExtractRun(bool retryFailed);
 bool WrExtractRunning(void);
 
+// The same launcher with different flags, for the map index and for fetching.
+// `needsMap` adds --map for the map you are standing in; indexing does not want
+// it. One process at a time, same as extraction, and never automatic.
+void WrExtractRunArgs(const char *extraArgs, bool needsMap);
+
 // Which interpreter we found, or why we could not find one.
 const char *WrExtractInterpreter(void);
 

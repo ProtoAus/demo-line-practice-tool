@@ -16,6 +16,7 @@
 #include "wr_extract.h"
 #include "wr_timer.h"
 #include "wr_savelocs.h"
+#include "wr_maps.h"
 #include "wr_stress.h"
 #include "wr_hook.h"
 #include "wr_log.h"
@@ -636,6 +637,183 @@ static void LabelPicker(const char *title, unsigned int *mask, bool *on)
         ImGui::Unindent();
     }
     ImGui::PopID();
+}
+
+static bool StrIContains(const char *hay, const char *needle)
+{
+    if (!needle || !*needle)
+        return true;
+    size_t n = strlen(needle);
+    for (const char *p = hay; *p; p++)
+        if (_strnicmp(p, needle, n) == 0)
+            return true;
+    return false;
+}
+
+// Every map Momentum knows about, what we hold for it, and a way to get more.
+//
+// The listing costs nothing: the game caches the whole catalogue on disk and
+// wr_maps.h reads an index made from it. Fetching is the one part that reaches
+// outside this machine, and it is off until you turn it on.
+static bool g_fetchEnabled = false;
+static int g_fetchTop = 25;
+static int g_fetchTrackType = 0;
+static int g_fetchTrackNum = 1;
+static char g_mapFilter[64] = {0};
+
+static void DrawMapsTab(void)
+{
+    if (!WrMapsReady())
+    {
+        WrMapsRefresh();
+        ImGui::TextDisabled("Reading...");
+        return;
+    }
+
+    ImGui::TextWrapped(
+        "Every map Momentum knows about, from the catalogue the game already "
+        "keeps on disk. Listing this asks nothing of anybody's server.");
+    ImGui::TextDisabled("%s", WrMapsStatus());
+
+    if (ImGui::Button("Rebuild the index"))
+        WrExtractRunArgs("--index-maps", false);
+    ImGui::SameLine();
+    if (ImGui::Button("Recount what is on disk"))
+        WrMapsRefresh();
+    ImGui::SameLine();
+    HelpMarker("The index comes from momentum\\_cache, which the game writes "
+               "when it fetches the map list. Rebuilding reads that file and "
+               "nothing else -- no network. If a map is missing, open the map "
+               "selector in game once so the game refreshes its own copy.");
+
+    ImGui::SetNextItemWidth(200.0f);
+    ImGui::InputTextWithHint("##filter", "filter by name", g_mapFilter,
+                             sizeof(g_mapFilter));
+    ImGui::SameLine();
+    ImGui::TextDisabled("%d maps", WrMapsCount());
+
+    // --- fetching -----------------------------------------------------------
+    ImGui::SeparatorText("Download demos");
+    ImGui::Checkbox("Allow downloading", &g_fetchEnabled);
+    ImGui::SameLine();
+    HelpMarker(
+        "The second thing WrLines does that reaches outside your machine, and "
+        "like the Steam name lookup it is a checkbox you control.\n\n"
+        "It asks Momentum's public leaderboard for a map's top runs and "
+        "downloads only the ones you do not already have. That last part is "
+        "exact rather than approximate: a run's replay hash IS the demo's "
+        "filename, so asking for the top fifty of a map you have forty-nine of "
+        "downloads one file.\n\n"
+        "One request at a time, a pause between them, and only when you press "
+        "the button -- never on a map change, never in the background. Demos "
+        "land in wrlines_data\\demos, not in the game install, which stays "
+        "untouched.\n\n"
+        "The endpoint needs no account and no token. Momentum's terms say "
+        "nothing about automated access either way, so the pacing here is "
+        "manners rather than a rule: this is free community infrastructure.");
+
+    if (g_fetchEnabled)
+    {
+        ImGui::SliderInt("Leaderboard places", &g_fetchTop, 5, 200);
+        ImGui::SetNextItemWidth(120.0f);
+        const char *kTracks[3] = { "main", "stage", "bonus" };
+        ImGui::Combo("Track", &g_fetchTrackType, kTracks, 3);
+        if (g_fetchTrackType != 0)
+        {
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(100.0f);
+            ImGui::InputInt("number", &g_fetchTrackNum);
+            if (g_fetchTrackNum < 1) g_fetchTrackNum = 1;
+        }
+    }
+
+    // --- the list -----------------------------------------------------------
+    const char *here = WrLevelName();
+    if (ImGui::BeginTable("##maps", 5,
+                          ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders |
+                          ImGuiTableFlags_ScrollY | ImGuiTableFlags_Sortable,
+                          ImVec2(0.0f, 320.0f)))
+    {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("map", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("tier", ImGuiTableColumnFlags_WidthFixed, 40.0f);
+        ImGui::TableSetupColumn("demos", ImGuiTableColumnFlags_WidthFixed, 55.0f);
+        ImGui::TableSetupColumn("lines", ImGuiTableColumnFlags_WidthFixed, 55.0f);
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed |
+                                    ImGuiTableColumnFlags_NoSort, 110.0f);
+        ImGui::TableHeadersRow();
+
+        for (int i = 0; i < WrMapsCount(); i++)
+        {
+            const WrMapInfo *m = WrMapsAt(i);
+            if (!m)
+                continue;
+            if (g_mapFilter[0] && !StrIContains(m->name, g_mapFilter))
+                continue;
+            // Anything with nothing on disk and no filter typed would be 2000
+            // rows of zeroes, so those only appear once you look for them.
+            if (!g_mapFilter[0] && m->demos == 0)
+                continue;
+
+            ImGui::TableNextRow();
+            ImGui::PushID(i);
+
+            ImGui::TableNextColumn();
+            bool isHere = (here && _stricmp(here, m->name) == 0);
+            if (isHere)
+                ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "%s", m->name);
+            else
+                ImGui::TextUnformatted(m->name);
+
+            ImGui::TableNextColumn();
+            if (m->tier > 0) ImGui::Text("%d", m->tier);
+            else             ImGui::TextDisabled("-");
+
+            ImGui::TableNextColumn();
+            ImGui::Text("%d", m->demos);
+
+            ImGui::TableNextColumn();
+            if (m->extracted < m->demos)
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "%d",
+                                   m->extracted);
+            else
+                ImGui::Text("%d", m->extracted);
+
+            ImGui::TableNextColumn();
+            if (g_fetchEnabled && !WrExtractRunning())
+            {
+                if (ImGui::SmallButton("fetch"))
+                {
+                    char args[256];
+                    _snprintf_s(args, sizeof(args), _TRUNCATE,
+                                "--fetch --map \"%s\" --map-id %d --top %d "
+                                "--track-type %d --track-num %d",
+                                m->name, m->id, g_fetchTop, g_fetchTrackType,
+                                g_fetchTrackNum);
+                    WrExtractRunArgs(args, false);
+                }
+            }
+            else if (isHere && m->extracted < m->demos)
+            {
+                ImGui::TextDisabled("extract in Runs");
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+
+    if (WrExtractRunning() || WrExtractLineCount() > 0)
+    {
+        ImGui::SeparatorText("Output");
+        if (ImGui::BeginChild("##fetchout", ImVec2(0.0f, 120.0f), true))
+        {
+            for (int i = 0; i < WrExtractLineCount(); i++)
+                ImGui::TextUnformatted(WrExtractLine(i));
+            if (WrExtractRunning())
+                ImGui::SetScrollHereY(1.0f);
+        }
+        ImGui::EndChild();
+    }
 }
 
 static void DrawDisplayTab(void)
@@ -1364,6 +1542,39 @@ static void DrawEnergyTab(void)
     ImGui::SameLine();
     HelpMarker("Rounds the displayed figure, with hysteresis, so the last digit "
                "stops churning. Zero shows the raw value.");
+    ImGui::SeparatorText("Comparison bar");
+    ImGui::Checkbox("Lean toward whoever is ahead", &g_energy.showBar);
+    ImGui::SameLine();
+    HelpMarker(
+        "A centre-zero bar under the crosshair readout, filling toward you when "
+        "you are ahead of the run you are chasing and away when you are not.\n\n"
+        "Energy is the default because it discriminates better. Measured over "
+        "28,243 matched samples on every map with at least ten clean runs, a "
+        "slower run has more energy than the fastest one at 15.6% of points but "
+        "more horizontal speed at 20.4% -- speed flatters you more often than "
+        "it should.\n\n"
+        "The maxima are the 90th percentile of the gap: 701 energy units and "
+        "207 u/s. Past the end of the scale an arrowhead appears rather than "
+        "the bar just sitting pinned, because the gap reaches 42,000 at the "
+        "99th percentile wherever a booster is involved.\n\n"
+        "It compares against the fastest ENABLED run near you, so enabling a "
+        "mid-pack run flips which way it leans. The line above it names who.");
+    if (g_energy.showBar)
+    {
+        const char *kBar[WR_BAR_MODE_COUNT] = { "energy", "horizontal speed" };
+        if (g_energy.barMode < 0 || g_energy.barMode >= WR_BAR_MODE_COUNT)
+            g_energy.barMode = 0;
+        ImGui::Combo("Bar measures", &g_energy.barMode, kBar, WR_BAR_MODE_COUNT);
+        if (g_energy.barMode == WR_BAR_ENERGY)
+            ImGui::SliderFloat("Full lean at", &g_energy.barMaxEnergy,
+                               100.0f, 3000.0f, "%.0f energy");
+        else
+            ImGui::SliderFloat("Full lean at", &g_energy.barMaxSpeed,
+                               50.0f, 1500.0f, "%.0f u/s");
+        ImGui::SliderFloat("Bar height", &g_energy.barHeight, 2.0f, 20.0f,
+                           "%.0f px");
+    }
+
     ImGui::SliderFloat("Corner block size", &g_energy.overlayScale, 0.6f, 3.0f, "%.2fx");
     ImGui::TextDisabled("sv_gravity. 800 is the Source default; change it only if");
     ImGui::TextDisabled("the map or gamemode does.");
@@ -1810,6 +2021,7 @@ void WrUiDraw(void)
         if (ImGui::BeginTabBar("tabs"))
         {
             if (ImGui::BeginTabItem("Runs"))       { DrawRunsTab();        ImGui::EndTabItem(); }
+            if (ImGui::BeginTabItem("Maps"))       { DrawMapsTab();        ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem("Display"))    { DrawDisplayTab();     ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem("Energy"))     { DrawEnergyTab();      ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem("Frame cap"))  { DrawFrameCapTab();    ImGui::EndTabItem(); }

@@ -135,6 +135,21 @@ struct WrEnergySettings
     // nothing here touches a cvar. See wr_stress.h for what they change.
     float airAccelerate;    // sv_airaccelerate, 150 on surf servers
     float maxSpeed;         // sv_maxspeed
+
+    // A bar that leans toward whoever is ahead. Reads at a glance where a signed
+    // number does not, which is the point of it beside a crosshair.
+    bool showBar;
+    int barMode;            // WrBarMode
+    float barMaxEnergy;     // gap that fills the bar, in energy units
+    float barMaxSpeed;      // ... or in units per second
+    float barHeight;        // pixels, before hudScale
+};
+
+enum WrBarMode
+{
+    WR_BAR_ENERGY = 0,      // the default; measured the better discriminator
+    WR_BAR_SPEED,
+    WR_BAR_MODE_COUNT
 };
 
 enum WrHudMode

@@ -1051,6 +1051,17 @@ def iter_demos(game_dir):
                 if fn.lower().endswith(".mtv"):
                     yield tree, os.path.join(dirpath, fn)
 
+    # Anything --fetch downloaded. It goes under wrlines_data rather than into
+    # momtv because nothing here writes to the game install, so it needs its own
+    # pass -- and it is named as a separate tree so the listing says where a
+    # demo came from.
+    ours = os.path.join(os.path.dirname(DEFAULT_OUT), "demos")
+    if os.path.isdir(ours):
+        for dirpath, _dirs, files in os.walk(ours):
+            for fn in files:
+                if fn.lower().endswith(".mtv"):
+                    yield "fetched", os.path.join(dirpath, fn)
+
 
 def peek_map(path):
     """Read just enough to get the map name, for cheap filtering."""
@@ -1430,6 +1441,238 @@ def cmd_extract(args):
     return 0 if failed == 0 else 1
 
 
+# ---------------------------------------------------------------------------
+# The map catalogue, and fetching demos
+# ---------------------------------------------------------------------------
+#
+# Two things live here that the DLL deliberately does not do itself.
+#
+# The DLL links no HTTP client and no zlib, and its import list is checked with
+# dumpbin as part of every build -- keeping it to five system DLLs is what makes
+# "it only reads memory and two files" auditable at a glance. Python already has
+# urllib and zlib in the standard library and the DLL already knows how to launch
+# it and stream its output into the panel, so this is where the work belongs.
+#
+# BROWSING NEEDS NO NETWORK AT ALL.
+#
+# The game keeps the whole map catalogue on disk, in momentum\_cache: an MSML
+# header, then raw zlib from offset 12, decompressing to JSON. 2049 maps across
+# the approved and submission lists, each with its id, name, and leaderboards
+# with their tiers. That is where map names and ids come from; nothing is asked
+# of anybody's server to list maps.
+#
+# FETCHING IS OPT-IN, RATE LIMITED, AND DEDUPES FIRST.
+#
+# Momentum's backend is open source and GET /maps/:id/leaderboard carries
+# @BypassJwtAuth, so this needs no account and no token. Each entry hands back an
+# absolute downloadURL and a replayHash -- and that hash IS the .mtv filename the
+# game itself stores, so working out what we already have costs nothing and is
+# exact. Asking for the top fifty of a map you have forty-nine of downloads one
+# file.
+#
+# The rules below are self-imposed. Momentum's terms say nothing about automated
+# access in either direction, which makes this a question of manners rather than
+# permission: one request at a time, a pause between them, a cap per invocation,
+# a User-Agent that says who we are, and never automatically -- only when a
+# button is pressed.
+
+API_BASE = "https://api.momentum-mod.org/v1"
+USER_AGENT = ("WrLines/%s (+https://github.com/ProtoAus/demo-line-practice-tool)"
+              % "0.2.1")
+FETCH_DELAY = 0.4          # seconds between requests
+FETCH_PAGE = 100           # leaderboard entries per request; the API's own max
+FETCH_MAX_DEFAULT = 50     # demos per invocation unless asked otherwise
+
+
+def _cache_dir(game):
+    return os.path.join(game, "momentum", "_cache")
+
+
+def read_map_catalogue(game):
+    """Every map the game knows about, from its own on-disk cache. No network."""
+    out = {}
+    d = _cache_dir(game)
+    if not os.path.isdir(d):
+        return out
+    for name in sorted(os.listdir(d)):
+        if not name.endswith(".dat"):
+            continue
+        try:
+            raw = open(os.path.join(d, name), "rb").read()
+        except OSError:
+            continue
+        if len(raw) < 16 or raw[:4] != b"MSML":
+            continue
+        try:
+            # Magic, then eight bytes we do not need, then a raw zlib stream.
+            js = json.loads(zlib.decompress(raw[12:]).decode("utf-8", "replace"))
+        except Exception:
+            continue
+        maps = js if isinstance(js, list) else (js.get("maps") or [])
+        for m in maps:
+            if not isinstance(m, dict):
+                continue
+            mid, nm = m.get("id"), m.get("name")
+            if not isinstance(mid, int) or not isinstance(nm, str):
+                continue
+            tier, modes = 0, set()
+            for lb in (m.get("leaderboards") or []):
+                if not isinstance(lb, dict):
+                    continue
+                if lb.get("trackType") == 0 and isinstance(lb.get("tier"), int):
+                    tier = lb["tier"]
+                if isinstance(lb.get("gamemode"), int):
+                    modes.add(lb["gamemode"])
+            out[nm] = (mid, tier, sorted(modes), name.startswith("approved"))
+    return out
+
+
+def cmd_index_maps(args):
+    """Write the catalogue where the DLL can read it without linking zlib."""
+    cat = read_map_catalogue(args.game)
+    if not cat:
+        print("[!] no map cache found under %s" % _cache_dir(args.game))
+        print("    Momentum writes it when it fetches the map list; open the")
+        print("    map selector in game once and it will appear.")
+        return 1
+
+    have = {}
+    for root in demo_roots(args.game):
+        for dirpath, _dirs, files in os.walk(root):
+            n = sum(1 for f in files if f.lower().endswith(".mtv"))
+            if n:
+                have[os.path.basename(dirpath)] = have.get(
+                    os.path.basename(dirpath), 0) + n
+
+    path = os.path.join(os.path.dirname(args.out), "maps.txt")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("# WrLines map index, from the game's own _cache. No network.\n")
+        f.write("# id\tname\ttier\tapproved\tmodes\n")
+        for nm in sorted(cat):
+            mid, tier, modes, approved = cat[nm]
+            f.write("%d\t%s\t%d\t%d\t%s\n" %
+                    (mid, nm, tier, 1 if approved else 0,
+                     ",".join(str(x) for x in modes)))
+    print("indexed %d maps -> %s" % (len(cat), path))
+    return 0
+
+
+def demo_roots(game):
+    """Everywhere a .mtv might be: the game's own tree, and ours."""
+    roots = [os.path.join(game, "momentum", "momtv")]
+    ours = os.path.join(os.path.dirname(DEFAULT_OUT), "demos")
+    if os.path.isdir(ours):
+        roots.append(ours)
+    return [r for r in roots if os.path.isdir(r)]
+
+
+def _have_hashes(game):
+    """Basenames of every .mtv we already hold, which are replay hashes."""
+    seen = set()
+    for root in demo_roots(game):
+        for _dirpath, _dirs, files in os.walk(root):
+            for f in files:
+                if f.lower().endswith(".mtv"):
+                    seen.add(os.path.splitext(f)[0].lower())
+    return seen
+
+
+def cmd_fetch(args):
+    import urllib.request
+    import urllib.error
+
+    cat = read_map_catalogue(args.game)
+    name = args.map
+    map_id = args.map_id
+    if not map_id:
+        if not name or name not in cat:
+            print("[!] don't know a map id for %r." % (name,))
+            print("    Run --index-maps first, or pass --map-id.")
+            return 1
+        map_id = cat[name][0]
+    if not name:
+        name = "map%d" % map_id
+
+    limit = args.top if args.top > 0 else FETCH_MAX_DEFAULT
+    dest = os.path.join(os.path.dirname(args.out), "demos", name)
+    have = _have_hashes(args.game)
+    print("map %s (id %d), track %d/%d, want the top %d"
+          % (name, map_id, args.track_type, args.track_num, limit))
+    print("%d demos already on disk; only what is missing will be fetched"
+          % len(have))
+
+    def get(url):
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.read()
+
+    # One page at a time, never in parallel.
+    wanted = []
+    skip = 0
+    while len(wanted) < limit:
+        take = min(FETCH_PAGE, limit - len(wanted))
+        url = ("%s/maps/%d/leaderboard?gamemode=%d&trackType=%d&trackNum=%d"
+               "&take=%d&skip=%d" % (API_BASE, map_id, args.gamemode,
+                                     args.track_type, args.track_num, take, skip))
+        try:
+            page = json.loads(get(url).decode("utf-8", "replace"))
+        except urllib.error.HTTPError as e:
+            print("[!] leaderboard request failed: HTTP %d" % e.code)
+            return 1
+        except Exception as e:
+            print("[!] leaderboard request failed: %s" % e)
+            return 1
+        rows = page.get("data") or []
+        if not rows:
+            break
+        wanted.extend(rows)
+        skip += len(rows)
+        if skip >= (page.get("totalCount") or 0):
+            break
+        time.sleep(FETCH_DELAY)
+
+    todo = [r for r in wanted
+            if isinstance(r.get("replayHash"), str)
+            and r["replayHash"].lower() not in have
+            and r.get("downloadURL")]
+    print("%d of the top %d are already here; %d to fetch"
+          % (len(wanted) - len(todo), len(wanted), len(todo)))
+    if not todo:
+        return 0
+    if args.dry_run:
+        for r in todo:
+            print("  would fetch rank %s  %.3fs  %s" %
+                  (r.get("rank"), (r.get("time") or 0.0),
+                   (r.get("user") or {}).get("alias", "?")))
+        return 0
+
+    os.makedirs(dest, exist_ok=True)
+    got = 0
+    for i, r in enumerate(todo):
+        h = r["replayHash"]
+        who = (r.get("user") or {}).get("alias", "?")
+        print("[%d/%d] rank %s  %.3fs  %s" %
+              (i + 1, len(todo), r.get("rank"), (r.get("time") or 0.0), who))
+        sys.stdout.flush()
+        try:
+            blob = get(r["downloadURL"])
+        except Exception as e:
+            print("      failed: %s" % e)
+            continue
+        if len(blob) < 0x100 or blob[:4] != b"MMTV":
+            print("      not a demo (%d bytes); skipped" % len(blob))
+            continue
+        with open(os.path.join(dest, h + ".mtv"), "wb") as f:
+            f.write(blob)
+        got += 1
+        time.sleep(FETCH_DELAY)
+
+    print("fetched %d demo%s into %s" % (got, "" if got == 1 else "s", dest))
+    print("run the extractor on this map to turn them into lines")
+    return 0
+
+
 def main(argv):
     ap = argparse.ArgumentParser(
         description="Extract run paths from Momentum Mod .mtv demos.")
@@ -1456,11 +1699,35 @@ def main(argv):
                     help="give up on a single demo after this many seconds "
                          "(0 for no limit). It is recorded as an ordinary "
                          "failure, so it is not paid for twice")
+    ap.add_argument("--index-maps", action="store_true",
+                    help="write wrlines_data\\maps.txt from the game's own map "
+                         "cache. Reads only local files; no network")
+    ap.add_argument("--fetch", action="store_true",
+                    help="download demos this machine does not have from "
+                         "Momentum's public leaderboard API. Never automatic")
+    ap.add_argument("--map-id", type=int, default=0,
+                    help="with --fetch, the Momentum map id, if --index-maps "
+                         "has not been run")
+    ap.add_argument("--top", type=int, default=0,
+                    help="with --fetch, how many leaderboard places to consider "
+                         "(default %d)" % FETCH_MAX_DEFAULT)
+    ap.add_argument("--gamemode", type=int, default=1,
+                    help="with --fetch, 1 is surf")
+    ap.add_argument("--track-type", type=int, default=0,
+                    help="with --fetch, 0 main, 1 stage, 2 bonus")
+    ap.add_argument("--track-num", type=int, default=1,
+                    help="with --fetch, which stage or bonus")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="with --fetch, list what would be downloaded and stop")
     args = ap.parse_args(argv)
 
     if not os.path.isdir(args.game):
         print("[!] game directory not found: %s" % args.game)
         return 1
+    if args.index_maps:
+        return cmd_index_maps(args)
+    if args.fetch:
+        return cmd_fetch(args)
     if args.list:
         return cmd_list(args)
     if not (args.map or args.file or args.all):

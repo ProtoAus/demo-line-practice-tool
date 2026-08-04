@@ -3,8 +3,9 @@
 Draws the path other players' runs took as a line in the world, in the Momentum Mod map you
 are currently playing. Follow the line instead of memorising a replay.
 
-It reads the `.mtv` demos the game has **already downloaded** for you — no scraping, no API,
-nothing you don't have on disk — and turns them into a route you can see while you surf, with
+It reads the `.mtv` demos the game has **already downloaded** for you — and, if you ask it to,
+fetches more from Momentum's public leaderboard — and turns them into a route you can see while
+you surf, with
 names and avatars on the lines, speeds at the bottom of every ramp, and a live energy readout
 that tells you where you are wasting momentum.
 
@@ -94,12 +95,12 @@ Press **INSERT** in game. Tick runs in the Runs tab. **ESC** closes the panel.
   `sv_cheats`. Everything it writes lives in `wrlines_data\` next to the DLL.
 - **In its default configuration it makes zero calls into the game.** It hooks `Present` to
   draw, reads memory read-only, and reads two files.
-- **It reaches outside your machine in exactly one place.** Name/avatar tags ask the Steam
-  client to look up each runner's persona and picture — the same request a scoreboard makes.
-  Your local avatar cache only ever holds people Steam already had reason to know about
-  (typically one file: yours), so there is no offline route to the pictures. It is a
-  checkbox in Diagnostics; with it off, tags fall back to the name already stored in the
-  `.wrpath` and a coloured dot, and nothing leaves the process.
+- **It reaches outside your machine in exactly two places, both behind a checkbox, both off
+  unless you say otherwise.** Name/avatar tags ask the Steam client to look up each runner's
+  persona and picture — the same request a scoreboard makes. And the Maps tab can download
+  demos you do not have from Momentum's public leaderboard. With both off, nothing leaves the
+  process; tags fall back to the name already stored in the `.wrpath` and a coloured dot.
+  See **Downloading demos** below for what the second one does and does not do.
 - **It does not decode the demo netstream properly.** See below — the extractor is a
   pattern-matcher, and it tells you when it is unsure rather than guessing quietly.
 
@@ -745,6 +746,43 @@ the achievable *gain* is not reduced. It cannot show whether the friction was se
 at these settings both branches predict the same ceiling — but the achievable gain is the only
 thing the tool uses. The ceiling takes `sv_airaccelerate` and `sv_maxspeed` as settings now, and
 the Energy tab says whether the quarter would bite at whatever they are set to.
+
+### Downloading demos
+
+There was no good way to see what existed. `surf_demise` has **9,104 runs on its main track**;
+this machine had 52 of them, and nothing told you about the other nine thousand.
+
+**Browsing costs nothing.** The game already keeps the whole catalogue on disk, in
+`momentum\_cache`: an `MSML` header, then raw zlib from offset 12, decompressing to JSON with
+every map's id, name and leaderboard tiers — **2049 maps**. The Maps tab lists all of it with
+what you hold for each, and asks nothing of anybody's server to do so.
+
+**Fetching is opt-in.** Momentum's backend is open source and `GET /maps/:id/leaderboard` carries
+`@BypassJwtAuth`, so it needs no account and no token. Each entry hands back an absolute
+`downloadURL` and a `replayHash` — and that hash **is** the `.mtv` filename the game itself
+stores, so working out what is missing is exact and free. Asking for the top fifty of a map you
+have forty-nine of downloads one file.
+
+The rules are self-imposed. Momentum's terms say nothing about automated access in either
+direction, which makes this manners rather than permission:
+
+- **Never automatic.** A button, every time — same policy as extraction. Nothing happens on a
+  map change or in the background.
+- **Off by default**, behind a checkbox next to the Steam one.
+- **One request at a time**, with a pause between them and a cap per press. No parallel fetching.
+- **Dedupe before fetching**, so a repeat costs one request.
+- **A User-Agent naming the tool and this repo**, so operators can see who we are.
+- **Written to `wrlines_data\demos\`, never into the game install** — the promise above still
+  holds. The extractor gained a second search root rather than the downloader gaining write
+  access to `momtv\`.
+
+None of it lives in the DLL. It links no HTTP client and no zlib, and `dumpbin /dependents` is
+checked on every build precisely so "it reads memory and two files" is verifiable rather than
+asserted — the import list is still five system DLLs. The work is flags on `wrpath_extract.py`,
+which the DLL already knew how to launch and stream.
+
+One consequence worth stating: downloaded demos carry other players' names and SteamID64s, the
+same as the ones the game downloads. That is why `wrlines_data\` is gitignored.
 
 ### Save-loc times
 

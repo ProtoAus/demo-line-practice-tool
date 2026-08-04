@@ -299,6 +299,11 @@ static DWORD WINAPI CountThread(LPVOID)
         _snprintf_s(root, sizeof(root), _TRUNCATE, "%s\\momentum\\momtv", WrGameDir());
         CountInTree(root, map, pathsDir);
 
+        // Demos we fetched ourselves. They live under wrlines_data because
+        // nothing here writes into the game install, so they are a second tree
+        // rather than more files in momtv.
+        CountInTree(WrDataPath("demos"), map, pathsDir);
+
         free(g_failed);
         g_failed = NULL;
         g_failedCount = 0;
@@ -447,6 +452,21 @@ static DWORD WINAPI ReadThread(LPVOID param)
 
 void WrExtractRun(bool retryFailed)
 {
+    char extra[64];
+    _snprintf_s(extra, sizeof(extra), _TRUNCATE, "--skip-existing%s",
+                retryFailed ? " --retry-failed" : "");
+    WrExtractRunArgs(extra, true);
+}
+
+// The one launcher. Extraction, the map index and a fetch are all the same
+// script with different flags, and all three want the same pipe, the same line
+// ring and the same "already running" guard -- so there is one of each rather
+// than three copies that can drift apart.
+//
+// `needsMap` is what makes the difference: extracting and fetching are about the
+// map you are standing in, indexing is not.
+void WrExtractRunArgs(const char *extraArgs, bool needsMap)
+{
     EnsureCs();
     FindInterpreter();
     if (!g_interpFound)
@@ -465,7 +485,7 @@ void WrExtractRun(bool retryFailed)
     g_lineCount = 0;
     LeaveCriticalSection(&g_cs);
 
-    if (!map[0])
+    if (needsMap && !map[0])
     {
         InterlockedExchange(&g_running, 0);
         return;
@@ -483,11 +503,15 @@ void WrExtractRun(bool retryFailed)
 
     // -u because Python block-buffers stdout when it is not a terminal, and
     // without it the panel would show nothing at all until the run ended.
+    char mapArg[96] = {0};
+    if (needsMap)
+        _snprintf_s(mapArg, sizeof(mapArg), _TRUNCATE, "--map \"%s\" ", map);
+
     char cmd[2048];
     _snprintf_s(cmd, sizeof(cmd), _TRUNCATE,
-                "\"%s\" %s-u \"%s\" --map \"%s\" --game \"%s\" --skip-existing%s",
-                g_interp, g_interpIsPy ? "-3 " : "", script, map, WrGameDir(),
-                retryFailed ? " --retry-failed" : "");
+                "\"%s\" %s-u \"%s\" %s--game \"%s\" %s",
+                g_interp, g_interpIsPy ? "-3 " : "", script, mapArg,
+                WrGameDir(), extraArgs ? extraArgs : "");
 
     SECURITY_ATTRIBUTES sa;
     sa.nLength = sizeof(sa);

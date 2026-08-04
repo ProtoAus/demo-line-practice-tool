@@ -10,6 +10,10 @@
 
 # Runtime data.
 #
+# wrlines_data\demos\ holds demos fetched from Momentum's leaderboard, which
+# carry other players' names and SteamID64s just as the ones the game
+# downloads do.
+#
 # Not just build noise: wrlines_data\paths\ holds .wrpath files derived from
 # other players' downloaded demos, and every one of them carries that player's
 # name and SteamID64. They are yours to generate locally, not to publish.
