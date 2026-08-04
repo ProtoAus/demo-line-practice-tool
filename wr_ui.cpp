@@ -17,6 +17,7 @@
 #include "wr_timer.h"
 #include "wr_savelocs.h"
 #include "wr_maps.h"
+#include "wr_profile.h"
 #include "wr_stress.h"
 #include "wr_hook.h"
 #include "wr_log.h"
@@ -691,6 +692,12 @@ static void DrawMapsTab(void)
                              sizeof(g_mapFilter));
     ImGui::SameLine();
     ImGui::TextDisabled("%d maps", WrMapsCount());
+    ImGui::SameLine();
+    HelpMarker("Two thousand maps and you have demos for a few hundred of "
+               "them, so the ones you hold nothing for are hidden until you "
+               "type a name. That is why a map you are looking for can appear "
+               "with a 0 beside it: the 0 is what is on your disk, not what "
+               "exists.");
 
     // --- fetching -----------------------------------------------------------
     ImGui::SeparatorText("Download demos");
@@ -728,6 +735,17 @@ static void DrawMapsTab(void)
     }
 
     // --- the list -----------------------------------------------------------
+    //
+    // Both counts are of THIS MACHINE. Neither is the leaderboard's, and the
+    // difference was not obvious from a column head reading "demos": Momentum
+    // holds thousands of runs per map and this table can show a 0 beside one of
+    // them. Saying so costs two lines and stops the table reading as a claim
+    // about what exists.
+    ImGui::TextDisabled("demos = .mtv files you hold    lines = .wrpath files "
+                        "extracted from them, which is what draws");
+    ImGui::TextDisabled("Neither is the server's count -- that costs a request "
+                        "per map, so it is on the browse button.");
+
     const char *here = WrLevelName();
     if (ImGui::BeginTable("##maps", 5,
                           ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders |
@@ -740,7 +758,7 @@ static void DrawMapsTab(void)
         ImGui::TableSetupColumn("demos", ImGuiTableColumnFlags_WidthFixed, 55.0f);
         ImGui::TableSetupColumn("lines", ImGuiTableColumnFlags_WidthFixed, 55.0f);
         ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed |
-                                    ImGuiTableColumnFlags_NoSort, 110.0f);
+                                    ImGuiTableColumnFlags_NoSort, 170.0f);
         ImGui::TableHeadersRow();
 
         for (int i = 0; i < WrMapsCount(); i++)
@@ -782,16 +800,25 @@ static void DrawMapsTab(void)
             ImGui::TableNextColumn();
             if (g_fetchEnabled && !WrExtractRunning())
             {
-                if (ImGui::SmallButton("fetch"))
+                char args[256];
+                _snprintf_s(args, sizeof(args), _TRUNCATE,
+                            "--fetch --map \"%s\" --map-id %d --top %d "
+                            "--track-type %d --track-num %d",
+                            m->name, m->id, g_fetchTop, g_fetchTrackType,
+                            g_fetchTrackNum);
+
+                // Browse first, download second. One request, nothing written,
+                // and it prints the leaderboard's own total -- which is the
+                // only place that number can come from.
+                if (ImGui::SmallButton("browse"))
                 {
-                    char args[256];
-                    _snprintf_s(args, sizeof(args), _TRUNCATE,
-                                "--fetch --map \"%s\" --map-id %d --top %d "
-                                "--track-type %d --track-num %d",
-                                m->name, m->id, g_fetchTop, g_fetchTrackType,
-                                g_fetchTrackNum);
-                    WrExtractRunArgs(args, false);
+                    char dry[300];
+                    _snprintf_s(dry, sizeof(dry), _TRUNCATE, "%s --dry-run", args);
+                    WrExtractRunArgs(dry, false);
                 }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("download"))
+                    WrExtractRunArgs(args, false);
             }
             else if (isHere && m->extracted < m->demos)
             {
@@ -860,6 +887,24 @@ static void DrawDisplayTab(void)
     ImGui::SeparatorText("Numbers on the line");
     LabelPicker("At ramp bottoms", &g_render.dipLabel, &g_render.drawDipSpeeds);
     ImGui::SliderInt("Max ramps per run", &g_render.maxDipsPerRun, 1, 100);
+    ImGui::Spacing();
+    LabelPicker("At tops", &g_render.peakLabel, &g_render.drawPeaks);
+    ImGui::SliderInt("Max tops per run", &g_render.maxPeaksPerRun, 1, 100);
+    ImGui::SameLine();
+    HelpMarker("The high points, found the same way the bottoms are: where the "
+               "stored vertical velocity changes sign, after a climb of at least "
+               "32 units so a wobble on a flat section does not become a label.\n\n"
+               "A bottom and a top answer different halves of one question. The "
+               "bottom says what a line carried THROUGH the ramp; the top says "
+               "what it bought with it. Energy is the default here because that "
+               "is the number that stays still between the two when nothing was "
+               "wasted -- speed traded for height reads as a large change and no "
+               "loss at all.\n\n"
+               "Off by default: every arc has one of each, so turning both on "
+               "puts twice as many numbers over the line.");
+    ImGui::TextDisabled("Exact on stored lines. Your own line has no marks yet --");
+    ImGui::TextDisabled("that needs a second derivative of a camera-differenced");
+    ImGui::TextDisabled("velocity and is not measured well enough to draw.");
     ImGui::Spacing();
     LabelPicker("At checkpoints", &g_render.markerLabel, &g_render.drawMarkers);
     ImGui::SliderFloat("Marker size", &g_render.markerRadius, 2.0f, 16.0f, "%.1f px");
@@ -1103,6 +1148,426 @@ static void DrawFrameCapTab(void)
         "None of this is derived from any other limiter's code. Frame pacing is "
         "standard technique, and copying a GPL-licensed implementation would "
         "have relicensed this whole project by accident.");
+}
+
+// ---------------------------------------------------------------------------
+// Graphs -- energy against distance or time, every enabled run at once
+// ---------------------------------------------------------------------------
+//
+// The crosshair readout says what your energy is NOW, and that cannot answer the
+// question this tab exists for: whether a surfer bled their energy away evenly
+// across a stage or threw it all away at one ramp. Those look identical at the
+// finish and want completely different practice.
+//
+// Everything here is relative to each series' OWN first point, which is not a
+// display preference -- a stored run's points are a player's feet and your live
+// line is your camera, 64 units apart forever. Subtracting each series' own
+// start cancels that exactly. See wr_profile.h.
+
+static bool g_gByTime = false;
+static bool g_gNormalise = false;
+static bool g_gBand = true;
+static bool g_gTurns = true;
+static bool g_gLive = true;
+static int g_gMaxSeries = 12;
+
+#define G_MAX_SERIES 32
+
+struct GSeries
+{
+    const WrProfile *p;
+    const WrRun *run;           // NULL for your own line
+    unsigned int colour;
+    const char *name;
+};
+
+static unsigned int GAlpha(unsigned int c, float a)
+{
+    unsigned int base = c & 0x00FFFFFFu;
+    unsigned int al = (unsigned int)(((c >> 24) & 0xFFu) * a);
+    if (al > 255) al = 255;
+    return base | (al << 24);
+}
+
+// A grid step that lands on a number a person would choose, covering `range` in
+// somewhere between four and ten lines.
+static float GNiceStep(float range)
+{
+    if (!(range > 0.0f))
+        return 1.0f;
+    float rough = range / 6.0f;
+    float mag = powf(10.0f, floorf(log10f(rough)));
+    float norm = rough / mag;
+    float step = (norm < 1.5f) ? 1.0f : (norm < 3.5f) ? 2.0f
+               : (norm < 7.5f) ? 5.0f : 10.0f;
+    return step * mag;
+}
+
+// A series' x for one bucket, in whatever the axis currently is.
+static float GX(const GSeries &s, const WrProfileBucket &b)
+{
+    float raw = g_gByTime ? b.t : b.d;
+    if (!g_gNormalise)
+        return raw;
+    float total = g_gByTime ? s.p->tTotal : s.p->dTotal;
+    return total > 1e-4f ? 100.0f * raw / total : 0.0f;
+}
+
+static void DrawGraphsTab(void)
+{
+    ImGui::TextWrapped(
+        "Every enabled run's energy across the whole of it, so you can see the "
+        "SHAPE of a loss rather than its total. A line that sags gently was "
+        "leaking everywhere; a line with one cliff in it lost everything at one "
+        "ramp, and only one of those is worth practising the same way.");
+    ImGui::TextDisabled(
+        "Each curve starts at zero -- its own start, not a shared one. Runs "
+        "store feet and your line is a camera, so nothing else would line up.");
+
+    // Resets the per-frame build budget as well as counting; see wr_profile.h.
+    int pending = WrProfilePending();
+
+    ImGui::Checkbox("Against time", &g_gByTime);
+    ImGui::SameLine();
+    ImGui::Checkbox("As a percentage", &g_gNormalise);
+    ImGui::SameLine();
+    HelpMarker("Distance is the honest axis: it is measured from the points "
+               "themselves and does not care whether the extraction recovered "
+               "every tick.\n\n"
+               "Time is recovered rather than recorded -- point times are "
+               "derived from the sample index, and a run whose recovered clock "
+               "failed its trust test is left out of a time plot entirely "
+               "instead of being drawn wrong. On the worst map measured that "
+               "clock ran anywhere from 0.36x to 10.32x.\n\n"
+               "As a percentage puts every run on 0-100 of its own length, "
+               "which is how you compare a stage against the main track, or two "
+               "runs that took different routes.");
+    ImGui::Checkbox("Min/max band", &g_gBand);
+    ImGui::SameLine();
+    ImGui::Checkbox("Mark tops and bottoms", &g_gTurns);
+    ImGui::SameLine();
+    ImGui::Checkbox("Your own line", &g_gLive);
+    ImGui::SetNextItemWidth(160.0f);
+    ImGui::SliderInt("Curves at once", &g_gMaxSeries, 1, G_MAX_SERIES);
+
+    // --- gather -------------------------------------------------------------
+    GSeries series[G_MAX_SERIES + 1];
+    int nSeries = 0;
+    int dropped = 0, untimed = 0, building = 0;
+
+    for (int i = 0; i < WrRunCount(); i++)
+    {
+        WrRun *r = WrRunAt(i);
+        if (!r || !r->enabled || r->pointCount < 4)
+            continue;
+        if (nSeries >= g_gMaxSeries)
+        {
+            dropped++;
+            continue;
+        }
+        const WrProfile *p = WrProfileFor(r);
+        if (!p)
+        {
+            // Still building. Counted here rather than from WrProfilePending,
+            // which counts every enabled run -- including the ones past the
+            // curve cap that will never be built, and would leave a "building"
+            // message on screen forever.
+            building++;
+            continue;                       // back next frame
+        }
+        if (g_gByTime && !p->timeUsable)
+        {
+            untimed++;
+            continue;
+        }
+        series[nSeries].p = p;
+        series[nSeries].run = r;
+        series[nSeries].colour = r->colour;
+        series[nSeries].name = r->player;
+        nSeries++;
+    }
+
+    if (g_gLive)
+    {
+        const WrProfile *lp = WrProfileLive();
+        if (lp && nSeries <= G_MAX_SERIES)
+        {
+            series[nSeries].p = lp;
+            series[nSeries].run = NULL;
+            series[nSeries].colour = g_render.liveColour;
+            series[nSeries].name = "you";
+            nSeries++;
+        }
+    }
+
+    (void)pending;
+    if (building > 0)
+        ImGui::TextDisabled("building %d more...", building);
+    if (dropped > 0)
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
+                           "%d more run%s enabled than will be drawn -- raise "
+                           "\"curves at once\" or enable fewer.",
+                           dropped, dropped == 1 ? " is" : "s are");
+    if (untimed > 0)
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
+                           "%d run%s left out: recovered timing failed its trust "
+                           "test, so it has no clock to plot against.",
+                           untimed, untimed == 1 ? "" : "s");
+
+    if (nSeries == 0)
+    {
+        ImGui::Spacing();
+        ImGui::TextDisabled(
+            "Nothing to plot. Enable a run in the Runs tab, or turn on your own "
+            "line so there is something of yours to compare against.");
+        return;
+    }
+
+    // --- ranges -------------------------------------------------------------
+    float xMax = 0.0f, eLo = 0.0f, eHi = 0.0f;
+    for (int i = 0; i < nSeries; i++)
+    {
+        const WrProfile *p = series[i].p;
+        float x = GX(series[i], p->b[p->n - 1]);
+        if (x > xMax) xMax = x;
+        if (p->eMin < eLo) eLo = p->eMin;
+        if (p->eMax > eHi) eHi = p->eMax;
+    }
+    if (xMax < 1e-3f) xMax = 1.0f;
+    if (eHi - eLo < 1.0f) { eHi += 0.5f; eLo -= 0.5f; }
+    float pad = (eHi - eLo) * 0.06f;
+    eHi += pad;
+    eLo -= pad;
+
+    // --- canvas -------------------------------------------------------------
+    const float kLeft = 56.0f, kBottom = 20.0f, kTop = 8.0f, kRight = 10.0f;
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    float ch = avail.y - 116.0f;            // leave room for the legend
+    if (ch < 140.0f) ch = 140.0f;
+    if (ch > 420.0f) ch = 420.0f;
+    ImVec2 c0 = ImGui::GetCursorScreenPos();
+    ImVec2 size(avail.x > 240.0f ? avail.x : 240.0f, ch);
+    ImGui::InvisibleButton("##plot", size);
+    bool hovered = ImGui::IsItemHovered();
+    ImVec2 c1(c0.x + size.x, c0.y + size.y);
+
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(c0, c1, IM_COL32(14, 14, 18, 255));
+    dl->AddRect(c0, c1, IM_COL32(70, 70, 80, 255));
+
+    float px0 = c0.x + kLeft, px1 = c1.x - kRight;
+    float py0 = c0.y + kTop,  py1 = c1.y - kBottom;
+    if (px1 - px0 < 40.0f || py1 - py0 < 40.0f)
+        return;
+
+    #define GPX(x) (px0 + (px1 - px0) * ((x) / xMax))
+    #define GPY(e) (py1 - (py1 - py0) * (((e) - eLo) / (eHi - eLo)))
+
+    dl->PushClipRect(c0, c1, true);
+
+    // grid
+    char buf[64];
+    float eStep = GNiceStep(eHi - eLo);
+    for (float e = ceilf(eLo / eStep) * eStep; e <= eHi; e += eStep)
+    {
+        float y = GPY(e);
+        bool zero = (e > -eStep * 0.01f && e < eStep * 0.01f);
+        dl->AddLine(ImVec2(px0, y), ImVec2(px1, y),
+                    zero ? IM_COL32(110, 110, 125, 255) : IM_COL32(42, 42, 50, 255));
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%.0f", e);
+        ImVec2 m = ImGui::CalcTextSize(buf);
+        dl->AddText(ImVec2(px0 - 6.0f - m.x, y - m.y * 0.5f),
+                    IM_COL32(150, 150, 160, 255), buf);
+    }
+
+    float xStep = GNiceStep(xMax);
+    for (float x = 0.0f; x <= xMax * 1.0001f; x += xStep)
+    {
+        float sx = GPX(x);
+        dl->AddLine(ImVec2(sx, py0), ImVec2(sx, py1), IM_COL32(42, 42, 50, 255));
+        if (g_gNormalise)      _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%.0f%%", x);
+        else if (g_gByTime)    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%.0fs", x);
+        else if (xMax > 4000.0f) _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%.1fk", x / 1000.0f);
+        else                   _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%.0f", x);
+        ImVec2 m = ImGui::CalcTextSize(buf);
+        dl->AddText(ImVec2(sx - m.x * 0.5f, py1 + 4.0f),
+                    IM_COL32(150, 150, 160, 255), buf);
+    }
+
+    // --- the curves ---------------------------------------------------------
+    static ImVec2 line[WR_PROFILE_BUCKETS];
+    for (int i = 0; i < nSeries; i++)
+    {
+        const WrProfile *p = series[i].p;
+        unsigned int col = series[i].colour;
+
+        // The band, coalesced to one vertical span per pixel column. Buckets
+        // are finer than the screen by design, so this is where the min and max
+        // of each bucket actually earn their keep -- a single mid-line would
+        // draw straight through a spike that a bucket caught.
+        if (g_gBand)
+        {
+            int lastPx = -99999;
+            float lo = 0.0f, hi = 0.0f;
+            for (int k = 0; k < p->n; k++)
+            {
+                int cx = (int)GPX(GX(series[i], p->b[k]));
+                if (cx != lastPx)
+                {
+                    if (lastPx > -99999 && hi - lo > 0.5f)
+                        dl->AddLine(ImVec2((float)lastPx, GPY(hi)),
+                                    ImVec2((float)lastPx, GPY(lo)),
+                                    GAlpha(col, 0.30f));
+                    lastPx = cx;
+                    lo = p->b[k].eMin;
+                    hi = p->b[k].eMax;
+                }
+                else
+                {
+                    if (p->b[k].eMin < lo) lo = p->b[k].eMin;
+                    if (p->b[k].eMax > hi) hi = p->b[k].eMax;
+                }
+            }
+            if (lastPx > -99999 && hi - lo > 0.5f)
+                dl->AddLine(ImVec2((float)lastPx, GPY(hi)),
+                            ImVec2((float)lastPx, GPY(lo)), GAlpha(col, 0.30f));
+        }
+
+        int n = p->n < WR_PROFILE_BUCKETS ? p->n : WR_PROFILE_BUCKETS;
+        for (int k = 0; k < n; k++)
+            line[k] = ImVec2(GPX(GX(series[i], p->b[k])), GPY(p->b[k].e));
+        dl->AddPolyline(line, n, GAlpha(col, 1.0f), ImDrawFlags_None,
+                        series[i].run ? 1.6f : 2.4f);
+
+        // Turning points, mapped from point index straight to bucket. Tops
+        // point up, bottoms point down, matching the ticks drawn in the world.
+        if (g_gTurns && series[i].run)
+        {
+            const WrRun *r = series[i].run;
+            for (int pass = 0; pass < 2; pass++)
+            {
+                const int *list = pass ? r->peaks : r->dips;
+                int cnt = pass ? r->peakCount : r->dipCount;
+                for (int j = 0; j < cnt; j++)
+                {
+                    int k = (int)(((long long)list[j] * p->n) / r->pointCount);
+                    if (k < 0 || k >= p->n)
+                        continue;
+                    float sx = GPX(GX(series[i], p->b[k]));
+                    float sy = GPY(p->b[k].e);
+                    float d = pass ? -3.5f : 3.5f;
+                    dl->AddTriangleFilled(ImVec2(sx - 3.5f, sy - d),
+                                          ImVec2(sx + 3.5f, sy - d),
+                                          ImVec2(sx, sy + d),
+                                          GAlpha(col, 0.85f));
+                }
+            }
+        }
+    }
+
+    // --- hover --------------------------------------------------------------
+    if (hovered)
+    {
+        ImVec2 mp = ImGui::GetIO().MousePos;
+        if (mp.x >= px0 && mp.x <= px1)
+        {
+            float xv = xMax * (mp.x - px0) / (px1 - px0);
+            dl->AddLine(ImVec2(mp.x, py0), ImVec2(mp.x, py1),
+                        IM_COL32(170, 170, 190, 160));
+
+            ImGui::BeginTooltip();
+            if (g_gNormalise)   ImGui::Text("%.1f%% of the way", xv);
+            else if (g_gByTime) ImGui::Text("%.2f s", xv);
+            else                ImGui::Text("%.0f units along", xv);
+            ImGui::Separator();
+
+            // Every series at once. Reading one curve at a time is what makes a
+            // plot decorative; the comparison is the product.
+            for (int i = 0; i < nSeries; i++)
+            {
+                const WrProfile *p = series[i].p;
+                float native = xv;
+                if (g_gNormalise)
+                {
+                    float total = g_gByTime ? p->tTotal : p->dTotal;
+                    native = xv * total / 100.0f;
+                }
+                float e = 0.0f;
+                ImGui::PushID(i);
+                ImGui::ColorButton("##c",
+                                   ImGui::ColorConvertU32ToFloat4(GAlpha(series[i].colour, 1.0f)),
+                                   ImGuiColorEditFlags_NoTooltip |
+                                   ImGuiColorEditFlags_NoDragDrop,
+                                   ImVec2(10.0f, 10.0f));
+                ImGui::PopID();
+                ImGui::SameLine();
+                if (WrProfileAt(p, native, g_gByTime, &e))
+                {
+                    float dy = GPY(e);
+                    dl->AddCircleFilled(ImVec2(mp.x, dy), 3.5f,
+                                        GAlpha(series[i].colour, 1.0f));
+                    ImGui::Text("%-18s %+7.0f", series[i].name, e);
+                }
+                else
+                {
+                    // Past the end of this run, which must read as nothing
+                    // rather than as a flat line at its final value.
+                    ImGui::TextDisabled("%-18s   --", series[i].name);
+                }
+            }
+            ImGui::EndTooltip();
+        }
+    }
+
+    dl->PopClipRect();
+
+    // --- legend -------------------------------------------------------------
+    if (ImGui::BeginTable("##legend", 4, ImGuiTableFlags_RowBg |
+                                         ImGuiTableFlags_ScrollY,
+                          ImVec2(0.0f, 96.0f)))
+    {
+        ImGui::TableSetupColumn("who", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("track", ImGuiTableColumnFlags_WidthFixed, 62.0f);
+        ImGui::TableSetupColumn("end", ImGuiTableColumnFlags_WidthFixed, 66.0f);
+        ImGui::TableSetupColumn("length", ImGuiTableColumnFlags_WidthFixed, 82.0f);
+        ImGui::TableHeadersRow();
+
+        for (int i = 0; i < nSeries; i++)
+        {
+            const WrProfile *p = series[i].p;
+            ImGui::TableNextRow();
+            ImGui::PushID(i);
+
+            ImGui::TableNextColumn();
+            ImGui::ColorButton("##lc",
+                               ImGui::ColorConvertU32ToFloat4(GAlpha(series[i].colour, 1.0f)),
+                               ImGuiColorEditFlags_NoTooltip |
+                               ImGuiColorEditFlags_NoDragDrop,
+                               ImVec2(10.0f, 10.0f));
+            ImGui::SameLine();
+            ImGui::TextUnformatted(series[i].name);
+
+            ImGui::TableNextColumn();
+            if (series[i].run) ImGui::TextUnformatted(WrTrackName(series[i].run));
+            else               ImGui::TextDisabled("live");
+
+            ImGui::TableNextColumn();
+            ImGui::Text("%+.0f", p->b[p->n - 1].e);
+
+            ImGui::TableNextColumn();
+            if (g_gByTime) ImGui::Text("%.1fs", p->tTotal);
+            else           ImGui::Text("%.0f u", p->dTotal);
+
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    ImGui::TextDisabled("Down triangles are ramp bottoms, up are tops. \"end\" is "
+                        "where the curve finishes: how much");
+    ImGui::TextDisabled("energy that run had thrown away by the time it got there.");
+
+    #undef GPX
+    #undef GPY
 }
 
 static void DrawEnergyTab(void)
@@ -2024,6 +2489,7 @@ void WrUiDraw(void)
             if (ImGui::BeginTabItem("Maps"))       { DrawMapsTab();        ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem("Display"))    { DrawDisplayTab();     ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem("Energy"))     { DrawEnergyTab();      ImGui::EndTabItem(); }
+            if (ImGui::BeginTabItem("Graphs"))     { DrawGraphsTab();      ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem("Frame cap"))  { DrawFrameCapTab();    ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem("Diagnostics")){ DrawDiagnosticsTab(); ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem("About"))      { DrawAboutTab();       ImGui::EndTabItem(); }

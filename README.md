@@ -54,8 +54,14 @@ Press **INSERT** in game. Tick runs in the Runs tab. **ESC** closes the panel.
   route is whose. Anchored where each line crosses the fade distance, so they spread along
   different lines instead of piling up, and de-overlapped rather than drawn on top of
   each other.
-- **Horizontal speed at the bottom of every ramp** — the points where a surf line either
-  kept its momentum or did not — in each run's own colour.
+- **Numbers at every turning point** — speed, energy, time or your delta, at the bottom of each
+  ramp and at the top of each arc, in each run's own colour. A bottom says what a line carried
+  *through* the ramp; a top says what it bought with it, and reading only one of the two tells
+  you a surfer lost speed without telling you whether they got height for it.
+- **Energy across a whole run, plotted** — the Graphs tab draws every enabled run's energy
+  against distance or time, your own line included, with a hover that reads all of them at once.
+  A line that sags gently leaked everywhere; a line with one cliff in it lost the lot at one
+  ramp, and only one of those is worth practising the same way.
 - **Energy**, beside the crosshair where you can read it mid-ramp: how high you could still
   get if you redirected everything you have straight up, measured from the last ground you
   stood on — 0 standing still, and the map's own descent cancels out, so what is left is the
@@ -784,6 +790,20 @@ which the DLL already knew how to launch and stream.
 One consequence worth stating: downloaded demos carry other players' names and SteamID64s, the
 same as the ones the game downloads. That is why `wrlines_data\` is gitignored.
 
+**The two counts in the Maps tab are both yours.** `demos` is `.mtv` files on your disk and
+`lines` is `.wrpath` files extracted from them; neither is what the leaderboard holds, and a map
+you have nothing for shows a 0 rather than a blank. The server's own total costs a request per
+map per track, so it lives on the **browse** button, which fetches one page, prints the
+leaderboard with everything you already hold marked, and downloads nothing.
+
+**Names are not ASCII.** Printing them was: Python takes stdout's encoding from the locale, and
+under the DLL that locale is cp1252, so the first alias outside it raised `UnicodeEncodeError`
+and killed the download mid-run — after some demos had already been written. `surf_demise`'s
+top 25 alone has Cyrillic, Hangul and a name built out of dingbats. Both streams are now UTF-8
+with replacement, so printing a name cannot fail. The panel's font only has Latin glyphs, so an
+unfamiliar alias shows as boxes there; the demo still lands under its hash, which is what it is
+keyed on anyway.
+
 ### Save-loc times
 
 `momentum\savedlocs.txt` is plain KeyValues with a `time` field per save-loc. It is `"-1"` in
@@ -792,6 +812,36 @@ its own note in `wrlines_data\savelocs\`, keyed on position rather than index be
 renumber when a save-loc is deleted. Load a save-loc and the clock returns to what it said when
 you made it. The game's file is opened read-only and shared; nothing is ever written into the
 game install.
+
+### Energy across a whole run
+
+The crosshair readout answers "what is my energy now", which cannot distinguish a run that bled
+its energy away evenly across a stage from one that threw the lot away at a single ramp. Those
+finish identically and want completely different practice. The Graphs tab plots the whole curve.
+
+Three decisions in it are worth stating, because each has a wrong answer that looks fine:
+
+**Every curve starts at zero, at its own start.** Not a display preference — a stored run's
+points are the player's **feet** and your live line is your **camera**, 64 units apart forever.
+Subtracting each series' own first point cancels that exactly, and it is the more useful question
+anyway: how much did this run lose from where it began, whatever height that was.
+
+**Buckets keep a minimum and a maximum, not one sample.** A 38,751-point run has to become a few
+hundred pixel columns somehow, and taking every Nth point is the obvious way. Measured against
+the full-resolution curve across all **396 runs** on this machine, one sample per bucket hides a
+**median of 1324 units** of excursion and tens of thousands on the worst runs — whole ramp exits
+fall between samples, and the plot then says a surfer was smooth exactly where they were not. The
+faint band around each curve is that lost detail; it is not shading.
+
+**Distance never crosses a teleport.** A save-loc load moves the player across the map in one
+sample, and adding that chord would put a kilometre of "path" on the axis where nobody travelled.
+Stored runs use the break list found at load; your own line has none, so it gets the same
+`WR_TELEPORT_UNITS` test directly. `tests\test_profile.exe` asserts both.
+
+Time is offered as an axis but only for runs whose recovered clock passed its trust test — point
+times are derived from the sample index, and on the worst map measured that ran from 0.36× to
+10.32×. Runs that fail it are **left out of a time plot and counted on screen**, rather than
+drawn wrong.
 
 ---
 
@@ -1040,6 +1090,10 @@ wr_hook             swapchain vtable, Present/ResizeBuffers, window proc
 wr_imgui            our own ImGui context, separate from the game's
 wr_render           projection, near-plane clip, LOD, polylines, markers, tags, HUD
 wr_path             .wrpath loading, run store, live recording
+wr_profile          energy against distance/time per run, for the Graphs tab
+wr_maps             the map catalogue and what is on disk for each
+wr_savelocs         our own times for the game's save-locs
+wr_timer            the run clock
 wr_limit            the frame cap
 wr_extract          counting unextracted demos, running the extractor
 wr_matrixlife.h     when a chosen matrix has died -- pure logic, tested
@@ -1048,8 +1102,9 @@ wr_budget.h         gross gain/loss without counting noise -- pure logic, tested
 wr_stress.h         the air-strafing ceiling and efficiency -- pure logic, tested
 wr_ui               the panel
 tests\              standalone harnesses -- tests\build.bat builds and runs all
-                    three. test_energy links the real wr_energy.cpp, because the
-                    teleport latch was in that file rather than in the headers.
+                    four. test_energy links the real wr_energy.cpp and
+                    test_profile the real wr_profile.cpp, because the defects
+                    they cover were in those files rather than in the headers.
 ```
 
 Everything the tool writes lives under `wrlines_data\`, next to the DLL:
