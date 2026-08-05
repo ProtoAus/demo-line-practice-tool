@@ -53,6 +53,7 @@
 #   python wrpath_extract.py --all --limit 50
 
 import argparse
+import calendar
 import json
 import lzma
 import bisect
@@ -1578,117 +1579,450 @@ def _have_hashes(game):
     return seen
 
 
-def cmd_fetch(args):
-    import urllib.request
-    import urllib.error
+# Momentum's own Gamemode enum, not a guess.
+#
+# The map index cannot supply this. Momentum gives nearly every map a
+# leaderboard in nearly every mode -- all 546 surf maps in the local catalogue
+# list twelve of them -- so "which modes does this map have" is not a question
+# the catalogue answers. Most of those boards are simply empty. The mode has to
+# be chosen, so it needs real names.
+GAMEMODES = {
+    1: "surf", 2: "bhop", 3: "bhop (HL1)", 4: "climb (Mom)", 5: "climb (KZT)",
+    6: "climb (16)", 7: "RJ", 8: "SJ", 9: "ahop", 10: "conc",
+    11: "defrag CPM", 12: "defrag VQ3", 13: "defrag VTG",
+}
 
+
+def _api_get(url):
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return r.read()
+
+
+def _epoch(iso):
+    """"2026-03-16T09:40:41.194Z" -> unix seconds. 0 if it will not parse."""
+    if not isinstance(iso, str) or len(iso) < 19:
+        return 0
+    try:
+        return int(calendar.timegm(time.strptime(iso[:19], "%Y-%m-%dT%H:%M:%S")))
+    except Exception:
+        return 0
+
+
+def _clean(s):
+    """A player's name has to survive being a field in a tab-separated file.
+
+    Aliases are free text. One tab in one name would silently shift every
+    column after it for that row, and the C reader would take a player's name
+    as a hash. Control characters go the same way and for the same reason.
+    """
+    if not isinstance(s, str):
+        return "?"
+    out = "".join(" " if (c == "\t" or c == "\n" or c == "\r" or ord(c) < 32)
+                  else c for c in s)
+    return out.strip() or "?"
+
+
+def board_path(out, name, gamemode, track_type, track_num):
+    return os.path.join(os.path.dirname(out), "boards",
+                        "%s_g%d_t%d%d.tsv" % (name, gamemode, track_type,
+                                              track_num))
+
+
+def read_board(path):
+    """(meta, {hash: row}) from a cache file. Empty pair if there is none."""
+    meta, rows = {}, {}
+    try:
+        f = open(path, "r", encoding="utf-8", errors="replace")
+    except OSError:
+        return meta, rows
+    with f:
+        for line in f:
+            line = line.rstrip("\n").rstrip("\r")
+            if not line:
+                continue
+            if line.startswith("#"):
+                parts = line[1:].strip().split("\t")
+                if len(parts) >= 2:
+                    meta[parts[0]] = parts[1:]
+                continue
+            p = line.split("\t")
+            if len(p) < 7:
+                continue
+            try:
+                rows[p[4].lower()] = (int(p[0]), float(p[1]), p[2], p[3],
+                                      p[4], int(p[5]), p[6])
+            except ValueError:
+                continue
+    return meta, rows
+
+
+def write_board(path, meta, rows):
+    """Rank-sorted, one record per line, tab separated -- as maps.txt is."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("# WrLines leaderboard cache -- the windows you asked for, not "
+                "the whole board.\n")
+        for k in ("map", "mapid", "gamemode", "track", "total", "fetched"):
+            if k in meta:
+                f.write("# %s\t%s\n" % (k, "\t".join(str(x) for x in meta[k])))
+        f.write("# rank\ttime\tsteamid\talias\thash\tepoch\turl\n")
+        for r in sorted(rows.values(), key=lambda r: r[0]):
+            f.write("%d\t%.6f\t%s\t%s\t%s\t%d\t%s\n" % r)
+    os.replace(tmp, path)
+
+
+def _leaderboard(map_id, gamemode, track_type, track_num, take, skip):
+    """One page. Returns (rows, totalCount). Raises on a failed request."""
+    url = ("%s/maps/%d/leaderboard?gamemode=%d&trackType=%d&trackNum=%d"
+           "&take=%d&skip=%d" % (API_BASE, map_id, gamemode, track_type,
+                                 track_num, take, max(0, skip)))
+    page = json.loads(_api_get(url).decode("utf-8", "replace"))
+    return (page.get("data") or []), page.get("totalCount")
+
+
+def _to_row(r):
+    """An API entry as a cache record, or None if it is missing what matters."""
+    h = r.get("replayHash")
+    if not isinstance(h, str) or not h:
+        return None
+    u = r.get("user") or {}
+    return (int(r.get("rank") or 0), float(r.get("time") or 0.0),
+            str(u.get("steamID") or "0"), _clean(u.get("alias")),
+            h, _epoch(r.get("createdAt")), str(r.get("downloadURL") or ""))
+
+
+def _resolve_map(args):
+    """(name, id) or (None, None) with the reason already printed."""
     cat = read_map_catalogue(args.game)
-    name = args.map
-    map_id = args.map_id
+    name, map_id = args.map, args.map_id
     if not map_id:
         if not name or name not in cat:
             print("[!] don't know a map id for %r." % (name,))
             print("    Run --index-maps first, or pass --map-id.")
-            return 1
+            return None, None
         map_id = cat[name][0]
-    if not name:
-        name = "map%d" % map_id
+    return (name or "map%d" % map_id), map_id
 
-    limit = args.top if args.top > 0 else FETCH_MAX_DEFAULT
-    dest = os.path.join(os.path.dirname(args.out), "demos", name)
-    have = _have_hashes(args.game)
-    print("map %s (id %d), track %d/%d, want the top %d"
-          % (name, map_id, args.track_type, args.track_num, limit))
-    print("%d demos on disk across every map; each run below is checked against "
-          "all of them by hash" % len(have))
 
-    def get(url):
-        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req, timeout=30) as r:
-            return r.read()
+# The API caps a page at 100 -- take=200 is a 400 Bad Request -- so any window
+# wider than that is paged. `skip` works all the way to the end of a board:
+# verified on surf_demise, skip=9106 returns rank 9107 of 9108.
+def _fetch_window(map_id, args, first, count):
+    """Ranks [first, first+count) as cache records, plus the board's size.
 
-    # One page at a time, never in parallel.
-    wanted = []
-    skip = 0
-    total = None
-    while len(wanted) < limit:
-        take = min(FETCH_PAGE, limit - len(wanted))
-        url = ("%s/maps/%d/leaderboard?gamemode=%d&trackType=%d&trackNum=%d"
-               "&take=%d&skip=%d" % (API_BASE, map_id, args.gamemode,
-                                     args.track_type, args.track_num, take, skip))
-        try:
-            page = json.loads(get(url).decode("utf-8", "replace"))
-        except urllib.error.HTTPError as e:
-            print("[!] leaderboard request failed: HTTP %d" % e.code)
-            return 1
-        except Exception as e:
-            print("[!] leaderboard request failed: %s" % e)
-            return 1
-        rows = page.get("data") or []
-        if total is None:
-            total = page.get("totalCount")
-            # The number people actually want to know, and the reason the map
-            # list cannot answer it: this costs a request, per map, per track.
-            if isinstance(total, int):
-                print("the leaderboard holds %d run%s for this track"
-                      % (total, "" if total == 1 else "s"))
+    `first` is 1-based. Returns (rows, total, requests).
+    """
+    out, total, reqs = [], None, 0
+    got = 0
+    while got < count:
+        take = min(FETCH_PAGE, count - got)
+        rows, tc = _leaderboard(map_id, args.gamemode, args.track_type,
+                                args.track_num, take, first - 1 + got)
+        reqs += 1
+        if total is None and isinstance(tc, int):
+            total = tc
         if not rows:
             break
-        wanted.extend(rows)
-        skip += len(rows)
-        if skip >= (total or 0):
+        for r in rows:
+            rec = _to_row(r)
+            if rec:
+                out.append(rec)
+        got += len(rows)
+        if total is not None and first - 1 + got >= total:
             break
-        time.sleep(FETCH_DELAY)
+        if got < count:
+            time.sleep(FETCH_DELAY)
+    return out, total, reqs
 
-    if not wanted:
+
+def _fetch_spread(map_id, args, n):
+    """N rows sampled evenly across the whole board, one request each.
+
+    The cheap way to SEE a seventeen-thousand-run distribution. Twenty requests
+    gives a fast one, a mid one and a slow one to lay over each other, where
+    caching the board to do the same costs a hundred and seventy.
+
+    The first sample is rank 1, which doubles as the probe for totalCount, so
+    this costs exactly N requests rather than N+1.
+    """
+    rows, total, reqs = [], None, 0
+    first, tc = _leaderboard(map_id, args.gamemode, args.track_type,
+                             args.track_num, 1, 0)
+    reqs += 1
+    total = tc if isinstance(tc, int) else 0
+    for r in first:
+        rec = _to_row(r)
+        if rec:
+            rows.append(rec)
+    if total <= 1 or n <= 1:
+        return rows, total, reqs
+
+    print("sampling %d places across %d runs" % (n, total))
+    for i in range(1, n):
+        rank = 1 + int(round((total - 1) * (float(i) / (n - 1))))
+        if rank > total:
+            rank = total
+        time.sleep(FETCH_DELAY)
+        page, _ = _leaderboard(map_id, args.gamemode, args.track_type,
+                               args.track_num, 1, rank - 1)
+        reqs += 1
+        for r in page:
+            rec = _to_row(r)
+            if rec:
+                rows.append(rec)
+        sys.stdout.flush()
+    return rows, total, reqs
+
+
+def cmd_board(args):
+    """Cache a window of a leaderboard so it can be browsed and sorted offline.
+
+    Deliberately not the whole board. surf_demise is 9108 runs, which is 92
+    requests; surf_boreas is 16993, which is 170 -- a minute or more of
+    sustained requests per map per refresh, against infrastructure somebody
+    else pays for. So you ask for a window, and the file ACCUMULATES: fetch the
+    top hundred, then the slowest hundred, then ranks 4000-4020, and the table
+    shows all three with the gaps between them visible. You end up browsing as
+    much of the board as you actually looked at.
+    """
+    import urllib.error
+
+    name, map_id = _resolve_map(args)
+    if not map_id:
+        return 1
+
+    path = board_path(args.out, name, args.gamemode, args.track_type,
+                      args.track_num)
+    meta, held = ({}, {}) if args.refresh else read_board(path)
+
+    print("map %s (id %d), %s, track %d/%d"
+          % (name, map_id, GAMEMODES.get(args.gamemode, "mode %d" % args.gamemode),
+             args.track_type, args.track_num))
+    if held:
+        print("%d rows already cached; this adds to them" % len(held))
+
+    count = args.count if args.count > 0 else FETCH_MAX_DEFAULT
+    try:
+        if args.spread > 0:
+            rows, total, reqs = _fetch_spread(map_id, args, args.spread)
+        elif args.slowest:
+            # One probe for the size, then land on the tail. Two requests for
+            # the hundred slowest runs of a nine-thousand-run board.
+            _, tc = _leaderboard(map_id, args.gamemode, args.track_type,
+                                 args.track_num, 1, 0)
+            total = tc if isinstance(tc, int) else 0
+            if total <= 0:
+                print("no runs on this track.")
+                return 0
+            first = total - count + 1
+            if first < 1:
+                first = 1
+            print("the board holds %d runs; taking ranks %d-%d"
+                  % (total, first, total))
+            time.sleep(FETCH_DELAY)
+            rows, t2, r2 = _fetch_window(map_id, args, first, count)
+            reqs = 1 + r2
+            total = t2 if isinstance(t2, int) else total
+        else:
+            first = args.from_rank if args.from_rank > 0 else 1
+            print("taking ranks %d-%d, which is %d request%s"
+                  % (first, first + count - 1, (count + FETCH_PAGE - 1) // FETCH_PAGE,
+                     "" if count <= FETCH_PAGE else "s"))
+            rows, total, reqs = _fetch_window(map_id, args, first, count)
+    except urllib.error.HTTPError as e:
+        print("[!] leaderboard request failed: HTTP %d" % e.code)
+        return 1
+    except Exception as e:
+        print("[!] leaderboard request failed: %s" % e)
+        return 1
+
+    if not rows and not held:
         print("no runs on this track. If the map has stages or bonuses, the "
               "main track can be empty while the stages are not -- try "
-              "--track-type 1 --track-num 1.")
+              "--track-type 1 --track-num 1, and check the gamemode.")
         return 0
 
-    todo = [r for r in wanted
-            if isinstance(r.get("replayHash"), str)
-            and r["replayHash"].lower() not in have
-            and r.get("downloadURL")]
-    print("%d of the top %d are already here; %d to fetch"
-          % (len(wanted) - len(todo), len(wanted), len(todo)))
+    # Deduped on the replay hash, NOT on rank. Ranks move as runs land, so the
+    # same run cached twice a week apart would otherwise sit in the file twice
+    # under two different numbers. The newer row wins, which also refreshes the
+    # rank of anything re-fetched.
+    fresh = 0
+    for r in rows:
+        if r[4].lower() not in held:
+            fresh += 1
+        held[r[4].lower()] = r
 
-    # In a browse, list the whole page and mark what is already here, so this
-    # doubles as "show me the leaderboard" rather than only "show me the gap".
-    if args.dry_run:
-        for r in wanted:
-            h = r.get("replayHash")
-            mark = "have" if (isinstance(h, str) and h.lower() in have) else "  --"
-            print("  %s  rank %-5s %8.3fs  %s"
-                  % (mark, r.get("rank"), (r.get("time") or 0.0),
-                     (r.get("user") or {}).get("alias", "?")))
-        return 0
+    meta["map"] = [name]
+    meta["mapid"] = [map_id]
+    meta["gamemode"] = [args.gamemode]
+    meta["track"] = [args.track_type, args.track_num]
+    if isinstance(total, int) and total > 0:
+        meta["total"] = [total]
+    meta["fetched"] = [int(time.time())]
+
+    write_board(path, meta, held)
+    print("%d request%s, %d rows returned, %d new; %d of %s now cached"
+          % (reqs, "" if reqs == 1 else "s", len(rows), fresh, len(held),
+             meta.get("total", ["?"])[0]))
+    print("-> %s" % path)
+    return 0
+
+
+def parse_ranks(spec):
+    """"5,9,120-140" -> a sorted list of ints. Silently ignores nonsense."""
+    out = set()
+    for part in (spec or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part[1:]:
+            a, _, b = part.partition("-")
+            try:
+                lo, hi = int(a), int(b)
+            except ValueError:
+                continue
+            if hi < lo:
+                lo, hi = hi, lo
+            for r in range(lo, min(hi, lo + 4096) + 1):
+                out.add(r)
+        else:
+            try:
+                out.add(int(part))
+            except ValueError:
+                continue
+    return sorted(out)
+
+
+def _download(dest, rows, have):
+    """Download cache records we do not already hold. Returns how many landed."""
+    todo = [r for r in rows if r[4].lower() not in have and r[6]]
+    print("%d of %d are already here; %d to fetch"
+          % (len(rows) - len(todo), len(rows), len(todo)))
     if not todo:
         return 0
 
     os.makedirs(dest, exist_ok=True)
     got = 0
     for i, r in enumerate(todo):
-        h = r["replayHash"]
-        who = (r.get("user") or {}).get("alias", "?")
-        print("[%d/%d] rank %s  %.3fs  %s" %
-              (i + 1, len(todo), r.get("rank"), (r.get("time") or 0.0), who))
+        print("[%d/%d] rank %s  %.3fs  %s" % (i + 1, len(todo), r[0], r[1], r[3]))
         sys.stdout.flush()
         try:
-            blob = get(r["downloadURL"])
+            blob = _api_get(r[6])
         except Exception as e:
             print("      failed: %s" % e)
             continue
         if len(blob) < 0x100 or blob[:4] != b"MMTV":
             print("      not a demo (%d bytes); skipped" % len(blob))
             continue
-        with open(os.path.join(dest, h + ".mtv"), "wb") as f:
+        with open(os.path.join(dest, r[4] + ".mtv"), "wb") as f:
             f.write(blob)
         got += 1
         time.sleep(FETCH_DELAY)
 
     print("fetched %d demo%s into %s" % (got, "" if got == 1 else "s", dest))
     print("run the extractor on this map to turn them into lines")
+    return got
+
+
+def cmd_fetch(args):
+    import urllib.error
+
+    name, map_id = _resolve_map(args)
+    if not map_id:
+        return 1
+
+    dest = os.path.join(os.path.dirname(args.out), "demos", name)
+    have = _have_hashes(args.game)
+    print("%d demos on disk across every map; each run below is checked against "
+          "all of them by hash" % len(have))
+
+    # --- from the cached board: no leaderboard request at all ---------------
+    #
+    # The cache holds the downloadURL the server itself handed back, so picking
+    # rows out of a board you have already browsed costs nothing but the demo
+    # bodies. This is the path the Board tab's tick-and-download uses.
+    if args.ranks:
+        path = board_path(args.out, name, args.gamemode, args.track_type,
+                          args.track_num)
+        _meta, held = read_board(path)
+        if not held:
+            print("[!] no cached board for %s (%s, track %d/%d)."
+                  % (name, GAMEMODES.get(args.gamemode, args.gamemode),
+                     args.track_type, args.track_num))
+            print("    Fetch a window of it first -- see --board.")
+            return 1
+        want = set(parse_ranks(args.ranks))
+        byrank = {r[0]: r for r in held.values()}
+        rows, missing = [], []
+        for rk in sorted(want):
+            if rk in byrank:
+                rows.append(byrank[rk])
+            else:
+                missing.append(rk)
+        print("map %s, %d rank%s asked for, %d in the cache, 0 leaderboard "
+              "requests" % (name, len(want), "" if len(want) == 1 else "s",
+                            len(rows)))
+        if missing:
+            # Named, not silently dropped: a rank outside the cached windows is
+            # a thing the user can fix by fetching that window.
+            show = ", ".join(str(m) for m in missing[:12])
+            print("    not cached, so skipped: %s%s"
+                  % (show, " ..." if len(missing) > 12 else ""))
+        if not rows:
+            return 1
+        _download(dest, rows, have)
+        return 0
+
+    # --- straight from the leaderboard --------------------------------------
+    count = args.count if args.count > 0 else (args.top if args.top > 0
+                                               else FETCH_MAX_DEFAULT)
+    try:
+        if args.slowest:
+            _, tc = _leaderboard(map_id, args.gamemode, args.track_type,
+                                 args.track_num, 1, 0)
+            total = tc if isinstance(tc, int) else 0
+            if total <= 0:
+                print("no runs on this track.")
+                return 0
+            first = max(1, total - count + 1)
+            print("the leaderboard holds %d runs; taking ranks %d-%d"
+                  % (total, first, total))
+            time.sleep(FETCH_DELAY)
+        else:
+            first = args.from_rank if args.from_rank > 0 else 1
+            print("map %s (id %d), track %d/%d, ranks %d-%d"
+                  % (name, map_id, args.track_type, args.track_num,
+                     first, first + count - 1))
+        rows, total, reqs = _fetch_window(map_id, args, first, count)
+        if isinstance(total, int):
+            print("the leaderboard holds %d run%s for this track (%d request%s "
+                  "made)" % (total, "" if total == 1 else "s", reqs,
+                             "" if reqs == 1 else "s"))
+    except urllib.error.HTTPError as e:
+        print("[!] leaderboard request failed: HTTP %d" % e.code)
+        return 1
+    except Exception as e:
+        print("[!] leaderboard request failed: %s" % e)
+        return 1
+
+    if not rows:
+        print("no runs on this track. If the map has stages or bonuses, the "
+              "main track can be empty while the stages are not -- try "
+              "--track-type 1 --track-num 1.")
+        return 0
+
+    # In a browse, list the whole page and mark what is already here, so this
+    # doubles as "show me the leaderboard" rather than only "show me the gap".
+    if args.dry_run:
+        for r in rows:
+            mark = "have" if r[4].lower() in have else "  --"
+            print("  %s  rank %-5s %8.3fs  %s" % (mark, r[0], r[1], r[3]))
+        return 0
+
+    _download(dest, rows, have)
     return 0
 
 
@@ -1750,9 +2084,34 @@ def main(argv):
     ap.add_argument("--map-id", type=int, default=0,
                     help="with --fetch, the Momentum map id, if --index-maps "
                          "has not been run")
+    ap.add_argument("--board", action="store_true",
+                    help="cache a window of a map's leaderboard so it can be "
+                         "browsed and sorted offline. Adds to whatever is "
+                         "already cached rather than replacing it")
+    ap.add_argument("--from-rank", type=int, default=0,
+                    help="first leaderboard place to take, 1-based")
+    ap.add_argument("--count", type=int, default=0,
+                    help="how many places to take (default %d). The API caps a "
+                         "page at 100, so this costs ceil(count/100) requests"
+                         % FETCH_MAX_DEFAULT)
+    ap.add_argument("--slowest", action="store_true",
+                    help="take the LAST places instead of the first. Two "
+                         "requests: totalCount comes back with the first page")
+    ap.add_argument("--spread", type=int, default=0,
+                    help="with --board, sample N places evenly across the whole "
+                         "board -- one request each, and the cheap way to see "
+                         "the shape of a seventeen-thousand-run leaderboard")
+    ap.add_argument("--refresh", action="store_true",
+                    help="with --board, discard what is cached first rather "
+                         "than adding to it")
+    ap.add_argument("--ranks",
+                    help="with --fetch, download these places from the cached "
+                         "board, e.g. \"5,9,120-140\". Costs no leaderboard "
+                         "requests at all -- the cache holds the download URL")
     ap.add_argument("--top", type=int, default=0,
                     help="with --fetch, how many leaderboard places to consider "
-                         "(default %d)" % FETCH_MAX_DEFAULT)
+                         "(default %d). An alias for --from-rank 1 --count N"
+                         % FETCH_MAX_DEFAULT)
     ap.add_argument("--gamemode", type=int, default=1,
                     help="with --fetch, 1 is surf")
     ap.add_argument("--track-type", type=int, default=0,
@@ -1768,6 +2127,8 @@ def main(argv):
         return 1
     if args.index_maps:
         return cmd_index_maps(args)
+    if args.board:
+        return cmd_board(args)
     if args.fetch:
         return cmd_fetch(args)
     if args.list:

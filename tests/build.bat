@@ -42,6 +42,10 @@ cl /nologo /O2 /EHsc /W3 %DEFS% /I. tests\test_profile.cpp wr_profile.cpp ^
    wr_energy.cpp wr_log.cpp /Fe:tests\test_profile.exe /Fo:tests\ >nul
 if errorlevel 1 ( echo [!] test_profile FAILED to build & exit /b 1 )
 
+cl /nologo /O2 /EHsc /W3 %DEFS% /I. tests\test_board.cpp wr_board.cpp ^
+   wr_log.cpp /Fe:tests\test_board.exe /Fo:tests\ >nul
+if errorlevel 1 ( echo [!] test_board FAILED to build & exit /b 1 )
+
 del tests\*.obj >nul 2>&1
 
 set "RC=0"
@@ -49,6 +53,7 @@ tests\test_matrixlife.exe || set "RC=1"
 tests\test_pacing.exe     || set "RC=1"
 tests\test_energy.exe     || set "RC=1"
 tests\test_profile.exe    || set "RC=1"
+tests\test_board.exe      || set "RC=1"
 
 if "%RC%"=="1" ( echo. & echo [!] SOME HARNESSES FAILED & exit /b 1 )
 echo.

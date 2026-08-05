@@ -58,6 +58,9 @@ Press **INSERT** in game. Tick runs in the Runs tab. **ESC** closes the panel.
   ramp and at the top of each arc, in each run's own colour. A bottom says what a line carried
   *through* the ramp; a top says what it bought with it, and reading only one of the two tells
   you a surfer lost speed without telling you whether they got height for it.
+- **A leaderboard you can scroll and sort**, and download any part of — including the slow end,
+  because the fastest runs are the hardest to follow. Two requests reach the bottom of a
+  9,000-run board.
 - **Energy across a whole run, plotted** — the Graphs tab draws every enabled run's energy
   against distance or time, your own line included, with a hover that reads all of them at once.
   A line that sags gently leaked everywhere; a line with one cliff in it lost the lot at one
@@ -796,6 +799,44 @@ you have nothing for shows a 0 rather than a blank. The server's own total costs
 map per track, so it lives on the **browse** button, which fetches one page, prints the
 leaderboard with everything you already hold marked, and downloads nothing.
 
+### Browsing a leaderboard, and reaching the slow end of it
+
+**The fastest runs are the hardest to follow.** A 37-second `surf_demise` record is not a line you
+can trace; the 79-second run at rank 9,108 is. Being able to ask only for "the top N" made the one
+thing a learner wants unreachable.
+
+The Board tab is as much of a map's leaderboard as you have asked for — scrollable, sortable on
+every column, filterable by player, with a tick box per row and one download button.
+
+**How a board is paged.** `take` is capped at 100 — `take=200` is an HTTP 400 — so any window
+wider than that is fetched a page at a time. "Top 200" is two requests. `skip` works all the way
+to the end: verified on `surf_demise`, `skip=9106` returns rank 9,107 of 9,108. So **the slowest
+runs cost two requests**, because `totalCount` comes back with the first page — one request gets
+the size and the next lands on the tail.
+
+**The cache is a window, and it accumulates.** The whole board would be 92 requests for
+`surf_demise` and **170 for `surf_boreas`** (16,993 runs) — a minute or more of sustained requests
+per map, per refresh, against infrastructure somebody else pays for. So you fetch the top hundred,
+then the slowest hundred, then ranks 4000–4020, and the table shows all three with the gaps
+between them visible. You browse as much of the board as you actually looked at.
+
+Rows are deduped on the **replay hash, not the rank**. Ranks move as runs land, so the same run
+cached a week apart would otherwise sit in the file twice under two different numbers.
+
+**Spread** samples N places evenly across the whole board, one request each — the cheap way to see
+the shape of a 17,000-run leaderboard. Twenty requests gives you a fast one, a mid one and a slow
+one to lay over each other, where caching that board in full costs a hundred and seventy.
+
+**Downloading from the board costs no leaderboard requests at all.** The cache stores the
+`downloadURL` the server itself handed back, so ticking rows and pressing download fetches only
+the demo bodies. Capped at 64 per press, and the cap is stated rather than silently truncating.
+
+**Gamemode has to be picked, and the map cannot tell you.** Momentum gives nearly every map a
+leaderboard in nearly every mode — all 546 surf maps in the local catalogue list twelve of them,
+and most of those boards are empty. (`surf_demise` really does have 3 bhop runs.) The names come
+from Momentum's own `Gamemode` enum rather than a guess: 1 surf, 2 bhop, 3 bhop HL1, 4 climb Mom,
+5 climb KZT, 6 climb 16, 7 RJ, 8 SJ, 9 ahop, 10 conc, 11–13 defrag CPM/VQ3/VTG.
+
 **Names are not ASCII.** Printing them was: Python takes stdout's encoding from the locale, and
 under the DLL that locale is cp1252, so the first alias outside it raised `UnicodeEncodeError`
 and killed the download mid-run — after some demos had already been written. `surf_demise`'s
@@ -1092,6 +1133,7 @@ wr_render           projection, near-plane clip, LOD, polylines, markers, tags, 
 wr_path             .wrpath loading, run store, live recording
 wr_profile          energy against distance/time per run, for the Graphs tab
 wr_maps             the map catalogue and what is on disk for each
+wr_board            a map's leaderboard, as much of it as you asked for
 wr_savelocs         our own times for the game's save-locs
 wr_timer            the run clock
 wr_limit            the frame cap
@@ -1102,9 +1144,9 @@ wr_budget.h         gross gain/loss without counting noise -- pure logic, tested
 wr_stress.h         the air-strafing ceiling and efficiency -- pure logic, tested
 wr_ui               the panel
 tests\              standalone harnesses -- tests\build.bat builds and runs all
-                    four. test_energy links the real wr_energy.cpp and
-                    test_profile the real wr_profile.cpp, because the defects
-                    they cover were in those files rather than in the headers.
+                    five. test_energy, test_profile and test_board link the
+                    real .cpp files, because the defects they cover were in
+                    those files rather than in the headers.
 ```
 
 Everything the tool writes lives under `wrlines_data\`, next to the DLL:

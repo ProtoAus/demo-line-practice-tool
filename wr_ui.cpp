@@ -17,6 +17,7 @@
 #include "wr_timer.h"
 #include "wr_savelocs.h"
 #include "wr_maps.h"
+#include "wr_board.h"
 #include "wr_profile.h"
 #include "wr_stress.h"
 #include "wr_hook.h"
@@ -26,6 +27,7 @@
 
 #include <float.h>
 #include <math.h>
+#include <time.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -700,6 +702,63 @@ static int g_fetchTrackType = 0;
 static int g_fetchTrackNum = 1;
 static char g_mapFilter[64] = {0};
 
+// Defined with the rest of the Board tab, below. Hands it a map and asks it to
+// come to the front, which is what the per-row "board" button does.
+static void BoardShow(const char *map, int trackType, int trackNum);
+
+// The Maps table used to pass ImGuiTableFlags_Sortable and implement nothing:
+// no column carried a user id and TableGetSortSpecs was never called, so
+// clicking a header drew the arrow and changed nothing at all. These are the
+// ids that make it real.
+enum
+{
+    MAPCOL_NAME = 1,
+    MAPCOL_TIER,
+    MAPCOL_DEMOS,
+    MAPCOL_LINES,
+};
+
+static const ImGuiTableSortSpecs *g_mapSpecs = NULL;
+
+static int CompareMapColumn(const WrMapInfo *a, const WrMapInfo *b, ImGuiID col)
+{
+    switch (col)
+    {
+    case MAPCOL_NAME:
+        return _stricmp(a->name, b->name);
+    case MAPCOL_TIER:
+        // Unknown tier sorts last either way rather than pretending to be a 0.
+        {
+            int ta = a->tier > 0 ? a->tier : 999;
+            int tb = b->tier > 0 ? b->tier : 999;
+            return ta == tb ? 0 : (ta < tb ? -1 : 1);
+        }
+    case MAPCOL_DEMOS:
+        return a->demos == b->demos ? 0 : (a->demos < b->demos ? -1 : 1);
+    case MAPCOL_LINES:
+        return a->extracted == b->extracted ? 0
+                                            : (a->extracted < b->extracted ? -1 : 1);
+    default:
+        return 0;
+    }
+}
+
+static int __cdecl CompareMapRows(const void *pa, const void *pb)
+{
+    const WrMapInfo *a = WrMapsAt(*(const int *)pa);
+    const WrMapInfo *b = WrMapsAt(*(const int *)pb);
+    if (!a || !b || !g_mapSpecs)
+        return 0;
+    for (int s = 0; s < g_mapSpecs->SpecsCount; s++)
+    {
+        const ImGuiTableColumnSortSpecs *spec = &g_mapSpecs->Specs[s];
+        int c = CompareMapColumn(a, b, spec->ColumnUserID);
+        if (c != 0)
+            return spec->SortDirection == ImGuiSortDirection_Ascending ? c : -c;
+    }
+    return _stricmp(a->name, b->name);      // ties never wobble
+}
+
 static void DrawMapsTab(void)
 {
     if (!WrMapsReady())
@@ -799,15 +858,25 @@ static void DrawMapsTab(void)
                           ImVec2(0.0f, tableH)))
     {
         ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn("map", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("tier", ImGuiTableColumnFlags_WidthFixed, 40.0f);
-        ImGui::TableSetupColumn("demos", ImGuiTableColumnFlags_WidthFixed, 55.0f);
-        ImGui::TableSetupColumn("lines", ImGuiTableColumnFlags_WidthFixed, 55.0f);
+        ImGui::TableSetupColumn("map", ImGuiTableColumnFlags_WidthStretch |
+                                       ImGuiTableColumnFlags_DefaultSort,
+                                0.0f, MAPCOL_NAME);
+        ImGui::TableSetupColumn("tier", ImGuiTableColumnFlags_WidthFixed,
+                                40.0f, MAPCOL_TIER);
+        ImGui::TableSetupColumn("demos", ImGuiTableColumnFlags_WidthFixed,
+                                55.0f, MAPCOL_DEMOS);
+        ImGui::TableSetupColumn("lines", ImGuiTableColumnFlags_WidthFixed,
+                                55.0f, MAPCOL_LINES);
         ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed |
-                                    ImGuiTableColumnFlags_NoSort, 170.0f);
+                                    ImGuiTableColumnFlags_NoSort, 230.0f);
         ImGui::TableHeadersRow();
 
-        for (int i = 0; i < WrMapsCount(); i++)
+        // Filter first, then sort the indices that survived -- the store keeps
+        // the order wr_maps read it in, exactly as the Runs tab leaves its own
+        // store alone.
+        static int order[4096];
+        int shown = 0;
+        for (int i = 0; i < WrMapsCount() && shown < 4096; i++)
         {
             const WrMapInfo *m = WrMapsAt(i);
             if (!m)
@@ -817,6 +886,23 @@ static void DrawMapsTab(void)
             // Anything with nothing on disk and no filter typed would be 2000
             // rows of zeroes, so those only appear once you look for them.
             if (!g_mapFilter[0] && m->demos == 0)
+                continue;
+            order[shown++] = i;
+        }
+
+        ImGuiTableSortSpecs *specs = ImGui::TableGetSortSpecs();
+        if (specs && specs->SpecsCount > 0 && shown > 1)
+        {
+            g_mapSpecs = specs;
+            qsort(order, (size_t)shown, sizeof(int), CompareMapRows);
+            g_mapSpecs = NULL;
+        }
+
+        for (int k = 0; k < shown; k++)
+        {
+            int i = order[k];
+            const WrMapInfo *m = WrMapsAt(i);
+            if (!m)
                 continue;
 
             ImGui::TableNextRow();
@@ -844,6 +930,11 @@ static void DrawMapsTab(void)
                 ImGui::Text("%d", m->extracted);
 
             ImGui::TableNextColumn();
+            // Always offered, because it costs nothing: it only opens the
+            // board tab on this map, and whether anything is fetched there is
+            // a separate decision behind the same toggle.
+            if (ImGui::SmallButton("board"))
+                BoardShow(m->name, g_fetchTrackType, g_fetchTrackNum);
             if (g_fetchEnabled && !WrExtractRunning())
             {
                 char args[256];
@@ -856,6 +947,7 @@ static void DrawMapsTab(void)
                 // Browse first, download second. One request, nothing written,
                 // and it prints the leaderboard's own total -- which is the
                 // only place that number can come from.
+                ImGui::SameLine();
                 if (ImGui::SmallButton("browse"))
                 {
                     char dry[300];
@@ -868,6 +960,7 @@ static void DrawMapsTab(void)
             }
             else if (isHere && m->extracted < m->demos)
             {
+                ImGui::SameLine();
                 ImGui::TextDisabled("extract in Runs");
             }
             ImGui::PopID();
@@ -1628,6 +1721,518 @@ static void DrawGraphsTab(void)
 
     #undef GPX
     #undef GPY
+}
+
+// ---------------------------------------------------------------------------
+// Board -- as much of a map's leaderboard as you have asked for
+// ---------------------------------------------------------------------------
+//
+// The fastest runs are the hardest to follow, which is the whole reason this
+// exists: a 37-second surf_demise world record is not a line a learner can
+// trace, and the 79-second run at rank 9108 is. See wr_board.h for why the
+// cache is a window rather than the whole board.
+
+static char g_bMap[72] = {0};
+static int g_bMode = 1, g_bTrackType = 0, g_bTrackNum = 1;
+static char g_bFilter[64] = {0};
+static int g_bFromRank = 1, g_bCount = 50, g_bSpread = 20;
+static bool g_bSelect[WR_BOARD_MAX];
+static bool g_bWantFocus = false;       // the Maps tab asked to come here
+static bool g_bLoaded = false;          // has this map/mode been asked for yet
+
+// 64, because the whole selection travels as one "--ranks 5,9,120-140"
+// argument on a 2048-byte command line, and because sixty-four demos is
+// already a long download. Stated in the UI rather than silently truncating.
+#define B_MAX_PICK 64
+
+enum
+{
+    BCOL_RANK = 1,
+    BCOL_TIME,
+    BCOL_PLAYER,
+    BCOL_DATE,
+    BCOL_HAVE,
+};
+
+static const ImGuiTableSortSpecs *g_bSpecs = NULL;
+
+static int CompareBoardColumn(const WrBoardRow *a, const WrBoardRow *b, ImGuiID col)
+{
+    switch (col)
+    {
+    case BCOL_RANK:
+        return a->rank == b->rank ? 0 : (a->rank < b->rank ? -1 : 1);
+    case BCOL_TIME:
+        return a->time == b->time ? 0 : (a->time < b->time ? -1 : 1);
+    case BCOL_PLAYER:
+        return _stricmp(a->alias, b->alias);
+    case BCOL_DATE:
+        return a->dateEpoch == b->dateEpoch ? 0
+                                            : (a->dateEpoch < b->dateEpoch ? -1 : 1);
+    case BCOL_HAVE:
+        return a->have == b->have ? 0 : (a->have ? 1 : -1);
+    default:
+        return 0;
+    }
+}
+
+static int __cdecl CompareBoardRows(const void *pa, const void *pb)
+{
+    const WrBoardRow *a = WrBoardAt(*(const int *)pa);
+    const WrBoardRow *b = WrBoardAt(*(const int *)pb);
+    if (!a || !b || !g_bSpecs)
+        return 0;
+    for (int s = 0; s < g_bSpecs->SpecsCount; s++)
+    {
+        const ImGuiTableColumnSortSpecs *spec = &g_bSpecs->Specs[s];
+        int c = CompareBoardColumn(a, b, spec->ColumnUserID);
+        if (c != 0)
+            return spec->SortDirection == ImGuiSortDirection_Ascending ? c : -c;
+    }
+    // Rank breaks every tie, so the order cannot wobble between frames.
+    return a->rank == b->rank ? 0 : (a->rank < b->rank ? -1 : 1);
+}
+
+// Build "5,9,120-140" from the ticked rows. Ranges rather than a flat list
+// because a contiguous block is the common case and it is four times shorter.
+//
+// Stops emitting at B_MAX_PICK but keeps counting, so the caller can say how
+// many were ticked against how many will be asked for instead of truncating
+// silently.
+static int BuildRankArg(char *out, size_t cap, int *picked)
+{
+    out[0] = '\0';
+    size_t used = 0;
+    int n = 0, emitted = 0, runStart = -1, runEnd = -1;
+
+    #define FLUSH()                                                            \
+        do {                                                                   \
+            if (runStart < 0) break;                                           \
+            char part[32];                                                     \
+            if (runEnd > runStart)                                             \
+                _snprintf_s(part, sizeof(part), _TRUNCATE, "%s%d-%d",          \
+                            used ? "," : "", runStart, runEnd);                \
+            else                                                               \
+                _snprintf_s(part, sizeof(part), _TRUNCATE, "%s%d",             \
+                            used ? "," : "", runStart);                        \
+            if (used + strlen(part) + 1 < cap) {                               \
+                strcat_s(out, cap, part);                                      \
+                used = strlen(out);                                            \
+            }                                                                  \
+            runStart = -1;                                                     \
+        } while (0)
+
+    // Walked in board order, not display order, so the ranges actually merge.
+    for (int i = 0; i < WrBoardCount(); i++)
+    {
+        if (!g_bSelect[i])
+            continue;
+        const WrBoardRow *r = WrBoardAt(i);
+        if (!r)
+            continue;
+        n++;
+        if (emitted >= B_MAX_PICK)
+            continue;
+        emitted++;
+        if (runStart >= 0 && r->rank == runEnd + 1)
+        {
+            runEnd = r->rank;
+            continue;
+        }
+        FLUSH();
+        runStart = runEnd = r->rank;
+    }
+    FLUSH();
+    #undef FLUSH
+
+    if (picked)
+        *picked = n;
+    return n;
+}
+
+static void BoardShow(const char *map, int trackType, int trackNum)
+{
+    if (map && *map)
+        strcpy_s(g_bMap, sizeof(g_bMap), map);
+    g_bTrackType = trackType;
+    g_bTrackNum = trackNum < 1 ? 1 : trackNum;
+    g_bLoaded = false;
+    g_bWantFocus = true;
+}
+
+static void BoardRun(const char *verb)
+{
+    char args[512];
+    _snprintf_s(args, sizeof(args), _TRUNCATE,
+                "%s --map \"%s\" --gamemode %d --track-type %d --track-num %d",
+                verb, g_bMap, g_bMode, g_bTrackType, g_bTrackNum);
+    WrExtractRunArgs(args, false);
+}
+
+static void DrawBoardTab(void)
+{
+    // Default to where you are standing, which is almost always the board you
+    // want, and is the only sensible answer before anything has been picked.
+    if (!g_bMap[0])
+    {
+        const char *here = WrLevelName();
+        if (here && *here)
+            strcpy_s(g_bMap, sizeof(g_bMap), here);
+    }
+
+    ImGui::TextWrapped(
+        "A map's leaderboard, as much of it as you have asked for. The fastest "
+        "runs are the hardest to follow -- a 37-second surf_demise record is "
+        "not a line you can trace, and the 79-second run at rank 9108 is.");
+
+    // --- what board ---------------------------------------------------------
+    ImGui::SetNextItemWidth(200.0f);
+    if (ImGui::InputText("Map", g_bMap, sizeof(g_bMap)))
+        g_bLoaded = false;
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(130.0f);
+    const char *modeNames[WR_GAMEMODE_COUNT];
+    for (int i = 0; i < WR_GAMEMODE_COUNT; i++)
+        modeNames[i] = WrGamemodeName(i + 1);
+    int modeIdx = g_bMode - 1;
+    if (modeIdx < 0 || modeIdx >= WR_GAMEMODE_COUNT)
+        modeIdx = 0;
+    if (ImGui::Combo("Mode", &modeIdx, modeNames, WR_GAMEMODE_COUNT))
+    {
+        g_bMode = modeIdx + 1;
+        g_bLoaded = false;
+    }
+    ImGui::SameLine();
+    HelpMarker("Momentum gives nearly every map a leaderboard in nearly every "
+               "mode -- all 546 surf maps in the local catalogue list twelve of "
+               "them -- and most of those boards are empty. So the mode cannot "
+               "be worked out from the map and has to be picked. If a fetch "
+               "comes back with no runs, this is the first thing to check.");
+
+    ImGui::SetNextItemWidth(120.0f);
+    const char *kTracks[3] = { "main", "stage", "bonus" };
+    if (ImGui::Combo("Track", &g_bTrackType, kTracks, 3))
+        g_bLoaded = false;
+    if (g_bTrackType != 0)
+    {
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(100.0f);
+        if (ImGui::InputInt("number", &g_bTrackNum))
+            g_bLoaded = false;
+        if (g_bTrackNum < 1)
+            g_bTrackNum = 1;
+    }
+
+    // A fetch that has just finished has rewritten the cache, so re-read it.
+    // Watched here rather than in dllmain because the extract slot is shared
+    // and only this tab knows the last command was a board one.
+    static bool wasRunning = false;
+    bool running = WrExtractRunning();
+    if (wasRunning && !running)
+        g_bLoaded = false;
+    wasRunning = running;
+
+    if (!g_bLoaded && g_bMap[0] && !WrBoardBusy())
+    {
+        WrBoardLoad(g_bMap, g_bMode, g_bTrackType, g_bTrackNum);
+        memset(g_bSelect, 0, sizeof(g_bSelect));
+        g_bLoaded = true;
+    }
+
+    ImGui::TextDisabled("%s", WrBoardStatus());
+    long long fetched = WrBoardFetched();
+    if (fetched > 0)
+    {
+        long long age = (long long)time(NULL) - fetched;
+        if (age < 0) age = 0;
+        if (age < 90)        ImGui::TextDisabled("fetched %lld seconds ago", age);
+        else if (age < 5400) ImGui::TextDisabled("fetched %lld minutes ago", age / 60);
+        else if (age < 172800) ImGui::TextDisabled("fetched %lld hours ago", age / 3600);
+        else                 ImGui::TextDisabled("fetched %lld days ago", age / 86400);
+        ImGui::SameLine();
+        HelpMarker("Ranks move as new runs land, so a cached board drifts. The "
+                   "run itself does not -- it is keyed on its replay hash, so a "
+                   "re-fetch updates the rank rather than duplicating the row.");
+    }
+
+    // --- fetching a window --------------------------------------------------
+    ImGui::SeparatorText("Fetch part of the board");
+    ImGui::Checkbox("Allow downloading", &g_fetchEnabled);
+    ImGui::SameLine();
+    HelpMarker("The same switch as in the Maps tab -- one setting, offered in "
+               "both places so neither tab is a dead end.\n\n"
+               "Nothing here reaches the network until it is on, and then only "
+               "when a button is pressed. One request at a time, with a pause "
+               "between them: this is free community infrastructure.");
+    if (g_fetchEnabled)
+    {
+        bool busy = WrExtractRunning();
+        if (busy)
+            ImGui::BeginDisabled();
+
+        ImGui::SetNextItemWidth(110.0f);
+        ImGui::InputInt("from rank", &g_bFromRank);
+        if (g_bFromRank < 1) g_bFromRank = 1;
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(110.0f);
+        ImGui::InputInt("places", &g_bCount);
+        if (g_bCount < 1) g_bCount = 1;
+        if (g_bCount > 500) g_bCount = 500;
+
+        // The cost, before it is paid. The API caps a page at 100.
+        int reqs = (g_bCount + 99) / 100;
+        char lbl[64];
+        _snprintf_s(lbl, sizeof(lbl), _TRUNCATE, "Fastest %d##fast", g_bCount);
+        if (ImGui::Button(lbl))
+        {
+            char v[128];
+            _snprintf_s(v, sizeof(v), _TRUNCATE,
+                        "--board --from-rank 1 --count %d", g_bCount);
+            BoardRun(v);
+        }
+        ImGui::SameLine();
+        _snprintf_s(lbl, sizeof(lbl), _TRUNCATE, "Slowest %d##slow", g_bCount);
+        if (ImGui::Button(lbl))
+        {
+            char v[128];
+            _snprintf_s(v, sizeof(v), _TRUNCATE,
+                        "--board --slowest --count %d", g_bCount);
+            BoardRun(v);
+        }
+        ImGui::SameLine();
+        _snprintf_s(lbl, sizeof(lbl), _TRUNCATE, "From %d##from", g_bFromRank);
+        if (ImGui::Button(lbl))
+        {
+            char v[128];
+            _snprintf_s(v, sizeof(v), _TRUNCATE,
+                        "--board --from-rank %d --count %d", g_bFromRank, g_bCount);
+            BoardRun(v);
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("%d request%s", reqs, reqs == 1 ? "" : "s");
+
+        ImGui::SetNextItemWidth(110.0f);
+        ImGui::InputInt("samples", &g_bSpread);
+        if (g_bSpread < 2) g_bSpread = 2;
+        if (g_bSpread > 100) g_bSpread = 100;
+        ImGui::SameLine();
+        _snprintf_s(lbl, sizeof(lbl), _TRUNCATE, "Spread %d##spread", g_bSpread);
+        if (ImGui::Button(lbl))
+        {
+            char v[128];
+            _snprintf_s(v, sizeof(v), _TRUNCATE, "--board --spread %d", g_bSpread);
+            BoardRun(v);
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("%d requests", g_bSpread);
+        ImGui::SameLine();
+        HelpMarker("Samples places evenly across the WHOLE board, one request "
+                   "each. The cheap way to see the shape of a seventeen-"
+                   "thousand-run leaderboard: twenty requests gives you a fast "
+                   "one, a mid one and a slow one to lay over each other, where "
+                   "caching the same board in full costs a hundred and seventy.");
+
+        if (busy)
+            ImGui::EndDisabled();
+
+        ImGui::TextDisabled("Each press adds to what is cached -- fetch the top,");
+        ImGui::TextDisabled("then the slowest, and both stay.");
+    }
+
+    // --- the table ----------------------------------------------------------
+    ImGui::SeparatorText("Places");
+    ImGui::SetNextItemWidth(180.0f);
+    ImGui::InputTextWithHint("##bfilter", "filter by player", g_bFilter,
+                             sizeof(g_bFilter));
+
+    int picked = 0;
+    char ranks[600];
+    BuildRankArg(ranks, sizeof(ranks), &picked);
+
+    ImGui::SameLine();
+    if (picked > 0)
+    {
+        bool busy = WrExtractRunning() || !g_fetchEnabled;
+        if (busy)
+            ImGui::BeginDisabled();
+        char lbl[64];
+        _snprintf_s(lbl, sizeof(lbl), _TRUNCATE, "Download %d ticked##dl", picked);
+        if (ImGui::Button(lbl))
+        {
+            char args[1024];
+            _snprintf_s(args, sizeof(args), _TRUNCATE,
+                        "--fetch --map \"%s\" --gamemode %d --track-type %d "
+                        "--track-num %d --ranks \"%s\"",
+                        g_bMap, g_bMode, g_bTrackType, g_bTrackNum, ranks);
+            WrExtractRunArgs(args, false);
+        }
+        if (busy)
+            ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::SmallButton("clear"))
+            memset(g_bSelect, 0, sizeof(g_bSelect));
+        ImGui::SameLine();
+        HelpMarker("Downloads straight from the cached board, which holds the "
+                   "download URL the server itself handed back -- so this costs "
+                   "no leaderboard requests at all, only the demo bodies.\n\n"
+                   "Anything you already hold is skipped by hash, so pressing "
+                   "it twice costs nothing.");
+        if (picked >= B_MAX_PICK)
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
+                               "%d ticked; only the first %d will be asked for.",
+                               picked, B_MAX_PICK);
+    }
+    else
+    {
+        ImGui::TextDisabled("tick rows to download them");
+    }
+
+    // The display order is built and sorted only when something has actually
+    // changed. A cached board can be twenty thousand rows, and re-filtering and
+    // re-sorting all of them every frame for a table nobody is touching would
+    // be the most expensive thing in the panel.
+    static int order[WR_BOARD_MAX];
+    static int shown = 0;
+    static char lastFilter[64] = {0};
+    static int lastCount = -1;
+    static long long lastFetched = -1;
+    bool needSort = false;
+
+    if (strcmp(lastFilter, g_bFilter) != 0 || lastCount != WrBoardCount() ||
+        lastFetched != WrBoardFetched())
+    {
+        // A reload can move every index, so a selection made against the old
+        // one has to go rather than silently pointing at other runs.
+        if (lastCount != WrBoardCount() || lastFetched != WrBoardFetched())
+            memset(g_bSelect, 0, sizeof(g_bSelect));
+
+        shown = 0;
+        for (int i = 0; i < WrBoardCount(); i++)
+        {
+            const WrBoardRow *r = WrBoardAt(i);
+            if (!r)
+                continue;
+            if (g_bFilter[0] && !StrIContains(r->alias, g_bFilter))
+                continue;
+            order[shown++] = i;
+        }
+        strcpy_s(lastFilter, sizeof(lastFilter), g_bFilter);
+        lastCount = WrBoardCount();
+        lastFetched = WrBoardFetched();
+        needSort = true;
+    }
+
+    bool showOut = WrExtractRunning() || WrExtractLineCount() > 0;
+    float tableH = showOut ? SplitHeight(SeparatorHeight(), 0.55f, 140.0f, 110.0f)
+                           : 0.0f;
+
+    ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                            ImGuiTableFlags_ScrollY | ImGuiTableFlags_Sortable |
+                            ImGuiTableFlags_SortMulti;
+    if (ImGui::BeginTable("##board", 6, flags, ImVec2(0.0f, tableH)))
+    {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed |
+                                    ImGuiTableColumnFlags_NoSort, 22.0f);
+        ImGui::TableSetupColumn("rank", ImGuiTableColumnFlags_WidthFixed |
+                                        ImGuiTableColumnFlags_DefaultSort,
+                                58.0f, BCOL_RANK);
+        ImGui::TableSetupColumn("time", ImGuiTableColumnFlags_WidthFixed,
+                                82.0f, BCOL_TIME);
+        ImGui::TableSetupColumn("player", ImGuiTableColumnFlags_WidthStretch,
+                                0.0f, BCOL_PLAYER);
+        ImGui::TableSetupColumn("set", ImGuiTableColumnFlags_WidthFixed,
+                                82.0f, BCOL_DATE);
+        ImGui::TableSetupColumn("have", ImGuiTableColumnFlags_WidthFixed,
+                                44.0f, BCOL_HAVE);
+        ImGui::TableHeadersRow();
+
+        ImGuiTableSortSpecs *specs = ImGui::TableGetSortSpecs();
+        if (specs && specs->SpecsCount > 0 && shown > 1 &&
+            (specs->SpecsDirty || needSort))
+        {
+            g_bSpecs = specs;
+            qsort(order, (size_t)shown, sizeof(int), CompareBoardRows);
+            g_bSpecs = NULL;
+            specs->SpecsDirty = false;
+        }
+
+        // A clipper, because a cached board can be twenty thousand rows and
+        // only the visible forty cost anything.
+        ImGuiListClipper clipper;
+        clipper.Begin(shown);
+        while (clipper.Step())
+        {
+            for (int k = clipper.DisplayStart; k < clipper.DisplayEnd; k++)
+            {
+                int i = order[k];
+                const WrBoardRow *r = WrBoardAt(i);
+                if (!r)
+                    continue;
+
+                ImGui::TableNextRow();
+                ImGui::PushID(i);
+
+                ImGui::TableNextColumn();
+                bool sel = g_bSelect[i];
+                if (r->have)
+                    ImGui::TextDisabled("-");
+                else if (ImGui::Checkbox("##pick", &sel))
+                    g_bSelect[i] = sel;
+
+                ImGui::TableNextColumn();
+                ImGui::Text("%d", r->rank);
+
+                ImGui::TableNextColumn();
+                char t[32];
+                FormatTime(r->time, t, sizeof(t));
+                ImGui::TextUnformatted(t);
+
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(r->alias);
+
+                ImGui::TableNextColumn();
+                if (r->dateEpoch > 0)
+                {
+                    time_t tt = (time_t)r->dateEpoch;
+                    struct tm tmv;
+                    if (gmtime_s(&tmv, &tt) == 0)
+                        ImGui::TextDisabled("%04d-%02d-%02d", tmv.tm_year + 1900,
+                                            tmv.tm_mon + 1, tmv.tm_mday);
+                    else
+                        ImGui::TextDisabled("-");
+                }
+                else
+                {
+                    ImGui::TextDisabled("-");
+                }
+
+                ImGui::TableNextColumn();
+                if (r->have)
+                    ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "yes");
+                else
+                    ImGui::TextDisabled("no");
+
+                ImGui::PopID();
+            }
+        }
+        ImGui::EndTable();
+    }
+
+    if (showOut)
+    {
+        ImGui::SeparatorText("Output");
+        if (ImGui::BeginChild("##boardout", ImVec2(0.0f, 0.0f),
+                              ImGuiChildFlags_Borders,
+                              ImGuiWindowFlags_HorizontalScrollbar))
+        {
+            for (int i = 0; i < WrExtractLineCount(); i++)
+                ImGui::TextUnformatted(WrExtractLine(i));
+            if (WrExtractRunning())
+                ImGui::SetScrollHereY(1.0f);
+        }
+        ImGui::EndChild();
+    }
 }
 
 static void DrawEnergyTab(void)
@@ -2550,6 +3155,14 @@ void WrUiDraw(void)
         {
             if (ImGui::BeginTabItem("Runs"))       { DrawRunsTab();        ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem("Maps"))       { DrawMapsTab();        ImGui::EndTabItem(); }
+            {
+                // The Maps tab's per-row "board" button asks to come here.
+                ImGuiTabItemFlags bf = g_bWantFocus ? ImGuiTabItemFlags_SetSelected
+                                                    : 0;
+                g_bWantFocus = false;
+                if (ImGui::BeginTabItem("Board", NULL, bf))
+                { DrawBoardTab(); ImGui::EndTabItem(); }
+            }
             if (ImGui::BeginTabItem("Display"))    { DrawDisplayTab();     ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem("Energy"))     { DrawEnergyTab();      ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem("Graphs"))     { DrawGraphsTab();      ImGui::EndTabItem(); }
