@@ -34,7 +34,11 @@ static int g_knownBad = 0;
 
 static volatile LONG g_running = 0;
 static volatile LONG g_finished = 0;
+// Both guarded by g_cs. The UI thread reads them to stop a run and ReadThread
+// closes them when one ends; unsynchronised, those two interleave badly.
 static HANDLE g_proc = NULL;
+static HANDLE g_job = NULL;
+static volatile LONG g_stopped = 0;     // this run ended because Stop was pressed
 static HANDLE g_readThread = NULL;
 static HANDLE g_countThread = NULL;
 
@@ -431,30 +435,120 @@ static DWORD WINAPI ReadThread(LPVOID param)
     CloseHandle(ctx->pipe);
     free(ctx);
 
-    if (g_proc)
+    // The handle is taken under the lock and nulled there before it is used, so
+    // a Stop pressed on the UI thread can never be holding it at the moment
+    // this closes it. Without that, the two threads race on g_proc and the
+    // worst case is TerminateProcess on a REUSED handle -- something else's
+    // process, killed by us, with no way to tell afterwards.
+    HANDLE proc = NULL, job = NULL;
+    EnterCriticalSection(&g_cs);
+    proc = g_proc;
+    job = g_job;
+    g_proc = NULL;
+    g_job = NULL;
+    LeaveCriticalSection(&g_cs);
+
+    if (proc)
     {
-        WaitForSingleObject(g_proc, INFINITE);
+        WaitForSingleObject(proc, INFINITE);
         DWORD code = 1;
-        GetExitCodeProcess(g_proc, &code);
+        GetExitCodeProcess(proc, &code);
         char msg[128];
-        _snprintf_s(msg, sizeof(msg), _TRUNCATE,
-                    "--- finished, exit code %lu ---", code);
+        if (InterlockedExchange(&g_stopped, 0))
+            _snprintf_s(msg, sizeof(msg), _TRUNCATE, "--- stopped ---");
+        else
+            _snprintf_s(msg, sizeof(msg), _TRUNCATE,
+                        "--- finished, exit code %lu ---", code);
         PushLine(msg);
-        WrLogf("extract: finished, exit code %lu", code);
-        CloseHandle(g_proc);
-        g_proc = NULL;
+        WrLogf("extract: %s (exit code %lu)", msg, code);
+        CloseHandle(proc);
     }
+    if (job)
+        CloseHandle(job);
 
     InterlockedExchange(&g_finished, 1);
     InterlockedExchange(&g_running, 0);
     return 0;
 }
 
+// A launch that got as far as a running child but no further. Kill it and let
+// go of everything, rather than clearing the running flag and orphaning both
+// the handle and the process.
+static void Abandon(void)
+{
+    HANDLE proc = NULL, job = NULL;
+    EnterCriticalSection(&g_cs);
+    proc = g_proc;
+    job = g_job;
+    g_proc = NULL;
+    g_job = NULL;
+    LeaveCriticalSection(&g_cs);
+
+    if (job)
+    {
+        TerminateJobObject(job, 1);
+        CloseHandle(job);
+    }
+    else if (proc)
+    {
+        TerminateProcess(proc, 1);
+    }
+    if (proc)
+        CloseHandle(proc);
+    InterlockedExchange(&g_running, 0);
+}
+
+void WrExtractStop(void)
+{
+    // Terminate the JOB, not the process.
+    //
+    // The extractor runs a worker pool -- cores minus two by default -- and
+    // those are grandchildren we hold no handles for. Killing only the parent
+    // leaves them burning a core each until their queue pipe breaks, and a
+    // worker mid-demo finishes that demo first. A kill-on-close job takes the
+    // whole tree at once.
+    //
+    // Everything after this is the ordinary path: the child's end of the pipe
+    // closes, the blocked ReadFile returns, and ReadThread tears down exactly
+    // as it would after a clean exit.
+    HANDLE job = NULL, proc = NULL;
+    EnterCriticalSection(&g_cs);
+    job = g_job;
+    proc = g_proc;
+    LeaveCriticalSection(&g_cs);
+
+    if (!proc && !job)
+        return;
+
+    InterlockedExchange(&g_stopped, 1);
+
+    if (job && TerminateJobObject(job, 1))
+    {
+        PushLine("--- stopping, and taking the worker processes with it ---");
+        WrLogf("extract: stop -- TerminateJobObject");
+        return;
+    }
+
+    // No job, or the job refused. Say which, rather than reporting a clean
+    // stop and leaving python.exe processes running behind the panel.
+    if (proc && TerminateProcess(proc, 1))
+    {
+        PushLine("--- stopping the extractor; its worker processes may take a "
+                 "moment longer ---");
+        WrLogf("extract: stop -- TerminateProcess only (no job object)");
+    }
+}
+
+static int g_timeout = WR_EXTRACT_TIMEOUT_DEFAULT;
+
+void WrExtractSetTimeout(int seconds) { g_timeout = seconds < 0 ? 0 : seconds; }
+int WrExtractTimeout(void) { return g_timeout; }
+
 void WrExtractRun(bool retryFailed)
 {
-    char extra[64];
-    _snprintf_s(extra, sizeof(extra), _TRUNCATE, "--skip-existing%s",
-                retryFailed ? " --retry-failed" : "");
+    char extra[96];
+    _snprintf_s(extra, sizeof(extra), _TRUNCATE, "--skip-existing%s --timeout %d",
+                retryFailed ? " --retry-failed" : "", g_timeout);
     WrExtractRunArgs(extra, true);
 }
 
@@ -558,18 +652,48 @@ void WrExtractRunArgs(const char *extraArgs, bool needsMap)
     }
 
     CloseHandle(pi.hThread);
+
+    // A kill-on-close job, so Stop can take the worker pool as well as the
+    // interpreter that spawned it. Assignment can be refused when the game is
+    // already inside a job that disallows nesting -- that is survivable, and
+    // WrExtractStop says which case it is in rather than claiming a clean stop.
+    HANDLE job = CreateJobObjectA(NULL, NULL);
+    if (job)
+    {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli;
+        memset(&jeli, 0, sizeof(jeli));
+        jeli.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+                                &jeli, sizeof(jeli));
+        if (!AssignProcessToJobObject(job, pi.hProcess))
+        {
+            WrLogf("extract: job assignment refused (%lu); Stop will reach the "
+                   "interpreter but not its workers", GetLastError());
+            CloseHandle(job);
+            job = NULL;
+        }
+    }
+
+    EnterCriticalSection(&g_cs);
     g_proc = pi.hProcess;
+    g_job = job;
+    LeaveCriticalSection(&g_cs);
+    InterlockedExchange(&g_stopped, 0);
 
     char msg[256];
     _snprintf_s(msg, sizeof(msg), _TRUNCATE, "running: %s", cmd);
     PushLine(msg);
     WrLogf("extract: started for \"%s\"", map);
 
+    // From here on a failure has to tear the child down too, not just clear the
+    // running flag. Leaving g_proc set with no reader means the next launch
+    // overwrites it and the old handle leaks while its process runs on.
     ReadCtx *ctx = (ReadCtx *)malloc(sizeof(ReadCtx));
     if (!ctx)
     {
         CloseHandle(rd);
-        InterlockedExchange(&g_running, 0);
+        Abandon();
         return;
     }
     ctx->pipe = rd;
@@ -584,7 +708,7 @@ void WrExtractRunArgs(const char *extraArgs, bool needsMap)
     {
         CloseHandle(rd);
         free(ctx);
-        InterlockedExchange(&g_running, 0);
+        Abandon();
     }
 }
 
@@ -619,8 +743,12 @@ bool WrExtractTakeFinished(void)
 
 void WrExtractShutdown(void)
 {
-    // Deliberately does not kill a running script. It writes .wrpath files, and
-    // stopping it halfway through one is how you get a truncated file that the
-    // loader then has to reject. It is a separate process; letting it finish
-    // costs nothing.
+    // Deliberately does not kill a running script. Not for the reason this
+    // comment used to give -- it claimed a kill could leave a truncated
+    // .wrpath, and that has not been true since the writer became tmp +
+    // os.replace, which is atomic. Every completed file survives any kill.
+    //
+    // The real reason is that this is a separate process doing useful work and
+    // nothing here needs it dead. Stopping it is a decision for the person at
+    // the keyboard, which is what WrExtractStop is for.
 }

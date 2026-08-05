@@ -53,6 +53,28 @@ bool WrExtractCounts(int *forThisMap, int *alreadyDone, int *notYetDone,
 void WrExtractRun(bool retryFailed);
 bool WrExtractRunning(void);
 
+// Stop whatever is running. Kills the interpreter AND its worker pool, which is
+// why the child is put in a kill-on-close job object at launch: the pool is
+// cores-minus-two grandchildren we hold no handles for, and killing only the
+// parent leaves them burning a core each.
+//
+// Safe at any time; does nothing when nothing is running. Completed .wrpath
+// files always survive -- every write is a temp file plus an atomic replace --
+// and the failure record is flushed as failures happen rather than at the end,
+// so a stop no longer throws away the expensive part of what was learned.
+void WrExtractStop(void);
+
+// Seconds to allow one demo before giving up on it, or 0 for no limit. Passed
+// to the extractor as --timeout.
+//
+// 30 rather than the extractor's old 180: measured across 4388 demos, the
+// median is 58 KB and extracts in about a second, while the 6.5% over 700 KB
+// are what actually hit the limit. Three minutes of silence per bad demo read
+// as a hang.
+#define WR_EXTRACT_TIMEOUT_DEFAULT 30
+void WrExtractSetTimeout(int seconds);
+int WrExtractTimeout(void);
+
 // The same launcher with different flags, for the map index and for fetching.
 // `needsMap` adds --map for the map you are standing in; indexing does not want
 // it. One process at a time, same as extraction, and never automatic.
