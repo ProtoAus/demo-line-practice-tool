@@ -569,82 +569,96 @@ static void DrawRunsTab(void)
         }
         SortRunOrder(order, shown, ImGui::TableGetSortSpecs());
 
-        for (int row = 0; row < shown; row++)
+        // A clipper, for the same reason the leaderboard has one. The store now
+        // holds up to a thousand runs, and every row here is nine columns of
+        // real work: a checkbox, a colour picker, and a delta that scans the
+        // store for the best run on that row's track. Doing that for a thousand
+        // rows to show forty of them is per-frame cost inside a Present hook.
+        //
+        // Safe because every row is exactly one line tall -- the "!" beside a
+        // low-confidence run is drawn with SameLine, not under it -- which is
+        // the assumption a clipper makes.
+        ImGuiListClipper clipper;
+        clipper.Begin(shown);
+        while (clipper.Step())
         {
-            int i = order[row];
-            WrRun *r = WrRunAt(i);
-            if (!r)
-                continue;
-            ImGui::TableNextRow();
-            ImGui::PushID(i);
-
-            ImGui::TableSetColumnIndex(0);
-            ImGui::Checkbox("##on", &r->enabled);
-
-            ImGui::TableSetColumnIndex(1);
-            ImVec4 col = UnpackColour(r->colour);
-            if (ImGui::ColorEdit4("##col", (float *)&col,
-                                  ImGuiColorEditFlags_NoInputs |
-                                  ImGuiColorEditFlags_NoLabel |
-                                  ImGuiColorEditFlags_AlphaPreview))
-                r->colour = PackColour(col);
-
-            ImGui::TableSetColumnIndex(2);
-            if (r->trackType == 0)
-                ImGui::TextColored(ImVec4(0.6f, 0.9f, 1.0f, 1.0f), "main");
-            else
-                ImGui::TextColored(ImVec4(0.85f, 0.8f, 0.55f, 1.0f), "%s",
-                                   WrTrackName(r));
-
-            ImGui::TableSetColumnIndex(3);
-            ImGui::TextUnformatted(r->player[0] ? r->player : "(unknown)");
-            if (r->flags & WRPATH_FLAG_LOW_CONFIDENCE)
+            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; row++)
             {
-                ImGui::SameLine();
-                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "!");
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip(
-                        "The extractor could not confirm this path against the\n"
-                        "run's own recorded max speed. It is probably right, but\n"
-                        "it is not proven.");
+                int i = order[row];
+                WrRun *r = WrRunAt(i);
+                if (!r)
+                    continue;
+                ImGui::TableNextRow();
+                ImGui::PushID(i);
+
+                ImGui::TableSetColumnIndex(0);
+                ImGui::Checkbox("##on", &r->enabled);
+
+                ImGui::TableSetColumnIndex(1);
+                ImVec4 col = UnpackColour(r->colour);
+                if (ImGui::ColorEdit4("##col", (float *)&col,
+                                      ImGuiColorEditFlags_NoInputs |
+                                      ImGuiColorEditFlags_NoLabel |
+                                      ImGuiColorEditFlags_AlphaPreview))
+                    r->colour = PackColour(col);
+
+                ImGui::TableSetColumnIndex(2);
+                if (r->trackType == 0)
+                    ImGui::TextColored(ImVec4(0.6f, 0.9f, 1.0f, 1.0f), "main");
+                else
+                    ImGui::TextColored(ImVec4(0.85f, 0.8f, 0.55f, 1.0f), "%s",
+                                       WrTrackName(r));
+
+                ImGui::TableSetColumnIndex(3);
+                ImGui::TextUnformatted(r->player[0] ? r->player : "(unknown)");
+                if (r->flags & WRPATH_FLAG_LOW_CONFIDENCE)
+                {
+                    ImGui::SameLine();
+                    ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "!");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip(
+                            "The extractor could not confirm this path against the\n"
+                            "run's own recorded max speed. It is probably right, but\n"
+                            "it is not proven.");
+                }
+
+                ImGui::TableSetColumnIndex(4);
+                char buf[64];
+                FormatTime(r->runTime, buf, sizeof(buf));
+                ImGui::TextUnformatted(buf);
+
+                ImGui::TableSetColumnIndex(5);
+                WrRun *best = BestOfSameTrack(r);
+                if (best && best != r)
+                    ImGui::TextColored(ImVec4(0.9f, 0.6f, 0.6f, 1.0f), "+%.3f",
+                                       r->runTime - best->runTime);
+                else
+                    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "best");
+
+                // The column that makes a staged map make sense: how far away
+                // this run actually is from where you are standing right now.
+                ImGui::TableSetColumnIndex(6);
+                if (r->nearestDist < 0.0f)
+                    ImGui::TextDisabled("-");
+                else if (r->nearestDist <= s_nearRadius)
+                    ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "%.0f",
+                                       r->nearestDist);
+                else
+                    ImGui::TextDisabled("%.0f", r->nearestDist);
+
+                ImGui::TableSetColumnIndex(7);
+                ImGui::Text("%d", r->pointCount);
+
+                ImGui::TableSetColumnIndex(8);
+                if (r->markerCount && (r->flags & WRPATH_FLAG_MARKERS_OK))
+                    ImGui::Text("%d", r->markerCount);
+                else if (r->markerCount)
+                    ImGui::TextDisabled("unanchored");
+                else
+                    ImGui::TextDisabled("-");
+
+                ImGui::PopID();
             }
-
-            ImGui::TableSetColumnIndex(4);
-            char buf[64];
-            FormatTime(r->runTime, buf, sizeof(buf));
-            ImGui::TextUnformatted(buf);
-
-            ImGui::TableSetColumnIndex(5);
-            WrRun *best = BestOfSameTrack(r);
-            if (best && best != r)
-                ImGui::TextColored(ImVec4(0.9f, 0.6f, 0.6f, 1.0f), "+%.3f",
-                                   r->runTime - best->runTime);
-            else
-                ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "best");
-
-            // The column that makes a staged map make sense: how far away this
-            // run actually is from where you are standing right now.
-            ImGui::TableSetColumnIndex(6);
-            if (r->nearestDist < 0.0f)
-                ImGui::TextDisabled("-");
-            else if (r->nearestDist <= s_nearRadius)
-                ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "%.0f",
-                                   r->nearestDist);
-            else
-                ImGui::TextDisabled("%.0f", r->nearestDist);
-
-            ImGui::TableSetColumnIndex(7);
-            ImGui::Text("%d", r->pointCount);
-
-            ImGui::TableSetColumnIndex(8);
-            if (r->markerCount && (r->flags & WRPATH_FLAG_MARKERS_OK))
-                ImGui::Text("%d", r->markerCount);
-            else if (r->markerCount)
-                ImGui::TextDisabled("unanchored");
-            else
-                ImGui::TextDisabled("-");
-
-            ImGui::PopID();
         }
         ImGui::EndTable();
     }
@@ -1081,7 +1095,23 @@ static void DrawDisplayTab(void)
     ImGui::TextDisabled("Caps per-frame work. Distance culling does the job on a big");
     ImGui::TextDisabled("open map, but a compact stage fits entirely inside the draw");
     ImGui::TextDisabled("distance, so nothing gets culled and cost scales with runs.");
-    ImGui::SliderInt("Max runs drawn", &g_render.maxRunsDrawn, 1, WR_MAX_RUNS);
+    ImGui::SliderInt("Max runs drawn", &g_render.maxRunsDrawn, 1, WR_MAX_RUNS,
+                     "%d", ImGuiSliderFlags_AlwaysClamp);
+    ImGui::SameLine();
+    HelpMarker(
+        "How many enabled runs are eligible to be drawn at all. The default is "
+        "256, and the slider reaches 1000 because the store does.\n\n"
+        "IT IS NOT FREE, and the \"points per run\" budget above does not bound "
+        "it -- that budget is PER RUN, so the work is the budget times the "
+        "number of lines. Distance culling is the only thing that caps the "
+        "total, and a compact stage is exactly the case where culling rejects "
+        "nothing.\n\n"
+        "Measured on such a stage: 8 lines cost 0.24 ms a frame, 256 cost about "
+        "8 ms, and 1000 cost 32 ms. A 60 Hz frame is 16.7 ms and a 144 Hz frame "
+        "is 6.9 ms, so the top of this slider will not hold a frame rate.\n\n"
+        "It only matters when that many runs are actually enabled, which takes "
+        "a deliberate All. If the panel starts to drag after one, this is the "
+        "slider to pull down.");
 
     ImGui::SeparatorText("Colour");
     const char *kRank[WR_RANK_MODE_COUNT] = {
@@ -1093,16 +1123,23 @@ static void DrawDisplayTab(void)
                  WR_RANK_MODE_COUNT);
     ImGui::SameLine();
     HelpMarker(
-        "Gold, silver and bronze for the first three, then green through red "
-        "for the rest -- fastest to slowest. With a lot of runs enabled it "
-        "tells you at a glance which line is worth following.\n\n"
+        "Violet for the fastest run on each leg, then green through red for "
+        "everyone behind it -- fastest to slowest. With a lot of runs enabled "
+        "it tells you at a glance which line is worth following.\n\n"
+        "Only FIRST is held out of the ramp. A gold, silver and bronze podium "
+        "was the obvious thing and it did not survive contact with a screen: "
+        "all three medals are warm mid-brightness colours living inside a ramp "
+        "that already runs green to amber to red, so second and third "
+        "disappeared into the field. Violet is the one hue the ramp never "
+        "reaches. Second and third are now shaded like anyone else, which also "
+        "says how close they were -- a silver medal never did.\n\n"
         "PLACED WITHIN EACH LEG. Momentum records a separate run per stage and "
         "per bonus, and the store is sorted by time across all of them, so the "
         "quickest time in the file is usually a stage rather than the main "
         "track. On bhop_futile here the main runs sit between 52.8 and 54.3 "
         "seconds and there is a bonus at 33.9 -- rank them together and the "
-        "bonus takes gold from a track it was never racing. Each leg gets its "
-        "own podium.\n\n"
+        "bonus takes first place from a track it was never racing. Each leg "
+        "gets its own winner.\n\n"
         "BY PLACING spreads the colours evenly over the field, so it stays "
         "readable however tightly the times are packed. BY TIME BEHIND shades "
         "by how far off the record each run actually is, which on a board where "
@@ -1117,7 +1154,7 @@ static void DrawDisplayTab(void)
         if (g_render.rankColour == WR_RANK_BY_TIME)
             ImGui::SliderFloat("Full red at", &g_render.rankFullBehind,
                                2.0f, 200.0f, "+%.0f%% off the best");
-        ImGui::Checkbox("Show the podium key on screen", &g_render.rankLegend);
+        ImGui::Checkbox("Show the rank key on screen", &g_render.rankLegend);
     }
 
     ImGui::Checkbox("Colour by speed", &g_render.colourBySpeed);
@@ -1530,7 +1567,12 @@ static void DrawGraphsTab(void)
     ImGui::SameLine();
     ImGui::Checkbox("Your own line", &g_gLive);
     ImGui::SetNextItemWidth(160.0f);
-    ImGui::SliderInt("Curves at once", &g_gMaxSeries, 1, G_MAX_SERIES);
+    // AlwaysClamp is not decoration. A slider's min/max bound the DRAG; ImGui
+    // lets you CTRL+Click any slider and type a number straight past them, and
+    // this one sizes nothing -- it is compared against an index into a fixed
+    // 33-element stack array below. Typing 900 here wrote 900 entries into it.
+    ImGui::SliderInt("Curves at once", &g_gMaxSeries, 1, G_MAX_SERIES, "%d",
+                     ImGuiSliderFlags_AlwaysClamp);
 
     // --- gather -------------------------------------------------------------
     GSeries series[G_MAX_SERIES + 1];
@@ -1542,7 +1584,10 @@ static void DrawGraphsTab(void)
         WrRun *r = WrRunAt(i);
         if (!r || !r->enabled || r->pointCount < 4)
             continue;
-        if (nSeries >= g_gMaxSeries)
+        // Both bounds, not just the setting. The clamp on the slider above is
+        // the fix; this is the one that does not depend on an ImGui flag staying
+        // where it was put, and it is the array's own bound.
+        if (nSeries >= g_gMaxSeries || nSeries >= G_MAX_SERIES)
         {
             dropped++;
             continue;

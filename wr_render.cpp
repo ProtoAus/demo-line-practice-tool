@@ -67,7 +67,31 @@ void WrRenderDefaults(void)
     g_render.maxDrawDistance = 4000.0f;
     g_render.fadeStartFraction = 0.75f;
     g_render.pixelTolerance = 2.0f;
-    g_render.maxRunsDrawn = 8;
+    // 256, not 8. Eight was chosen when a map's runs were whatever the game had
+    // downloaded and the interesting ones were the top few; with a board you can
+    // fetch in bulk, a cap of eight silently hides most of what you just asked
+    // for.
+    //
+    // What this costs, measured rather than assumed, on a compact stage where
+    // the whole leg sits inside the draw distance and nothing is culled:
+    //
+    //     8 drawn    0.24 ms/frame        256 drawn   8.1 ms/frame
+    //                                    1000 drawn  32.5 ms/frame
+    //
+    // plus about 1.7 ms of ImGui tessellation at 256, for ~15 MB of vertex and
+    // index data built every frame. A 60 Hz frame is 16.7 ms.
+    //
+    // So this is not free, and the point budget does NOT bound it -- that is per
+    // run (see EmitPath), so the total is the budget times the number of lines.
+    // Distance culling is the only thing that does bound it, and the compact
+    // stage is precisely the case where culling rejects nothing.
+    //
+    // It is still the right default, because the number that matters is how many
+    // runs are ENABLED, and that is one out of the box: FinishLoad enables the
+    // first run and the auto-enable picks one more nearby. Nothing reaches 256
+    // lines without ticking All on a map that has them. This cap is what stops
+    // that press from being a freeze; it is not what makes it cheap.
+    g_render.maxRunsDrawn = 256;
     g_render.pointBudget = 1500;
     g_render.colourBySpeed = false;
     g_render.speedMin = 250.0f;
@@ -296,7 +320,37 @@ static inline unsigned int WithAlpha(unsigned int colour, float a)
     return base | (alpha << 24);
 }
 
-// Blue -> cyan -> green -> yellow -> red across the configured speed range.
+// The field ramp: green at the front, red at the back, t in [0, 1].
+//
+// Amber through the middle rather than a straight green-to-red lerp, which
+// passes through a muddy olive that reads as neither. Blue stays at or below
+// 0.25 for the whole length, which is what leaves violet free to mean first
+// place and nothing else.
+//
+// Its own function so the on-screen key can draw the ACTUAL endpoints of the
+// ramp rather than two colours that merely look about right -- the same reason
+// WrRunColour exists at all.
+static unsigned int RankRampColour(float t)
+{
+    t = WrClampF(t, 0.0f, 1.0f);
+
+    float r, g, b;
+    if (t < 0.5f)
+    {
+        float u = t / 0.5f;
+        r = 0.30f + 0.70f * u; g = 0.90f; b = 0.25f * (1.0f - u);
+    }
+    else
+    {
+        float u = (t - 0.5f) / 0.5f;
+        r = 1.00f; g = 0.90f - 0.75f * u; b = 0.10f * u;
+    }
+    unsigned int ri = (unsigned int)(WrClampF(r, 0.0f, 1.0f) * 255.0f + 0.5f);
+    unsigned int gi = (unsigned int)(WrClampF(g, 0.0f, 1.0f) * 255.0f + 0.5f);
+    unsigned int bi = (unsigned int)(WrClampF(b, 0.0f, 1.0f) * 255.0f + 0.5f);
+    return 0xFF000000u | (bi << 16) | (gi << 8) | ri;
+}
+
 // What colour is this run?
 //
 // Every place that used to read run->colour goes through here. That is the whole
@@ -319,9 +373,7 @@ unsigned int WrRunColour(const WrRun *run)
     if (rank <= 0)
         return run->colour;
 
-    if (rank == 1) return WR_COL_GOLD;
-    if (rank == 2) return WR_COL_SILVER;
-    if (rank == 3) return WR_COL_BRONZE;
+    if (rank == 1) return WR_COL_FIRST;
 
     // t is 0 at the front of the field and 1 at the back.
     float t = 0.5f;
@@ -351,32 +403,21 @@ unsigned int WrRunColour(const WrRun *run)
     }
     else
     {
-        // Even spread over the runs that are not on the podium.
-        int spread = total - 3;
-        t = (spread > 1) ? (float)(rank - 4) / (float)(spread - 1) : 0.0f;
+        // Even spread over everyone behind the winner: rank 2 is the front of
+        // the ramp, last is the back. Only one run is held out of the ramp, so
+        // second and third are shaded like anyone else -- which is the point.
+        // On a tight board they come out barely off green, and that is a truer
+        // picture than a silver medal that says "second" and nothing about by
+        // how much.
+        int spread = total - 1;
+        t = (spread > 1) ? (float)(rank - 2) / (float)(spread - 1) : 0.0f;
         t = WrClampF(t, 0.0f, 1.0f);
     }
 
-    // Green at the front, red at the back. Amber through the middle rather than
-    // a straight green-to-red lerp, which passes through a muddy olive that
-    // reads as neither.
-    float r, g, b;
-    if (t < 0.5f)
-    {
-        float u = t / 0.5f;
-        r = 0.30f + 0.70f * u; g = 0.90f; b = 0.25f * (1.0f - u);
-    }
-    else
-    {
-        float u = (t - 0.5f) / 0.5f;
-        r = 1.00f; g = 0.90f - 0.75f * u; b = 0.10f * u;
-    }
-    unsigned int ri = (unsigned int)(WrClampF(r, 0.0f, 1.0f) * 255.0f + 0.5f);
-    unsigned int gi = (unsigned int)(WrClampF(g, 0.0f, 1.0f) * 255.0f + 0.5f);
-    unsigned int bi = (unsigned int)(WrClampF(b, 0.0f, 1.0f) * 255.0f + 0.5f);
-    return 0xFF000000u | (bi << 16) | (gi << 8) | ri;
+    return RankRampColour(t);
 }
 
+// Blue -> cyan -> green -> yellow -> red across the configured speed range.
 static unsigned int SpeedColour(float speed)
 {
     float t = (speed - g_render.speedMin) /
@@ -802,7 +843,16 @@ static void EmitTurns(ImDrawList *dl, const WrRun *run, bool tops)
     const float maxDistSqr = g_render.maxDrawDistance * g_render.maxDrawDistance;
     int drawn = 0;
 
-    for (int i = 0; i < listCount && drawn < budget; i++)
+    // The per-frame label budget belongs in the guard, not just inside DrawLabel.
+    //
+    // `drawn` only advances when a label is actually placed, so once the global
+    // budget is spent DrawLabel refuses every call, `drawn` stops moving, and
+    // this loop walks the entire dip list of every remaining run -- distance
+    // test, projection, and a formatted string per point, all discarded on
+    // arrival. Invisible at eight drawn runs. At 256 it is around half a
+    // millisecond a frame spent building text nothing will show.
+    for (int i = 0; i < listCount && drawn < budget &&
+                    g_statLabels < g_render.maxLabelsPerFrame; i++)
     {
         int idx = list[i];
         if (idx < 0 || idx >= run->pointCount)
@@ -1089,6 +1139,20 @@ static void EmitTag(ImDrawList *dl, WrRun *run)
         return;
     if (s.x < -64.0f || s.x > g_sw + 64.0f || s.y < -32.0f || s.y > g_sh + 32.0f)
         return;
+
+    // Queue the Steam lookup HERE, past the tag budget and the screen test, and
+    // not in the draw loop where it used to sit under a comment claiming this is
+    // what it did.
+    //
+    // The cache is 96 entries, it has no eviction, and nothing resets it for the
+    // life of the process. From the draw loop it was fed by every drawn run, so
+    // at the old default of eight it filled slowly and by accident; with 256 it
+    // fills in a single frame the first time you tick All, and every player you
+    // meet afterwards -- on this map or any later one -- gets no avatar for the
+    // rest of the session. Twelve tags are drawn by default and 32 at the
+    // slider's ceiling, so asking only for tags that actually render keeps the
+    // 96 slots several times larger than anything that can consume them.
+    WrSteamWant(run->steamId);
 
     const char *name = WrSteamPersona(run->steamId);
     if (!name || !*name)
@@ -1638,15 +1702,17 @@ static void EmitEfficiencyLegend(ImDrawList *dl)
 
     if (rankOn)
     {
-        rows[n].colour = WR_COL_GOLD;   rows[n].dim = false;
+        // The ramp swatches come from RankRampColour itself, so the key cannot
+        // drift from the lines it is describing.
+        rows[n].colour = WR_COL_FIRST;         rows[n].dim = false;
         rows[n++].text = "1st on this leg";
-        rows[n].colour = WR_COL_SILVER; rows[n].dim = false;
+        rows[n].colour = RankRampColour(0.0f); rows[n].dim = false;
         rows[n++].text = "2nd";
-        rows[n].colour = WR_COL_BRONZE; rows[n].dim = false;
-        rows[n++].text = "3rd";
+        rows[n].colour = RankRampColour(1.0f); rows[n].dim = false;
+        rows[n++].text = "last";
         foots[nf++] = (g_render.rankColour == WR_RANK_BY_TIME)
-            ? "the rest: green to red by how far off the best they are"
-            : "the rest: green to red by placing, evenly spread";
+            ? "everyone behind: green to red by how far off the best they are"
+            : "everyone behind: green to red by placing, evenly spread";
         // The thing that would otherwise look like a bug on a staged map.
         foots[nf++] = "placed within each leg -- a bonus cannot out-place a "
                       "main run";
@@ -1889,13 +1955,7 @@ void WrRenderWorld(void)
         EmitTurns(dl, run, true);
         EmitMarkers(dl, run);
         if (g_render.drawTags)
-        {
-            // Queue the Steam lookup for anyone actually on screen, rather than
-            // for every run in the store. Forty requests when the map loads
-            // would be forty network lookups for lines you may never enable.
-            WrSteamWant(run->steamId);
-            EmitTag(dl, run);
-        }
+            EmitTag(dl, run);       // which queues the Steam lookup, if it draws
         drawn++;
     }
 

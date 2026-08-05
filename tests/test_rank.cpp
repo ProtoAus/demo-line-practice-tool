@@ -1,12 +1,12 @@
 // test_rank.cpp  --  where a run places, and on which leg.
 //
 // The failure this exists to catch is not a crash and would not look like a bug
-// on screen: it would look like a gold line. Momentum records a separate run per
-// stage and per bonus, and the run store is sorted by time across all of them,
-// so the quickest time in a map's files is routinely a stage rather than the
-// main track. Rank without splitting by leg and a 34-second bonus takes gold
-// from a main track it was never racing -- and the result is entirely plausible
-// right up until you notice the medal is on the wrong line.
+// on screen: it would look like a winning line. Momentum records a separate run
+// per stage and per bonus, and the run store is sorted by time across all of
+// them, so the quickest time in a map's files is routinely a stage rather than
+// the main track. Rank without splitting by leg and a 34-second bonus takes
+// first place from a main track it was never racing -- and the result is
+// entirely plausible right up until you notice it is on the wrong line.
 //
 // The numbers below are the real shape of bhop_futile as extracted here: twenty
 // main runs between 52.85 and 54.34 seconds, plus one bonus at 33.97.
@@ -73,7 +73,7 @@ int main(void)
     }
 
     // -----------------------------------------------------------------------
-    printf("\na bonus cannot take gold from the main track\n");
+    printf("\na bonus cannot take first place from the main track\n");
     {
         // bhop_futile as it actually sits on disk here.
         WrRun runs[4] = {
@@ -134,6 +134,30 @@ int main(void)
         Check(WrRunRankInTrack(WrRunAt(2), NULL) == 1, "and the third");
         Check(WrRunRankInTrack(WrRunAt(3), NULL) == 4,
               "and the next run is 4th, not 2nd");
+    }
+
+    // -----------------------------------------------------------------------
+    printf("\na run with no path is not placed, and does not pad the field\n");
+    {
+        // Rank is computed once when the store settles and read back as a field,
+        // so "unranked" has to be representable. Rank 0 is it -- the renderer
+        // falls back to the palette colour rather than colouring a run as though
+        // it came last, which is what a rank of `total` would have meant.
+        WrRun runs[3] = {
+            Make(40.00, 0, 1, "real"),
+            Make(41.00, 0, 1, "also real"),
+            Make(39.00, 0, 1, "empty"),
+        };
+        runs[2].pointCount = 0;         // loaded, rejected, no path
+        WrPathTestLoad(runs, 3);
+
+        int outOf = -1;
+        Check(WrRunRankInTrack(WrRunAt(2), &outOf) == 0, "the empty run is rank 0");
+        Check(outOf == 0, "and reports no field");
+        Check(WrRunRankInTrack(WrRunAt(0), &outOf) == 1 && outOf == 2,
+              "and the two real runs are a field of two, not three");
+        Check(WrRunRankInTrack(WrRunAt(1), NULL) == 2,
+              "so the 41.00 is 2nd, not 3rd behind a run with no path");
     }
 
     // -----------------------------------------------------------------------

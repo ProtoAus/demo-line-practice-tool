@@ -72,12 +72,22 @@ enum WrRankColour
     WR_RANK_MODE_COUNT
 };
 
-// The podium, in ImGui's ABGR. Deliberately not part of the ramp: a medal is a
-// place, not a measurement, and blending them would make second look like a
-// slightly worse first rather than second.
-#define WR_COL_GOLD   0xFF00D7FFu
-#define WR_COL_SILVER 0xFFC0C0C0u
-#define WR_COL_BRONZE 0xFF327FCDu
+// The winner, in ImGui's ABGR. Deliberately not part of the ramp: first place is
+// a place, not a measurement, and blending it in would make the best line look
+// like a slightly greener version of the second-best.
+//
+// It was a full gold/silver/bronze podium, and on screen that failed for the
+// reason a medal table does not have to work at: the ramp it sits in already
+// runs green -> amber -> red, and gold, silver and bronze are all warm, mid
+// brightness colours inside that range. Second and third simply vanished into
+// the field, and gold was hard to pick out of the fast end.
+//
+// Violet is the one hue the ramp never reaches. The ramp holds blue at or below
+// 0.25 everywhere along its length, so a colour that is mostly blue cannot be
+// confused with any position in the field -- which is the entire job of this
+// value. Only first place gets it; second and third are ordinary members of the
+// ramp, where their colour at least tells you how close they were.
+#define WR_COL_FIRST 0xFFFF5ABEu    // rgb(190, 90, 255)
 
 // What a run should be drawn in, given the mode. Every site that used to read
 // run->colour goes through this, or the line changes colour and its labels do

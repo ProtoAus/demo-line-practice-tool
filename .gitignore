@@ -34,6 +34,11 @@ minhook/
 __pycache__/
 *.pyc
 
+# Dear ImGui's own settings file. Inert here -- wr_imgui.cpp sets
+# io.IniFilename = NULL, so nothing reads or writes it -- but a stray copy turns
+# up in the working tree and is not ours to ship.
+imgui.ini
+
 # Editors / IDE
 .vs/
 .vscode/

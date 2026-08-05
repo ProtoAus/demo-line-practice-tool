@@ -12,15 +12,28 @@
 
 #include "wr_common.h"
 
-// 256, not 64, and not 2000.
+// 1000, and it used to be 256.
 //
-// Measured across a 4095-demo library covering 475 maps: the busiest map has
-// 221 demos, the next 141, and only two maps exceed 128. Sixty-four truncated
-// several maps outright. Two thousand would be a five-megabyte static array and,
-// if ever filled, about 150 MB of point data for maps that do not exist.
+// The old figure was measured, and the measurement was of the wrong thing. Across
+// a 4095-demo library covering 475 maps the busiest map had 221 demos, so 256
+// cleared the largest real map with room. But that library was whatever the game
+// happened to have downloaded while playing, and the Board tab has since made the
+// leaderboard itself the source: you can sort a board, tick the whole filtered
+// set and fetch it. A busy map's board runs to the thousands, so the number that
+// bounds this is no longer "how many demos does the game keep lying around".
 //
-// 256 clears the largest real map with room and costs 665 KB of static array.
-#define WR_MAX_RUNS 256
+// sizeof(WrRun) is 2672 bytes -- most of it the 64 embedded markers -- so the
+// static array goes from 668 KB to 2.55 MB, which is nothing in an x64 process.
+// The real cost is the per-run heap: points, breaks, dips, peaks and eff, tens of
+// KB each, so a genuinely full store is tens of megabytes. That is the price of
+// having asked for a thousand runs, and it is paid only if you do.
+//
+// Still a cap rather than a growable array, because the store is a static that
+// several systems index into every frame, and a realloc that moved it would
+// invalidate every WrRun* held across a frame boundary -- tag anchors, the
+// compare target, the nearest-run cache. A bigger number is a one-line change;
+// making it dynamic is not.
+#define WR_MAX_RUNS 1000
 #define WR_MAX_MARKERS 64
 #define WR_LIVE_POINTS 32768
 
@@ -157,14 +170,30 @@ struct WrRun
 
     bool enabled;
     unsigned int colour;        // ImGui packed ABGR
+
+    // Where this run placed on its own leg, and how big that leg is. Computed
+    // once when the store settles, not per query.
+    //
+    // It was a scan of the whole store per call, which was fine at a cap of 256
+    // and is not at 1000: the renderer asks for a run's colour once for the
+    // line, again for its name tag, again for its ramp numbers, its checkpoints
+    // and its comparison ring, and every one of those was another full pass. At
+    // 256 drawn out of 1000 loaded that is a quarter of a million comparisons
+    // per call site per frame, inside a Present hook.
+    //
+    // Zero until the store settles, which reads as "unranked" and falls back to
+    // the palette colour -- correct during a progressive load, when the store is
+    // not yet sorted and any rank would be provisional anyway.
+    int rank;                   // 1 is fastest; 0 = not computed yet
+    int rankOutOf;
 };
 
 // Load every .wrpath under wrlines_data\paths\<map>\. Replaces whatever was
 // loaded before. Safe to call with an empty/unknown map name (clears the store).
 void WrPathLoadMap(const char *map);
 
-// Loads a few of them per frame; call once per frame. Doing all 256 at once
-// inside Present would stall the render thread for most of a second.
+// Loads a few of them per frame; call once per frame. Doing a full store at once
+// inside Present would stall the render thread for seconds, not milliseconds.
 void WrPathLoadTick(void);
 bool WrPathLoading(int *done, int *total);
 
@@ -177,8 +206,11 @@ int WrRunEnabledCount(void);
 const char *WrTrackName(const WrRun *run);
 
 // Where a run places among the loaded runs of its OWN leg, 1 being fastest, and
-// how many runs that leg has. Ranking across legs would award a podium place to
-// a bonus for beating a main track it was never racing.
+// how many runs that leg has. Ranking across legs would award first place to a
+// bonus for beating a main track it was never racing.
+//
+// Rank 0 means "not placed yet" -- a store still loading, or a run with too few
+// points to be one. Callers treat that as unranked rather than as last.
 int WrRunRankInTrack(const WrRun *run, int *outOf);
 
 // Refresh every run's distance-to-camera. Cheap: samples the path rather than

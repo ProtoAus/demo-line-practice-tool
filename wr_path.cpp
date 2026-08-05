@@ -459,30 +459,54 @@ static bool LoadOne(const char *path, WrRun *run)
 //
 // Returns 1 for the fastest. `outOf` gets how many runs share the leg, which is
 // what a colour ramp needs to spread itself over.
+//
+// A lookup, not a search. ComputeRanks below fills these in when the store
+// settles; see the note on WrRun::rank for why the scan that used to live here
+// could not stay.
 int WrRunRankInTrack(const WrRun *run, int *outOf)
 {
     if (outOf)
-        *outOf = 0;
-    if (!run)
-        return 0;
+        *outOf = run ? run->rankOutOf : 0;
+    return run ? run->rank : 0;
+}
 
-    int rank = 1, total = 0;
+// Place every run on its own leg, once.
+//
+// Quadratic, and deliberately so: it is the same comparison the per-query scan
+// made, hoisted to run one time per store rather than several times per drawn
+// run per frame. A thousand runs is a million trivial compares -- about a
+// millisecond, once, next to a qsort and a directory full of file reads.
+//
+// Written to make no assumption about the store's order, so it is equally right
+// when called on a store that has just been sorted and on one a test filled by
+// hand.
+static void ComputeRanks(void)
+{
     for (int i = 0; i < g_runCount; i++)
     {
-        const WrRun *c = &g_runs[i];
-        if (c->pointCount < 2)
+        WrRun *run = &g_runs[i];
+        run->rank = 0;
+        run->rankOutOf = 0;
+        if (run->pointCount < 2)
             continue;
-        if (c->trackType != run->trackType || c->trackNum != run->trackNum)
-            continue;
-        total++;
-        // Strictly faster, so equal times share a place rather than one of them
-        // silently losing a medal to array order.
-        if (c != run && c->runTime < run->runTime)
-            rank++;
+
+        int rank = 1, total = 0;
+        for (int j = 0; j < g_runCount; j++)
+        {
+            const WrRun *c = &g_runs[j];
+            if (c->pointCount < 2)
+                continue;
+            if (c->trackType != run->trackType || c->trackNum != run->trackNum)
+                continue;
+            total++;
+            // Strictly faster, so equal times share a place rather than one of
+            // them silently losing a place to array order.
+            if (c != run && c->runTime < run->runTime)
+                rank++;
+        }
+        run->rank = rank;
+        run->rankOutOf = total;
     }
-    if (outOf)
-        *outOf = total;
-    return rank;
 }
 
 const char *WrTrackName(const WrRun *run)
@@ -753,7 +777,14 @@ static int CompareByTime(const void *a, const void *b)
 //
 // So the file list is collected up front -- cheap, one directory walk -- and the
 // files themselves are loaded a few per frame. The run store is usable the whole
-// time; the list simply fills in over the next second.
+// time; the list fills in behind you.
+//
+// At the raised cap that fill is no longer instant: a thousand runs at four a
+// frame is 250 frames, so roughly four seconds at 60 Hz. Left at four
+// deliberately -- the number that matters here is the size of the worst hitch,
+// not the total, and the panel says "loading runs n / total" throughout. Runs
+// stay unranked until the last one is in (see ComputeRanks), so during those
+// seconds the lines wear their palette colours and then settle.
 #define LOAD_PER_FRAME 4
 
 static char (*g_pending)[MAX_PATH] = NULL;
@@ -769,6 +800,7 @@ static void FinishLoad(void)
         g_runs[i].colour = PaletteColour(i);
         g_runs[i].enabled = (i == 0);       // provisional; see WrUpdateNearest
     }
+    ComputeRanks();     // after the sort, and after the last run is in
     g_autoEnablePending = true;
 
     WrLogf("loaded %d run%s for \"%s\"%s", g_runCount, g_runCount == 1 ? "" : "s",
@@ -788,10 +820,12 @@ void WrPathLoadTick(void)
         return;
     for (int n = 0; n < LOAD_PER_FRAME && g_pendingNext < g_pendingCount; n++)
     {
+        // Unreachable, and kept: WrPathLoadMap caps g_pendingCount at
+        // WR_MAX_RUNS and warns there, so g_runCount cannot reach the cap here.
+        // This is the bounds check on the &g_runs[g_runCount] write below, and
+        // unreachable is the correct state for one of those.
         if (g_runCount >= WR_MAX_RUNS)
         {
-            WrLogf("[!] %s has more than %d runs; the rest are ignored",
-                   g_loadedMap, WR_MAX_RUNS);
             g_pendingNext = g_pendingCount;
             break;
         }
@@ -845,16 +879,30 @@ void WrPathLoadMap(const char *map)
         return;
     }
 
+    // This break is where truncation actually happens -- the cap in
+    // WrPathLoadTick is a bounds guard that cannot fire, because this runs
+    // first. It used to be silent, and it was firing: surf_demise has 273
+    // .wrpath files on this machine against the old cap of 256, so seventeen
+    // runs were being dropped with nothing said anywhere. The map picker shows
+    // the count on disk and the log says how many loaded, and nobody is
+    // expected to subtract two numbers in different parts of the UI.
+    int found = 0;
     do {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
             continue;
+        found++;
         if (g_pendingCount >= WR_MAX_RUNS)
-            break;
+            continue;           // keep counting, so the message can be honest
         _snprintf_s(g_pending[g_pendingCount], MAX_PATH, _TRUNCATE, "%s\\%s",
                     base, fd.cFileName);
         g_pendingCount++;
     } while (FindNextFileA(h, &fd));
     FindClose(h);
+
+    if (found > g_pendingCount)
+        WrLogf("[!] \"%s\" has %d paths on disk and the store holds %d; "
+               "%d were not loaded", map, found, WR_MAX_RUNS,
+               found - g_pendingCount);
 
     if (g_pendingCount == 0)
         FinishLoad();
@@ -880,6 +928,7 @@ void WrPathTestLoad(const WrRun *runs, int count)
         return;
     memcpy(g_runs, runs, sizeof(WrRun) * (size_t)count);
     g_runCount = count;
+    ComputeRanks();     // the loader's job, done here because there is no loader
 }
 const char *WrPathLoadedMap(void) { return g_loadedMap; }
 

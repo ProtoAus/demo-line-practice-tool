@@ -58,10 +58,12 @@ Press **INSERT** in game. Tick runs in the Runs tab. **ESC** closes the panel.
   ramp and at the top of each arc, in each run's own colour. A bottom says what a line carried
   *through* the ramp; a top says what it bought with it, and reading only one of the two tells
   you a surfer lost speed without telling you whether they got height for it.
-- **Colour every run by where it placed** — gold, silver and bronze for the podium, then green
-  through red for the rest. Placed **within each leg**, because a map's files hold separate runs
-  per stage and per bonus and the quickest time in the folder is usually a stage, not the main
-  track.
+- **Colour every run by where it placed** — violet for the winner, then green through red for
+  everyone behind it. Only first is held out of the ramp: a gold/silver/bronze podium was tried
+  and all three medals are warm mid-brightness colours sitting inside a ramp that already runs
+  green to amber to red, so second and third vanished into the field. Violet is the one hue the
+  ramp never reaches. Placed **within each leg**, because a map's files hold separate runs per
+  stage and per bonus and the quickest time in the folder is usually a stage, not the main track.
 - **A ring on the point being compared.** Every gap on screen is your energy against theirs at one
   point of their line — the point nearest you, re-picked each frame — and it is now drawn, in that
   run's colour, so you can see which point and which line the number came from.
@@ -84,9 +86,17 @@ Press **INSERT** in game. Tick runs in the Runs tab. **ESC** closes the panel.
 - Records **your own path** live, so you can see your line next to theirs.
 - Distance culling, distance fade, screen-space decimation and per-run point budgets, so
   eight full runs on screen cost a fraction of a millisecond.
-- Holds up to **256 runs** per map. Measured across a 4095-demo library covering 475 maps,
-  the busiest has 221 — so that is the whole of the largest map at once, and the files are
-  loaded a few per frame so a big map does not stall on load.
+- Holds up to **1000 runs** per map and draws **256** by default. The old cap of 256 was sized
+  against a demo library the game had downloaded by itself, where the busiest of 475 maps had
+  221 runs; the leaderboard tab made that measurement obsolete, since you can now sort a board
+  and fetch as much of it as you like. Files load a few per frame, so a big map fills in behind
+  you rather than stalling.
+- The draw cap is **not** a free knob, and the point budget does not bound it — that budget is
+  per run, so the work is the budget times the number of lines, and distance culling is the
+  only thing that caps the total. On a compact stage where culling rejects nothing: 8 lines
+  cost 0.24 ms a frame, 256 cost about 8 ms, 1000 cost 32 ms. It only bites once that many runs
+  are actually *enabled*, which takes a deliberate **All** — out of the box a map draws one
+  line. The slider says all of this where you can read it.
 - Stops drawing when you leave a map. Disconnecting does not clear the camera matrix or stop
   it looking valid — it just stops being written — so without this the whole route stayed
   drawn over the main menu, frozen in place. That rule is suspended while the panel is open,
