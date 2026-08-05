@@ -58,6 +58,25 @@ const char *WrSteamStatus(void);
 int WrSteamAvatarCount(void);
 int WrSteamPendingCount(void);
 
+// Your Steam friends, as SteamID64s.
+//
+// Momentum's own leaderboard filter=friends answers 401 without an account, so
+// the site does not hand this out -- but asking its API for specific SteamID64s
+// is not gated. This is the half only the DLL can do: it is injected into the
+// game, so it has a live ISteamFriends, and the fetch script does not.
+//
+// Reads local client state, so it is synchronous and costs nothing. Enumerated
+// on first use and cached; Refresh re-reads it.
+int WrSteamFriendCount(void);
+unsigned long long WrSteamFriendAt(int i);
+bool WrSteamIsFriend(unsigned long long id);    // sorted, binary searched
+void WrSteamRefreshFriends(void);
+
+// False when steam_api64 is too old to export the two enumeration functions.
+// They are deliberately not part of the mandatory export set, so an old DLL
+// loses this and keeps its avatars.
+bool WrSteamCanListFriends(void);
+
 // Master switch. Turning it off stops all lookups immediately; avatars already
 // fetched stay usable.
 void WrSteamSetEnabled(bool on);

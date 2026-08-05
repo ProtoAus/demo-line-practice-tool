@@ -35,6 +35,19 @@ typedef const char *(*GetPersonaFn)(void *self, unsigned long long id);
 typedef bool (*GetImageSizeFn)(void *self, int image, unsigned int *w, unsigned int *h);
 typedef bool (*GetImageRGBAFn)(void *self, int image, unsigned char *dst, int destSize);
 
+// Your friends list. Local client state, so unlike a persona name these return
+// immediately -- no callback, no polling, nothing to wait for.
+//
+// The flat API returns a CSteamID as a plain 8-byte scalar, which is the same
+// reason the calls above pass one IN as a bare unsigned long long: there is no
+// struct-return ABI to get wrong.
+typedef int (*GetFriendCountFn)(void *self, int flags);
+typedef unsigned long long (*GetFriendByIndexFn)(void *self, int i, int flags);
+
+// k_EFriendFlagImmediate. A literal because there are no Steamworks headers
+// here and adding them for one constant would be the tail wagging the dog.
+#define WR_FRIEND_IMMEDIATE 0x04
+
 static void *g_friends = NULL;
 static void *g_utils = NULL;
 static RequestUserInfoFn g_requestUserInfo = NULL;
@@ -42,6 +55,14 @@ static GetAvatarFn g_getAvatar = NULL;
 static GetPersonaFn g_getPersona = NULL;
 static GetImageSizeFn g_getImageSize = NULL;
 static GetImageRGBAFn g_getImageRGBA = NULL;
+static GetFriendCountFn g_getFriendCount = NULL;
+static GetFriendByIndexFn g_getFriendByIndex = NULL;
+
+// Their own storage, not the 96-slot avatar cache: a friends list is routinely
+// bigger than that, and none of these need an avatar.
+static unsigned long long *g_friendIds = NULL;
+static int g_friendCount = 0;
+static bool g_friendsRead = false;
 
 static bool g_tried = false;
 static bool g_ready = false;
@@ -173,6 +194,13 @@ bool WrSteamInit(void)
         mod, "SteamAPI_ISteamUtils_GetImageSize");
     g_getImageRGBA = (GetImageRGBAFn)GetProcAddress(
         mod, "SteamAPI_ISteamUtils_GetImageRGBA");
+
+    // Deliberately NOT in the mandatory set below. An older steam_api64 that is
+    // missing these should lose the friends filter, not the avatars.
+    g_getFriendCount = (GetFriendCountFn)GetProcAddress(
+        mod, "SteamAPI_ISteamFriends_GetFriendCount");
+    g_getFriendByIndex = (GetFriendByIndexFn)GetProcAddress(
+        mod, "SteamAPI_ISteamFriends_GetFriendByIndex");
 
     if (!g_requestUserInfo || !g_getAvatar || !g_getImageSize || !g_getImageRGBA)
     {
@@ -405,6 +433,108 @@ int WrSteamPendingCount(void)
         if (g_cache[i].state == ST_WANTED || g_cache[i].state == ST_ASKED)
             n++;
     return n;
+}
+
+// ---------------------------------------------------------------------------
+// Your friends list
+// ---------------------------------------------------------------------------
+//
+// WHY THIS IS WORTH HAVING AT ALL
+//
+// Momentum's own leaderboard can filter to friends -- and answers 401 without
+// an account, so it is not something the API hands out. Asking for specific
+// SteamID64s is not gated at all. Between the two, "show me my friends' runs"
+// becomes: enumerate them here, where there is a live ISteamFriends because we
+// are inside the game, and let the fetcher ask for exactly those ids.
+//
+// Nothing here reaches the network. GetFriendCount and GetFriendByIndex read
+// state the Steam client already holds, so this is a synchronous loop and needs
+// none of the polling above.
+
+static int CompareIds(const void *a, const void *b)
+{
+    unsigned long long x = *(const unsigned long long *)a;
+    unsigned long long y = *(const unsigned long long *)b;
+    return (x < y) ? -1 : (x > y ? 1 : 0);
+}
+
+void WrSteamRefreshFriends(void)
+{
+    g_friendsRead = true;
+    free(g_friendIds);
+    g_friendIds = NULL;
+    g_friendCount = 0;
+
+    if (!WrSteamInit() || !g_getFriendCount || !g_getFriendByIndex)
+        return;
+
+    int n = 0;
+    __try
+    {
+        n = g_getFriendCount(g_friends, WR_FRIEND_IMMEDIATE);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        n = 0;
+    }
+    if (n <= 0 || n > 8192)     // 8192 is well past Steam's own 2000 cap
+    {
+        WrLogf("steam: friend count %d, nothing to enumerate", n);
+        return;
+    }
+
+    g_friendIds = (unsigned long long *)malloc(sizeof(unsigned long long) * n);
+    if (!g_friendIds)
+        return;
+
+    for (int i = 0; i < n; i++)
+    {
+        unsigned long long id = 0;
+        __try
+        {
+            id = g_getFriendByIndex(g_friends, i, WR_FRIEND_IMMEDIATE);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            id = 0;
+        }
+        if (id)
+            g_friendIds[g_friendCount++] = id;
+    }
+
+    // Sorted so the display filter can binary search it once per row rather
+    // than scanning a few hundred ids per row of a 20 000-row board.
+    if (g_friendCount > 1)
+        qsort(g_friendIds, (size_t)g_friendCount, sizeof(unsigned long long),
+              CompareIds);
+    WrLogf("steam: %d friends enumerated", g_friendCount);
+}
+
+int WrSteamFriendCount(void)
+{
+    if (!g_friendsRead)
+        WrSteamRefreshFriends();
+    return g_friendCount;
+}
+
+unsigned long long WrSteamFriendAt(int i)
+{
+    if (!g_friendIds || i < 0 || i >= g_friendCount)
+        return 0;
+    return g_friendIds[i];
+}
+
+bool WrSteamIsFriend(unsigned long long id)
+{
+    if (!g_friendIds || g_friendCount <= 0 || !id)
+        return false;
+    return bsearch(&id, g_friendIds, (size_t)g_friendCount,
+                   sizeof(unsigned long long), CompareIds) != NULL;
+}
+
+bool WrSteamCanListFriends(void)
+{
+    return g_getFriendCount != NULL && g_getFriendByIndex != NULL;
 }
 
 void WrSteamShutdown(void)
