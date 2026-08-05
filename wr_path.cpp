@@ -448,6 +448,43 @@ static bool LoadOne(const char *path, WrRun *run)
     return run->pointCount >= 2;
 }
 
+// Where this run places among the loaded runs OF ITS OWN LEG.
+//
+// Within the track, and that is not a detail. The store is sorted by runTime
+// across every track at once, so its first entry is the numerically smallest
+// time in the file -- which on a staged map is usually a stage run, not the
+// main one. Locally, bhop_futile holds twenty main runs between 52.85 and
+// 54.34 s and one bonus at 33.97 s: rank naively and the bonus takes gold from
+// a main track it was never racing.
+//
+// Returns 1 for the fastest. `outOf` gets how many runs share the leg, which is
+// what a colour ramp needs to spread itself over.
+int WrRunRankInTrack(const WrRun *run, int *outOf)
+{
+    if (outOf)
+        *outOf = 0;
+    if (!run)
+        return 0;
+
+    int rank = 1, total = 0;
+    for (int i = 0; i < g_runCount; i++)
+    {
+        const WrRun *c = &g_runs[i];
+        if (c->pointCount < 2)
+            continue;
+        if (c->trackType != run->trackType || c->trackNum != run->trackNum)
+            continue;
+        total++;
+        // Strictly faster, so equal times share a place rather than one of them
+        // silently losing a medal to array order.
+        if (c != run && c->runTime < run->runTime)
+            rank++;
+    }
+    if (outOf)
+        *outOf = total;
+    return rank;
+}
+
 const char *WrTrackName(const WrRun *run)
 {
     static char buf[32];
@@ -825,6 +862,25 @@ void WrPathLoadMap(const char *map)
 
 int WrRunCount(void) { return g_runCount; }
 WrRun *WrRunAt(int i) { return (i >= 0 && i < g_runCount) ? &g_runs[i] : NULL; }
+
+// Fill the store directly, for tests\test_rank.exe.
+//
+// Here rather than in the harness so the ranking is tested against the REAL
+// store, the way test_energy drives the real sampler. Ranking is a property of
+// what is loaded, and a test that ranked its own private array would pass while
+// the shipped function looked at something else. Nothing in the DLL calls this;
+// it allocates nothing, so the ordinary FreeRuns path is untouched.
+void WrPathTestLoad(const WrRun *runs, int count)
+{
+    if (count > WR_MAX_RUNS)
+        count = WR_MAX_RUNS;
+    memset(g_runs, 0, sizeof(g_runs));
+    g_runCount = 0;
+    if (!runs || count <= 0)
+        return;
+    memcpy(g_runs, runs, sizeof(WrRun) * (size_t)count);
+    g_runCount = count;
+}
 const char *WrPathLoadedMap(void) { return g_loadedMap; }
 
 int WrRunEnabledCount(void)

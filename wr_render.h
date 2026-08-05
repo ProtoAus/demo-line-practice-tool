@@ -5,6 +5,8 @@
 
 #include "wr_common.h"
 
+struct WrRun;
+
 struct WrRenderSettings
 {
     float thickness;
@@ -53,7 +55,34 @@ struct WrRenderSettings
     float effNoDataAlpha;       // multiplier where there is no reading at all
     bool effColourblind;        // blue/orange instead of red/green
     bool effLegend;             // draw the key on screen while the mode is on
+
+    // Colour each whole run by where it placed on its own leg. Per RUN, unlike
+    // the two above -- it replaces the palette colour a run was given, so the
+    // line, its name tag, its ramp numbers and its checkpoints all agree.
+    int rankColour;             // WrRankColour
+    float rankFullBehind;       // WR_RANK_BY_TIME: +% off the best that reads red
+    bool rankLegend;            // its rows go in the same key the efficiency uses
 };
+
+enum WrRankColour
+{
+    WR_RANK_OFF = 0,
+    WR_RANK_BY_PLACING,     // even green->red across the field
+    WR_RANK_BY_TIME,        // shaded by how far off the best each run is
+    WR_RANK_MODE_COUNT
+};
+
+// The podium, in ImGui's ABGR. Deliberately not part of the ramp: a medal is a
+// place, not a measurement, and blending them would make second look like a
+// slightly worse first rather than second.
+#define WR_COL_GOLD   0xFF00D7FFu
+#define WR_COL_SILVER 0xFFC0C0C0u
+#define WR_COL_BRONZE 0xFF327FCDu
+
+// What a run should be drawn in, given the mode. Every site that used to read
+// run->colour goes through this, or the line changes colour and its labels do
+// not.
+unsigned int WrRunColour(const WrRun *run);
 
 // What a label on the line may say. Any combination; empty draws nothing.
 #define WR_LABEL_SPEED  (1u << 0)

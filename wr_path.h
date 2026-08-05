@@ -176,6 +176,11 @@ int WrRunEnabledCount(void);
 // "main", "stage 3", "bonus 1".
 const char *WrTrackName(const WrRun *run);
 
+// Where a run places among the loaded runs of its OWN leg, 1 being fastest, and
+// how many runs that leg has. Ranking across legs would award a podium place to
+// a bonus for beating a main track it was never racing.
+int WrRunRankInTrack(const WrRun *run, int *outOf);
+
 // Refresh every run's distance-to-camera. Cheap: samples the path rather than
 // walking every point, which is plenty to answer "is this run near me".
 void WrUpdateNearest(const Vec3 &cam);

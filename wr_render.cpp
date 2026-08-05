@@ -109,6 +109,13 @@ void WrRenderDefaults(void)
     g_render.effNoDataAlpha = 0.35f;
     g_render.effColourblind = false;
     g_render.effLegend = true;
+
+    g_render.rankColour = WR_RANK_OFF;
+    // 25% off the record is fully red. Measured on the 66 surf_demise runs here
+    // (37.17 to 79.08 s): at 25% the pack near 40 s stays green and only the
+    // genuinely slow runs redden, which is the point of the time mode.
+    g_render.rankFullBehind = 25.0f;
+    g_render.rankLegend = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -290,6 +297,86 @@ static inline unsigned int WithAlpha(unsigned int colour, float a)
 }
 
 // Blue -> cyan -> green -> yellow -> red across the configured speed range.
+// What colour is this run?
+//
+// Every place that used to read run->colour goes through here. That is the whole
+// point: colour is a run's identity on screen, and if the line changed but its
+// name tag, its ramp numbers, its checkpoints and its comparison ring did not,
+// the run would be two different colours at once.
+//
+// Off by default, in which case this is exactly run->colour -- including any
+// colour picked by hand in the Runs tab, which a rank mode necessarily
+// overrides while it is on.
+unsigned int WrRunColour(const WrRun *run)
+{
+    if (!run)
+        return 0xFFCCCCCCu;
+    if (g_render.rankColour == WR_RANK_OFF)
+        return run->colour;
+
+    int total = 0;
+    int rank = WrRunRankInTrack(run, &total);
+    if (rank <= 0)
+        return run->colour;
+
+    if (rank == 1) return WR_COL_GOLD;
+    if (rank == 2) return WR_COL_SILVER;
+    if (rank == 3) return WR_COL_BRONZE;
+
+    // t is 0 at the front of the field and 1 at the back.
+    float t = 0.5f;
+    if (g_render.rankColour == WR_RANK_BY_TIME)
+    {
+        // How far off the best this run is, as a fraction of the best. Truthful
+        // rather than even: on a board where everyone is within a second of the
+        // record, everyone stays green, because they are all nearly as fast.
+        const WrRun *best = NULL;
+        for (int i = 0; i < WrRunCount(); i++)
+        {
+            const WrRun *c = WrRunAt(i);
+            if (c && c->pointCount >= 2 && c->trackType == run->trackType &&
+                c->trackNum == run->trackNum)
+            {
+                best = c;       // store is time-sorted, so the first match is it
+                break;
+            }
+        }
+        float span = g_render.rankFullBehind;
+        if (span < 0.5f)
+            span = 0.5f;
+        if (best && best->runTime > 0.001)
+            t = (float)((run->runTime - best->runTime) / best->runTime) *
+                (100.0f / span);
+        t = WrClampF(t, 0.0f, 1.0f);
+    }
+    else
+    {
+        // Even spread over the runs that are not on the podium.
+        int spread = total - 3;
+        t = (spread > 1) ? (float)(rank - 4) / (float)(spread - 1) : 0.0f;
+        t = WrClampF(t, 0.0f, 1.0f);
+    }
+
+    // Green at the front, red at the back. Amber through the middle rather than
+    // a straight green-to-red lerp, which passes through a muddy olive that
+    // reads as neither.
+    float r, g, b;
+    if (t < 0.5f)
+    {
+        float u = t / 0.5f;
+        r = 0.30f + 0.70f * u; g = 0.90f; b = 0.25f * (1.0f - u);
+    }
+    else
+    {
+        float u = (t - 0.5f) / 0.5f;
+        r = 1.00f; g = 0.90f - 0.75f * u; b = 0.10f * u;
+    }
+    unsigned int ri = (unsigned int)(WrClampF(r, 0.0f, 1.0f) * 255.0f + 0.5f);
+    unsigned int gi = (unsigned int)(WrClampF(g, 0.0f, 1.0f) * 255.0f + 0.5f);
+    unsigned int bi = (unsigned int)(WrClampF(b, 0.0f, 1.0f) * 255.0f + 0.5f);
+    return 0xFF000000u | (bi << 16) | (gi << 8) | ri;
+}
+
 static unsigned int SpeedColour(float speed)
 {
     float t = (speed - g_render.speedMin) /
@@ -747,10 +834,10 @@ static void EmitTurns(ImDrawList *dl, const WrRun *run, bool tops)
         // the whole reason for having both.
         float side = tops ? 1.0f : -1.0f;
         ImVec2 tp(s.x + 4.0f, tops ? s.y + 9.0f : s.y - 16.0f);
-        if (!DrawLabel(dl, tp, label, WithAlpha(run->colour, 1.0f)))
+        if (!DrawLabel(dl, tp, label, WithAlpha(WrRunColour(run), 1.0f)))
             continue;
         dl->AddLine(ImVec2(s.x, s.y), ImVec2(s.x, s.y + 7.0f * side),
-                    WithAlpha(run->colour, 0.9f), 1.5f);
+                    WithAlpha(WrRunColour(run), 0.9f), 1.5f);
         drawn++;
     }
 }
@@ -781,7 +868,7 @@ static void EmitComparePoint(ImDrawList *dl)
     if (!Project(p, &s))
         return;
 
-    unsigned int col = WithAlpha(ref->colour, 1.0f);
+    unsigned int col = WithAlpha(WrRunColour(ref), 1.0f);
 
     // From your midsection, the same origin the velocity vector uses, so the
     // two read as coming from the same place -- you.
@@ -792,7 +879,7 @@ static void EmitComparePoint(ImDrawList *dl)
         Vec3 b = p;
         ImVec2 pa, pb;
         if (ClipToNear(&a, &b) && Project(a, &pa) && Project(b, &pb))
-            dl->AddLine(pa, pb, WithAlpha(ref->colour, 0.35f), 1.0f);
+            dl->AddLine(pa, pb, WithAlpha(WrRunColour(ref), 0.35f), 1.0f);
     }
 
     // A ring rather than a disc: it has to sit ON the line without hiding the
@@ -827,7 +914,7 @@ static void EmitMarkers(ImDrawList *dl, const WrRun *run)
             continue;
 
         float r = g_render.markerRadius;
-        dl->AddCircleFilled(s, r, WithAlpha(run->colour, 0.95f), 16);
+        dl->AddCircleFilled(s, r, WithAlpha(WrRunColour(run), 0.95f), 16);
         // Dark ring so the marker survives a bright surf texture behind it.
         dl->AddCircle(s, r, 0xE0000000u, 16, 1.5f);
         drawn++;
@@ -852,7 +939,7 @@ static void EmitMarkers(ImDrawList *dl, const WrRun *run)
             continue;
 
         ImVec2 tp(s.x + r + 3.0f, s.y - 7.0f);
-        DrawLabel(dl, tp, label, WithAlpha(run->colour, 1.0f));
+        DrawLabel(dl, tp, label, WithAlpha(WrRunColour(run), 1.0f));
     }
 }
 
@@ -1047,20 +1134,20 @@ static void EmitTag(ImDrawList *dl, WrRun *run)
 
     // Leader from the line to the tag, so a nudged tag still reads as belonging
     // to its own path.
-    dl->AddLine(s, ImVec2(r.x0, r.y0 + h * 0.5f), WithAlpha(run->colour, 0.55f),
+    dl->AddLine(s, ImVec2(r.x0, r.y0 + h * 0.5f), WithAlpha(WrRunColour(run), 0.55f),
                 1.0f);
 
     dl->AddRectFilled(ImVec2(r.x0, r.y0), ImVec2(r.x1, r.y1), 0xB0000000u,
                       4.0f * scale);
     dl->AddRect(ImVec2(r.x0, r.y0), ImVec2(r.x1, r.y1),
-                WithAlpha(run->colour, 0.85f), 4.0f * scale, 0, 1.5f);
+                WithAlpha(WrRunColour(run), 0.85f), 4.0f * scale, 0, 1.5f);
 
     ImVec2 ic(r.x0 + pad, r.y0 + (h - icon) * 0.5f);
     if (avatar)
         dl->AddImage((ImTextureID)avatar, ic, ImVec2(ic.x + icon, ic.y + icon));
     else
         dl->AddCircleFilled(ImVec2(ic.x + icon * 0.5f, ic.y + icon * 0.5f),
-                            icon * 0.42f, WithAlpha(run->colour, 1.0f), 14);
+                            icon * 0.42f, WithAlpha(WrRunColour(run), 1.0f), 14);
 
     ImVec2 tp(ic.x + icon + pad, r.y0 + (h - text.y) * 0.5f);
     dl->AddText(tagFont, tagSize, ImVec2(tp.x + 1.0f, tp.y + 1.0f), 0xC0000000u, name);
@@ -1523,9 +1610,19 @@ static void EmitVelocityVector(ImDrawList *dl)
 //
 // It goes in the corner OPPOSITE the energy overlay, so the two cannot collide
 // whichever corner that has been moved to.
+// ONE key, whichever modes are on.
+//
+// It was a hardcoded four rows and three footers for the efficiency colours,
+// with its height written out as `lh * 7.0f`. A second box for the rank colours
+// had nowhere to go: it sits in the corner opposite the energy overlay, and with
+// two of the four corners already claimed the third would eventually collide
+// with something. So the rows are built rather than fixed, and both modes append
+// to the same box.
 static void EmitEfficiencyLegend(ImDrawList *dl)
 {
-    if (!g_render.colourByEfficiency || !g_render.effLegend)
+    bool effOn = g_render.colourByEfficiency && g_render.effLegend;
+    bool rankOn = g_render.rankColour != WR_RANK_OFF && g_render.rankLegend;
+    if (!effOn && !rankOn)
         return;
 
     float size = 0.0f;
@@ -1534,37 +1631,71 @@ static void EmitEfficiencyLegend(ImDrawList *dl)
     float lh = size * 1.35f;
     float sw = size * 1.6f;         // swatch width
 
-    struct Row { float eta; bool noData; const char *text; };
-    static const Row kRows[4] = {
-        { 1.0f,  false, "gaining -- strafing is adding energy" },
-        { 0.0f,  false, "nothing happening -- free flight" },
-        { -1.0f, false, "losing -- a ramp entry, a wall, a landing" },
-        { 0.0f,  true,  "no reading -- a booster, or a gap" },
-    };
-    static const char *kFoot = "full colour = 37 energy/s, all air strafing can add";
+    struct Row { unsigned int colour; bool dim; const char *text; };
+    Row rows[10];
+    const char *foots[6];
+    int n = 0, nf = 0;
 
-    // The two things people ask about the moment this is on, because the same
-    // red-and-green ramp is used for two different quantities and nothing said
-    // so. They are ON THE LINES YOU ARE CHASING, and the arrow is a TREND -- and
-    // the two disagreeing is not a fault, it is the interesting case: you can
-    // strafe well while a ramp takes more than you are adding.
-    static const char *kFoot2 = "demo lines only -- your own line cannot be "
-                                "measured this finely";
-    static const char *kFoot3 = "the velocity arrow is your energy TREND, not "
-                                "this; they differ on purpose";
+    if (rankOn)
+    {
+        rows[n].colour = WR_COL_GOLD;   rows[n].dim = false;
+        rows[n++].text = "1st on this leg";
+        rows[n].colour = WR_COL_SILVER; rows[n].dim = false;
+        rows[n++].text = "2nd";
+        rows[n].colour = WR_COL_BRONZE; rows[n].dim = false;
+        rows[n++].text = "3rd";
+        foots[nf++] = (g_render.rankColour == WR_RANK_BY_TIME)
+            ? "the rest: green to red by how far off the best they are"
+            : "the rest: green to red by placing, evenly spread";
+        // The thing that would otherwise look like a bug on a staged map.
+        foots[nf++] = "placed within each leg -- a bonus cannot out-place a "
+                      "main run";
+    }
 
-    float w = font->CalcTextSizeA(size, FLT_MAX, 0.0f, kFoot).x;
-    float w2 = font->CalcTextSizeA(size, FLT_MAX, 0.0f, kFoot2).x;
-    float w3 = font->CalcTextSizeA(size, FLT_MAX, 0.0f, kFoot3).x;
-    if (w2 > w) w = w2;
-    if (w3 > w) w = w3;
-    for (int i = 0; i < 4; i++)
+    if (effOn)
+    {
+        static const float kEta[4] = { 1.0f, 0.0f, -1.0f, 0.0f };
+        static const char *kText[4] = {
+            "gaining -- strafing is adding energy",
+            "nothing happening -- free flight",
+            "losing -- a ramp entry, a wall, a landing",
+            "no reading -- a booster, or a gap",
+        };
+        for (int i = 0; i < 4; i++)
+        {
+            bool noData = (i == 3);
+            rows[n].colour = noData
+                ? WithAlpha(0xFFB0B0B0u, g_render.effNoDataAlpha)
+                : EfficiencyColour(kEta[i] * g_render.effSaturation, 0xFFB0B0B0u);
+            rows[n].dim = noData;
+            rows[n++].text = kText[i];
+        }
+        foots[nf++] = "full colour = 37 energy/s, all air strafing can add";
+        // The two things people ask the moment this is on, because the same
+        // red-and-green ramp is used for two different quantities and nothing
+        // said so. They are ON THE LINES YOU ARE CHASING, and the arrow is a
+        // TREND -- and the two disagreeing is not a fault, it is the
+        // interesting case: you can strafe well while a ramp takes more than
+        // you are adding.
+        foots[nf++] = "demo lines only -- your own line cannot be measured "
+                      "this finely";
+        foots[nf++] = "the velocity arrow is your energy TREND, not this; they "
+                      "differ on purpose";
+    }
+
+    float w = 0.0f;
+    for (int i = 0; i < nf; i++)
+    {
+        float fw = font->CalcTextSizeA(size, FLT_MAX, 0.0f, foots[i]).x;
+        if (fw > w) w = fw;
+    }
+    for (int i = 0; i < n; i++)
     {
         float lw = sw + pad + font->CalcTextSizeA(size, FLT_MAX, 0.0f,
-                                                  kRows[i].text).x;
+                                                  rows[i].text).x;
         if (lw > w) w = lw;
     }
-    float h = lh * 7.0f + pad * 2.0f;
+    float h = lh * (float)(n + nf) + pad * 2.0f;
     w += pad * 2.0f;
 
     // Opposite corner to the overlay, in both axes.
@@ -1575,26 +1706,24 @@ static void EmitEfficiencyLegend(ImDrawList *dl)
 
     dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h), 0xA0000000u, 5.0f);
 
-    // A neutral grey stands in for "some run's colour" -- the swatches show what
-    // the ramp does, and every enabled run has a different base.
-    for (int i = 0; i < 4; i++)
+    // For the efficiency rows a neutral grey stands in for "some run's colour",
+    // since the swatch shows what the ramp does and every run has its own base.
+    // The rank swatches are the real thing -- a medal is not relative to
+    // anything.
+    for (int i = 0; i < n; i++)
     {
         float ry = y + pad + lh * i;
-        unsigned int c = kRows[i].noData
-            ? WithAlpha(0xFFB0B0B0u, g_render.effNoDataAlpha)
-            : EfficiencyColour(kRows[i].eta * g_render.effSaturation,
-                               0xFFB0B0B0u);
         dl->AddRectFilled(ImVec2(x + pad, ry + size * 0.15f),
-                          ImVec2(x + pad + sw, ry + size * 0.95f), c, 2.0f);
+                          ImVec2(x + pad + sw, ry + size * 0.95f),
+                          rows[i].colour, 2.0f);
         ImVec2 p(x + pad + sw + pad, ry);
         dl->AddText(font, size, ImVec2(p.x + 1.0f, p.y + 1.0f), 0xC0000000u,
-                    kRows[i].text);
-        dl->AddText(font, size, p, 0xFFE0E0E0u, kRows[i].text);
+                    rows[i].text);
+        dl->AddText(font, size, p, 0xFFE0E0E0u, rows[i].text);
     }
-    const char *foots[3] = { kFoot, kFoot2, kFoot3 };
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < nf; i++)
     {
-        ImVec2 fp(x + pad, y + pad + lh * (4.0f + i));
+        ImVec2 fp(x + pad, y + pad + lh * (float)(n + i));
         dl->AddText(font, size, ImVec2(fp.x + 1.0f, fp.y + 1.0f), 0xC0000000u,
                     foots[i]);
         dl->AddText(font, size, fp, 0xFF909090u, foots[i]);
@@ -1755,7 +1884,7 @@ void WrRenderWorld(void)
         if (!run || !run->enabled || run->pointCount < 2)
             continue;
         EmitPath(dl, run->points, run->pointCount, run->breaks, run->breakCount,
-                 run->colour, 1.0f, run->eff);
+                 WrRunColour(run), 1.0f, run->eff);
         EmitTurns(dl, run, false);
         EmitTurns(dl, run, true);
         EmitMarkers(dl, run);
