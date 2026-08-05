@@ -393,6 +393,13 @@ def scan_candidates(buf, start_byte=0):
     skip = start_byte // 4
 
     for phase in range(8):
+        # The deadline has to be checked HERE too, not only in the chain search.
+        # This scan is 32 passes over the whole decompressed body, and on a
+        # 47 MB demo -- the largest in the library measured -- it is the phase
+        # that runs long. It used to be outside the timeout entirely, so a demo
+        # could sail past --timeout by any margin it liked and the only thing
+        # that would ever end it was closing the game.
+        check_deadline("the candidate scan")
         sb = (whole >> phase).to_bytes(n, "little")
         for q in range(4):
             view = sb[q:]
@@ -1204,6 +1211,20 @@ def load_failures(out_dir, map_name):
     return out
 
 
+def _flush_failures(out_dir, map_name, now_failed, now_ok):
+    """Merge this run's failures and rescues for one map into its record file.
+
+    Read-modify-write rather than an append, because the file also has to lose
+    entries: a demo that failed last time and worked this time must have its
+    record dropped, or it is skipped for ever.
+    """
+    recs = load_failures(out_dir, map_name)
+    recs.update(now_failed.get(map_name, {}))
+    for base in now_ok.get(map_name, ()):         # rescued: forget the failure
+        recs.pop(base, None)
+    save_failures(out_dir, map_name, recs)
+
+
 def save_failures(out_dir, map_name, records):
     path = failures_path(out_dir, map_name)
     if not records:
@@ -1261,6 +1282,13 @@ def _run_all(targets, args):
     so this is about as parallel as work gets. It matters because the cost per
     demo is wildly uneven: 0.7 s on a normal map, up to a minute on a bad one,
     which serially reads as "it did four quickly and then stopped".
+
+    submit + as_completed, NOT pool.map. This docstring used to say "in whatever
+    order they finish" while the code used pool.map, which yields in SUBMISSION
+    order -- so one slow demo held back the progress line of every finished demo
+    behind it, and the panel went silent for as long as that demo took. Which is
+    exactly the thing the paragraph above claims to have fixed. The reported
+    symptom was the extractor looking hung; it was not hung, it was mute.
     """
     jobs = _job_count(getattr(args, "jobs", 0))
     if jobs <= 1 or len(targets) < 2:
@@ -1270,7 +1298,7 @@ def _run_all(targets, args):
         return
 
     try:
-        from concurrent.futures import ProcessPoolExecutor
+        from concurrent.futures import ProcessPoolExecutor, as_completed
     except ImportError:
         jobs = 1
 
@@ -1281,10 +1309,11 @@ def _run_all(targets, args):
         return
 
     print("%d worker%s" % (jobs, "" if jobs == 1 else "s"))
-    items = [(path, demo_map, args) for path, demo_map in targets]
     with ProcessPoolExecutor(max_workers=jobs) as pool:
-        for result in pool.map(_process_one_job, items, chunksize=1):
-            yield result
+        futures = [pool.submit(_process_one_job, (path, demo_map, args))
+                   for path, demo_map in targets]
+        for fut in as_completed(futures):
+            yield fut.result()
 
 
 def wrpath_revision(path):
@@ -1379,6 +1408,17 @@ def cmd_extract(args):
         pre = "[%d/%d]" % (done, total)
         if kind == "error":
             failed += 1
+            # Written NOW, not in the epilogue.
+            #
+            # A failure record is what stops the next run paying the same
+            # timeout again, and the epilogue is not reached if the run is
+            # stopped -- which it now can be, from the panel. Recording 40
+            # demos' worth of expensive failures and then throwing all of them
+            # away because the user pressed Stop is the worst of both. The
+            # write is tmp + os.replace and the record set is tens of entries,
+            # so doing it per failure costs nothing worth measuring.
+            if not args.verify and demo_map:
+                _flush_failures(args.out, demo_map, now_failed, now_ok)
             # An older extractor may have left an output for this demo. We have
             # just established the current one cannot produce it, so that file is
             # a path derived from an assumption we no longer trust -- remove it
@@ -1427,14 +1467,14 @@ def cmd_extract(args):
               "extracted" % (len(removed), "" if len(removed) == 1 else "s"))
 
     # --verify writes nothing, and that has to include this.
+    #
+    # Still done at the end as well as per failure, because this is also where
+    # RESCUES land: a demo that failed before and worked this time has to have
+    # its old record dropped, and that is only known once it has succeeded.
     if not args.verify:
         recorded = 0
         for m in seen_maps:
-            recs = load_failures(args.out, m)
-            recs.update(now_failed.get(m, {}))
-            for base in now_ok.get(m, ()):        # rescued: forget the failure
-                recs.pop(base, None)
-            save_failures(args.out, m, recs)
+            _flush_failures(args.out, m, now_failed, now_ok)
             recorded += len(now_failed.get(m, {}))
         if recorded:
             print("recorded %d failure%s so re-running this map skips them"
@@ -1777,6 +1817,72 @@ def _fetch_spread(map_id, args, n):
     return rows, total, reqs
 
 
+# How many SteamID64s go in one leaderboard request.
+#
+# Verified against the live API: 200 ids in a 3704-character URL is accepted and
+# answered correctly. 100 leaves generous headroom under any proxy's URL limit
+# while still being one request for almost everybody's friends list.
+FRIEND_BATCH = 100
+
+
+def read_friends(out):
+    """The SteamID64s the DLL enumerated, from wrlines_data\\friends.txt.
+
+    The DLL writes this because only it can: it is injected into the game, so
+    it has a live ISteamFriends, and this script does not and cannot. Same
+    fence as maps.txt, pointing the other way.
+    """
+    path = os.path.join(os.path.dirname(out), "friends.txt")
+    ids = []
+    try:
+        f = open(path, "r", encoding="utf-8", errors="replace")
+    except OSError:
+        return ids, path
+    with f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                v = int(line.split()[0])
+            except ValueError:
+                continue
+            if v > 0:
+                ids.append(v)
+    return ids, path
+
+
+def _fetch_friends(map_id, args, ids):
+    """Every listed player's run on this track, at its true rank.
+
+    Momentum's own filter=friends needs an account -- it answers 401 without a
+    session, which is exactly why this is not something the site offers you.
+    steamIDs= needs nothing, and hands back each player's run with its real
+    global rank, so a friend at rank 4500 is found without caching the 4499
+    runs above them.
+
+    Ids that have no run are silently absent rather than an error, so a friends
+    list full of people who have never touched the map costs one request.
+    """
+    rows, reqs = [], 0
+    for i in range(0, len(ids), FRIEND_BATCH):
+        chunk = ids[i:i + FRIEND_BATCH]
+        url = ("%s/maps/%d/leaderboard?gamemode=%d&trackType=%d&trackNum=%d"
+               "&take=%d&steamIDs=%s"
+               % (API_BASE, map_id, args.gamemode, args.track_type,
+                  args.track_num, FETCH_PAGE,
+                  ",".join(str(x) for x in chunk)))
+        page = json.loads(_api_get(url).decode("utf-8", "replace"))
+        reqs += 1
+        for r in (page.get("data") or []):
+            rec = _to_row(r)
+            if rec:
+                rows.append(rec)
+        if i + FRIEND_BATCH < len(ids):
+            time.sleep(FETCH_DELAY)
+    return rows, reqs
+
+
 def cmd_board(args):
     """Cache a window of a leaderboard so it can be browsed and sorted offline.
 
@@ -1806,7 +1912,22 @@ def cmd_board(args):
 
     count = args.count if args.count > 0 else FETCH_MAX_DEFAULT
     try:
-        if args.spread > 0:
+        if args.friends:
+            ids, fpath = read_friends(args.out)
+            if not ids:
+                print("[!] no friends list at %s." % fpath)
+                print("    Press \"Refresh my friends\" in the Board tab -- only")
+                print("    the injected DLL can read your Steam friends, so it")
+                print("    has to write the list for this script to use.")
+                return 1
+            print("%d friend%s to look up, %d request%s"
+                  % (len(ids), "" if len(ids) == 1 else "s",
+                     (len(ids) + FRIEND_BATCH - 1) // FRIEND_BATCH,
+                     "" if len(ids) <= FRIEND_BATCH else "s"))
+            rows, reqs = _fetch_friends(map_id, args, ids)
+            total = None
+            print("%d of them have a run on this track" % len(rows))
+        elif args.spread > 0:
             rows, total, reqs = _fetch_spread(map_id, args, args.spread)
         elif args.slowest:
             # One probe for the size, then land on the tail. Two requests for
@@ -1896,8 +2017,27 @@ def parse_ranks(spec):
     return sorted(out)
 
 
-def _download(dest, rows, have):
-    """Download cache records we do not already hold. Returns how many landed."""
+def game_demo_dir(game, map_id):
+    """Where the GAME keeps its own downloaded replays for a map.
+
+    momtv\\online\\<mapID>\\<replayHash>.mtv -- the game's own layout, and the
+    same filename we already write, because the hash IS the name. There is no
+    index file next to them: the game finds replays by scanning the directory,
+    which is why dropping one in is enough for it to be found.
+    """
+    if not map_id:
+        return None
+    return os.path.join(game, "momentum", "momtv", "online", str(map_id))
+
+
+def _download(dest, rows, have, into_game=None):
+    """Download cache records we do not already hold. Returns how many landed.
+
+    `into_game` is the game's own replay directory for this map, or None. When
+    given, each demo is COPIED there as well -- a copy, not a move, so a game
+    cache clear cannot take the lines with it. This is the only thing WrLines
+    ever writes into the game install and it is off unless asked for.
+    """
     todo = [r for r in rows if r[4].lower() not in have and r[6]]
     print("%d of %d are already here; %d to fetch"
           % (len(rows) - len(todo), len(rows), len(todo)))
@@ -1905,6 +2045,15 @@ def _download(dest, rows, have):
         return 0
 
     os.makedirs(dest, exist_ok=True)
+    if into_game:
+        try:
+            os.makedirs(into_game, exist_ok=True)
+            print("also placing them where the game looks: %s" % into_game)
+        except OSError as e:
+            print("[!] cannot write to the game's replay folder (%s); "
+                  "downloading to wrlines_data only" % e)
+            into_game = None
+
     got = 0
     for i, r in enumerate(todo):
         print("[%d/%d] rank %s  %.3fs  %s" % (i + 1, len(todo), r[0], r[1], r[3]))
@@ -1919,6 +2068,18 @@ def _download(dest, rows, have):
             continue
         with open(os.path.join(dest, r[4] + ".mtv"), "wb") as f:
             f.write(blob)
+        if into_game:
+            # Written the same way everything else here is: a temp file then an
+            # atomic replace, so the game can never see a half-written replay
+            # even if it is scanning that directory at the time.
+            try:
+                gpath = os.path.join(into_game, r[4] + ".mtv")
+                tmp = gpath + ".tmp"
+                with open(tmp, "wb") as f:
+                    f.write(blob)
+                os.replace(tmp, gpath)
+            except OSError as e:
+                print("      (could not place it in the game folder: %s)" % e)
         got += 1
         time.sleep(FETCH_DELAY)
 
@@ -1936,6 +2097,7 @@ def cmd_fetch(args):
 
     dest = os.path.join(os.path.dirname(args.out), "demos", name)
     have = _have_hashes(args.game)
+    into_game = game_demo_dir(args.game, map_id) if args.into_game else None
     print("%d demos on disk across every map; each run below is checked against "
           "all of them by hash" % len(have))
 
@@ -1944,7 +2106,21 @@ def cmd_fetch(args):
     # The cache holds the downloadURL the server itself handed back, so picking
     # rows out of a board you have already browsed costs nothing but the demo
     # bodies. This is the path the Board tab's tick-and-download uses.
-    if args.ranks:
+    ranks_spec = args.ranks
+    if args.ranks_file:
+        # A file rather than an argument, because a selection is not bounded by
+        # anything sensible and a command line is bounded by 2048 bytes. Ticking
+        # every row of a 500-place board should just work.
+        try:
+            with open(args.ranks_file, "r", encoding="utf-8") as f:
+                ranks_spec = ",".join(
+                    line.strip() for line in f
+                    if line.strip() and not line.startswith("#"))
+        except OSError as e:
+            print("[!] cannot read the selection file: %s" % e)
+            return 1
+
+    if ranks_spec:
         path = board_path(args.out, name, args.gamemode, args.track_type,
                           args.track_num)
         _meta, held = read_board(path)
@@ -1954,7 +2130,7 @@ def cmd_fetch(args):
                      args.track_type, args.track_num))
             print("    Fetch a window of it first -- see --board.")
             return 1
-        want = set(parse_ranks(args.ranks))
+        want = set(parse_ranks(ranks_spec))
         byrank = {r[0]: r for r in held.values()}
         rows, missing = [], []
         for rk in sorted(want):
@@ -1973,7 +2149,7 @@ def cmd_fetch(args):
                   % (show, " ..." if len(missing) > 12 else ""))
         if not rows:
             return 1
-        _download(dest, rows, have)
+        _download(dest, rows, have, into_game)
         return 0
 
     # --- straight from the leaderboard --------------------------------------
@@ -2022,7 +2198,7 @@ def cmd_fetch(args):
             print("  %s  rank %-5s %8.3fs  %s" % (mark, r[0], r[1], r[3]))
         return 0
 
-    _download(dest, rows, have)
+    _download(dest, rows, have, into_game)
     return 0
 
 
@@ -2071,10 +2247,14 @@ def main(argv):
     ap.add_argument("--jobs", type=int, default=0,
                     help="worker processes; 0 (default) uses all cores but two, "
                          "1 runs serially")
-    ap.add_argument("--timeout", type=float, default=180.0,
+    ap.add_argument("--timeout", type=float, default=30.0,
                     help="give up on a single demo after this many seconds "
                          "(0 for no limit). It is recorded as an ordinary "
-                         "failure, so it is not paid for twice")
+                         "failure, so it is not paid for twice. 30 is four "
+                         "times the slowest normal extraction measured; the "
+                         "old default of 180 turned one bad demo into three "
+                         "minutes of silence. NOTE it only covers the chain "
+                         "search -- see check_deadline")
     ap.add_argument("--index-maps", action="store_true",
                     help="write wrlines_data\\maps.txt from the game's own map "
                          "cache. Reads only local files; no network")
@@ -2104,10 +2284,25 @@ def main(argv):
     ap.add_argument("--refresh", action="store_true",
                     help="with --board, discard what is cached first rather "
                          "than adding to it")
+    ap.add_argument("--friends", action="store_true",
+                    help="with --board, look up everyone in "
+                         "wrlines_data\\friends.txt on this map's leaderboard. "
+                         "Momentum's own filter=friends needs an account and "
+                         "answers 401 without one; steamIDs= needs nothing, so "
+                         "this works where the site's own filter does not")
+    ap.add_argument("--into-game", action="store_true",
+                    help="with --fetch, also copy each demo into the game's own "
+                         "replay folder (momtv\\online\\<mapID>) so it can be "
+                         "watched in game. The ONLY thing this tool writes into "
+                         "the game install, and off unless you ask")
     ap.add_argument("--ranks",
                     help="with --fetch, download these places from the cached "
                          "board, e.g. \"5,9,120-140\". Costs no leaderboard "
                          "requests at all -- the cache holds the download URL")
+    ap.add_argument("--ranks-file",
+                    help="with --fetch, the same thing read from a file, one "
+                         "place or range per line. For selections too big to "
+                         "fit on a command line")
     ap.add_argument("--top", type=int, default=0,
                     help="with --fetch, how many leaderboard places to consider "
                          "(default %d). An alias for --from-rank 1 --count N"
