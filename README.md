@@ -58,6 +58,10 @@ Press **INSERT** in game. Tick runs in the Runs tab. **ESC** closes the panel.
   ramp and at the top of each arc, in each run's own colour. A bottom says what a line carried
   *through* the ramp; a top says what it bought with it, and reading only one of the two tells
   you a surfer lost speed without telling you whether they got height for it.
+- **Colour every run by where it placed** — gold, silver and bronze for the podium, then green
+  through red for the rest. Placed **within each leg**, because a map's files hold separate runs
+  per stage and per bonus and the quickest time in the folder is usually a stage, not the main
+  track.
 - **A ring on the point being compared.** Every gap on screen is your energy against theirs at one
   point of their line — the point nearest you, re-picked each frame — and it is now drawn, in that
   run's colour, so you can see which point and which line the number came from.
@@ -103,8 +107,11 @@ Press **INSERT** in game. Tick runs in the Runs tab. **ESC** closes the panel.
   while another thread is inside the trampoline is the classic injected-DLL
   crash-on-exit. Restart the game to load a rebuilt DLL; the injector refuses to inject
   twice for the same reason.
-- **It writes nothing into the game install**, sets no cvars, and never touches
-  `sv_cheats`. Everything it writes lives in `wrlines_data\` next to the DLL.
+- **It writes nothing into the game install unless you turn one thing on**, sets no cvars, and
+  never touches `sv_cheats`. Everything it writes lives in `wrlines_data\` next to the DLL —
+  with a single exception you have to enable by hand: *Also put them where the game can play
+  them*, which copies downloaded demos into the game's own replay folder so you can watch them.
+  Off by default, and described under **Watching what you download** below.
 - **In its default configuration it makes zero calls into the game.** It hooks `Present` to
   draw, reads memory read-only, and reads two files.
 - **It reaches outside your machine in exactly two places, both behind a checkbox, both off
@@ -302,6 +309,41 @@ neither.
 
 The panel is there whether or not the map has any paths yet. A map with nothing extracted is
 exactly when you need the button most.
+
+### The extractor was not hung, it was mute
+
+Reported as "the timeout needs to be quicker". The timeout was not the problem.
+
+`_run_all` used `ProcessPoolExecutor.map`, which yields in **submission** order — while its own
+docstring claimed completion order. One slow demo held back the `[n/total]` line of every finished
+demo behind it, so the panel went silent for as long as that demo took, however much work was
+actually completing. It is `submit` + `as_completed` now.
+
+The timeout was also narrower than it looked: `check_deadline` was called from two places, both
+inside the chain-search DP. Decompression and the **candidate scan** — 32 passes over the whole
+decompressed body, which on the 47 MB demo in this library is the phase that runs long — were
+outside it entirely, so a demo could sail past `--timeout` by any margin it liked. The scan checks
+it now.
+
+The default drops **180 s → 30 s**, and it is a slider. Measured across 4,388 demos here: median
+58 KB and about a second, slowest normal one 7 s, but the 99th percentile is 5.8 MB and 6.5% are
+over 700 KB — which is the size that actually hit the old limit, twice, at three minutes each.
+
+And there is a **Stop** button, which needed three things to be true first:
+
+- It terminates a **job object**, not the process. The extractor runs one worker per core bar two,
+  and those are grandchildren we hold no handles for; killing the parent alone leaves them each
+  burning a core. If the job cannot be created the fallback says so rather than reporting a clean
+  stop.
+- `g_proc` is under the lock. The UI thread and the reader thread both touch it, and unsynchronised
+  the worst case is `TerminateProcess` on a **reused** handle — someone else's process.
+- The failure record is flushed **as failures happen**. It used to be written only in the epilogue,
+  so stopping at demo 40 of 66 would have thrown away every expensive timeout learned so far and
+  you would pay them all again. Fixing that had to come before the button existed.
+
+Completed `.wrpath` files survive any kill — every write is a temp file plus an atomic replace. The
+comment claiming otherwise, which was the only cancel-adjacent reasoning in the codebase, was stale
+and has been corrected.
 
 ### Demos that cannot be extracted
 
@@ -892,6 +934,56 @@ and most of those boards are empty. (`surf_demise` really does have 3 bhop runs.
 from Momentum's own `Gamemode` enum rather than a guess: 1 surf, 2 bhop, 3 bhop HL1, 4 climb Mom,
 5 climb KZT, 6 climb 16, 7 RJ, 8 SJ, 9 ahop, 10 conc, 11–13 defrag CPM/VQ3/VTG.
 
+### Your friends' runs, which the site itself will not give you
+
+Momentum's leaderboard **does** have a friends filter — and it answers **401 Unauthorized** without
+an account, so it is not something the API hands out. That is exactly why it isn't an option.
+
+Asking for **specific SteamID64s is not gated at all**, and that turns out to be strictly better.
+Verified live:
+
+```
+&steamIDs=76561198273400282,76561197994615740,76561198027112507,...
+  -> each player's run, at its TRUE global rank: 1, 1302, 2603, 3904, 9109
+```
+
+- Comma-separated. The repeated-parameter form is a 500.
+- **200 ids in a 3,704-character URL works**, so 100 per request has room to spare.
+- Ids with no run come back absent rather than as an error, so a friends list full of people who
+  have never played the map costs one request.
+
+The client half was already built: `wr_steam.cpp` holds a live `ISteamFriends` and calls it through
+the flat C API by name, so enumerating your friends is two more `GetProcAddress` lines and no new
+mechanism. It has to happen in the DLL because that is the half that is *inside the game* and has a
+Steam connection; the fetch script does not and cannot. So the DLL writes `wrlines_data\friends.txt`
+and the script reads it.
+
+Found a friend at **rank 14,491 of 17,001** on `surf_boreas` in one request, without caching the
+14,490 runs above them. There is also a **friends only** filter on the cached board, which is purely
+local — the rows already carry each runner's SteamID64.
+
+`friends.txt` holds your friends' SteamID64s, which is one more reason `wrlines_data\` is
+gitignored.
+
+### Watching what you download
+
+Downloads normally land in `wrlines_data\demos\`, which the game knows nothing about — so you could
+draw them as lines but not watch them. **Also put them where the game can play them** copies each
+one into `momentum\momtv\online\<mapID>\` as well.
+
+That is the game's own replay folder, under the game's own filename — the replay hash, which is
+already what our copies are named — and there is no index file beside them, so the game finds
+replays by scanning. A **copy, not a move**: your own tree keeps its copy, so a game cache clear
+cannot take your lines with it. Written as a temp file and moved into place, so the game can never
+see a half-written replay.
+
+**Off by default**, because it is the one thing here that writes into the game install, and the
+promise at the top of this file is qualified rather than quietly dropped.
+
+Honest limit: this puts the file exactly where the game keeps its own downloads, but whether the
+in-game replay menu *lists* it or only finds it already present when you pick that run from the
+leaderboard is not something this side can verify.
+
 **Names are not ASCII.** Printing them was: Python takes stdout's encoding from the locale, and
 under the DLL that locale is cp1252, so the first alias outside it raised `UnicodeEncodeError`
 and killed the download mid-run — after some demos had already been written. `surf_demise`'s
@@ -1199,9 +1291,9 @@ wr_budget.h         gross gain/loss without counting noise -- pure logic, tested
 wr_stress.h         the air-strafing ceiling and efficiency -- pure logic, tested
 wr_ui               the panel
 tests\              standalone harnesses -- tests\build.bat builds and runs all
-                    five. test_energy, test_profile and test_board link the
-                    real .cpp files, because the defects they cover were in
-                    those files rather than in the headers.
+                    six. test_energy, test_profile, test_board and test_rank
+                    link the real .cpp files, because the defects they cover
+                    were in those files rather than in the headers.
 ```
 
 Everything the tool writes lives under `wrlines_data\`, next to the DLL:

@@ -18,6 +18,12 @@
 # other players' downloaded demos, and every one of them carries that player's
 # name and SteamID64. They are yours to generate locally, not to publish.
 # wrlines.log and wrlines_offsets.ini are per-machine too.
+#
+# wrlines_data\friends.txt is the SteamID64 of every one of YOUR Steam friends,
+# written so the fetch script can ask the leaderboard about them. That is other
+# people's identities, in a file, for your convenience -- it does not leave your
+# machine except as the ids in that one request, and it must not leave this
+# repository at all.
 wrlines_data/
 
 # Third-party trees, cloned by hand -- see README, "Build".

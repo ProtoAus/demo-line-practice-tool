@@ -388,6 +388,47 @@ static void DrawRunsTab(void)
         if (running)
             ImGui::EndDisabled();
 
+        // OUTSIDE the disabled pair above, which is the whole point: while a
+        // run was in flight this section had no live control at all.
+        if (running)
+        {
+            ImGui::SameLine();
+            if (ImGui::Button("Stop"))
+                WrExtractStop();
+            ImGui::SameLine();
+            HelpMarker(
+                "Stops whatever is running -- an extraction, a leaderboard "
+                "fetch, a download. There is one slot, so this is it whichever "
+                "tab started it.\n\n"
+                "It takes the worker processes with it, not just the "
+                "interpreter that spawned them: the extractor runs one worker "
+                "per core bar two, and killing only the parent would leave "
+                "them each burning a core until they noticed.\n\n"
+                "Nothing is lost. Every file already written is complete -- "
+                "they are written to a temporary name and moved into place -- "
+                "and the record of which demos failed is saved as they fail, "
+                "so a stop does not make you pay those timeouts again.");
+        }
+
+        ImGui::SetNextItemWidth(180.0f);
+        int tmo = WrExtractTimeout();
+        if (ImGui::SliderInt("Give up on a demo after", &tmo, 0, 300,
+                             tmo > 0 ? "%d s" : "no limit"))
+            WrExtractSetTimeout(tmo);
+        ImGui::SameLine();
+        HelpMarker(
+            "Measured across 4388 demos here: the median is 58 KB and extracts "
+            "in about a second, and the slowest normal one took seven. But the "
+            "tail is enormous -- the 99th percentile is 5.8 MB and the largest "
+            "is 47 MB -- and 6.5% are over 700 KB, which is the size that "
+            "actually hit the old three-minute limit.\n\n"
+            "So 30 seconds is four times the slowest normal extraction and "
+            "turns a pathological demo from three minutes of apparent hang "
+            "into half a minute. A demo that runs out is recorded as an "
+            "ordinary failure and skipped next time, so it is never paid for "
+            "twice.\n\n"
+            "0 means no limit, and then only Stop will end a bad one.");
+
         int nLines = WrExtractLineCount();
         if (nLines > 0)
         {
@@ -680,6 +721,24 @@ static float SeparatorHeight(void)
     return ImGui::GetTextLineHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y;
 }
 
+// How tall the Python output box is, in the tabs that have one.
+//
+// FIXED, and the list above it takes everything else. It used to be the other
+// way round -- SplitHeight gave the list a fraction and the log soaked up the
+// remainder -- so making the window taller grew the log and the list lost rows
+// off the bottom. Reported as the two fighting each other, which is exactly
+// what a proportional split between a list and a log is. A log does not get
+// more useful with height; a list of players does.
+#define WR_OUTPUT_HEIGHT 132.0f
+
+// The list pane above a fixed-height output box.
+static float ListHeightAbove(bool showingOutput)
+{
+    if (!showingOutput)
+        return 0.0f;            // ImGui reads 0 as "take what is left"
+    return FillHeight(WR_OUTPUT_HEIGHT + SeparatorHeight(), 140.0f);
+}
+
 static bool StrIContains(const char *hay, const char *needle)
 {
     if (!needle || !*needle)
@@ -697,6 +756,7 @@ static bool StrIContains(const char *hay, const char *needle)
 // wr_maps.h reads an index made from it. Fetching is the one part that reaches
 // outside this machine, and it is off until you turn it on.
 static bool g_fetchEnabled = false;
+static bool g_intoGame = false;         // also put downloads where the game looks
 static int g_fetchTop = 25;
 static int g_fetchTrackType = 0;
 static int g_fetchTrackNum = 1;
@@ -818,6 +878,26 @@ static void DrawMapsTab(void)
 
     if (g_fetchEnabled)
     {
+        ImGui::Checkbox("Also put them where the game can play them",
+                        &g_intoGame);
+        ImGui::SameLine();
+        HelpMarker(
+            "OFF BY DEFAULT, and the only thing WrLines ever writes into the "
+            "game install.\n\n"
+            "Downloads normally land in wrlines_data\\demos, which the game "
+            "knows nothing about -- so you can draw them as lines but not watch "
+            "them. With this on they are ALSO copied into "
+            "momentum\\momtv\\online\\<map id>, which is the game's own replay "
+            "folder, under the game's own filename: the replay hash, which is "
+            "what our copies are already named. There is no index file beside "
+            "them, so the game finds replays by scanning that folder.\n\n"
+            "A copy, not a move. Your own tree keeps its copy, so if the game "
+            "ever clears its cache your lines survive.\n\n"
+            "Honest limit: this puts the file exactly where the game keeps its "
+            "own downloads, but whether the in-game replay menu LISTS it or "
+            "only finds it already downloaded when you pick that run from the "
+            "leaderboard is not something this side can check. Worth trying "
+            "once and seeing.");
         ImGui::SliderInt("Leaderboard places", &g_fetchTop, 5, 200);
         ImGui::SetNextItemWidth(120.0f);
         const char *kTracks[3] = { "main", "stage", "bonus" };
@@ -846,10 +926,9 @@ static void DrawMapsTab(void)
     // The table and the output share what is left of the window, rather than
     // both being a fixed box with the rest of a maximised panel wasted under
     // them. Browsing a leaderboard 200 places deep is the case that wants the
-    // room, so the output gets the larger share whenever it is showing.
+    // room, so the map list takes every pixel the output box does not need.
     bool showOut = WrExtractRunning() || WrExtractLineCount() > 0;
-    float tableH = showOut ? SplitHeight(SeparatorHeight(), 0.45f, 120.0f, 120.0f)
-                           : 0.0f;
+    float tableH = ListHeightAbove(showOut);
 
     const char *here = WrLevelName();
     if (ImGui::BeginTable("##maps", 5,
@@ -940,9 +1019,9 @@ static void DrawMapsTab(void)
                 char args[256];
                 _snprintf_s(args, sizeof(args), _TRUNCATE,
                             "--fetch --map \"%s\" --map-id %d --top %d "
-                            "--track-type %d --track-num %d",
+                            "--track-type %d --track-num %d%s",
                             m->name, m->id, g_fetchTop, g_fetchTrackType,
-                            g_fetchTrackNum);
+                            g_fetchTrackNum, g_intoGame ? " --into-game" : "");
 
                 // Browse first, download second. One request, nothing written,
                 // and it prints the leaderboard's own total -- which is the
@@ -974,7 +1053,7 @@ static void DrawMapsTab(void)
         // Zero height: the last pane takes whatever the table did not. Also a
         // horizontal scrollbar, because a leaderboard line is wider than a
         // narrow panel and wrapping a fixed-column listing makes it unreadable.
-        if (ImGui::BeginChild("##fetchout", ImVec2(0.0f, 0.0f),
+        if (ImGui::BeginChild("##fetchout", ImVec2(0.0f, WR_OUTPUT_HEIGHT),
                               ImGuiChildFlags_Borders,
                               ImGuiWindowFlags_HorizontalScrollbar))
         {
@@ -1005,6 +1084,42 @@ static void DrawDisplayTab(void)
     ImGui::SliderInt("Max runs drawn", &g_render.maxRunsDrawn, 1, WR_MAX_RUNS);
 
     ImGui::SeparatorText("Colour");
+    const char *kRank[WR_RANK_MODE_COUNT] = {
+        "off -- each run its own colour", "by placing", "by time behind the best"
+    };
+    if (g_render.rankColour < 0 || g_render.rankColour >= WR_RANK_MODE_COUNT)
+        g_render.rankColour = 0;
+    ImGui::Combo("Colour runs by rank", &g_render.rankColour, kRank,
+                 WR_RANK_MODE_COUNT);
+    ImGui::SameLine();
+    HelpMarker(
+        "Gold, silver and bronze for the first three, then green through red "
+        "for the rest -- fastest to slowest. With a lot of runs enabled it "
+        "tells you at a glance which line is worth following.\n\n"
+        "PLACED WITHIN EACH LEG. Momentum records a separate run per stage and "
+        "per bonus, and the store is sorted by time across all of them, so the "
+        "quickest time in the file is usually a stage rather than the main "
+        "track. On bhop_futile here the main runs sit between 52.8 and 54.3 "
+        "seconds and there is a bonus at 33.9 -- rank them together and the "
+        "bonus takes gold from a track it was never racing. Each leg gets its "
+        "own podium.\n\n"
+        "BY PLACING spreads the colours evenly over the field, so it stays "
+        "readable however tightly the times are packed. BY TIME BEHIND shades "
+        "by how far off the record each run actually is, which on a board where "
+        "everyone is within a second of the best leaves them all green -- "
+        "truthful, and the more useful of the two for judging a field rather "
+        "than picking a line.\n\n"
+        "It replaces the run's colour everywhere: the line, its name tag, its "
+        "ramp numbers, its checkpoints. That includes any colour you picked by "
+        "hand in the Runs tab, which this necessarily overrides while it is on.");
+    if (g_render.rankColour != WR_RANK_OFF)
+    {
+        if (g_render.rankColour == WR_RANK_BY_TIME)
+            ImGui::SliderFloat("Full red at", &g_render.rankFullBehind,
+                               2.0f, 200.0f, "+%.0f%% off the best");
+        ImGui::Checkbox("Show the podium key on screen", &g_render.rankLegend);
+    }
+
     ImGui::Checkbox("Colour by speed", &g_render.colourBySpeed);
     if (g_render.colourBySpeed)
     {
@@ -1762,6 +1877,13 @@ static int g_bFromRank = 1, g_bCount = 50, g_bSpread = 20;
 static bool g_bSelect[WR_BOARD_MAX];
 static bool g_bWantFocus = false;       // the Maps tab asked to come here
 static bool g_bLoaded = false;          // has this map/mode been asked for yet
+static bool g_bFriendsOnly = false;
+static bool g_bRefilter = false;        // something other than the text changed
+
+// The display order, at file scope because the tick-all buttons work over the
+// rows the filter is currently showing rather than the whole board.
+static int g_bOrder[WR_BOARD_MAX];
+static int g_bShown = 0;
 
 // 64, because the whole selection travels as one "--ranks 5,9,120-140"
 // argument on a 2048-byte command line, and because sixty-four demos is
@@ -1854,8 +1976,6 @@ static int BuildRankArg(char *out, size_t cap, int *picked)
         if (!r)
             continue;
         n++;
-        if (emitted >= B_MAX_PICK)
-            continue;
         emitted++;
         if (runStart >= 0 && r->rank == runEnd + 1)
         {
@@ -1870,6 +1990,57 @@ static int BuildRankArg(char *out, size_t cap, int *picked)
 
     if (picked)
         *picked = n;
+    return n;
+}
+
+// Write the selection to a file and hand the fetcher its path.
+//
+// The 64-pick cap existed only because the whole selection travelled as one
+// --ranks argument on a 2048-byte command line, and "tick all" makes that cap
+// absurd rather than merely arbitrary. A file has no such limit, so the cap is
+// gone rather than raised to another number somebody will hit.
+static bool WritePickFile(char *out, size_t cap)
+{
+    char rel[192];
+    _snprintf_s(rel, sizeof(rel), _TRUNCATE, "boards\\%s_g%d_t%d%d.pick",
+                g_bMap, g_bMode, g_bTrackType, g_bTrackNum);
+    strncpy_s(out, cap, WrDataPath(rel), _TRUNCATE);
+
+    FILE *f = NULL;
+    if (fopen_s(&f, out, "w") != 0 || !f)
+        return false;
+    fprintf(f, "# WrLines: the places ticked in the Board tab, for --ranks-file.\n");
+    int n = 0;
+    for (int i = 0; i < WrBoardCount(); i++)
+    {
+        if (!g_bSelect[i])
+            continue;
+        const WrBoardRow *r = WrBoardAt(i);
+        if (!r)
+            continue;
+        fprintf(f, "%d\n", r->rank);
+        n++;
+    }
+    fclose(f);
+    return n > 0;
+}
+
+// Hand the fetcher the friends we can see. Only this side can: it is inside the
+// game, so it has a live ISteamFriends, and the script does not.
+static int WriteFriendsFile(void)
+{
+    WrSteamRefreshFriends();
+    int n = WrSteamFriendCount();
+
+    FILE *f = NULL;
+    if (fopen_s(&f, WrDataPath("friends.txt"), "w") != 0 || !f)
+        return -1;
+    fprintf(f, "# WrLines: SteamID64s from your Steam friends list.\n");
+    fprintf(f, "# Written here so wrpath_extract.py can ask the leaderboard "
+               "about them.\n");
+    for (int i = 0; i < n; i++)
+        fprintf(f, "%llu\n", WrSteamFriendAt(i));
+    fclose(f);
     return n;
 }
 
@@ -2055,6 +2226,33 @@ static void DrawBoardTab(void)
                    "one, a mid one and a slow one to lay over each other, where "
                    "caching the same board in full costs a hundred and seventy.");
 
+        // --- friends --------------------------------------------------------
+        if (!WrSteamCanListFriends())
+        {
+            ImGui::TextDisabled("Steam is not answering, so your friends list "
+                                "cannot be read.");
+        }
+        else if (ImGui::Button("My friends' runs"))
+        {
+            int n = WriteFriendsFile();
+            if (n > 0)
+                BoardRun("--board --friends");
+            else
+                WrLogf("[!] board: no friends to look up (%d)", n);
+        }
+        ImGui::SameLine();
+        HelpMarker(
+            "Everyone on your Steam friends list who has a run on this track, "
+            "at their real rank -- so a friend sitting at rank 14,491 of "
+            "17,001 is found without caching the 14,490 runs above them.\n\n"
+            "Momentum's own leaderboard has a friends filter and it answers 401 "
+            "without an account, which is why the site does not offer you this. "
+            "Asking for specific SteamID64s is not gated at all. Your friends "
+            "are enumerated here, inside the game, because only this side has a "
+            "live Steam connection -- the fetch script does not and cannot.\n\n"
+            "One request per hundred friends. Friends with no run on the map "
+            "cost nothing; they simply come back absent.");
+
         if (busy)
             ImGui::EndDisabled();
 
@@ -2067,12 +2265,41 @@ static void DrawBoardTab(void)
     ImGui::SetNextItemWidth(180.0f);
     ImGui::InputTextWithHint("##bfilter", "filter by player", g_bFilter,
                              sizeof(g_bFilter));
+    ImGui::SameLine();
+    if (ImGui::Checkbox("friends only", &g_bFriendsOnly))
+        g_bRefilter = true;
+    ImGui::SameLine();
+    HelpMarker("Filters what is already cached down to your Steam friends. "
+               "Costs nothing and asks nothing -- the board rows carry each "
+               "runner's SteamID64 and your friends list is read locally.\n\n"
+               "It can only show friends whose runs are IN the cache, so pair "
+               "it with the \"My friends' runs\" button, which goes and gets "
+               "exactly them.");
 
     int picked = 0;
     char ranks[600];
     BuildRankArg(ranks, sizeof(ranks), &picked);
 
+    // Tick and untick over the FILTERED set, which is what makes them useful:
+    // filter to a player, or to your friends, then take the lot.
+    if (ImGui::SmallButton("tick all"))
+    {
+        for (int k = 0; k < g_bShown; k++)
+        {
+            const WrBoardRow *r = WrBoardAt(g_bOrder[k]);
+            if (r && !r->have)
+                g_bSelect[g_bOrder[k]] = true;
+        }
+    }
     ImGui::SameLine();
+    if (ImGui::SmallButton("tick none"))
+        memset(g_bSelect, 0, sizeof(g_bSelect));
+    ImGui::SameLine();
+    HelpMarker("Over the rows the filter is currently showing, not the whole "
+               "board. Runs you already hold are left alone -- they have no "
+               "tick box, because downloading them again would do nothing.");
+    ImGui::SameLine();
+
     if (picked > 0)
     {
         bool busy = WrExtractRunning() || !g_fetchEnabled;
@@ -2082,28 +2309,28 @@ static void DrawBoardTab(void)
         _snprintf_s(lbl, sizeof(lbl), _TRUNCATE, "Download %d ticked##dl", picked);
         if (ImGui::Button(lbl))
         {
-            char args[1024];
-            _snprintf_s(args, sizeof(args), _TRUNCATE,
-                        "--fetch --map \"%s\" --gamemode %d --track-type %d "
-                        "--track-num %d --ranks \"%s\"",
-                        g_bMap, g_bMode, g_bTrackType, g_bTrackNum, ranks);
-            WrExtractRunArgs(args, false);
+            // Through a file, not the command line. A selection has no natural
+            // bound and a command line has a 2048-byte one.
+            char pick[MAX_PATH];
+            if (WritePickFile(pick, sizeof(pick)))
+            {
+                char args[1024];
+                _snprintf_s(args, sizeof(args), _TRUNCATE,
+                            "--fetch --map \"%s\" --gamemode %d --track-type %d "
+                            "--track-num %d --ranks-file \"%s\"%s",
+                            g_bMap, g_bMode, g_bTrackType, g_bTrackNum, pick,
+                            g_intoGame ? " --into-game" : "");
+                WrExtractRunArgs(args, false);
+            }
         }
         if (busy)
             ImGui::EndDisabled();
-        ImGui::SameLine();
-        if (ImGui::SmallButton("clear"))
-            memset(g_bSelect, 0, sizeof(g_bSelect));
         ImGui::SameLine();
         HelpMarker("Downloads straight from the cached board, which holds the "
                    "download URL the server itself handed back -- so this costs "
                    "no leaderboard requests at all, only the demo bodies.\n\n"
                    "Anything you already hold is skipped by hash, so pressing "
                    "it twice costs nothing.");
-        if (picked >= B_MAX_PICK)
-            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
-                               "%d ticked; only the first %d will be asked for.",
-                               picked, B_MAX_PICK);
     }
     else
     {
@@ -2114,22 +2341,22 @@ static void DrawBoardTab(void)
     // changed. A cached board can be twenty thousand rows, and re-filtering and
     // re-sorting all of them every frame for a table nobody is touching would
     // be the most expensive thing in the panel.
-    static int order[WR_BOARD_MAX];
-    static int shown = 0;
     static char lastFilter[64] = {0};
     static int lastCount = -1;
     static long long lastFetched = -1;
     bool needSort = false;
 
-    if (strcmp(lastFilter, g_bFilter) != 0 || lastCount != WrBoardCount() ||
-        lastFetched != WrBoardFetched())
+    if (g_bRefilter || strcmp(lastFilter, g_bFilter) != 0 ||
+        lastCount != WrBoardCount() || lastFetched != WrBoardFetched())
     {
         // A reload can move every index, so a selection made against the old
-        // one has to go rather than silently pointing at other runs.
+        // one has to go rather than silently pointing at other runs. A mere
+        // filter change must NOT clear it, or ticking across two filters is
+        // impossible.
         if (lastCount != WrBoardCount() || lastFetched != WrBoardFetched())
             memset(g_bSelect, 0, sizeof(g_bSelect));
 
-        shown = 0;
+        g_bShown = 0;
         for (int i = 0; i < WrBoardCount(); i++)
         {
             const WrBoardRow *r = WrBoardAt(i);
@@ -2137,17 +2364,21 @@ static void DrawBoardTab(void)
                 continue;
             if (g_bFilter[0] && !StrIContains(r->alias, g_bFilter))
                 continue;
-            order[shown++] = i;
+            if (g_bFriendsOnly && !WrSteamIsFriend(r->steamId))
+                continue;
+            g_bOrder[g_bShown++] = i;
         }
         strcpy_s(lastFilter, sizeof(lastFilter), g_bFilter);
         lastCount = WrBoardCount();
         lastFetched = WrBoardFetched();
+        g_bRefilter = false;
         needSort = true;
     }
+    int *order = g_bOrder;
+    int shown = g_bShown;
 
     bool showOut = WrExtractRunning() || WrExtractLineCount() > 0;
-    float tableH = showOut ? SplitHeight(SeparatorHeight(), 0.55f, 140.0f, 110.0f)
-                           : 0.0f;
+    float tableH = ListHeightAbove(showOut);
 
     ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                             ImGuiTableFlags_ScrollY | ImGuiTableFlags_Sortable |
@@ -2245,7 +2476,7 @@ static void DrawBoardTab(void)
     if (showOut)
     {
         ImGui::SeparatorText("Output");
-        if (ImGui::BeginChild("##boardout", ImVec2(0.0f, 0.0f),
+        if (ImGui::BeginChild("##boardout", ImVec2(0.0f, WR_OUTPUT_HEIGHT),
                               ImGuiChildFlags_Borders,
                               ImGuiWindowFlags_HorizontalScrollbar))
         {
