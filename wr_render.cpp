@@ -755,6 +755,54 @@ static void EmitTurns(ImDrawList *dl, const WrRun *run, bool tops)
     }
 }
 
+// Where the comparison is actually reading from.
+//
+// Every "+240 vs .x" on screen is your energy against theirs AT ONE POINT of
+// their line -- the point of it nearest you, picked fresh every frame. That
+// point was invisible, so a number that jumped had no explanation: you could
+// not tell a real difference from the reference having slid twenty units along
+// a ramp, or from it having latched onto the wrong line entirely where two
+// routes cross.
+//
+// So it is drawn: a ring on their line at exactly the point being read, and a
+// thin leader from you to it. The leader is the part that matters when several
+// runs are enabled, because it says WHICH line won the comparison.
+static void EmitComparePoint(ImDrawList *dl)
+{
+    if (!g_energy.showComparePoint)
+        return;
+
+    const WrRun *ref = WrEnergyReferenceRun();
+    if (!ref || ref->nearestIndex < 0 || ref->nearestIndex >= ref->pointCount)
+        return;
+
+    const Vec3 &p = ref->points[ref->nearestIndex].pos;
+    ImVec2 s;
+    if (!Project(p, &s))
+        return;
+
+    unsigned int col = WithAlpha(ref->colour, 1.0f);
+
+    // From your midsection, the same origin the velocity vector uses, so the
+    // two read as coming from the same place -- you.
+    if (g_energy.comparePointLeader)
+    {
+        Vec3 a = g_cam;
+        a.z -= (g_energy.eyeHeight - 36.0f);
+        Vec3 b = p;
+        ImVec2 pa, pb;
+        if (ClipToNear(&a, &b) && Project(a, &pa) && Project(b, &pb))
+            dl->AddLine(pa, pb, WithAlpha(ref->colour, 0.35f), 1.0f);
+    }
+
+    // A ring rather than a disc: it has to sit ON the line without hiding the
+    // stretch of it you are trying to read.
+    float r = 7.0f;
+    dl->AddCircle(s, r + 1.0f, 0xC0000000u, 20, 3.0f);      // dark halo
+    dl->AddCircle(s, r, col, 20, 2.0f);
+    dl->AddCircleFilled(s, 2.0f, col, 8);
+}
+
 static void EmitMarkers(ImDrawList *dl, const WrRun *run)
 {
     if (!g_render.drawMarkers || run->markerCount <= 0)
@@ -1495,14 +1543,28 @@ static void EmitEfficiencyLegend(ImDrawList *dl)
     };
     static const char *kFoot = "full colour = 37 energy/s, all air strafing can add";
 
+    // The two things people ask about the moment this is on, because the same
+    // red-and-green ramp is used for two different quantities and nothing said
+    // so. They are ON THE LINES YOU ARE CHASING, and the arrow is a TREND -- and
+    // the two disagreeing is not a fault, it is the interesting case: you can
+    // strafe well while a ramp takes more than you are adding.
+    static const char *kFoot2 = "demo lines only -- your own line cannot be "
+                                "measured this finely";
+    static const char *kFoot3 = "the velocity arrow is your energy TREND, not "
+                                "this; they differ on purpose";
+
     float w = font->CalcTextSizeA(size, FLT_MAX, 0.0f, kFoot).x;
+    float w2 = font->CalcTextSizeA(size, FLT_MAX, 0.0f, kFoot2).x;
+    float w3 = font->CalcTextSizeA(size, FLT_MAX, 0.0f, kFoot3).x;
+    if (w2 > w) w = w2;
+    if (w3 > w) w = w3;
     for (int i = 0; i < 4; i++)
     {
         float lw = sw + pad + font->CalcTextSizeA(size, FLT_MAX, 0.0f,
                                                   kRows[i].text).x;
         if (lw > w) w = lw;
     }
-    float h = lh * 5.0f + pad * 2.0f;
+    float h = lh * 7.0f + pad * 2.0f;
     w += pad * 2.0f;
 
     // Opposite corner to the overlay, in both axes.
@@ -1529,9 +1591,14 @@ static void EmitEfficiencyLegend(ImDrawList *dl)
                     kRows[i].text);
         dl->AddText(font, size, p, 0xFFE0E0E0u, kRows[i].text);
     }
-    ImVec2 fp(x + pad, y + pad + lh * 4.0f);
-    dl->AddText(font, size, ImVec2(fp.x + 1.0f, fp.y + 1.0f), 0xC0000000u, kFoot);
-    dl->AddText(font, size, fp, 0xFF909090u, kFoot);
+    const char *foots[3] = { kFoot, kFoot2, kFoot3 };
+    for (int i = 0; i < 3; i++)
+    {
+        ImVec2 fp(x + pad, y + pad + lh * (4.0f + i));
+        dl->AddText(font, size, ImVec2(fp.x + 1.0f, fp.y + 1.0f), 0xC0000000u,
+                    foots[i]);
+        dl->AddText(font, size, fp, 0xFF909090u, foots[i]);
+    }
 }
 
 static void EmitEnergyOverlay(ImDrawList *dl)
@@ -1705,6 +1772,7 @@ void WrRenderWorld(void)
 
     EmitEnergyOverlay(dl);
     EmitEfficiencyLegend(dl);
+    EmitComparePoint(dl);
     EmitVelocityVector(dl);
     EmitEnergyHud(dl);
 

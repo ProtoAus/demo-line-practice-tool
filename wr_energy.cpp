@@ -90,6 +90,14 @@ static float g_clock = 0.0f;
 
 static bool g_valid = false;
 static Vec3 g_vel;
+
+// The consistent pair: the RAW window velocity and the position at the window's
+// MIDPOINT, which is the instant that velocity actually refers to. g_now is
+// built from these two and not from g_vel, and anything else that wants to
+// compute an energy has to use them for the same reason. See WrEnergySampleAt.
+static Vec3 g_sampleMid;
+static Vec3 g_sampleRaw;
+static bool g_sampleOk = false;
 static Vec3 g_lastPos;
 static bool g_havePos = false;      // g_lastPos holds a real position
 static bool g_restart = false;      // a teleport landed back at the anchor
@@ -178,6 +186,11 @@ void WrEnergyDefaults(void)
     g_energy.barMaxEnergy = 700.0f;
     g_energy.barMaxSpeed = 200.0f;
     g_energy.barHeight = 6.0f;
+
+    // On by default. The gap is the number people actually steer by, and it
+    // was being read off a point nobody could see.
+    g_energy.showComparePoint = true;
+    g_energy.comparePointLeader = true;
 }
 
 void WrEnergyCycleHudMode(void)
@@ -485,6 +498,14 @@ void WrEnergySample(const Vec3 &pos, float dt)
     // of free fall, and energy is conserved in free fall. See WrVelEstimate.
     g_now = WrEnergyOf(mid, raw);
 
+    // Published for the live recorder, which must store the same pair. It used
+    // to be handed the CURRENT feet and the SMOOTHED velocity -- two instants
+    // about 80 ms apart -- and every energy computed from a live point was
+    // wrong by whatever the trajectory did in between. See WrEnergySampleAt.
+    g_sampleMid = mid;
+    g_sampleRaw = raw;
+    g_sampleOk = true;
+
     // The headline figure is filtered here rather than at the point of display,
     // so the arrow, the peak and the plot all agree with what is on screen.
     g_nowSmooth = WrEmaStep(&g_energyEma, g_now, dt, g_energy.smoothSeconds);
@@ -662,6 +683,20 @@ bool WrEnergyVelocity(Vec3 *out)
         return false;
     if (out)
         *out = g_vel;
+    return true;
+}
+
+bool WrEnergySampleAt(Vec3 *feet, Vec3 *vel)
+{
+    if (!g_sampleOk)
+        return false;
+    if (feet)
+    {
+        *feet = g_sampleMid;
+        feet->z -= g_energy.eyeHeight;
+    }
+    if (vel)
+        *vel = g_sampleRaw;
     return true;
 }
 

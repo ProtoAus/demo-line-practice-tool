@@ -58,6 +58,9 @@ Press **INSERT** in game. Tick runs in the Runs tab. **ESC** closes the panel.
   ramp and at the top of each arc, in each run's own colour. A bottom says what a line carried
   *through* the ramp; a top says what it bought with it, and reading only one of the two tells
   you a surfer lost speed without telling you whether they got height for it.
+- **A ring on the point being compared.** Every gap on screen is your energy against theirs at one
+  point of their line — the point nearest you, re-picked each frame — and it is now drawn, in that
+  run's colour, so you can see which point and which line the number came from.
 - **A leaderboard you can scroll and sort**, and download any part of — including the slow end,
   because the fastest runs are the hardest to follow. Two requests reach the bottom of a
   9,000-run board.
@@ -722,6 +725,58 @@ Full green needed 6.75 energy units over the window — smaller than the 12-unit
 module refuses to call "rising", and larger than the 5-unit step it rounds the number to for
 display. It is coloured by the 0.75 s trend now, the same signal as the arrow beside the
 crosshair, so the two can no longer disagree.
+
+**It shares a colour ramp with the line efficiency and does not mean the same thing**, which is
+worth stating because it reads as a contradiction. The lines are **efficiency** — how much of what
+air strafing *could* add was actually added. The arrow is a **trend** — which way your total is
+going. On a ramp you can be strafing beautifully, green on a demo line, while your own energy
+falls because the ramp is taking more than you can put in. The on-screen key says so now.
+
+### Why efficiency colours demo lines and not your own
+
+Asked directly, and measured before answering. A stored run differences a velocity the demo
+recorded; your own line has to difference one estimated from where the camera was. Simulated
+against twelve real `surf_demise` runs — resample the position at 200 Hz, add view bob, push it
+through the real estimator, record points the way `WrLiveRecord` does, then compare against the
+truth **over the same window** so only the estimate is judged:
+
+| window | colours it right | points the **wrong way** |
+| --- | --- | --- |
+| 0.25 s | 45.2 % | 26.0 % |
+| 0.40 s | 58.2 % | 24.1 % |
+| 0.60 s | 63.5 % | 21.8 % |
+| 2.00 s | 81.5 % | 8.5 % |
+
+A quarter of the line drawn backwards is not a metric, and a 2-second window smears across a whole
+ramp. Two results make this conclusive rather than a tuning problem.
+
+**View bob does not matter.** At bob = 0 — a perfectly steady camera — the figures are the same to
+a point or two. This is not jitter a filter could remove.
+
+**It is worse exactly where it matters.** Restricted to airborne samples, where eta really is air
+strafing rather than a ramp collision, it agrees **45.5 %** at 0.40 s and points the wrong way
+**32.1 %** — and barely improves with a longer window. Surface contact is easy to sign because the
+losses are enormous; the small numbers are the whole point of the metric, and they are the ones a
+camera-differenced velocity cannot resolve against a 37 units/s ceiling.
+
+So it is not shipped for the live line, and the on-screen key says so rather than leaving you to
+wonder why your line is plain.
+
+### The live line was pairing a position with a velocity from a different moment
+
+Found by that measurement: with a *perfectly noiseless* camera the error was still larger than the
+signal, which is not what noise looks like.
+
+`WrEnergySample` is careful about this — it pairs the **raw** window velocity with the position at
+the window's **midpoint**, because those refer to the same instant, and a comment records that
+getting it 20 ms wrong made a ballistic arc appear to lose 46 units over 1.6 s of free fall. But
+`WrLiveRecord` was handed *this frame's* feet and the *smoothed* velocity readout: two moments
+about **80 ms** apart. Energy is quadratic in speed, so on a ramp that is worth hundreds of units,
+and everything computed from a live point inherited it — the Graphs tab's live curve included.
+
+`WrEnergySampleAt` now hands out the sampler's own pair. Measured in `tests\test_energy.exe` on a
+ballistic arc, where energy is conserved by definition: mean energy drift across the arc
+**0.8 units, against 78.7 before**.
 
 ### The deadstrafe period, and why it does not apply here
 

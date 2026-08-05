@@ -143,6 +143,13 @@ struct WrEnergySettings
     float barMaxEnergy;     // gap that fills the bar, in energy units
     float barMaxSpeed;      // ... or in units per second
     float barHeight;        // pixels, before hudScale
+
+    // Where the comparison is reading from. Every gap on screen is measured at
+    // ONE point of the reference line -- the point nearest you, re-picked each
+    // frame -- and until this was drawn there was no way to see which point, or
+    // even which line, had won.
+    bool showComparePoint;
+    bool comparePointLeader;    // and a thread from you to it
 };
 
 enum WrBarMode
@@ -271,6 +278,21 @@ void WrEnergyCycleHudMode(void);
 
 // Convert a position and velocity into an absolute energy height.
 float WrEnergyOf(const Vec3 &pos, const Vec3 &vel);
+
+// The position and velocity of THE SAME INSTANT, for anything that computes an
+// energy from a pair rather than reading the finished number.
+//
+// This is not a convenience accessor. The window velocity refers to the middle
+// of its window and the smoothed velocity trails that by another EMA, so the
+// obvious pairing -- where you are now, and the velocity readout -- describes
+// two moments about 80 ms apart. Energy is quadratic in speed, so on a ramp
+// that mismatch is worth hundreds of units and it does not average out: the
+// same 20 ms mistake made a ballistic arc appear to lose 46 units over 1.6 s of
+// free fall, which is what put the mid-window position in the sampler in the
+// first place. Feet, not eye, because that is what a run stores.
+//
+// False until a sample has succeeded.
+bool WrEnergySampleAt(Vec3 *feet, Vec3 *vel);
 
 // --- live state -------------------------------------------------------------
 

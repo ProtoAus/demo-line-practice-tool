@@ -52,6 +52,40 @@
 // +0.010 and +0.003. Across 51 surf_demise runs, corr(run time, mean eta) is
 // -0.787.
 //
+// WHY THIS COLOURS DEMO LINES AND NOT YOUR OWN
+//
+// Asked for directly, and measured before answering. A stored run differences a
+// velocity the demo recorded; your own line has to difference one estimated
+// from camera positions. Simulated against twelve real surf_demise runs --
+// resample the position at 200 Hz, add view bob, push it through the real
+// estimator in wr_smooth.h, record points the way WrLiveRecord does, then
+// compare eta against the truth OVER THE SAME WINDOW so only the estimate is
+// being judged:
+//
+//     window    colour agrees    points the wrong way
+//     0.25 s        45.2%              26.0%
+//     0.40 s        58.2%              24.1%
+//     0.60 s        63.5%              21.8%
+//     2.00 s        81.5%               8.5%
+//
+// A quarter of the line drawn backwards is not a metric, and 2 s smears across
+// a whole ramp. Two things make this conclusive rather than a tuning problem:
+//
+// View bob does not matter. At bob = 0 -- a perfectly noiseless camera -- the
+// numbers are the same to a point or two. This is not jitter that a filter
+// could take out.
+//
+// And it is WORSE where it matters. Restricted to airborne samples, where eta
+// is actually air-strafing efficiency rather than a ramp collision, it agrees
+// 45.5% at 0.40 s and points the wrong way 32.1% -- and barely improves with a
+// longer window. Contact is easy to sign because the losses are enormous; the
+// small numbers are the whole point of the metric, and they are exactly the
+// ones a camera-differenced velocity cannot resolve against a 37 units/s
+// ceiling.
+//
+// So: not shipped for the live line, and the legend says so on screen. The
+// energy readout and the gap against a run remain the live answer.
+//
 // THE CEILING IS ON GAIN ONLY, AND THE FIRST VERSION GOT THAT BACKWARDS
 //
 // P_max bounds how fast energy can be ADDED. Nothing bounds how fast it can be

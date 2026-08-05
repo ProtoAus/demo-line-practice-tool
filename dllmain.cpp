@@ -117,10 +117,16 @@ void WrIdleTick(void)
         // deliberately frozen.
         if (!WrEnergyHeld())
         {
-            Vec3 vel;
-            if (!WrEnergyVelocity(&vel))
-                vel = WrVec(0.0f, 0.0f, 0.0f);
-            WrLiveRecord(feet, vel, WrTimerElapsed());
+            // The sampler's OWN pair, not this frame's feet and the smoothed
+            // velocity readout. Those describe two instants about 80 ms apart,
+            // and every energy computed from a live point -- the Graphs tab's
+            // live curve, any comparison against your own line -- was wrong by
+            // whatever the trajectory did in between. Measured: with a
+            // perfectly noiseless camera the resulting efficiency error was
+            // still larger than the signal. See WrEnergySampleAt.
+            Vec3 lvPos, lvVel;
+            if (WrEnergySampleAt(&lvPos, &lvVel))
+                WrLiveRecord(lvPos, lvVel, WrTimerElapsed());
         }
     }
 

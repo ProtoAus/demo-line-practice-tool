@@ -790,6 +790,86 @@ int main(void)
               "and the readout follows to where you now are");
     }
 
+    // -----------------------------------------------------------------------
+    //
+    // The live recorder used to be handed THIS frame's feet and the SMOOTHED
+    // velocity readout. Those describe two instants about 80 ms apart -- the
+    // window velocity refers to its own midpoint, and the EMA trails that
+    // again -- so every energy computed from a live point was wrong by whatever
+    // the trajectory did in between. Energy is quadratic in speed, so on a ramp
+    // that is worth hundreds of units.
+    //
+    // Free flight is the test that catches it, because there the answer is
+    // known exactly: E is conserved. A mismatched pair cannot hold it.
+    printf("\nthe pair handed to the live recorder is of one instant\n");
+    {
+        WrEnergyDefaults();
+        g_energy.gravity = G;
+        WrEnergyReset();
+
+        // Measured as DRIFT, not as spread. A single raw pair is noisy -- it is
+        // a 40 ms difference, which is why the readout is filtered before it is
+        // shown -- and no pairing fixes that. What a mismatched pair adds is
+        // BIAS that moves with the trajectory, so the test is whether the mean
+        // energy early in the arc matches the mean late in it. In free flight
+        // those must be equal.
+        const float dt = 1.0f / 200.0f;
+        const float z0 = 3000.0f;
+        double earlySum = 0.0, lateSum = 0.0;
+        int earlyN = 0, lateN = 0;
+        double oldEarly = 0.0, oldLate = 0.0;
+        int oldEarlyN = 0, oldLateN = 0;
+        int samples = 0;
+
+        for (int i = 0; i < 400; i++)
+        {
+            float t = i * dt;
+            float x = 1600.0f * t;
+            float z = z0 + 400.0f * t - 0.5f * G * t * t;
+            float bob = 2.0f * sinf(t * 15.0f * 6.28318f) + 0.35f * Noise();
+            Vec3 cam = WrVec(x, 0.0f, z + bob);
+            WrEnergySample(cam, dt);
+
+            Vec3 p, v;
+            if (!WrEnergySampleAt(&p, &v))
+                continue;
+            if (t < 0.25f)          // let the window and the filters fill
+                continue;
+            samples++;
+
+            float e = WrEnergyOf(p, v);
+
+            // What the recorder used to be handed: where the camera is NOW,
+            // and the smoothed velocity readout.
+            Vec3 oldFeet = cam;
+            oldFeet.z -= g_energy.eyeHeight;
+            Vec3 oldVel;
+            float eOld = WrEnergyVelocity(&oldVel)
+                       ? WrEnergyOf(oldFeet, oldVel) : 0.0f;
+
+            if (t < 0.9f)       { earlySum += e; earlyN++;
+                                  oldEarly += eOld; oldEarlyN++; }
+            else if (t > 1.6f)  { lateSum += e;  lateN++;
+                                  oldLate += eOld;  oldLateN++; }
+        }
+
+        float drift = (float)fabs(lateSum / lateN - earlySum / earlyN);
+        float driftOld = (float)fabs(oldLate / oldLateN - oldEarly / oldEarlyN);
+        printf("     %d pairs; drift across the arc %.1f units, was %.1f\n",
+               samples, drift, driftOld);
+        Check(samples > 200, "the recorder is offered a pair on nearly every frame");
+        Check(drift < 20.0f,
+              "free flight holds its energy, which a mismatched pair cannot");
+        Check(drift < driftOld * 0.5f,
+              "and the old pairing drifted at least twice as far");
+
+        // And the feet are the feet: a run stores the player origin, so a live
+        // point 64 units high would sit above a demo line of the same path.
+        Vec3 p, v;
+        if (WrEnergySampleAt(&p, &v))
+            Check(p.z < z0 + 400.0f && p.z > 0.0f, "the position is a real height");
+    }
+
     printf("\n%s\n\n", g_failures ? "SOME CHECKS FAILED" : "all checks passed");
     return g_failures ? 1 : 0;
 }

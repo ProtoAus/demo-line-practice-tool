@@ -1077,11 +1077,21 @@ static void DrawDisplayTab(void)
                "reaching as far as you will travel in the next quarter second. "
                "Length is time rather than an arbitrary scale, so the tip lands "
                "on the surface you are about to meet.\n\n"
-               "Its colour is the same rise/fall signal as the arrow beside your "
-               "crosshair, so the two can never disagree. It used to be live "
-               "strafing efficiency, and that was measuring noise: on a path "
-               "where energy is exactly constant it saturated red or green 14% "
-               "of the time at 2000 u/s and 36% at 3200.");
+               "GREEN means your energy is RISING, red means falling, grey "
+               "means neither -- measured over 0.75 s. It is the same signal as "
+               "the arrow beside your crosshair, so those two can never "
+               "disagree.\n\n"
+               "IT IS NOT THE SAME THING AS THE LINE COLOURS, even though it "
+               "uses the same red and green. Those are efficiency: how much of "
+               "what air strafing could add was actually added. This is a "
+               "trend: which way your total is going. They disagree on purpose "
+               "and the disagreement is the interesting case -- on a ramp you "
+               "can be strafing beautifully, green on a demo line, while your "
+               "own energy falls because the ramp is taking more than you can "
+               "put in.\n\n"
+               "It used to be live strafing efficiency, and that was measuring "
+               "noise: on a path where energy is exactly constant it saturated "
+               "red or green 14% of the time at 2000 u/s and 36% at 3200.");
 
     ImGui::SeparatorText("Strafing efficiency");
     ImGui::Checkbox("Colour lines by strafing efficiency",
@@ -1107,7 +1117,20 @@ static void DrawDisplayTab(void)
         "record measured, because the ramp does the turning.\n\n"
         "FADED -- no reading at all. A booster fired (they add energy for free "
         "and would otherwise look like perfect strafing), or the line teleports "
-        "nearby. About 0.6% of points.");
+        "nearby. About 0.6% of points.\n\n"
+        "DEMO LINES ONLY. Your own line is not coloured this way and will not "
+        "be. A stored run differences a velocity the demo recorded; yours has "
+        "to difference one estimated from where the camera was. Simulated "
+        "against twelve real runs, that estimate colours the line correctly "
+        "58% of the time over a 0.4 s window and points the WRONG WAY 24% of "
+        "it -- and restricted to airborne samples, where the number actually "
+        "means air strafing, it is 46% right and 32% backwards.\n\n"
+        "It is not camera shake: with a perfectly steady camera the figures "
+        "are the same. Air acceleration's whole budget is 37 energy units per "
+        "second, and a velocity worked out from camera positions cannot "
+        "resolve a number that small. A quarter of your line drawn backwards, "
+        "beside demo lines that are exact, would be worse than drawing "
+        "nothing.");
 
     if (g_render.colourByEfficiency)
     {
@@ -2672,6 +2695,28 @@ static void DrawEnergyTab(void)
     ImGui::SameLine();
     HelpMarker("Rounds the displayed figure, with hysteresis, so the last digit "
                "stops churning. Zero shows the raw value.");
+    ImGui::SeparatorText("Where the comparison is reading");
+    ImGui::Checkbox("Ring the point being compared", &g_energy.showComparePoint);
+    ImGui::SameLine();
+    HelpMarker(
+        "Every gap on screen -- the number, the bar -- is your energy against "
+        "theirs AT ONE POINT of their line: the point of it nearest you, picked "
+        "fresh every frame. This draws a ring exactly there.\n\n"
+        "Without it a number that jumps has no explanation. You cannot tell a "
+        "real difference from the reference sliding twenty units along a ramp, "
+        "or from it having latched onto a different line entirely where two "
+        "routes cross -- which happens constantly on a staged map.\n\n"
+        "The ring is in the run's own colour, so it also says WHICH run won the "
+        "comparison when several are enabled.");
+    if (g_energy.showComparePoint)
+    {
+        ImGui::Checkbox("Draw a thread to it", &g_energy.comparePointLeader);
+        ImGui::SameLine();
+        HelpMarker("A faint line from you to that point. Worth having when "
+                   "several runs are enabled and the ring is off in the "
+                   "distance; worth turning off if you find it busy.");
+    }
+
     ImGui::SeparatorText("Comparison bar");
     ImGui::Checkbox("Lean toward whoever is ahead", &g_energy.showBar);
     ImGui::SameLine();
