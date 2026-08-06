@@ -1519,7 +1519,7 @@ def cmd_extract(args):
 
 API_BASE = "https://api.momentum-mod.org/v1"
 USER_AGENT = ("WrLines/%s (+https://github.com/ProtoAus/demo-line-practice-tool)"
-              % "0.2.1")
+              % "0.3.0")
 FETCH_DELAY = 0.4          # seconds between requests
 FETCH_PAGE = 100           # leaderboard entries per request; the API's own max
 FETCH_MAX_DEFAULT = 50     # demos per invocation unless asked otherwise
