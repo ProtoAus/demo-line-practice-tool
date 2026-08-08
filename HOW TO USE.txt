@@ -1,0 +1,133 @@
+Demo Line Practice Tool
+=======================
+
+Draws other players' run paths as lines in the world, in the Momentum Mod map
+you are currently playing.
+
+Put all of these files in one folder, anywhere you like.
+
+
+GETTING STARTED
+
+  1. Start Momentum Mod and load into a map.
+  2. Run wrinject.exe.
+  3. Press INSERT in game.
+  4. Runs tab -> "Extract new demos". Wait. The lines appear when it finishes.
+
+That reads the .mtv demos the game has already downloaded. If you want more
+lines than the game happens to have, use the Board tab: it lists the map's
+real board, top to bottom, and you tick the runs you want and fetch them.
+
+Extraction needs Python (py.exe or python.exe on PATH). The panel says which one
+it found, or that it found neither. Everything else is self-contained.
+
+
+KEYS
+
+  INSERT      show / hide the panel
+  ESC         close it
+  PAGE DOWN   the box at your crosshair: next mode
+  PAGE UP     ... and the previous one
+  HOME        "whose line am I looking at" -- off by default
+  END         the corner block -- off by default
+
+  All but INSERT are rebindable, and the About tab lists them as they are
+  currently bound. They are READ, never swallowed, so if one collides with
+  something you have bound the game still acts on it.
+
+
+WHERE YOUR FILES GO
+
+  Everything this creates lives in a wrlines_data folder next to wrlines.dll,
+  including your settings -- those are kept in settings.cfg and survive a
+  restart. It holds display settings only: no names, no SteamIDs, no record of
+  what you watched, so it is safe to paste into a bug report. Delete it to go
+  back to the defaults.
+
+  Nothing is written into your game install unless you press a button that says
+  it will. "Send", "local" and "watch" each copy ONE demo into Momentum's own
+  replay folder so the game can play it. Every copy is recorded first, and
+  "take out" is only ever allowed to delete things on that list -- the demos the
+  game downloaded itself cannot be reached from here.
+
+
+WATCHING A DEMO YOU HAVE FETCHED
+
+  Press "watch" on a run. It copies a console command to your clipboard:
+
+      mom_tv_replay_watch "momtv/local/<map>/<hash>.mtv"
+
+  Paste that in the console and the demo plays.
+
+  Use this rather than hunting for the run in the Downloaded tab. That tab is
+  built from leaderboard rows that have a cached file, not from the folder, so a
+  demo dropped in there only shows up if the game had already listed that run.
+  The command takes a path and needs no list at all -- it is what the game's own
+  end-of-run screen uses.
+
+  The tool does not run the command for you. It goes on your clipboard.
+
+
+IF NOTHING IS DRAWN
+
+  Diagnostics tab. It tells you which stage did not complete, in plain words,
+  and keeps a log at wrlines_data\wrlines.log.
+
+  The most common cause is simply that no runs are ticked, or that the ones
+  ticked are on a different stage of the map. "Best 3 near me" fixes that.
+
+
+IF AN EXTRACTION SEEMS STUCK
+
+  It probably is not -- a slow demo used to hold up the progress line for every
+  demo already finished. That is fixed, and there is now a timeout you can set
+  and a Stop button that takes the whole worker pool with it, not just the
+  parent process.
+
+
+A FEW THINGS WORTH FINDING
+
+  - "Colour runs by rank" (Display tab). Violet for the fastest run on each
+    leg, then green through red for everyone behind it.
+  - Graphs tab. Energy across a whole run, every enabled line at once, your own
+    last attempt included -- and it survives failing, so you can look at what
+    went wrong after it went wrong.
+  - Numbers at the tops and bottoms of every arc: what a line carried through a
+    ramp, and what it bought with it.
+  - The strafe gauge -- PAGE DOWN to it. Green to red on how close you are to
+    the most energy air strafing could physically add. It reads over two
+    seconds on purpose; a faster one measures noise, and the About and Energy
+    tabs show the numbers that decided that.
+  - Save-loc times. The game has a "time" field for save-locs and never fills
+    it in, so this keeps its own. Load a loc and your clock goes back with it.
+  - "My friends' runs" on the Board tab, if you would rather chase people you
+    actually know.
+
+  Drawing a lot of lines is not free -- about 8 ms a frame at 256 of them. The
+  cap is automatic now rather than a slider you had to know about; the Runs tab
+  says plainly when more runs are ticked than are being drawn.
+
+
+A NOTE ON FAIR PLAY
+
+  This is an injected DLL. Momentum has no anti-cheat and is in a testing phase,
+  and this reads memory rather than writing it -- it sets no cvars, runs no
+  console commands, never touches sv_cheats, and writes nothing into the game
+  install except the opt-in copies described above. But injected code may still
+  invalidate a submitted run under the project's own rules. If you care about a
+  run counting, do not have this loaded while you set it.
+
+
+A NOTE ON YOUR DATA
+
+  Nothing leaves your machine unless you press a button that says it will. There
+  is no telemetry, no analytics, and no phone-home of any kind: the DLL links no
+  HTTP client at all, which you can check yourself -- dumpbin /dependents on
+  wrlines.dll lists five Windows system DLLs and nothing else. Every request to
+  Momentum's servers is made by wrpath_extract.py, which you can read.
+
+
+Source, full documentation and issues:
+https://github.com/ProtoAus/demo-line-practice-tool
+
+MIT licensed. See LICENSE.
