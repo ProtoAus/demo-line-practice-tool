@@ -22,6 +22,7 @@ static WrProfile g_live;
 static bool g_liveInit = false;
 
 int g_wrProfileBuckets = WR_PROFILE_BUCKETS;
+bool g_wrProfileDespike = true;
 
 // ---------------------------------------------------------------------------
 
@@ -54,6 +55,66 @@ static void FreeProfile(WrProfile *p)
 //
 // Runs whose start could not be recovered pass first = 0 and get exactly the
 // behaviour they had before.
+// The energy at one point, with two-tick transients taken out.
+//
+// WHAT IS BEING REMOVED, AND HOW IT IS KNOWN TO BE NOISE
+//
+// Momentum's recorded velocity jumps for a tick or two and comes straight back,
+// at fixed places on a map. Measured over the 14 surf_fiellu bonus-4 runs on
+// this machine: 208 single-tick energy jumps above 150 units, of which 206 are
+// in the SPEED term and only 2 in height -- so it is not ducking, which is the
+// obvious suspect and would move the height. 88% of the excursions are back
+// where they started within two ticks. Across the whole library it is 0.13% of
+// 7.4 million ticks, but 76% of runs carry at least one.
+//
+// The proof that they are not real: they happen in free fall, where energy is
+// conserved by definition. One run sits at 1476 units for twenty ticks, reads
+// 2054 for exactly two, and returns to 1470, while its height falls smoothly at
+// 21 units a tick throughout. Nothing can gain 577 units and give them back
+// inside 30 ms under gravity alone.
+//
+// WHY A MEDIAN AND NOT AN AVERAGE
+//
+// A median of five discards up to two outliers in its window and passes
+// everything else through UNCHANGED. An average would do the opposite of what is
+// wanted: it would spread that 577-unit spike across 75 ms rather than remove
+// it, and it would round off the genuine ramp exits either side -- which are the
+// steepest real features on the curve and the entire reason to look at it.
+//
+// Five samples, not more: it is the smallest odd window that survives two
+// adjacent bad ticks, and it stays under the shortest real feature worth seeing.
+static float EnergyAt(const WrPoint *pts, int count, int i, int lo, float e0)
+{
+    float raw = WrEnergyOf(pts[i].pos, pts[i].vel) - e0;
+    if (!g_wrProfileDespike)
+        return raw;
+
+    // Gathered on the fly rather than kept in an array. WrEnergyOf is a dot
+    // product and a divide with no sqrt, and a stored array would go stale the
+    // moment the gravity slider moved -- the same reason wr_path.cpp gives for
+    // not caching per-point energy at all.
+    float v[5];
+    int n = 0;
+    for (int k = i - 2; k <= i + 2; k++)
+    {
+        if (k < lo || k >= count)
+            continue;
+        v[n++] = WrEnergyOf(pts[k].pos, pts[k].vel) - e0;
+    }
+    if (n < 3)
+        return raw;         // too near an end to have neighbours either side
+
+    // Insertion sort of at most five floats.
+    for (int a = 1; a < n; a++)
+    {
+        float key = v[a];
+        int b = a - 1;
+        while (b >= 0 && v[b] > key) { v[b + 1] = v[b]; b--; }
+        v[b + 1] = key;
+    }
+    return v[n / 2];
+}
+
 static bool Build(WrProfile *out, const WrPoint *pts, int count, int first,
                   const int *breaks, int breakCount,
                   float timeScale, bool timeUsable)
@@ -65,6 +126,8 @@ static bool Build(WrProfile *out, const WrPoint *pts, int count, int first,
     out->builtFrom = count;
     out->builtStart = first;
     out->builtBuckets = WrClampI(g_wrProfileBuckets, 16, WR_PROFILE_BUCKETS);
+    out->builtDespike = g_wrProfileDespike;
+    out->despiked = 0;
     if (!pts || count < 4)
         return false;
     if (first < 0 || first > count - 4)
@@ -127,7 +190,19 @@ static bool Build(WrProfile *out, const WrPoint *pts, int count, int first,
                 }
             }
 
-            float e = WrEnergyOf(pts[i].pos, pts[i].vel) - e0;
+            // Filtered BEFORE the band, not just before the drawn value. The
+            // faint envelope around each curve is min/max within the bucket, so
+            // it is where a two-tick spike shows most -- `last` can miss one
+            // entirely while the band cannot.
+            float e = EnergyAt(pts, count, i, first, e0);
+            if (g_wrProfileDespike)
+            {
+                float raw = WrEnergyOf(pts[i].pos, pts[i].vel) - e0;
+                float diff = e - raw;
+                if (diff < 0.0f) diff = -diff;
+                if (diff > WR_DESPIKE_NOTE)
+                    out->despiked++;
+            }
             if (e < lo) lo = e;
             if (e > hi) hi = e;
             last = e;
@@ -159,11 +234,14 @@ const WrProfile *WrProfileFor(WrRun *run)
     {
         // What can move under a built profile: gravity, which moves the whole
         // curve (E = z + |v|^2/2g); the bucket count, which is the graph's
-        // averaging window; and the run's recovered start, which moves the
-        // origin of both axes. Rebuilding on those three is what lets this be
-        // cached at all.
+        // averaging window; the run's recovered start, which moves the origin of
+        // both axes; and the transient filter, which changes the samples
+        // themselves. Rebuilding on those four is what lets this be cached at
+        // all -- and a toggle that did not appear here would leave the old curve
+        // on screen while the checkbox said otherwise.
         if (run->profile->b && run->profile->gravity == g_energy.gravity &&
             run->profile->builtStart == run->startIndex &&
+            run->profile->builtDespike == g_wrProfileDespike &&
             run->profile->builtBuckets ==
                 WrClampI(g_wrProfileBuckets, 16, WR_PROFILE_BUCKETS))
             return run->profile;
@@ -202,6 +280,7 @@ int WrProfilePending(void)
         if (!r->profile || !r->profile->b ||
             r->profile->gravity != g_energy.gravity ||
             r->profile->builtStart != r->startIndex ||
+            r->profile->builtDespike != g_wrProfileDespike ||
             r->profile->builtBuckets !=
                 WrClampI(g_wrProfileBuckets, 16, WR_PROFILE_BUCKETS))
             owed++;
@@ -228,6 +307,7 @@ const WrProfile *WrProfileLive(void)
     // that also gets cleared on a map change is not worth that.
     if (g_live.b && g_live.builtFrom == count &&
         g_live.gravity == g_energy.gravity &&
+        g_live.builtDespike == g_wrProfileDespike &&
         g_live.builtBuckets == WrClampI(g_wrProfileBuckets, 16, WR_PROFILE_BUCKETS))
         return &g_live;
 

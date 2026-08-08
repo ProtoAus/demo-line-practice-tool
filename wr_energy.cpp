@@ -95,7 +95,24 @@ static bool g_spliced = false;
 // bleed through the filters.
 #define SEED_TOLERANCE_FRAC 0.20f
 #define SEED_TOLERANCE_MIN  150.0f      // u/s; gravity over 35 ms is 28
+
+// How far the camera has to leave the landing spot before a seed is judged, and
+// how long it may sit there first.
+//
+// Holding Momentum's save-loc load key puts you at the stored position and
+// FREEZES you there until you let go. Nothing is moving, so the only velocity
+// available to measure is zero -- and judging the file's answer against zero
+// throws out every seed of a save-loc made at speed, which is 62% of them. Two
+// units is far below anything a moving player covers in a frame and far above
+// float noise; the timeout only exists so that some other way of standing
+// perfectly still cannot stand a seed up for ever.
+#define SEED_MOVED_UNITS 2.0f
+#define SEED_HOLD_MAX 15.0f
+
 static float g_seedEnergy = 0.0f, g_seedSpeed = 0.0f;
+static Vec3 g_seedAt = { 0.0f, 0.0f, 0.0f };
+static float g_seedHeldFor = 0.0f;
+static bool g_seedFrozen = false;       // put somewhere and not yet let go of
 static bool g_seedPending = false;      // a seed is waiting for its first check
 static bool g_seedChecked = false;      // a result exists to report
 static bool g_seedRejected = false;
@@ -187,8 +204,13 @@ void WrEnergyDefaults(void)
     g_energy.showHud = true;
     g_energy.hudOffsetX = 72.0f;
     g_energy.hudOffsetY = 0.0f;
+    // Left at a positive offset is exactly what the old sign trick did with a
+    // positive offset, so nothing moves for anyone who never touches these.
+    g_energy.hudAlignX = WR_HUD_LEFT;
+    g_energy.hudAnchorY = WR_HUD_CENTRE_Y;
     g_energy.hudScale = 1.4f;
     g_energy.hudBacking = true;
+    g_energy.showHudClock = false;
 
     g_energy.showOverlay = false;
     g_energy.overlayCorner = 3;
@@ -261,6 +283,7 @@ void WrEnergyReset(void)
     g_haveShownSpent = false;
     g_haveShownCarried = false;
     g_seedPending = false;
+    g_seedFrozen = false;
     g_seedChecked = false;      // a new map's Diagnostics starts with no claim
     g_seedRejected = false;
     g_seedCount = g_seedRejects = 0;
@@ -545,6 +568,9 @@ void WrEnergySeed(const Vec3 &camPos, const Vec3 &vel, const char *why)
     // and throws the seed away if it was wrong.
     g_seedEnergy = energy;
     g_seedSpeed = speed;
+    g_seedAt = camPos;
+    g_seedHeldFor = 0.0f;
+    g_seedFrozen = true;
     g_seedPending = true;
 
     WrLogf("energy: seeded from %s -- %.0f u/s, energy %.0f", why ? why : "a save-loc",
@@ -644,11 +670,17 @@ void WrEnergySample(const Vec3 &pos, float dt)
     // frame rate above the tick rate the camera genuinely has nothing new to
     // say on some frames, and that is not a pause.
     // Gated on already having a reading to hold, and that is not a detail. With
-    // no reading yet -- at spawn, or having just landed somewhere from a
-    // save-loc -- skipping repeats would stop the window ever filling, so a
-    // player standing perfectly still would never get a readout at all. In that
-    // state the repeats are pushed, the window fills with identical positions,
-    // and the honest answer falls out: zero velocity, energy is height alone.
+    // no reading yet -- at spawn, for instance -- skipping repeats would stop the
+    // window ever filling, so a player standing perfectly still would never get a
+    // readout at all. In that state the repeats are pushed, the window fills with
+    // identical positions, and the honest answer falls out: zero velocity, energy
+    // is height alone.
+    //
+    // That used to be the answer after a save-loc load too, and it is no longer
+    // the right one: the file records the velocity being restored, so a frozen
+    // load has a real answer available where a spawn does not. That case is
+    // handled separately below, by the seed's own hold -- see SEED_MOVED_UNITS --
+    // because it exits on the camera MOVING rather than on a timer.
     if (g_haveReading && havePrev &&
         pos.x == prev.x && pos.y == prev.y && pos.z == prev.z)
     {
@@ -664,6 +696,41 @@ void WrEnergySample(const Vec3 &pos, float dt)
 
     if (havePrev && WrDist(prev, pos) > TELEPORT_UNITS)
         Teleported(pos);
+
+    // --- a save-loc that has been loaded but not let go of ---------------------
+    //
+    // Momentum's load key holds you at the stored position while it is held
+    // down. The player is not moving, so nothing here can measure a velocity --
+    // and the honest answer used to be zero, because there was nothing else. Now
+    // there is: the velocity in the file, already seeded.
+    //
+    // So while a seed is waiting to be judged and the camera has not left where
+    // it landed, keep showing it and measure nothing. Not doing this had two
+    // effects, both bad: the window filled with identical positions and the
+    // readout collapsed to height-alone, and then the guard-rail compared the
+    // file's velocity against that zero and threw out a seed that was right.
+    if (g_seedFrozen)
+    {
+        g_seedHeldFor += dt;
+        if (WrDist(pos, g_seedAt) < SEED_MOVED_UNITS &&
+            g_seedHeldFor < SEED_HOLD_MAX)
+            return;
+
+        // Moving again. Cleared FIRST, and that is not tidiness: the window is
+        // reset on this transition and on no other frame. Leaving this armed
+        // would reset it every frame for as long as the seed was unjudged, so it
+        // could never span the 30 ms it needs to produce an estimate, and the
+        // seed would never be judged at all -- each condition keeping the other
+        // true.
+        g_seedFrozen = false;
+
+        // The window must start from HERE. It still holds the frozen samples,
+        // and differencing across them would charge the whole stationary stretch
+        // to the first movement, read far too low, and reject the seed for
+        // disagreeing with a number that only looks that way because the freeze
+        // is still inside the measurement.
+        WrVelReset(&g_win);
+    }
 
     WrVelPush(&g_win, pos.x, pos.y, pos.z, dt);
 

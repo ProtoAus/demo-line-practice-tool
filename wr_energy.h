@@ -100,11 +100,19 @@ struct WrEnergySettings
     // The readout beside the crosshair. This is the one you read while surfing;
     // the corner panel is the one you read while standing still.
     bool showHud;
-    float hudOffsetX;       // from screen centre; negative puts it left of the
-                            // crosshair and right-aligns the block
+    float hudOffsetX;       // from screen centre
     float hudOffsetY;
+    // Which part of the block the offset positions.
+    //
+    // Alignment used to be an unwritten side effect of the offset's SIGN --
+    // negative right-aligned it -- which meant there was no way to centre the
+    // block on the crosshair at all, and no way to sit it above without it
+    // creeping as rows came and went. Both are now said outright.
+    int hudAlignX;          // WrHudAlignX
+    int hudAnchorY;         // WrHudAnchorY
     float hudScale;
     bool hudBacking;        // dark plate behind the text
+    bool showHudClock;      // the run clock, as a fourth row
 
     bool showOverlay;       // the older corner panel, off by default now
     int overlayCorner;      // 0 TL, 1 TR, 2 BL, 3 BR
@@ -183,6 +191,29 @@ enum WrBarMode
     WR_BAR_ENERGY = 0,      // the default; measured the better discriminator
     WR_BAR_SPEED,
     WR_BAR_MODE_COUNT
+};
+
+// Which edge of the crosshair readout the offset places.
+//
+// WR_HUD_LEFT puts the block's left edge at the offset, RIGHT puts its right
+// edge there, and CENTRE straddles it -- so "directly above the crosshair" is
+// CENTRE with a negative Y, which was not expressible before.
+enum WrHudAlignX
+{
+    WR_HUD_LEFT = 0,
+    WR_HUD_CENTRE_X,
+    WR_HUD_RIGHT,
+};
+
+// The block grows and shrinks as the comparison row, the bar and the clock come
+// and go. CENTRE keeps its middle on the offset, so it creeps in both directions
+// as that happens; ABOVE pins its bottom edge and BELOW its top, so the edge
+// nearest the crosshair stays where it was put.
+enum WrHudAnchorY
+{
+    WR_HUD_CENTRE_Y = 0,
+    WR_HUD_ABOVE,
+    WR_HUD_BELOW,
 };
 
 enum WrHudMode

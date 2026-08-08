@@ -342,6 +342,90 @@ int main(void)
         WrProfileShutdown();
     }
 
+    // -----------------------------------------------------------------------
+    printf("\na two-tick spike is removed, and a real step is not\n");
+    {
+        // The distinction this section exists for. An average passes the first
+        // check and fails the second: it would spread the spike over the window
+        // rather than remove it, AND round off the step. Only a median does
+        // both, which is why it is a median.
+        //
+        // The shape is taken from a real run: energy flat, then two ticks 577
+        // units high, then flat again at the same value. That happens in free
+        // fall, where energy is conserved, so it cannot be the player.
+        const int n = 600;
+        WrRun run;
+        MakeRun(&run, n, 1500.0f);
+
+        // Two-tick impulses, well apart, by raising z -- the profile reads
+        // energy, and which term carries it does not matter to the filter.
+        const int kSpikes[3] = { 120, 300, 480 };
+        for (int s = 0; s < 3; s++)
+            for (int k = 0; k < 2; k++)
+                run.points[kSpikes[s] + k].pos.z += 577.0f;
+
+        // And one genuine, permanent step: a ramp exit is exactly this shape and
+        // must survive untouched.
+        for (int i = 400; i < n; i++)
+            run.points[i].pos.z += 577.0f;
+
+        g_stubRuns = &run;
+        g_stubRunCount = 1;
+        g_wrProfileDespike = true;
+        g_wrProfileBuckets = WR_PROFILE_BUCKETS;    // one bucket per point
+
+        WrProfilePending();
+        const WrProfile *p = WrProfileFor(&run);
+        Check(p != NULL, "it builds");
+        if (p)
+        {
+            Check(p->despiked >= 6,
+                  "and reports having moved the spiked samples");
+
+            // The band is what matters: `last` can step over a two-tick event
+            // entirely while min/max within the bucket cannot.
+            float worst = 0.0f;
+            for (int k = 0; k < p->n; k++)
+            {
+                // Everything before the real step should sit near zero.
+                if (p->b[k].t > run.points[380].t)
+                    break;
+                if (p->b[k].eMax > worst) worst = p->b[k].eMax;
+            }
+            Check(worst < 100.0f,
+                  "no spike survives anywhere in the band before the step");
+
+            // ...and the step itself is still 577, not blurred toward it.
+            float after = p->b[p->n - 1].e;
+            Check(fabsf(after - 577.0f) < 20.0f,
+                  "the real step is still its full height");
+        }
+
+        // Off, the spikes come back -- so the toggle is a view and the data was
+        // never touched.
+        g_wrProfileDespike = false;
+        WrProfilePending();
+        const WrProfile *q = WrProfileFor(&run);
+        Check(q && q->despiked == 0, "with it off, nothing is reported");
+        if (q)
+        {
+            float worst = 0.0f;
+            for (int k = 0; k < q->n; k++)
+            {
+                if (q->b[k].t > run.points[380].t)
+                    break;
+                if (q->b[k].eMax > worst) worst = q->b[k].eMax;
+            }
+            Check(worst > 400.0f, "and the spikes are back in the raw curve");
+        }
+        g_wrProfileDespike = true;
+
+        free(run.points);
+        g_stubRuns = NULL;
+        g_stubRunCount = 0;
+        WrProfileShutdown();
+    }
+
     printf("\n%s\n\n", g_failures ? "SOME CHECKS FAILED" : "all checks passed");
     return g_failures ? 1 : 0;
 }

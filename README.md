@@ -112,6 +112,15 @@ Press **INSERT** in game. Tick runs in the Runs tab. **ESC** closes the panel.
   sample and comes with a measured spread. The circle, the way out and the trigger line are
   drawn in the world with the uncertainty band to scale, so it is visible guesswork rather than
   magic. Details under **The start zone**.
+- **Colour lines by energy**, either as an absolute world height — where the same colour means the
+  same energy on every line, so two runs read against each other directly — or **against each run's
+  own start**, where every line reads zero where it began and the colours compare margins rather
+  than energies. The second is the scale the crosshair readout uses, which is why a range like
+  −100 to 500 makes sense there and would be meaningless on the first.
+- **The run clock on screen**, optionally, beside the crosshair rather than only in a panel you close
+  before you play — which is why loading a save-loc appeared to restore nothing. It goes green for a
+  moment when a save-loc puts it back. The readout block can also be centred on the crosshair or
+  pinned above or below it, so it stops creeping as rows come and go.
 - **Search and filter the run list**, by player, by their current Steam name, or by track. One
   button per leg turns all of *bonus 4* on at once, and **All**/**None** work on whatever the
   filter left rather than on the whole store. The map list and the leaderboard each have a
@@ -1092,12 +1101,54 @@ seed costs the 35 ms it was always going to cost and nothing more. Diagnostics c
 the rejects; if that ratio is ever bad, the file is not saying what the game does and the feature
 should be switched off.
 
+**Held down, it holds.** Momentum's load key freezes you at the loaded position until you let go —
+so the first velocity measurable after landing is *zero*, and the guard-rail above would compare the
+file's answer against that zero and throw out a good seed, on every save-loc made at speed, which is
+62% of them. While a seed is unjudged and the camera has not left where it landed, the loaded values
+stay on screen and nothing is measured. The moment you move, the velocity window is **reset** before
+measuring resumes: without that, the first measurement averages the frozen stretch together with the
+new motion, reads far too low, and rejects a seed that was right all along.
+
 Two things it deliberately refuses. A **restart** is never seeded — a fail trigger drops you at the
 start, and keeping a save-loc on the start pad is ordinary, so the landing matches one and the
 claimed speed would be applied to a player the game just stopped dead. And a `startmarks` entry is
 never treated as a save-loc: that is a second list of positions in the same file, carrying a `pos`
 and no `vel`, **16 of them across 12 maps here**, which had been silently read in as save-locs and
 were eligible to be stamped with your clock.
+
+### The spikes in the graph, and why they are not ducking
+
+Runs show two-tick jumps in energy that come straight back. The obvious suspect is ducking, which
+moves the camera height — and it is the wrong one. Measured across the fourteen surf_fiellu bonus-4
+runs here: of 208 single-tick jumps over 150 units, **206 are in the speed term and 2 in height**,
+and the component that moves is **vertical velocity** (median |Δvz| 283 u/s against |Δv| horizontal
+of 31). **88%** of the excursions are back where they started within two ticks, and they **cluster by
+map position** — eight of the fourteen runs spike within 300 units of the same spot.
+
+They are not the player, and the proof is that they happen in **free fall, where energy is
+conserved**. One run sits at 1476 units for twenty ticks, reads 2054 for exactly two, and returns to
+1470, with its height falling smoothly at 21 units a tick throughout. Nothing gains 577 units and
+gives them back inside 30 ms under gravity alone.
+
+Library-wide that is 0.13% of 7.4 million ticks — but **76% of runs carry at least one**, and one is
+enough to set the graph's vertical scale.
+
+So the plotted curve is filtered with a **median of five**, which is the one filter that removes a
+two-tick impulse *exactly* and passes everything else through untouched. An average would do the
+opposite of what is wanted: smear the spike across 75 ms and round off the genuine ramp exits, which
+are the steepest real features on the curve and the entire reason to look at it. Measured over the
+whole library:
+
+| | |
+|---|---|
+| two-tick impulses removed | **99.7%** (9,987 → 26) |
+| samples changed by more than 25 units | **0.6%** — so 99.4% of the curve is passed through |
+| a real step's height, median error | **0.0 units**; p90 15 |
+
+It filters **the picture and never the stored run**, the toggle is in the Graphs tab, and the panel
+says how many samples it moved — median 7 per run, 48 at the ninetieth percentile. It is not applied
+to the coloured lines, where the same impulses are two points in several thousand: a colour blip
+rather than a scale problem.
 
 ### Energy across a whole run
 

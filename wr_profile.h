@@ -74,6 +74,12 @@ struct WrProfile
     int builtFrom;      // point count at build time; the live series grows
     int builtStart;     // startIndex at build time; the store can reload
     int builtBuckets;   // g_wrProfileBuckets at build time
+    bool builtDespike;  // g_wrProfileDespike at build time
+
+    // How many samples the transient filter actually moved. Reported rather
+    // than kept quiet: a filter that rewrites the picture without saying how
+    // much is indistinguishable from the data having been that shape.
+    int despiked;
 };
 
 // How many buckets a curve is actually drawn with, up to WR_PROFILE_BUCKETS.
@@ -87,6 +93,24 @@ struct WrProfile
 // The array is still allocated at the compile-time maximum; only the used count
 // moves, so changing it costs a rebuild and no reallocation.
 extern int g_wrProfileBuckets;
+
+// Take two-tick transients out of the plotted curve. On by default.
+//
+// Momentum's recorded velocity jumps and comes straight back at fixed places on
+// a map: over the whole library here, 0.13% of 7.4 million ticks, but 76% of
+// runs carry at least one, and one of them is worth 577 units in the middle of
+// a free fall where energy is conserved. They set the graph's vertical scale
+// while saying nothing about how the run went. See EnergyAt in wr_profile.cpp
+// for the measurement and for why the filter is a median rather than a mean.
+//
+// This changes the PICTURE and never the stored run. Off restores the raw curve
+// exactly, and WrProfile::despiked says how many samples it moved.
+extern bool g_wrProfileDespike;
+
+// How far a sample has to move before it counts as one the filter changed. Well
+// above the ordinary tick-to-tick wobble of a smooth run and far below a real
+// transient, so the reported count means "spikes", not "samples touched".
+#define WR_DESPIKE_NOTE 25.0f
 
 // The profile for a loaded run, building it if needed. NULL while it has not
 // been built yet -- the caller is expected to ask again next frame rather than

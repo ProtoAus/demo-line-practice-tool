@@ -25,6 +25,11 @@ struct WrRenderSettings
     int lineColour;             // WrLineColour
     float speedMin, speedMax;
     float energyMin, energyMax;
+    // WR_LINE_ENERGY_REL's own range. A separate pair, because the two modes
+    // measure the same quantity on scales two orders of magnitude apart: an
+    // absolute energy is a map coordinate in the thousands, and a relative one
+    // sits either side of zero.
+    float energyRelMin, energyRelMax;
 
     // Skip the pre-roll: start each line where the run starts rather than where
     // the recording does. See startIndex in wr_path.h -- there is roughly three
@@ -102,7 +107,8 @@ enum WrLineColour
 {
     WR_LINE_FLAT = 0,       // one colour per run
     WR_LINE_SPEED,          // speedMin..speedMax
-    WR_LINE_ENERGY,         // energyMin..energyMax, z + |v|^2/2g
+    WR_LINE_ENERGY,         // energyMin..energyMax, z + |v|^2/2g, absolute
+    WR_LINE_ENERGY_REL,     // the same, less each run's own energy at its start
     WR_LINE_EFFICIENCY,     // dE/dt against what air accel could have added
     WR_LINE_MODE_COUNT
 };

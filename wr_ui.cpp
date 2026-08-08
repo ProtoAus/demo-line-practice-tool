@@ -1469,6 +1469,47 @@ static void FitEnergyRange(void)
     g_render.energyMax = ceilf((hi + pad) / 50.0f) * 50.0f;
 }
 
+// The same, for the relative mode.
+//
+// Separate rather than a flag on the one above, because the quantity is
+// different: this tracks how far each run strays from ITS OWN start, so a map
+// whose runs all sit at z = 12000 fits to a band around zero here and to a band
+// around twelve thousand there. Sharing a range between the two would make one
+// of them useless whenever the other was fitted.
+static void FitEnergyRelRange(void)
+{
+    float lo = 1e30f, hi = -1e30f;
+    for (int i = 0; i < WrRunCount(); i++)
+    {
+        const WrRun *r = WrRunAt(i);
+        if (!r || !r->enabled || r->pointCount < 2)
+            continue;
+        int from = r->startIndex;
+        if (from < 0 || from >= r->pointCount)
+            from = 0;
+        float e0 = WrEnergyOf(r->points[from].pos, r->points[from].vel);
+        if (!WrSaneFloat(e0))
+            continue;
+        int step = (r->pointCount - from) / 1000;
+        if (step < 1)
+            step = 1;
+        for (int k = from; k < r->pointCount; k += step)
+        {
+            float e = WrEnergyOf(r->points[k].pos, r->points[k].vel) - e0;
+            if (!WrSaneFloat(e))
+                continue;
+            if (e < lo) lo = e;
+            if (e > hi) hi = e;
+        }
+    }
+    if (lo > hi)
+        return;
+
+    float pad = (hi - lo) * 0.05f + 25.0f;
+    g_render.energyRelMin = floorf((lo - pad) / 50.0f) * 50.0f;
+    g_render.energyRelMax = ceilf((hi + pad) / 50.0f) * 50.0f;
+}
+
 static void DrawDisplayTab(void)
 {
     ImGui::SeparatorText("Line");
@@ -1585,7 +1626,8 @@ static void DrawDisplayTab(void)
         "have added was actually added. It needs the per-point data the "
         "extractor writes, so it works on demo lines and not on your own.");
     const char *kLine[WR_LINE_MODE_COUNT] = {
-        "nothing -- one colour per run", "speed", "energy", "strafing efficiency"
+        "nothing -- one colour per run", "speed", "energy (absolute height)",
+        "energy above its own start", "strafing efficiency"
     };
     if (g_render.lineColour < 0 || g_render.lineColour >= WR_LINE_MODE_COUNT)
         g_render.lineColour = WR_LINE_FLAT;
@@ -1620,6 +1662,31 @@ static void DrawDisplayTab(void)
             "stop matching the lines it was fitted to.");
         ImGui::Checkbox("Show the key on screen##nrg", &g_render.lineKey);
         ImGui::TextDisabled("blue low -> cyan -> green -> yellow -> red high");
+    }
+    else if (g_render.lineColour == WR_LINE_ENERGY_REL)
+    {
+        ImGui::SliderFloat("Low", &g_render.energyRelMin, -4000.0f, 1000.0f, "%.0f");
+        ImGui::SliderFloat("High", &g_render.energyRelMax, -1000.0f, 8000.0f, "%.0f");
+        if (g_render.energyRelMax < g_render.energyRelMin + 50.0f)
+            g_render.energyRelMax = g_render.energyRelMin + 50.0f;
+        if (ImGui::Button("Fit to the runs on screen##rel"))
+            FitEnergyRelRange();
+        ImGui::SameLine();
+        HelpMarker(
+            "The same energy as the mode above, less whatever each run started "
+            "with -- so every line reads zero at its own start and the numbers "
+            "sit either side of it. That is the scale the crosshair readout uses, "
+            "which is why a range like -100 to 500 makes sense here and would be "
+            "meaningless above.\n\n"
+            "The trade is exact and worth knowing. Absolute energy means the "
+            "same colour is the same energy on every line, so two runs can be "
+            "read against each other directly. This does not: it is the same "
+            "MARGIN over each run's own start. A line that begins four hundred "
+            "units lower than another is not painted worse for it, which is the "
+            "right question when what you want to know is who held on to what "
+            "they had.");
+        ImGui::Checkbox("Show the key on screen##rel", &g_render.lineKey);
+        ImGui::TextDisabled("blue lost the most -> green -> red gained the most");
     }
 
     ImGui::SeparatorText("Aim at a line");
@@ -2142,6 +2209,29 @@ static void DrawGraphsTab(void)
         "Changing it rebuilds the curves, a few per frame, so the plot settles "
         "over the next moment rather than instantly.");
 
+    ImGui::Checkbox("Take out transient spikes", &g_wrProfileDespike);
+    ImGui::SameLine();
+    HelpMarker(
+        "Momentum's recorded velocity jumps for a tick or two and comes straight "
+        "back, at fixed places on a map. It is not something the player did: "
+        "measured across the fourteen surf_fiellu bonus-4 runs here, 206 of 208 "
+        "of these jumps are in the SPEED term and only two in height -- so it is "
+        "not ducking -- and 88% of them are back where they started within two "
+        "ticks. Across the whole library it is 0.13% of 7.4 million ticks, but "
+        "76% of runs carry at least one.\n\n"
+        "What proves they are not real: they happen in free fall, where energy "
+        "is conserved. One run sits at 1476 units for twenty ticks, reads 2054 "
+        "for exactly two, and returns to 1470, while its height falls smoothly "
+        "throughout. Nothing gains 577 units and gives them back in 30 ms under "
+        "gravity alone.\n\n"
+        "A median of five removes a two-tick spike exactly and passes everything "
+        "else through untouched -- an average would smear the spike across 75 ms "
+        "and round off the real ramp exits, which are the steepest features on "
+        "the curve and the reason to look at it.\n\n"
+        "It changes the PICTURE and never the stored run, and it is not applied "
+        "to the coloured lines: there the same spikes are two points in several "
+        "thousand, a colour blip rather than a scale problem.");
+
     // --- gather -------------------------------------------------------------
     GSeries series[G_MAX_SERIES + 1];
     int nSeries = 0;
@@ -2212,6 +2302,22 @@ static void DrawGraphsTab(void)
                            "%d run%s left out: recovered timing failed its trust "
                            "test, so it has no clock to plot against.",
                            untimed, untimed == 1 ? "" : "s");
+
+    // Say what the filter did. A filter that quietly rewrites the picture is
+    // indistinguishable from the data having been that shape all along, and this
+    // one moves samples by hundreds of units.
+    if (g_wrProfileDespike)
+    {
+        int spikes = 0;
+        for (int i = 0; i < nSeries; i++)
+            if (series[i].p)
+                spikes += series[i].p->despiked;
+        if (spikes > 0)
+            ImGui::TextDisabled("%d transient spike%s taken out of %s -- untick "
+                                "above to see them", spikes,
+                                spikes == 1 ? "" : "s",
+                                nSeries == 1 ? "this curve" : "these curves");
+    }
 
     if (nSeries == 0)
     {
@@ -3720,11 +3826,41 @@ static void DrawEnergyTab(void)
 
     ImGui::SeparatorText("Crosshair readout");
     ImGui::Checkbox("Show beside the crosshair", &g_energy.showHud);
-    ImGui::SliderFloat("Offset X", &g_energy.hudOffsetX, -400.0f, 400.0f, "%.0f px");
+    ImGui::SetNextItemWidth(150.0f);
+    const char *kAlignX[3] = { "left of it", "centred on it", "right of it" };
+    if (g_energy.hudAlignX < 0 || g_energy.hudAlignX > 2)
+        g_energy.hudAlignX = WR_HUD_LEFT;
+    ImGui::Combo("Across", &g_energy.hudAlignX, kAlignX, 3);
     ImGui::SameLine();
-    HelpMarker("Negative puts it on the left of the crosshair and right-aligns "
-               "it, so the block does not creep as the numbers get wider.");
+    ImGui::SetNextItemWidth(150.0f);
+    const char *kAnchorY[3] = { "centred", "above", "below" };
+    if (g_energy.hudAnchorY < 0 || g_energy.hudAnchorY > 2)
+        g_energy.hudAnchorY = WR_HUD_CENTRE_Y;
+    ImGui::Combo("Down", &g_energy.hudAnchorY, kAnchorY, 3);
+    ImGui::SameLine();
+    HelpMarker(
+        "Which part of the block the offsets below place, and it used to be "
+        "neither of these: alignment was inferred from the sign of Offset X, so "
+        "the block could hang left or right of the crosshair but never sit "
+        "centred over it.\n\n"
+        "\"Above\" and \"below\" pin the edge nearest the crosshair rather than "
+        "the block's middle. That matters because the block grows and shrinks -- "
+        "the comparison row, the bar and the clock all come and go -- and "
+        "centred means every one of those nudges it up or down while you are "
+        "trying to read it.");
+    ImGui::SliderFloat("Offset X", &g_energy.hudOffsetX, -400.0f, 400.0f, "%.0f px");
     ImGui::SliderFloat("Offset Y", &g_energy.hudOffsetY, -400.0f, 400.0f, "%.0f px");
+    ImGui::Checkbox("Show the run clock", &g_energy.showHudClock);
+    ImGui::SameLine();
+    HelpMarker(
+        "The clock lived only in this panel, and the panel is shut whenever you "
+        "are actually playing -- so loading a save-loc put the clock back to "
+        "what it said when you made it and there was nothing on screen to show "
+        "for it. That is why it looked like the feature was missing.\n\n"
+        "It turns green for a moment when a save-loc restores it, so the restore "
+        "is something you see rather than something you work out afterwards.\n\n"
+        "Grey means the clock is not running. It starts when you leave the "
+        "anchor and is not the game's own timer -- WrLines cannot read that.");
     ImGui::SliderFloat("Text scale", &g_energy.hudScale, 0.6f, 3.0f, "%.2f");
     ImGui::Checkbox("Dark plate behind it", &g_energy.hudBacking);
 

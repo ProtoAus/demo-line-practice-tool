@@ -363,20 +363,72 @@ int main(void)
         for (int i = 0; i < 40; i++)
             WrEnergySample(pos, dt);        // bit-identical, over and over
 
-        // The window FILLED and judged the seed. That is the property: a seed
-        // that armed the hold would have frozen the readout on itself, the
-        // repeats would have been skipped instead of pushed, and no measurement
-        // would ever have arrived to confirm or contradict it.
-        //
-        // Latching the hold afterwards is correct and expected -- a camera that
-        // is not moving has nothing left to say, and the held value is the right
-        // one. What matters is that it happens after the measurement, not
-        // instead of it.
-        WrEnergySeedInfo si;
-        Check(WrEnergySeedReport(&si) && si.seeds == 1 && !si.rejected,
-              "the window still filled, and confirmed the seed");
+        // Still right, and right from the first frame rather than after the
+        // window filled. Nothing here is ever judged, and that is correct: the
+        // camera never moves, so there is no independent measurement to judge it
+        // against -- and none is needed, because a seed of zero and a
+        // measurement of zero cannot disagree.
         Check(WrEnergyValid() && WrEnergySpeed() < 1.0f,
-              "and it settles on nothing moving, rather than nothing at all");
+              "still reads nothing moving, rather than nothing at all");
+        Check(fabsf(WrEnergyNow() - pos.z) < 0.001f,
+              "and energy is still exactly the height");
+
+        // Move, and it takes over normally.
+        Vec3 walk = pos;
+        for (int i = 0; i < 40; i++)
+        {
+            walk = WrAdd(walk, WrScale(WrVec(250.0f, 0.0f, 0.0f), dt));
+            WrEnergySample(walk, dt);
+        }
+        Check(WrEnergySpeed() > 100.0f,
+              "and moving off it measures again rather than staying stuck");
+    }
+
+    // -----------------------------------------------------------------------
+    printf("\nheld frozen on the loaded position, the loaded values stay\n");
+    {
+        // Holding Momentum's load key puts you at the stored position and
+        // freezes you there. Nothing is moving, so the only velocity that can be
+        // measured is zero -- and the guard-rail, comparing the file's answer
+        // against that zero, threw out every seed of a save-loc made at speed.
+        // Which is 62% of them. This is that defect.
+        WrEnergyReset();
+        const float dt = 1.0f / 200.0f;
+        Vec3 pos = WrVec(0.0f, 0.0f, 500.0f);
+        const Vec3 fast = WrVec(2400.0f, 0.0f, 0.0f);
+
+        for (int i = 0; i < 40; i++)
+        {
+            WrEnergySample(pos, dt);
+            pos = WrAdd(pos, WrScale(WrVec(300.0f, 0.0f, 0.0f), dt));
+        }
+
+        Vec3 landed = WrVec(9000.0f, 0.0f, 500.0f);
+        WrEnergySample(landed, dt);
+        WrEnergySeed(landed, fast, "a test");
+
+        // Frozen: the same position, over and over, for a full second.
+        for (int i = 0; i < 200; i++)
+            WrEnergySample(landed, dt);
+
+        Check(fabsf(WrEnergySpeed() - 2400.0f) < 1.0f,
+              "a second of being frozen still reads the loaded speed");
+        WrEnergySeedInfo si;
+        Check(!WrEnergySeedReport(&si) || si.seeds == 0,
+              "and the seed has not been judged, because nothing has moved");
+
+        // Released, and now genuinely moving at the speed the file promised.
+        for (int i = 0; i < 40; i++)
+        {
+            landed = WrAdd(landed, WrScale(fast, dt));
+            WrEnergySample(landed, dt);
+        }
+        bool have = WrEnergySeedReport(&si);
+        Check(have && si.seeds == 1, "moving again, it is judged");
+        Check(have && !si.rejected,
+              "and kept -- the frozen stretch did not drag the measurement down");
+        Check(fabsf(WrEnergySpeed() - 2400.0f) < 120.0f,
+              "the readout never left the loaded speed");
     }
 
     // -----------------------------------------------------------------------

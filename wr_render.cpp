@@ -25,6 +25,11 @@
 #include "wr_steam.h"
 #include "wr_energy.h"
 #include "wr_start.h"
+// The run clock, and the note a save-loc restore leaves. Both existed only
+// inside the panel until now, which is why the restore looked like it did
+// nothing: the panel is shut whenever you are actually playing.
+#include "wr_timer.h"
+#include "wr_savelocs.h"
 #include "wr_imgui.h"
 #include "wr_stress.h"
 #include "wr_hook.h"
@@ -105,6 +110,12 @@ void WrRenderDefaults(void)
     // guess until it is fitted to the map, which is what the button is for.
     g_render.energyMin = 0.0f;
     g_render.energyMax = 4000.0f;
+
+    // Relative to each run's own start, so it is centred on zero and the useful
+    // band is narrow: a good run holds what it left the start with, and the
+    // interesting question is how far either side of that it strayed.
+    g_render.energyRelMin = -500.0f;
+    g_render.energyRelMax = 2000.0f;
 
     // On. The pre-roll is not part of the run, and showing it is what makes a
     // line appear to start somewhere the player was not yet racing.
@@ -390,6 +401,24 @@ static unsigned int RankRampColour(float t)
 // Off by default, in which case this is exactly run->colour -- including any
 // colour picked by hand in the Runs tab, which a rank mode necessarily
 // overrides while it is on.
+// The energy a run began with, for WR_LINE_ENERGY_REL.
+//
+// Computed fresh each frame rather than stored on the run, and that is the same
+// decision wr_path.cpp records for not keeping a per-point energy array at all:
+// E = z + |v|^2/2g moves with the gravity setting, so a cached one would go
+// silently stale the moment that slider did and the lines would stop matching
+// their own key. It is one dot product and a divide per run per frame, with no
+// sqrt -- far below the cost of drawing the run it belongs to.
+static float RunStartEnergy(const WrRun *run)
+{
+    if (!run || run->pointCount < 1)
+        return 0.0f;
+    int i = run->startIndex;
+    if (i < 0 || i >= run->pointCount)
+        i = 0;
+    return WrEnergyOf(run->points[i].pos, run->points[i].vel);
+}
+
 unsigned int WrRunColour(const WrRun *run)
 {
     if (!run)
@@ -488,6 +517,13 @@ struct WrPathDraw
     float velScale;
     float thickness;
     float lift;                 // 0 normally; mixes toward white for the pick
+
+    // The energy this run began with, for WR_LINE_ENERGY_REL. Passed in rather
+    // than worked out here, because `first` is NOT reliably the run's start: it
+    // is startIndex only while hidePreRoll is on, and the live trail has no run
+    // behind it at all. Computing it from `first` would silently colour against
+    // the walk-in whenever that toggle was off.
+    float startEnergy;
 };
 
 static void EmitPath(ImDrawList *dl, const WrPathDraw &d)
@@ -709,6 +745,27 @@ static void EmitPath(ImDrawList *dl, const WrPathDraw &d)
             float e = WrEnergyOf(pts[i].pos, pts[i].vel);
             float t = WrClampF((e - g_render.energyMin) /
                                (g_render.energyMax - g_render.energyMin + 1e-3f),
+                               0.0f, 1.0f);
+            int cBucket = (int)(t * (COLOUR_BUCKETS - 1) + 0.5f);
+            colour = WithAlpha(SpeedColour(g_render.speedMin +
+                        (g_render.speedMax - g_render.speedMin) *
+                        ((float)cBucket / (COLOUR_BUCKETS - 1))), a01);
+            bucket = fBucket * COLOUR_BUCKETS + cBucket;
+        }
+        else if (g_render.lineColour == WR_LINE_ENERGY_REL && velScale > 0.0f)
+        {
+            // The same quantity as above, less what this run began with -- so
+            // every line reads zero at its own start whatever height that was.
+            //
+            // The trade against the absolute mode is exact and worth knowing:
+            // there, the same colour is the same energy on every line, and two
+            // runs can be read against each other directly. Here it is the same
+            // MARGIN over each run's own start, so a line that begins 400 units
+            // lower than another is not penalised for it -- which is the right
+            // question when the answer wanted is "who held onto what they had".
+            float e = WrEnergyOf(pts[i].pos, pts[i].vel) - d.startEnergy;
+            float t = WrClampF((e - g_render.energyRelMin) /
+                               (g_render.energyRelMax - g_render.energyRelMin + 1e-3f),
                                0.0f, 1.0f);
             int cBucket = (int)(t * (COLOUR_BUCKETS - 1) + 0.5f);
             colour = WithAlpha(SpeedColour(g_render.speedMin +
@@ -1504,17 +1561,68 @@ static void EmitEnergyHud(ImDrawList *dl)
     ImVec2 wBig = fBig->CalcTextSizeA(sBig, FLT_MAX, 0.0f, wideBig);
     ImVec2 wSub = fSub->CalcTextSizeA(sSub, FLT_MAX, 0.0f, wideSub);
 
+    // The run clock, which until now lived only in a tab you close before you
+    // play -- so a save-loc putting the clock back where it was had nothing on
+    // screen to show for it, and looked like it had done nothing at all.
+    //
+    // Highlighted for a moment when that happens, off the same note the panel
+    // reads rather than a second mechanism: WrSavelocRecent already carries what
+    // happened and how long ago.
+    char clk[48];
+    bool haveClk = false;
+    bool clkFresh = false;
+    ImVec2 mClk(0.0f, 0.0f);
+    if (g_energy.showHudClock)
+    {
+        float secs = WrTimerElapsed();
+        int mins = (int)(secs / 60.0f);
+        float rem = secs - (float)mins * 60.0f;
+        if (mins > 0)
+            _snprintf_s(clk, sizeof(clk), _TRUNCATE, "%d:%06.3f", mins, rem);
+        else
+            _snprintf_s(clk, sizeof(clk), _TRUNCATE, "%.3f", rem);
+        haveClk = true;
+
+        float age = 0.0f;
+        const char *note = WrSavelocRecent(&age);
+        clkFresh = (note && note[0] && age < 2.0f);
+
+        mClk = fSub->CalcTextSizeA(sSub, FLT_MAX, 0.0f, clk);
+    }
+    // Reserved worst-case like every other row, and for the same reason: this
+    // one changes width every tenth of a second as the digits roll.
+    ImVec2 wClk = haveClk ? fSub->CalcTextSizeA(sSub, FLT_MAX, 0.0f, "88:88.888")
+                          : ImVec2(0.0f, 0.0f);
+
     bool drawBar = haveCmp && g_energy.showBar;
     float barH = drawBar ? (g_energy.barHeight * g_energy.hudScale + 4.0f) : 0.0f;
 
     float w = wBig.x;
     if (wSub.x > w) w = wSub.x;
+    if (wClk.x > w) w = wClk.x;
     if (mCmp.x > w) w = mCmp.x;     // the name is not ours to bound
-    float h = mBig.y + mSub.y + (haveCmp ? mCmp.y : 0.0f) + barH;
+    float h = mBig.y + mSub.y + (haveCmp ? mCmp.y : 0.0f) +
+              (haveClk ? mClk.y : 0.0f) + barH;
 
-    bool rightAlign = (g_energy.hudOffsetX < 0.0f);
-    float x = g_sw * 0.5f + g_energy.hudOffsetX - (rightAlign ? w : 0.0f);
-    float y = g_sh * 0.5f + g_energy.hudOffsetY - h * 0.5f;
+    // Where the offset puts the block, said outright.
+    //
+    // Alignment used to be inferred from the offset's sign, so the block could
+    // only hang left or right of the crosshair and never sit centred over it.
+    // The vertical was worse: it always straddled the offset, so the edge
+    // nearest the crosshair moved every time the comparison row, the bar or the
+    // clock appeared -- exactly when you least want it to.
+    float x = g_sw * 0.5f + g_energy.hudOffsetX;
+    if (g_energy.hudAlignX == WR_HUD_RIGHT)       x -= w;
+    else if (g_energy.hudAlignX == WR_HUD_CENTRE_X) x -= w * 0.5f;
+
+    float y = g_sh * 0.5f + g_energy.hudOffsetY;
+    if (g_energy.hudAnchorY == WR_HUD_ABOVE)      y -= h;
+    else if (g_energy.hudAnchorY != WR_HUD_BELOW) y -= h * 0.5f;
+
+    // Rows still right-align their text within the block when the block itself
+    // is right-aligned; centred and left both read from the left edge, which is
+    // what a column of numbers wants.
+    bool rightAlign = (g_energy.hudAlignX == WR_HUD_RIGHT);
 
     if (g_energy.hudBacking)
     {
@@ -1524,10 +1632,20 @@ static void EmitEnergyHud(ImDrawList *dl)
     }
 
     float ty = y;
-    struct { const char *s; float size; float width; unsigned int col; } rows[3];
+    struct { const char *s; float size; float width; unsigned int col; } rows[4];
     int n = 0;
     rows[n].s = big; rows[n].size = sBig; rows[n].width = mBig.x; rows[n].col = bigCol; n++;
     rows[n].s = sub; rows[n].size = sSub; rows[n].width = mSub.x; rows[n].col = 0xFFB0B0B0u; n++;
+    if (haveClk)
+    {
+        // Green for a couple of seconds after a save-loc put it back, so the
+        // restore is something you SEE rather than something you infer from the
+        // number having changed while you were not looking at it.
+        rows[n].s = clk; rows[n].size = sSub; rows[n].width = mClk.x;
+        rows[n].col = clkFresh ? 0xFF80FF80u
+                              : (WrTimerRunning() ? 0xFFE0E0E0u : 0xFF808080u);
+        n++;
+    }
     if (haveCmp)
     {
         rows[n].s = cmp; rows[n].size = sSub; rows[n].width = mCmp.x; rows[n].col = cmpCol; n++;
@@ -1865,8 +1983,9 @@ static void EmitEfficiencyLegend(ImDrawList *dl)
     bool effOn = g_render.lineColour == WR_LINE_EFFICIENCY && g_render.lineKey;
     bool spdOn = g_render.lineColour == WR_LINE_SPEED && g_render.lineKey;
     bool nrgOn = g_render.lineColour == WR_LINE_ENERGY && g_render.lineKey;
+    bool relOn = g_render.lineColour == WR_LINE_ENERGY_REL && g_render.lineKey;
     bool rankOn = g_render.rankColour != WR_RANK_OFF && g_render.rankLegend;
-    if (!effOn && !spdOn && !nrgOn && !rankOn)
+    if (!effOn && !spdOn && !nrgOn && !relOn && !rankOn)
         return;
 
     float size = 0.0f;
@@ -1905,11 +2024,14 @@ static void EmitEfficiencyLegend(ImDrawList *dl)
     // way: the swatches are taken from the ramp function itself at the ends and
     // the middle, which is what stops the key from drifting away from the lines
     // it describes.
-    if (spdOn || nrgOn)
+    if (spdOn || nrgOn || relOn)
     {
-        float lo = nrgOn ? g_render.energyMin : g_render.speedMin;
-        float hi = nrgOn ? g_render.energyMax : g_render.speedMax;
-        const char *unit = nrgOn ? "units of height" : "u/s";
+        float lo = relOn ? g_render.energyRelMin
+                         : (nrgOn ? g_render.energyMin : g_render.speedMin);
+        float hi = relOn ? g_render.energyRelMax
+                         : (nrgOn ? g_render.energyMax : g_render.speedMax);
+        const char *unit = relOn ? "from its own start"
+                                 : (nrgOn ? "units of height" : "u/s");
         _snprintf_s(sLo, sizeof(sLo), _TRUNCATE, "%.0f %s and below", lo, unit);
         _snprintf_s(sMid, sizeof(sMid), _TRUNCATE, "%.0f", (lo + hi) * 0.5f);
         _snprintf_s(sHi, sizeof(sHi), _TRUNCATE, "%.0f and above", hi);
@@ -1921,7 +2043,19 @@ static void EmitEfficiencyLegend(ImDrawList *dl)
         rows[n].colour = SpeedColour(hi);                 rows[n].dim = false;
         rows[n++].text = sHi;
 
-        if (nrgOn)
+        if (relOn)
+        {
+            // The opposite of the absolute mode's promise, and it has to be said
+            // out loud rather than left to be discovered: a colour here is a
+            // margin, not an energy. Two lines the same colour are each holding
+            // the same amount over their OWN starts, which may be hundreds of
+            // units apart in the world.
+            foots[nf++] = "energy = height + speed^2 / 2g, less what this run "
+                          "started with";
+            foots[nf++] = "each line reads zero at its own start, so colours "
+                          "compare margins, not energies";
+        }
+        else if (nrgOn)
         {
             // The one thing that is not obvious about the energy mode, and the
             // reason it is worth having at all: it is an absolute height, so the
@@ -2828,6 +2962,7 @@ void WrRenderWorld(void)
         d.velScale = 1.0f;
         d.thickness = g_render.thickness;
         d.lift = 0.0f;
+        d.startEnergy = RunStartEnergy(run);
         EmitPath(dl, d);
         EmitTurns(dl, run, false);
         EmitTurns(dl, run, true);
@@ -2856,6 +2991,7 @@ void WrRenderWorld(void)
             d.velScale = 1.0f;
             d.thickness = g_render.thickness * g_render.pickThickBoost;
             d.lift = 0.35f;
+            d.startEnergy = RunStartEnergy(run);
             EmitPath(dl, d);
             EmitTurns(dl, run, false);
             EmitTurns(dl, run, true);
@@ -2896,6 +3032,9 @@ void WrRenderWorld(void)
             d.velScale = 1.0f;
             d.thickness = g_render.thickness;
             d.lift = 0.0f;
+            // Where your own recording began, which is the closest thing your
+            // line has to a start.
+            d.startEnergy = WrEnergyOf(live[0].pos, live[0].vel);
             EmitPath(dl, d);
         }
     }
