@@ -78,6 +78,22 @@ struct WrSavelocHit
 // save-locs -- see the comment on the implementation.
 bool WrSavelocMatch(const Vec3 &pos, WrSavelocHit *out);
 
+// The save-loc you are standing EXACTLY on, within about a unit horizontally.
+//
+// This exists because loading a save-loc is not an event the game tells anyone
+// about, and the only signal the tool had was its teleport detector -- a camera
+// jump of more than 400 units between two frames. Loading a save-loc you are
+// standing on or beside moves you far less than that, often not at all, so the
+// load was simply invisible and the clock kept counting. Momentum restores the
+// exact stored origin, so agreeing with one to within a unit in both x and y is
+// a far stronger statement than any distance test: at surf speed the camera
+// covers fifty units a frame.
+//
+// Being here is not the event. ARRIVING here is, so the caller must fire on the
+// rising edge -- holding +mom_savestate_load parks you on the spot for as long
+// as the key is down.
+bool WrSavelocExactMatch(const Vec3 &pos, WrSavelocHit *out);
+
 // Our recorded time for the save-loc nearest `pos`, if there is one within a few
 // units. False when that save-loc has no recorded time -- which is the normal
 // case for every save-loc made before this tool ever ran. A thin wrapper over
@@ -85,6 +101,12 @@ bool WrSavelocMatch(const Vec3 &pos, WrSavelocHit *out);
 bool WrSavelocTimeAt(const Vec3 &pos, float *seconds);
 
 // --- for the panel -----------------------------------------------------------
+
+// Bumped whenever the table is replaced. The clock uses it to tell "you arrived
+// on a save-loc" apart from "a save-loc appeared under you", which is what
+// making one where you stand looks like from the outside -- same camera, new
+// entry, and without this it read as a load and rewound the clock.
+unsigned int WrSavelocGeneration(void);
 
 int WrSavelocCount(void);          // save-locs the game has for this map
 int WrSavelocTimedCount(void);     // how many of those we have a time for
@@ -121,10 +143,37 @@ void WrSavelocSetTime(int index, float seconds);
 bool WrSavelocParseFile(const char *path, const char *map,
                         WrSavelocHit *out, int maxOut, int *count);
 
+// Put a known set of save-locs in front of the matchers.
+//
+// The matching rules are properties of THIS module's private table, which is
+// otherwise only ever filled by a background read of the game's own file at a
+// fixed path. Without a seam the only way to test "loading a save-loc you are
+// standing on restores the clock" would be to restate the matcher in the
+// harness and watch it agree with itself.
+void WrSavelocInstallForTest(const WrSavelocHit *rows, int n);
+
 // The last thing that happened, for a moment, so a stamp or a restore is visible
 // somewhere other than the log. Empty when nothing recent.
 const char *WrSavelocRecent(float *ageSeconds);
 void WrSavelocNoteRestore(float seconds);
+
+// Which of them it was, so a caller can react differently. The crosshair clock
+// borrows a row for a RESTORE and colours it green; it must not do that for the
+// other two, where the clock has not been put back and a green one would be a
+// lie.
+enum WrSavelocNote
+{
+    WR_NOTE_NONE = 0,
+    WR_NOTE_STAMPED,        // a new save-loc was given the clock
+    WR_NOTE_RESTORED,       // the clock was put back from one
+    WR_NOTE_NO_TIME         // a load was seen, on a save-loc we never timed
+};
+WrSavelocNote WrSavelocRecentKind(void);
+
+// A load that WAS noticed, on a save-loc with no time of ours. Said out loud
+// because otherwise it is indistinguishable from not having noticed at all,
+// and that is the common case: most save-locs have no time.
+void WrSavelocNoteNoTime(void);
 
 void WrSavelocShutdown(void);
 

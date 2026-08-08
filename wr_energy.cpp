@@ -211,10 +211,13 @@ void WrEnergyDefaults(void)
     g_energy.hudScale = 1.4f;
     g_energy.hudBacking = true;
     g_energy.showHudClock = false;
+    g_energy.showHudSpeed = false;
+    g_energy.hudWidth = 0.0f;       // as wide as the reserved rows need
 
-    g_energy.showOverlay = false;
+    g_energy.showOverlay = true;
     g_energy.overlayCorner = 3;
     g_energy.overlayScale = 1.0f;
+    g_energy.overlayMargin = 24.0f;
 
     g_energy.compareToRun = true;
     g_energy.compareRadius = 384.0f;

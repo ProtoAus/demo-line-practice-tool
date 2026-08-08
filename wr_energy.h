@@ -114,8 +114,30 @@ struct WrEnergySettings
     bool hudBacking;        // dark plate behind the text
     bool showHudClock;      // the run clock, as a fourth row
 
-    bool showOverlay;       // the older corner panel, off by default now
+    // The second line -- in the default "net" mode the energy expressed as a
+    // speed, which is the headline in different units and nothing more. Off,
+    // because two ways of saying one number is one too many on a readout you
+    // glance at mid-ramp. The other three modes put different figures on that
+    // line and are not affected.
+    bool showHudSpeed;
+
+    // Width of the block in pixels before hudScale, or 0 for "however wide the
+    // reserved rows need to be".
+    //
+    // It exists because the comparison row prints the other player's name, the
+    // name has no bound, and the block used to be measured from it -- so the
+    // plate, the position when centred or right-aligned, AND the lean bar all
+    // changed size depending on who you happened to be nearest. The bar was the
+    // worst of it: its fill is a fraction of the width, so the same energy gap
+    // drew a physically longer bar for a player with a longer name.
+    float hudWidth;
+
+    bool showOverlay;       // the corner block; ON by default
     int overlayCorner;      // 0 TL, 1 TR, 2 BL, 3 BR
+
+    // How far a corner block is kept from the edge of the screen. Was a hard
+    // 18 and unclamped, so a block could and did hang off the bottom.
+    float overlayMargin;
 
     bool compareToRun;      // show the reference run's energy at your position
     float compareRadius;    // don't compare against a run this far from you

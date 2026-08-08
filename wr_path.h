@@ -42,6 +42,15 @@
 // MAX_STEP = 200 units apart, so nothing inside a single leg can reach this.
 #define WR_TELEPORT_UNITS 256.0f
 
+// The same idea for the LIVE trail, where the samples are frames of a real
+// camera rather than the extractor's linked points, so the safe number is
+// different -- and it is 400 because that is what wr_energy.cpp calls a
+// teleport. It was 512 and nothing agreed with it: a jump of 450 units was a
+// teleport to the energy sampler and to the graph, and ordinary movement to the
+// recorder, which then drew the straight bar across the map that the recorder's
+// own comment says it exists to prevent.
+#define WR_LIVE_TELEPORT_UNITS 400.0f
+
 // A dip only counts once the path has actually descended this far and then
 // climbed this far again. Without it, every wobble on a flat section becomes a
 // label and the line disappears under text.
@@ -305,6 +314,13 @@ void WrPathRefreshEfficiency(void);
 // things a demo point does and can be compared against one directly.
 void WrLiveRecord(const Vec3 &pos, const Vec3 &vel, float elapsed);
 void WrLiveClear(void);
+
+// Pause recording without discarding what is already there, so a failed attempt
+// is still on the graph when you go and look at it. Set by wr_timer.cpp on a
+// restart and let go of when you leave the start zone; WrLiveClear also drops
+// it, which is what makes the Clear button and a map change correct for free.
+void WrLiveHold(bool on);
+bool WrLiveHeld(void);
 bool WrLiveEnabled(void);
 void WrLiveSetEnabled(bool on);
 const WrPoint *WrLivePoints(int *count);

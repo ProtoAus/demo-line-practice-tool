@@ -42,18 +42,30 @@ static char g_uiMap[72] = {0};
 // atomicity of an aligned 32-bit store.
 static int g_hudCycleKey = VK_END;
 
+// And which key turns "say whose line I am looking at" off and on, for the same
+// reason: the plate is in the way exactly when you are trying to see past it,
+// and opening a panel to hide it defeats the point.
+static int g_pickToggleKey = VK_HOME;
+
 int WrUiHudCycleKey(void) { return g_hudCycleKey; }
+int WrUiPickToggleKey(void) { return g_pickToggleKey; }
 
 // "Near me" means within this many units of the camera. 4096 comfortably covers
 // one stage of a surf map without reaching into the next one.
 static float s_nearRadius = 4096.0f;
 static bool s_nearOnly = false;
 
+static void WrSendForget(void);
+
 void WrUiOnMapChanged(const char *map)
 {
     strcpy_s(g_uiMap, sizeof(g_uiMap), map ? map : "");
+    // Whatever the last send said was about a run on the map you have left.
+    WrSendForget();
 }
 
+// Forget the last send message -- see below. Declared here because the map
+// change above is the earliest thing that has to drop it.
 // A "(?)" that explains a control on hover, for the settings whose reason is
 // not obvious from the label.
 static void HelpMarker(const char *text)
@@ -256,7 +268,94 @@ static WrRun *BestOfSameTrack(const WrRun *r)
 static char s_runFilter[64] = "";
 
 // Defined below; shared by the Runs and Board tabs.
-static void DrawIntoGameLine(void);
+// The answer to the last send, and WHICH run asked for it.
+//
+// This used to be one shared string inside wr_intogame.cpp printed by both tabs,
+// so an answer about one run stayed on screen while you looked at another -- and
+// two perfectly true per-run answers ("the game already has that one" for a demo
+// the fetcher had already copied in, "no .mtv on disk for that run" for one
+// whose demo had been deleted in game) read as the tool contradicting itself.
+static char s_sendWho[48] = {0};
+static char s_sendText[384] = {0};
+static bool s_sendBad = false;
+// Which tab produced it. DrawIntoGameLine is shared, so without this an answer
+// about a Runs-tab run is printed above the Board list, attributed to a player
+// who is not in it.
+static int s_sendTab = -1;
+
+static void WrSendForget(void)
+{
+    s_sendText[0] = '\0';
+    s_sendWho[0] = '\0';
+    s_sendBad = false;
+    s_sendTab = -1;
+}
+
+// Where each loaded run's .mtv actually is, worked out once per map rather than
+// per row per frame.
+//
+// It has to be worked out at all because two states are invisible otherwise.
+// 35 of the 1,749 .wrpath files on this machine have no .mtv anywhere: deleting
+// a demo in game leaves the path cache behind, so the run lists for ever with
+// nothing to send, and pressing send was the only way to find out. Another 202
+// came from the player's own recordings in momtv\local, which the game can
+// already see -- "send" is not a thing those need.
+//
+// Rebuilt when the run store changes, which is a map load. Four stats per run,
+// two dozen runs: once, not forty file-system round trips a frame.
+static unsigned char s_runSrc[WR_MAX_RUNS];
+static unsigned int s_runSrcGen = 0xFFFFFFFFu;
+static int s_runSrcMapId = -1;
+static int s_runSrcCount = -1;
+
+static void RefreshRunSources(const char *map, int mapId)
+{
+    unsigned int gen = WrRunStoreGeneration();
+    int count = WrRunCount();
+    // The COUNT as well as the generation, and that is not belt and braces. A
+    // map's runs stream in a few files per frame and the generation is bumped
+    // once at the start and once when the last one lands -- so keying on the
+    // generation alone latches the answer after the first handful of runs and
+    // every run that arrives afterwards keeps the PREVIOUS map's classification
+    // until loading finishes. On a busy map that is a couple of hundred frames
+    // of rows saying "no demo" about runs that have one.
+    if (gen == s_runSrcGen && mapId == s_runSrcMapId && count == s_runSrcCount)
+        return;
+    s_runSrcGen = gen;
+    s_runSrcMapId = mapId;
+    s_runSrcCount = count;
+
+    int n = WrRunCount();
+    for (int i = 0; i < n && i < WR_MAX_RUNS; i++)
+    {
+        const WrRun *r = WrRunAt(i);
+        s_runSrc[i] = r ? (unsigned char)WrIntoGameSourceOf(
+                              r->map[0] ? r->map : map, mapId, r->srcSha1,
+                              NULL, 0)
+                        : (unsigned char)WR_DEMO_NONE;
+    }
+}
+
+static void WrSendFromRow(WrIntoGameWhere where, const char *map, int mapId,
+                          const char *hash, const char *who, int tab)
+{
+    char detail[384];
+    WrIntoGameResult r = WrIntoGameSendTo(where, map, mapId, hash, detail,
+                                          sizeof(detail));
+    s_sendTab = tab;
+    strncpy_s(s_sendWho, sizeof(s_sendWho), (who && *who) ? who : "that run",
+              _TRUNCATE);
+    strncpy_s(s_sendText, sizeof(s_sendText), detail, _TRUNCATE);
+    s_sendBad = (r != WR_SEND_OK && r != WR_SEND_ALREADY &&
+                 r != WR_SEND_ALREADY_LOCAL);
+}
+
+#define WR_SEND_TAB_RUNS  0
+#define WR_SEND_TAB_BOARD 1
+static void DrawIntoGameLine(const char *map, int mapId, int tab);
+static void WrSendFromRow(WrIntoGameWhere where, const char *map, int mapId,
+                          const char *hash, const char *who, int tab);
+static void WrSendForget(void);
 
 // Does this run match what was typed?
 //
@@ -775,7 +874,15 @@ static void DrawRunsTab(void)
     ImGui::SetNextItemWidth(160.0f);
     ImGui::SliderFloat("within", &s_nearRadius, 512.0f, 16384.0f, "%.0f u");
 
-    DrawIntoGameLine();
+    // Momentum's numeric map id, which is what names the replay directory. Not
+    // derivable from the map name, so without the map index the Watch column has
+    // nowhere to write and says so per row rather than failing on the press.
+    int mapIdx = WrMapsFind(map);
+    const WrMapInfo *mapInfo = (mapIdx >= 0) ? WrMapsAt(mapIdx) : NULL;
+    int mapId = mapInfo ? mapInfo->id : 0;
+
+    RefreshRunSources(map, mapId);
+    DrawIntoGameLine(map, mapId, WR_SEND_TAB_RUNS);
 
     // The list takes whatever height is left, so dragging the window taller
     // shows more runs instead of a taller empty panel around a fixed 320-pixel
@@ -786,13 +893,6 @@ static void DrawRunsTab(void)
     float tableHeight = ImGui::GetContentRegionAvail().y - reserve;
     if (tableHeight < 140.0f)
         tableHeight = 140.0f;    // below this the header eats the whole list
-
-    // Momentum's numeric map id, which is what names the replay directory. Not
-    // derivable from the map name, so without the map index the Watch column has
-    // nowhere to write and says so per row rather than failing on the press.
-    int mapIdx = WrMapsFind(map);
-    const WrMapInfo *mapInfo = (mapIdx >= 0) ? WrMapsAt(mapIdx) : NULL;
-    int mapId = mapInfo ? mapInfo->id : 0;
 
     ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                             ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit |
@@ -915,20 +1015,92 @@ static void DrawRunsTab(void)
                 // The viewer lists ten, so being able to choose which ten is
                 // the whole point -- see wr_intogame.h.
                 ImGui::TableSetColumnIndex(9);
-                // Only the manifest is consulted here, never the disk: this
-                // runs per visible row per frame, and a GetFileAttributes
-                // each would be forty file-system round trips a frame --
-                // translated ones, under Proton. Send handles the
-                // already-present case itself and says so.
-                if (mapId <= 0)
-                    ImGui::TextDisabled("-");
-                else if (WrIntoGameMine(mapId, r->srcSha1))
+                // The manifest and a cached per-map answer, never the disk on
+                // this path: this runs per visible row per frame, and a
+                // GetFileAttributes each would be forty file-system round trips
+                // a frame -- translated ones, under Proton.
+                unsigned char kind = (i >= 0 && i < WR_MAX_RUNS)
+                                         ? s_runSrc[i]
+                                         : (unsigned char)WR_DEMO_NONE;
+                if (WrIntoGameMine(mapId, r->srcSha1))
                 {
                     if (ImGui::SmallButton("take out"))
+                    {
                         WrIntoGameRemoveOne(mapId, r->srcSha1);
+                        // The answer to the send that put it there is now a
+                        // claim about a file that has just been deleted.
+                        WrSendForget();
+                    }
                 }
-                else if (ImGui::SmallButton("send"))
-                    WrIntoGameSend(r->map, mapId, r->srcSha1);
+                else if (kind == WR_DEMO_NONE)
+                {
+                    // The demo this line came from is gone -- deleted in game,
+                    // most likely -- and only the path cache is left. Say so
+                    // instead of offering a button that cannot work.
+                    ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.4f, 1.0f), "no demo");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip(
+                            "The .mtv this line was extracted from is not on disk\n"
+                            "any more, in our folder or either of the game's. The\n"
+                            "line itself is unaffected -- it is read from the\n"
+                            ".wrpath -- but there is nothing to send or to watch.\n\n"
+                            "35 of the 1749 lines on this machine are in this state.");
+                }
+                else if (kind == WR_DEMO_GAME_ONLINE)
+                {
+                    // Already at the destination and not ours -- the game
+                    // downloaded it. A send button here can only ever answer
+                    // "already has that one", which is the "send did nothing"
+                    // complaint restated. The state was worked out; say it.
+                    ImGui::TextDisabled("in game");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip(
+                            "Already in the game's downloaded folder, and not\n"
+                            "one of ours -- the game fetched it itself. There is\n"
+                            "nothing to send and nothing here may remove it.");
+                }
+                else if (kind == WR_DEMO_GAME_LOCAL)
+                {
+                    ImGui::TextDisabled("yours");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip(
+                            "One of your own recordings, already sitting in the\n"
+                            "game's local replay folder. There is nowhere to send\n"
+                            "it that it is not already.");
+                }
+                else if (mapId <= 0)
+                {
+                    ImGui::TextDisabled("-");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip(
+                            "No numeric map id for this map, and the game's\n"
+                            "downloaded folder is named by id. Refresh the map\n"
+                            "list in Maps.");
+                }
+                else
+                {
+                    if (ImGui::SmallButton("send"))
+                        WrSendFromRow(WR_INTO_ONLINE, r->map, mapId, r->srcSha1,
+                                      r->player, WR_SEND_TAB_RUNS);
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("local"))
+                        WrSendFromRow(WR_INTO_LOCAL, r->map, mapId, r->srcSha1,
+                                      r->player, WR_SEND_TAB_RUNS);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip(
+                            "Put this ONE demo in the game's local replay folder\n"
+                            "instead -- the tab that lists the runs you recorded\n"
+                            "yourself.\n\n"
+                            "Worth trying because a local replay has no server\n"
+                            "record, so that list has to be built by reading the\n"
+                            "folder, while the downloaded list may well be built\n"
+                            "from the game's own record of what it fetched -- in\n"
+                            "which case a file we drop in is on disk and never\n"
+                            "listed. That would explain \"send did nothing\"\n"
+                            "exactly.\n\n"
+                            "It is one press, it is recorded like everything else,\n"
+                            "and \"take out\" removes it again.");
+                }
 
                 ImGui::PopID();
             }
@@ -936,21 +1108,22 @@ static void DrawRunsTab(void)
         ImGui::EndTable();
     }
 
-    if (WrRunEnabledCount() > g_render.maxRunsDrawn)
+    if (WrRunEnabledCount() > WR_MAX_RUNS_DRAWN)
         ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
-                           "%d enabled but only %d drawn -- raise the limit in Display.",
-                           WrRunEnabledCount(), g_render.maxRunsDrawn);
+                           "%d enabled; the fastest %d of them are drawn.",
+                           WrRunEnabledCount(), WR_MAX_RUNS_DRAWN);
 }
 
 // The count of what we have put in the game's replay folder, and the one button
 // that takes it back out. Shared by the Runs and Board tabs, which both have a
 // per-row "send".
-static void DrawIntoGameLine(void)
+static void DrawIntoGameLine(const char *map, int mapId, int tab)
 {
     // Re-checked here rather than trusted: a game cache clear takes our copies
     // with everything else, and a number that still counted them would be wrong
-    // about the only thing this feature is about.
-    WrIntoGameRefresh();
+    // about the only thing this feature is about. Handed the map so it can also
+    // adopt copies the fetcher put there without telling anyone.
+    WrIntoGameRefresh(map, mapId);
     int n = WrIntoGameCount();
 
     ImGui::Text("In the game's replay viewer:");
@@ -962,29 +1135,51 @@ static void DrawIntoGameLine(void)
                            "%d of ours", n);
     ImGui::SameLine();
     HelpMarker(
-        "Momentum's demo viewer lists ten local demos, and it finds them by "
-        "scanning its own replay folder -- there is no index beside them. So "
-        "the cap is not a wall: put the run you want in, take the others out, "
-        "and it is the one you can watch.\n\n"
-        "\"Send\" copies that demo's .mtv into the game's folder. It is a copy, "
-        "so your line stays whatever happens to it.\n\n"
+        "\"Send\" copies that demo's .mtv into momentum\\momtv\\online\\<map "
+        "id>\\, which is where the game puts what IT downloads -- the "
+        "\"downloaded replays\" tab. It is a copy, so your line stays whatever "
+        "happens to it.\n\n"
+        "WHAT IS NOT KNOWN, said plainly: whether that tab lists a file which "
+        "appears there without the game having downloaded it. It cannot be "
+        "checked from this side. The game's OTHER tree, momtv\\local\\<map>\\, "
+        "holds runs you recorded yourself -- 2591 of them here -- and those have "
+        "no server record at all, so that list must be built by reading the "
+        "folder. If send leaves nothing in the game's list, the \"try local\" "
+        "button on a row is the experiment that settles it.\n\n"
         "REMOVING ONLY EVER TOUCHES OURS. Every file sent is written into "
         "wrlines_data\\into_game.txt first, and nothing outside that list can be "
         "deleted from here. The demos the game downloaded by itself -- 4268 of "
         "them on the machine this was built on -- are not in that list and are "
-        "not reachable.\n\n"
+        "not reachable. A copy already there is adopted into the list only if "
+        "our own fetched .mtv of the same hash exists, which is what makes it "
+        "ours rather than the game's.\n\n"
         "Nothing here makes the game play anything. No console command, no "
         "cvar: it copies a file and the game's own menu does the rest.");
     if (n > 0)
     {
         ImGui::SameLine();
         if (ImGui::SmallButton("Remove ours"))
+        {
             WrIntoGameRemoveAll();
+            WrSendForget();
+            strncpy_s(s_sendText, sizeof(s_sendText), WrIntoGameStatus(),
+                      _TRUNCATE);
+            s_sendTab = tab;
+        }
     }
-    if (WrIntoGameStatus()[0])
+
+    // The answer belongs to the run that asked for it, on the tab that asked.
+    if (s_sendText[0] && s_sendTab == tab)
     {
+        ImVec4 col = s_sendBad ? ImVec4(1.0f, 0.6f, 0.4f, 1.0f)
+                               : ImVec4(0.6f, 0.9f, 1.0f, 1.0f);
+        if (s_sendWho[0])
+            ImGui::TextColored(col, "%s: %s", s_sendWho, s_sendText);
+        else
+            ImGui::TextColored(col, "%s", s_sendText);
         ImGui::SameLine();
-        ImGui::TextDisabled("%s", WrIntoGameStatus());
+        if (ImGui::SmallButton("ok##sendmsg"))
+            s_sendText[0] = '\0';
     }
 }
 
@@ -1542,23 +1737,21 @@ static void DrawDisplayTab(void)
     ImGui::TextDisabled("Caps per-frame work. Distance culling does the job on a big");
     ImGui::TextDisabled("open map, but a compact stage fits entirely inside the draw");
     ImGui::TextDisabled("distance, so nothing gets culled and cost scales with runs.");
-    ImGui::SliderInt("Max runs drawn", &g_render.maxRunsDrawn, 1, WR_MAX_RUNS,
-                     "%d", ImGuiSliderFlags_AlwaysClamp);
+    ImGui::TextDisabled("At most 256 enabled runs are drawn.");
     ImGui::SameLine();
     HelpMarker(
-        "How many enabled runs are eligible to be drawn at all. The default is "
-        "256, and the slider reaches 1000 because the store does.\n\n"
-        "IT IS NOT FREE, and the \"points per run\" budget above does not bound "
-        "it -- that budget is PER RUN, so the work is the budget times the "
-        "number of lines. Distance culling is the only thing that caps the "
-        "total, and a compact stage is exactly the case where culling rejects "
-        "nothing.\n\n"
+        "There was a slider here and it is gone, because it was never a "
+        "preference -- it is a backstop on one button.\n\n"
+        "The \"points per run\" budget above does NOT bound the total: it is per "
+        "run, so the work is that budget times the number of lines. Distance "
+        "culling is the only other thing that caps it, and a compact stage is "
+        "exactly the case where culling rejects nothing.\n\n"
         "Measured on such a stage: 8 lines cost 0.24 ms a frame, 256 cost about "
-        "8 ms, and 1000 cost 32 ms. A 60 Hz frame is 16.7 ms and a 144 Hz frame "
-        "is 6.9 ms, so the top of this slider will not hold a frame rate.\n\n"
-        "It only matters when that many runs are actually enabled, which takes "
-        "a deliberate All. If the panel starts to drag after one, this is the "
-        "slider to pull down.");
+        "8 ms, and 1000 cost 32 ms. A 60 Hz frame is 16.7 ms.\n\n"
+        "It is not the same thing as the per-run ticks, which is why it exists: "
+        "one press of All in Runs can enable up to a thousand, and this is "
+        "applied afterwards, in the renderer. The Runs tab says so when you have "
+        "ticked more than are being drawn.");
 
     ImGui::SeparatorText("Colour");
     const char *kRank[WR_RANK_MODE_COUNT] = {
@@ -1707,6 +1900,33 @@ static void DrawDisplayTab(void)
         "coin toss is visible instead of being presented as an answer.\n\n"
         "The cost is about 0.3 ms a frame with 256 lines drawn, against the "
         "8 ms drawing them already costs. Diagnostics shows the real figure.");
+    {
+        static const struct { int vk; const char *name; } kPickKeys[] = {
+            { 0, "none" }, { VK_HOME, "Home" }, { VK_END, "End" },
+            { VK_NEXT, "Page Down" }, { VK_PRIOR, "Page Up" },
+            { VK_DELETE, "Delete" }, { VK_F9, "F9" }, { VK_F10, "F10" },
+        };
+        const int n = (int)(sizeof(kPickKeys) / sizeof(kPickKeys[0]));
+        int sel = 0;
+        for (int i = 0; i < n; i++)
+            if (kPickKeys[i].vk == g_pickToggleKey) { sel = i; break; }
+        const char *names[8];
+        for (int i = 0; i < n; i++) names[i] = kPickKeys[i].name;
+        if (ImGui::Combo("Toggle key", &sel, names, n))
+            g_pickToggleKey = kPickKeys[sel].vk;
+        ImGui::SameLine();
+        HelpMarker(
+            "Turns the plate off and on without opening this panel, which is the "
+            "only way it is useful: the plate sits over the thing it is naming, "
+            "so wanting it gone is a mid-run thought.\n\n"
+            "A list rather than a fixed key, because WrLines cannot see what you "
+            "have bound. The key is read, not swallowed -- a collision means the "
+            "game acts on it too.");
+        if (g_pickToggleKey && g_pickToggleKey == g_hudCycleKey)
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
+                               "Same key as the readout cycle in Energy -- one "
+                               "press will do both.");
+    }
     if (g_render.pickEnabled)
     {
         ImGui::SliderFloat("Aim tolerance", &g_render.pickRadiusPx, 8.0f, 160.0f,
@@ -1806,22 +2026,34 @@ static void DrawDisplayTab(void)
                "is the number that stays still between the two when nothing was "
                "wasted -- speed traded for height reads as a large change and no "
                "loss at all.\n\n"
-               "Off by default: every arc has one of each, so turning both on "
-               "puts twice as many numbers over the line.");
+               "Both ends default to energy now. The pair is worth more than "
+               "either alone, because the DIFFERENCE between the top and the "
+               "bottom is what the arc cost -- and speed at a ramp bottom "
+               "cannot be compared with anything above it.\n\n"
+               "It does mean twice as many numbers. Nothing from the walk-in is "
+               "labelled any more, which takes one off every line, and name "
+               "tags now keep a reserved share of the space so a crowd of "
+               "numbers cannot push them off.");
     ImGui::TextDisabled("Exact on stored lines. Your own line has no marks yet --");
     ImGui::TextDisabled("that needs a second derivative of a camera-differenced");
     ImGui::TextDisabled("velocity and is not measured well enough to draw.");
     ImGui::Spacing();
     LabelPicker("At checkpoints", &g_render.markerLabel, &g_render.drawMarkers);
     ImGui::SliderFloat("Marker size", &g_render.markerRadius, 2.0f, 16.0f, "%.1f px");
-    ImGui::SliderInt("Max checkpoints per run", &g_render.maxMarkersPerRun, 1, 64);
     ImGui::Spacing();
-    ImGui::SliderInt("Labels on screen", &g_render.maxLabelsPerFrame, 4, 200);
+    ImGui::TextDisabled("Numbers on screen are capped, and name tags keep a share");
+    ImGui::TextDisabled("of the room so they cannot be crowded out.");
     ImGui::SameLine();
     HelpMarker("Numbers reserve their rectangle and skip if something is already "
                "there, so they never print on top of each other or of a name "
-               "tag. Whatever does not fit is dropped rather than stacked -- "
-               "Diagnostics shows how many were drawn.\n\n"
+               "tag. Whatever does not fit is dropped rather than stacked.\n\n"
+               "Two sliders that were here are gone. The checkpoint one could "
+               "not express anything: it stopped at 64 and a run cannot hold "
+               "more than 64 checkpoints. The label one is not clutter control "
+               "-- numbers and name tags share one pool of 128 rectangles and "
+               "numbers are placed first, so with no cap two or three runs' "
+               "numbers take the lot and every later run silently loses its "
+               "NAME.\n\n"
                "Time at a ramp bottom is only offered on runs whose recovered "
                "timing passed the trust test: point times are derived from the "
                "sample index, and on the worst map measured that runs from 0.36x "
@@ -1929,11 +2161,25 @@ static void DrawDisplayTab(void)
     ImGui::SameLine();
     if (ImGui::Button("Clear"))
         WrLiveClear();
+    ImGui::SameLine();
+    HelpMarker("Kept until the next attempt actually starts, not until you fail.\n\n"
+               "Failing a run drops you back on the pad, which is a long way, and "
+               "the recorder used to read that as a teleport and wipe the buffer "
+               "on the spot -- so by the time you opened the graph to see what "
+               "went wrong there was nothing left to see, and it looked as though "
+               "looking at it had cleared it.\n\n"
+               "Now a restart HOLDS what you recorded. It clears when you leave "
+               "the start zone, which is the moment the next attempt begins.");
     ImGui::Checkbox("Draw my path", &g_render.drawLive);
     int n = 0;
     WrLivePoints(&n);
     ImGui::SameLine();
-    ImGui::TextDisabled("(%d points)", n);
+    if (WrLiveHeld())
+        ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f),
+                           "(%d points, held -- your last attempt, until you "
+                           "leave the start)", n);
+    else
+        ImGui::TextDisabled("(%d points)", n);
 
     ImGui::Spacing();
     if (ImGui::Button("Reset to defaults"))
@@ -3126,7 +3372,7 @@ static void DrawBoardTab(void)
     int *order = g_bOrder;
     int shown = g_bShown;
 
-    DrawIntoGameLine();
+    DrawIntoGameLine(WrBoardMap(), WrBoardMapId(), WR_SEND_TAB_BOARD);
 
     bool showOut = WrExtractRunning() || WrExtractLineCount() > 0;
     float tableH = ListHeightAbove(showOut);
@@ -3150,8 +3396,12 @@ static void DrawBoardTab(void)
                                 82.0f, BCOL_DATE);
         ImGui::TableSetupColumn("have", ImGuiTableColumnFlags_WidthFixed,
                                 44.0f, BCOL_HAVE);
+        // Wide enough for BOTH buttons. It was 66 when the cell held one, and
+        // an ImGui table clips its cells, so "local" was drawn cut in half and
+        // only the visible part of it was clickable -- on the tab where trying
+        // it is the natural thing to do.
         ImGui::TableSetupColumn("watch", ImGuiTableColumnFlags_WidthFixed |
-                                         ImGuiTableColumnFlags_NoSort, 66.0f);
+                                         ImGuiTableColumnFlags_NoSort, 118.0f);
         ImGui::TableHeadersRow();
 
         ImGuiTableSortSpecs *specs = ImGui::TableGetSortSpecs();
@@ -3230,10 +3480,21 @@ static void DrawBoardTab(void)
                 else if (WrIntoGameMine(bMapId, r->hash))
                 {
                     if (ImGui::SmallButton("take out"))
+                    {
                         WrIntoGameRemoveOne(bMapId, r->hash);
+                        WrSendForget();
+                    }
                 }
-                else if (ImGui::SmallButton("send"))
-                    WrIntoGameSend(WrBoardMap(), bMapId, r->hash);
+                else
+                {
+                    if (ImGui::SmallButton("send"))
+                        WrSendFromRow(WR_INTO_ONLINE, WrBoardMap(), bMapId,
+                                      r->hash, r->alias, WR_SEND_TAB_BOARD);
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("local"))
+                        WrSendFromRow(WR_INTO_LOCAL, WrBoardMap(), bMapId,
+                                      r->hash, r->alias, WR_SEND_TAB_BOARD);
+                }
 
                 ImGui::PopID();
             }
@@ -3859,15 +4120,61 @@ static void DrawEnergyTab(void)
         "for it. That is why it looked like the feature was missing.\n\n"
         "It turns green for a moment when a save-loc restores it, so the restore "
         "is something you see rather than something you work out afterwards.\n\n"
+        "Off is not silent: with the clock hidden, a restore still borrows the "
+        "row for about two seconds and then gives it back, so the one moment it "
+        "matters is visible without a permanent row for it.\n\n"
         "Grey means the clock is not running. It starts when you leave the "
         "anchor and is not the game's own timer -- WrLines cannot read that.");
+    ImGui::Checkbox("Show the speed line", &g_energy.showHudSpeed);
+    ImGui::SameLine();
+    HelpMarker(
+        "The second line of the box, in the default \"net\" mode: your energy "
+        "written out as a speed.\n\n"
+        "Off, because it is the number above it in different units and nothing "
+        "more -- two ways of saying one thing, on a readout you glance at "
+        "mid-ramp.\n\n"
+        "Only that mode. The other three put figures on that line which appear "
+        "nowhere else, and they are unaffected by this.");
     ImGui::SliderFloat("Text scale", &g_energy.hudScale, 0.6f, 3.0f, "%.2f");
+    ImGui::SliderFloat("Box width", &g_energy.hudWidth, 0.0f, 400.0f,
+                       g_energy.hudWidth > 0.0f ? "%.0f px" : "automatic");
+    ImGui::SameLine();
+    HelpMarker(
+        "0 means as wide as the rows need, which is a fixed width per mode.\n\n"
+        "Either way the compared player's NAME never sets the width -- it is cut "
+        "to fit. It used to set it, and that was worse than untidy: the block is "
+        "positioned by its own width when centred or right-aligned, so it moved "
+        "as you passed between lines, and the lean bar's fill is a fraction of "
+        "the width, so the same energy gap drew a longer bar for a player with a "
+        "longer name. A bar you read a comparison off cannot have a scale that "
+        "depends on somebody's Steam name.\n\n"
+        "Raise it if you would rather see the whole name than have the narrowest "
+        "box.");
     ImGui::Checkbox("Dark plate behind it", &g_energy.hudBacking);
 
     ImGui::SeparatorText("Settings");
     ImGui::Checkbox("Also show the corner block", &g_energy.showOverlay);
     const char *corners[] = { "top left", "top right", "bottom left", "bottom right" };
     ImGui::Combo("Corner", &g_energy.overlayCorner, corners, 4);
+    ImGui::SliderFloat("Edge padding", &g_energy.overlayMargin, 0.0f, 200.0f,
+                       "%.0f px");
+    ImGui::SameLine();
+    {
+        int bw = 0, bh = 0;
+        WrBackbufferSize(&bw, &bh);
+        char tip[512];
+        _snprintf_s(tip, sizeof(tip), _TRUNCATE,
+            "How far the corner block and the key are kept from the edge of the "
+            "screen.\n\n"
+            "It was a hard 18 pixels and nothing checked the result, so a block "
+            "in a bottom corner could hang off the bottom of the screen. Both "
+            "blocks are now clamped inside the screen as well, so this is "
+            "padding rather than the only thing holding them on.\n\n"
+            "If a block still looks cut off after this, the screen size itself "
+            "is wrong rather than the padding. WrLines measures it as %d x %d "
+            "right now -- if that is not your resolution, say so.", bw, bh);
+        HelpMarker(tip);
+    }
     ImGui::Checkbox("Compare against the fastest enabled run nearby",
                     &g_energy.compareToRun);
     ImGui::SliderFloat("Compare radius", &g_energy.compareRadius, 64.0f, 4096.0f,

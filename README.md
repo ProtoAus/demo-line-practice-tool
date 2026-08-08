@@ -56,10 +56,12 @@ Press **INSERT** in game. Tick runs in the Runs tab. **ESC** closes the panel.
   route is whose. Anchored where each line crosses the fade distance, so they spread along
   different lines instead of piling up, and de-overlapped rather than drawn on top of
   each other.
-- **Numbers at every turning point** — speed, energy, time or your delta, at the bottom of each
-  ramp and at the top of each arc, in each run's own colour. A bottom says what a line carried
-  *through* the ramp; a top says what it bought with it, and reading only one of the two tells
-  you a surfer lost speed without telling you whether they got height for it.
+- **Numbers at every turning point** — energy at the bottom of each ramp and at the top of each
+  arc by default, in each run's own colour, and speed, time or your delta instead if you would
+  rather. A bottom says what a line carried *through* the ramp; a top says what it bought with it,
+  and the **difference between the two is what the arc cost** — which is why both ends read energy
+  rather than speed. Nothing from the two seconds of walking into the start zone is labelled, so no
+  line grows a number where it has not begun.
 - **Colour every run by where it placed** — violet for the winner, then green through red for
   everyone behind it. Only first is held out of the ramp: a gold/silver/bronze podium was tried
   and all three medals are warm mid-brightness colours sitting inside a ramp that already runs
@@ -81,6 +83,10 @@ Press **INSERT** in game. Tick runs in the Runs tab. **ESC** closes the panel.
   stood on — 0 standing still, and the map's own descent cancels out, so what is left is the
   energy you have wasted or gained. Shown as a height, as the speed that height is worth, with
   a rise/fall arrow, and as a gap against the record's energy at the same point on the route.
+  A **fixed width**, so the box and the lean bar under it stay the same size whoever you are
+  nearest — the compared player's name used to set the width, which meant the bar's scale
+  depended on how long somebody's Steam name was. `Home` turns the aim-at-a-line plate off and on
+  without opening the panel.
 - Puts **split markers** on the line where each checkpoint was reached, labelled with
   the split time.
 - **Colour along each line** by speed, by **energy**, or by strafing efficiency — one at a
@@ -1028,18 +1034,15 @@ draw them as lines but not watch them. **Also put them where the game can play t
 one into `momentum\momtv\online\<mapID>\` as well.
 
 That is the game's own replay folder, under the game's own filename — the replay hash, which is
-already what our copies are named — and there is no index file beside them, so the game finds
-replays by scanning. A **copy, not a move**: your own tree keeps its copy, so a game cache clear
-cannot take your lines with it. Written as a temp file and moved into place, so the game can never
-see a half-written replay.
+already what our copies are named. A **copy, not a move**: your own tree keeps its copy, so a game
+cache clear cannot take your lines with it. Written as a temp file and moved into place, so the game
+can never see a half-written replay.
 
 **Off by default**, because it is the one thing here that writes into the game install, and the
 promise at the top of this file is qualified rather than quietly dropped.
 
-**The viewer lists ten.** That is not a wall, because it finds them by scanning the directory:
-which ten it lists is decided entirely by which files are there. So there is also a **send**
-button on each row of the Runs and Board tabs, which copies that one demo in, and a count of
-how many of ours are currently sitting in that folder.
+There is also a **send** button on each row of the Runs and Board tabs, which copies that one demo
+in, and a count of how many of ours are currently sitting in that folder.
 
 Removal is where the care goes. That directory is the game's, not ours — it holds replays the
 game downloaded by itself, 4,268 of them on this machine — so a *clear* that removed `*.mtv`
@@ -1048,6 +1051,57 @@ the copy, and **removal only ever touches paths in that file**. A demo the game 
 not in the list and cannot be reached from the panel. The list is re-checked against disk each
 time it is shown, so a game cache clear that took our copies with it shows up as a smaller
 count rather than as a stale claim.
+
+### Two replay folders, and which one the game reads
+
+Sending demos looked broken, and every message the panel printed was true. Both tabs shared one
+status string, so an answer about one run stayed on screen while you looked at another, and two
+correct per-run answers read as the tool contradicting itself. Measured here:
+
+| | |
+|---|---|
+| entries in `into_game.txt` | **0**, while 7 of the 16 files in `momtv\online\104` had been put there by us |
+| `.wrpath` files with no `.mtv` anywhere | **35 of 1,749** — surf_me 12, surf_ispy 10, surf_fiellu 2 |
+| `.wrpath` whose name is not a replay hash | **202 of 1,749** — your own local recordings |
+
+The fetcher's `--into-game` writes the identical destination as the send button and never told the
+manifest, so the panel said "none of ours", the **Remove ours** button never appeared at all, and
+pressing send correctly answered *"the game already has that one"* while doing nothing. Those copies
+are now **adopted** — but only when `wrlines_data\demos\<map>\<hash>.mtv` exists too, because that is
+the proof they came from us. A demo the game downloaded has no counterpart in our tree, is never
+adopted, and stays exactly as untouchable as before.
+
+The other two states are now shown rather than discovered by pressing a button that cannot work. A
+run whose `.mtv` was deleted in game leaves its `.wrpath` behind and lists for ever with nothing to
+send: those rows say **no demo**. A run extracted from one of your own recordings says **yours** —
+the game can already see it. That last case used to report *"no numeric map id — refresh the map
+list"*, which was the wrong advice for 202 files, and the map id was never the problem: the name was.
+`srcSha1` is the source `.mtv`'s filename **stem**, and yours look like
+`104455274-surf_fiellu-1781797367-main-nrm-60.990`.
+
+**What is still not known.** The game keeps replays in two trees:
+
+```
+momentum\momtv\online\<numeric map id>\<40-hex replay hash>.mtv      1,675 files, 290 dirs
+momentum\momtv\local\<map name>\<user id>-<map>-<unix>-<track>-<style>-<time>.mtv
+                                                                     2,591 files, 447 dirs
+```
+
+and its leaderboard panel has a tab for each — `Leaderboards_Error_NoLocalReplays` and
+`Leaderboards_Error_NoDownloadedReplays` in `momentum_english.txt`. `engine.dll` carries the literals
+`momtv/local`, `momtv/online` and a `momtv/local/*%s` glob.
+
+Send writes the **online** tree. Whether the Downloaded tab lists a file that appears there without
+the game having downloaded it cannot be checked from this side, and the honest reading of the
+evidence is that it may not: a *local* replay has no server record of any kind, so that list must be
+built by reading the folder, while the downloaded list may well be the game's own record of what it
+fetched — which would explain the symptom exactly, a file that is present on disk (hence "already has
+that one") and never listed.
+
+So each row also has a **local** button, which puts that one demo in the local tree instead. It is
+one press per demo rather than a default, because those are other people's runs going in among 2,591
+of your own recordings, and it is recorded and removable like everything else. It is the experiment
+that settles the question.
 
 Nothing here makes the game *play* anything. No console command, no cvar, no call into the
 game: it copies a file, and the game's own menu does the rest.
@@ -1076,6 +1130,76 @@ rule cannot be loosened, and it leaves every save-loc made before WrLines existe
 untimed: **141 of 3239 have a time, across 11 of 261 maps.** A time that was never recorded cannot
 be recovered and will not be guessed at, so those can be **typed in** instead, and are marked `*`
 so a stated time is never mistaken for a measured one.
+
+### The load that nobody noticed
+
+The clock kept counting through a save-loc load, and the reason had nothing to do with the times.
+The restore lived entirely inside `if (teleported)`, and `teleported` is raised in exactly one
+place: when the camera moves more than **400 units between two consecutive frames**. Momentum
+restores the *exact* stored origin — so loading a save-loc you are standing beside moves you a few
+units, often none, no teleport fires, the match is never even attempted, and control falls straight
+through to `g_elapsed += dt`. Practising a section by loading the same loc over and over is precisely
+the case that could never work.
+
+The threshold is not the thing to change: 400 is what keeps ordinary movement from resetting the
+energy filters, and having exactly one teleport detector is a rule this file has broken before and
+paid for. So there is a second, much narrower trigger beside it. After a load the camera's **x and
+y** equal the save-loc's to a fraction of a unit, and that is a far stronger statement than any
+distance test — at surf speed the camera crosses fifty units in a frame, so a one-unit circle is not
+somewhere you arrive by moving.
+
+It is **horizontal only**, deliberately. The obvious sharper test is `cam.z == pos.z + eyeHeight`,
+and it is wrong twice: `eyeHeight` is a setting with a slider, fixed at 64 because that is the
+standing view offset, and it is simply not 64 when the loc was saved or loaded ducked. Two
+coordinates at sub-unit precision say everything a third would, and ducking cannot defeat them.
+
+And it fires on the **rising edge**, because holding `+mom_savestate_load` parks you on the spot for
+as long as the key is down and a level trigger would re-set the clock every frame — it would restore
+correctly and then never advance.
+
+Three things about *recording* a time were wrong in the same direction:
+
+- `firstForMap` was inferred as "we hold nothing, so this is the first look". On a map with no
+  save-locs yet that stays true after the first read and for ever, so the first save-loc you ever
+  make on a map — the one you make while finding out whether the feature works — was never stamped.
+- The file's timestamp was committed as seen *before* the "a read is already running" guard, so a
+  change that arrived during a read was recorded as handled and then dropped. The file will not
+  change again by itself, so it was never re-read. Two save-locs in quick succession is all it takes.
+- `WrSavelocMatch` never filled `fromCps` or `ordinal`, and its caller declares the hit
+  uninitialised. Latent rather than live, until the new matcher wanted `fromCps`.
+
+A load on a save-loc with **no** time now says so, rather than doing nothing. That silence was half
+the problem: it is indistinguishable from not having noticed the load, and 3,098 of 3,239 save-locs
+here have no time, so the common case was a correct answer that looked like a broken one.
+
+Two things it will not do, said outright. **Making** a save-loc where you stand looks identical to
+arriving on one — same camera, new entry — so the table carries a version and a change to it on a
+frame you have not moved is read as a creation, not a load. And **loading the same save-loc twice
+without leaving its one-unit circle** is genuinely invisible: nothing observable changes, so the
+clock is not put back the second time. Step off it and back and it works; that is what practising
+actually looks like, but it is a limit rather than an oversight.
+
+### Your own line, after you fail
+
+*Record my path* was being wiped by the fail trigger, not by the graph. The recorder clears its
+buffer on a camera jump — right for a teleport — and failing a run drops you back on the pad, which
+is a very long way. So the attempt was erased on that frame, and by the time you had opened the panel
+to see what went wrong there were one or two points left and the graph drew nothing. It reads exactly
+like the graph clearing itself every time you look at it. Nothing in the Graphs tab ever touched the
+buffer.
+
+A restart now **holds** the buffer instead: recording stops, what is there stays, and leaving the
+start zone clears it and begins the next one. A hold rather than "keep appending", and that is not a
+preference — a live point's `t` is the run clock, which is zeroed on a restart and again at the start
+line, so appending across one would send the graph's time axis backwards, and `wr_profile` binary-
+searches that axis.
+
+The hold is only ever taken when a start zone is actually known, because leaving one is what releases
+it; and the clock restarting from the anchor releases it too, so a leg whose zone never fires cannot
+strand the recorder. While in there, the recorder's own teleport threshold moved from 512 to **400**,
+to agree with the one every other part of the tool uses — a 450-unit jump used to be a teleport
+everywhere except here, which drew the straight bar across the map that the recorder exists to
+prevent.
 
 ### The velocity was in the file all along
 
@@ -1564,9 +1688,15 @@ wr_budget.h         gross gain/loss without counting noise -- pure logic, tested
 wr_stress.h         the air-strafing ceiling and efficiency -- pure logic, tested
 wr_ui               the panel
 tests\              standalone harnesses -- tests\build.bat builds and runs all
-                    seven. test_energy, test_profile, test_board, test_rank and
-                    test_start link the real .cpp files, because the defects
-                    they cover were in those files rather than in the headers.
+                    nine. test_energy, test_profile, test_board, test_rank,
+                    test_start, test_saveloc and test_live link the real .cpp
+                    files, because the defects they cover were in those files
+                    rather than in the headers. test_live links the timer, the
+                    recorder and the save-loc table together, because both
+                    things it checks are interactions BETWEEN them: a restart
+                    that must hold the recording rather than wipe it, and a
+                    save-loc load that does not move the camera far enough to
+                    look like a teleport.
 ```
 
 Everything the tool writes lives under `wrlines_data\`, next to the DLL:

@@ -45,6 +45,7 @@ WrRenderSettings g_render;
 
 #define NEAR_W 1.0f
 #define MAX_BATCH 4096
+
 // Buckets for the distance FADE, not for the alpha setting -- see EmitPath.
 // Twelve rather than eight makes the fade ramp smoother; the cost is at most a
 // few extra polyline flushes on a path that spans the whole fade band.
@@ -92,12 +93,17 @@ void WrRenderDefaults(void)
     // Distance culling is the only thing that does bound it, and the compact
     // stage is precisely the case where culling rejects nothing.
     //
-    // It is still the right default, because the number that matters is how many
+    // It is still the right number, because the count that matters is how many
     // runs are ENABLED, and that is one out of the box: FinishLoad enables the
     // first run and the auto-enable picks one more nearby. Nothing reaches 256
     // lines without ticking All on a map that has them. This cap is what stops
     // that press from being a freeze; it is not what makes it cheap.
-    g_render.maxRunsDrawn = 256;
+    //
+    // A constant rather than a slider, because it was never a preference. It is
+    // a backstop on one button, the answer is measured, and a slider invited the
+    // reading that it duplicates the per-run checkboxes -- which it does not: it
+    // is applied in the renderer, after and independently of whatever the Runs
+    // list is filtered to. See WR_MAX_RUNS_DRAWN.
     g_render.pointBudget = 1500;
     g_render.lineColour = WR_LINE_FLAT;
     g_render.speedMin = 250.0f;
@@ -131,23 +137,22 @@ void WrRenderDefaults(void)
     // Twelve, not forty. Forty legible tags do not fit on a screen, and drawing
     // forty overlapping ones is worse than saying so in the UI.
     g_render.maxTags = 12;
+    // Energy at both ends of every arc.
+    //
+    // Bottoms used to say SPEED and tops were off, on the argument that one
+    // number per arc is enough and the bottom is the one that answers "did this
+    // line carry its speed". That argument was about clutter and it lost to a
+    // better one: energy at the top and energy at the bottom is a READING --
+    // what the arc cost -- and the pair is worth more than either alone,
+    // because the difference between them is the whole point. Speed at a ramp
+    // bottom cannot be compared with anything above it.
     g_render.drawDipSpeeds = true;
     g_render.maxDipsPerRun = 24;
-    g_render.dipLabel = WR_LABEL_SPEED;
-
-    // Tops default OFF, unlike bottoms. Every arc has one of each, so turning
-    // both on doubles the numbers on screen, and the bottom is the one that
-    // answers "did this line carry its speed". A top is what you turn on when
-    // you are asking a narrower question.
-    g_render.drawPeaks = false;
+    g_render.dipLabel = WR_LABEL_ENERGY;
+    g_render.drawPeaks = true;
     g_render.maxPeaksPerRun = 24;
     g_render.peakLabel = WR_LABEL_ENERGY;
     g_render.markerLabel = WR_LABEL_TIME;
-    g_render.maxMarkersPerRun = 24;
-    // A label is far bigger than a line segment and cannot be decimated, so the
-    // budget that matters is a global one. Eight runs with four-line labels at
-    // every checkpoint is unreadable long before it is slow.
-    g_render.maxLabelsPerFrame = 40;
     g_render.drawVelocity = true;
     // Symmetric. Measured p60 of in-band eta is +0.589, and once the loss side
     // stopped being discarded it carries more mass than the gain side, not less.
@@ -283,6 +288,27 @@ void WrRenderStats(int *segments, int *pointsConsidered, int *batches,
 static const VMatrix *g_m;
 static float g_sw, g_sh;
 static Vec3 g_cam;
+
+// Keep a w x h block inside the screen, with a margin.
+//
+// The two corner blocks placed themselves at "screen minus size minus 18" and
+// then never checked, so the bottom-right one hung off the bottom edge -- the
+// margin was the only thing between the block and the edge, and eighteen pixels
+// is not enough of one at every size and scale. A clamp costs two comparisons
+// and cannot make a correct position wrong.
+//
+// The margin is honoured even when the block is too big to fit, in which case
+// the top-left corner wins: a block cut off at the bottom hides its most recent
+// rows, and a block cut off at the top hides its heading, and of the two the
+// heading is the one you can do without.
+static void WrClampToScreen(float *x, float *y, float w, float h, float m)
+{
+    float maxX = g_sw - w - m, maxY = g_sh - h - m;
+    if (*x > maxX) *x = maxX;
+    if (*y > maxY) *y = maxY;
+    if (*x < m) *x = m;
+    if (*y < m) *y = m;
+}
 
 static inline float ClipW(const Vec3 &p)
 {
@@ -839,6 +865,22 @@ static void EmitPath(ImDrawList *dl, const WrPathDraw &d)
 #define WR_MAX_TAG_RECTS 128
 #define WR_TAG_NUDGES 6
 
+// ...and the thing that keeps numbers from taking the whole pool is the label
+// budget, not a reservation.
+//
+// Worth stating, because a reservation was written here and then measured: the
+// pool holds 128, and the only two things that ever claim a slot are a label
+// (bounded by WR_MAX_LABELS_PER_FRAME, 40, across every run) and a tag (bounded
+// by maxTags, at most 32). 72 is the worst case and it cannot reach 128, so a
+// slice held back for tags would never once have been consulted. It was removed
+// rather than left in looking like it did something.
+//
+// What CAN still cost a far run its tag is overlap rather than exhaustion: a
+// tag tries six positions and gives up if numbers already placed this frame
+// cover all of them. That is a different mechanism and the honest answer to it
+// is the label budget, which is why the budget stays even though the slider
+// that set it has gone.
+
 struct TagRect { float x0, y0, x1, y1; };
 static TagRect g_tagRects[WR_MAX_TAG_RECTS];
 static int g_tagRectCount = 0;
@@ -938,7 +980,7 @@ static bool DrawLabel(ImDrawList *dl, ImVec2 at, const char *text,
 {
     if (!text || !text[0])
         return false;
-    if (g_statLabels >= g_render.maxLabelsPerFrame)
+    if (g_statLabels >= WR_MAX_LABELS_PER_FRAME)
         return false;
 
     float ls = 0.0f;
@@ -990,10 +1032,22 @@ static void EmitTurns(ImDrawList *dl, const WrRun *run, bool tops)
     // arrival. Invisible at eight drawn runs. At 256 it is around half a
     // millisecond a frame spent building text nothing will show.
     for (int i = 0; i < listCount && drawn < budget &&
-                    g_statLabels < g_render.maxLabelsPerFrame; i++)
+                    g_statLabels < WR_MAX_LABELS_PER_FRAME; i++)
     {
         int idx = list[i];
         if (idx < 0 || idx >= run->pointCount)
+            continue;
+        // Nothing from the pre-roll, for the same reason the LINE does not start
+        // there. A .mtv carries about two seconds of the player walking into the
+        // start zone before the timer runs, and the turning points found in it
+        // are steps off a pad, not surfing -- so every run grew a number where
+        // it starts, over a stretch of line that hidePreRoll is not even
+        // drawing. EmitPath, UpdatePick and RunStartEnergy all filter on this
+        // already; this was the one that did not.
+        //
+        // startIndex is 0 when the start was never recovered, so on those runs
+        // the guard passes everything, which is exactly today's behaviour.
+        if (g_render.hidePreRoll && idx < run->startIndex)
             continue;
 
         const WrPoint *p = &run->points[idx];
@@ -1086,10 +1140,14 @@ static void EmitMarkers(ImDrawList *dl, const WrRun *run)
         return;     // anchoring was not trusted; better nothing than wrong
 
     int drawn = 0;
-    for (int i = 0; i < run->markerCount && drawn < g_render.maxMarkersPerRun; i++)
+    for (int i = 0; i < run->markerCount && drawn < WR_MAX_MARKERS; i++)
     {
         const WrMarker *mk = &run->markers[i];
         if (mk->pointIndex >= (unsigned int)run->pointCount)
+            continue;
+        // Same pre-roll guard as EmitTurns, and it had the same omission.
+        if (g_render.hidePreRoll &&
+            mk->pointIndex < (unsigned int)run->startIndex)
             continue;
         Vec3 p = run->points[mk->pointIndex].pos;
         if (WrDistSqr(p, g_cam) > g_render.maxDrawDistance * g_render.maxDrawDistance)
@@ -1489,8 +1547,18 @@ static void EmitEnergyHud(ImDrawList *dl)
 
         default:
             _snprintf_s(big, sizeof(big), _TRUNCATE, "%.0f%s", rel, arrow);
-            _snprintf_s(sub, sizeof(sub), _TRUNCATE, "%.0f u/s",
-                        WrEnergyEquivSpeed());
+            // The energy above, expressed as a speed. The same number twice, so
+            // it is off unless asked for -- and only HERE, because the other
+            // three modes put figures on this line that appear nowhere else and
+            // gating those would gut them.
+            if (g_energy.showHudSpeed)
+                _snprintf_s(sub, sizeof(sub), _TRUNCATE, "%.0f u/s",
+                            WrEnergyEquivSpeed());
+            else
+            {
+                sub[0] = '\0';
+                wideSub = "";
+            }
             break;
         }
     }
@@ -1572,7 +1640,18 @@ static void EmitEnergyHud(ImDrawList *dl)
     bool haveClk = false;
     bool clkFresh = false;
     ImVec2 mClk(0.0f, 0.0f);
-    if (g_energy.showHudClock)
+
+    // The note is read whether or not the clock row is on, because the row being
+    // off is exactly the case that needed fixing: with no clock on screen a
+    // save-loc putting the clock back had nowhere at all to say so, which is
+    // half of why the feature read as doing nothing. So a restore borrows the
+    // row for two seconds and then gives it back.
+    float noteAge = 0.0f;
+    const char *note = WrSavelocRecent(&noteAge);
+    bool noteFresh = (note && note[0] && noteAge < 2.0f &&
+                      WrSavelocRecentKind() == WR_NOTE_RESTORED);
+
+    if (g_energy.showHudClock || noteFresh)
     {
         float secs = WrTimerElapsed();
         int mins = (int)(secs / 60.0f);
@@ -1582,10 +1661,7 @@ static void EmitEnergyHud(ImDrawList *dl)
         else
             _snprintf_s(clk, sizeof(clk), _TRUNCATE, "%.3f", rem);
         haveClk = true;
-
-        float age = 0.0f;
-        const char *note = WrSavelocRecent(&age);
-        clkFresh = (note && note[0] && age < 2.0f);
+        clkFresh = noteFresh;
 
         mClk = fSub->CalcTextSizeA(sSub, FLT_MAX, 0.0f, clk);
     }
@@ -1597,11 +1673,75 @@ static void EmitEnergyHud(ImDrawList *dl)
     bool drawBar = haveCmp && g_energy.showBar;
     float barH = drawBar ? (g_energy.barHeight * g_energy.hudScale + 4.0f) : 0.0f;
 
+    // The width, and what is NOT allowed to set it.
+    //
+    // The comparison row used to: it prints the other player's name, the name
+    // has no bound, and it was measured rather than reserved. So the plate grew
+    // and shrank as you moved between lines, a centred or right-aligned block
+    // moved with it, and the lean bar -- whose fill is a fraction of this width
+    // -- drew a physically longer bar for the same energy gap when the player it
+    // named had a longer name. A comparison you read off a bar cannot have a
+    // scale that depends on somebody's Steam name.
+    //
+    // So the name is clipped into whatever room the block has, rather than the
+    // block being stretched to hold the name.
     float w = wBig.x;
     if (wSub.x > w) w = wSub.x;
     if (wClk.x > w) w = wClk.x;
-    if (mCmp.x > w) w = mCmp.x;     // the name is not ours to bound
-    float h = mBig.y + mSub.y + (haveCmp ? mCmp.y : 0.0f) +
+    // A floor, not a replacement. Setting it BELOW what the rows need would put
+    // the headline outside the plate it is drawn on -- and, right-aligned,
+    // several pixels to the left of the block's own origin, since a row is
+    // placed at x + w - itsWidth.
+    float wanted = g_energy.hudWidth * g_energy.hudScale;
+    if (wanted > w)
+        w = wanted;
+
+    // Clip, in pixels, not characters: the face is proportional, so a character
+    // count is not a width. CalcWordWrapPositionA finds the break, and an
+    // ellipsis marks that something was cut rather than pretending the name is
+    // short.
+    if (haveCmp && mCmp.x > w)
+    {
+        // Cut per character, measured, and NOT with CalcWordWrapPositionA.
+        //
+        // That function is a WORD wrapper: handed "+240 vs SomeLongName" and a
+        // budget the name does not fit in, it rolls the cut back to the last
+        // word boundary -- the space before the name -- and hands back "+240
+        // vs". So the name was not shortened, it was deleted, for every name
+        // longer than about three characters. The row exists to say who, and it
+        // said nobody.
+        //
+        // A prefix walk instead. At most 63 characters and once a frame, and it
+        // gets the scale right by measuring with the same call that produced
+        // mCmp rather than assuming the font is baked at the size being drawn.
+        float budget = w - fSub->CalcTextSizeA(sSub, FLT_MAX, 0.0f, "...").x;
+        if (budget < sSub)
+            budget = sSub;
+        size_t keep = 0;
+        size_t len = strlen(cmp);
+        for (size_t i = 1; i <= len; i++)
+        {
+            float px = fSub->CalcTextSizeA(sSub, FLT_MAX, 0.0f, cmp,
+                                           cmp + i).x;
+            if (px > budget)
+                break;
+            keep = i;
+        }
+        // Bounded against the DESTINATION, which is `cmp` itself: writing the
+        // ellipsis in place needs three characters and a terminator, and the
+        // one thing that must not happen is handing strcpy_s a source longer
+        // than the buffer -- it does not truncate, it calls the invalid
+        // parameter handler, and that ends the process. Inside somebody else's
+        // game.
+        if (keep > sizeof(cmp) - 4)
+            keep = sizeof(cmp) - 4;
+        strcpy_s(cmp + keep, sizeof(cmp) - keep, "...");
+        mCmp = fSub->CalcTextSizeA(sSub, FLT_MAX, 0.0f, cmp);
+    }
+
+    bool haveSub = (sub[0] != '\0');
+    float h = mBig.y + (haveSub ? mSub.y : 0.0f) +
+              (haveCmp ? mCmp.y : 0.0f) +
               (haveClk ? mClk.y : 0.0f) + barH;
 
     // Where the offset puts the block, said outright.
@@ -1635,7 +1775,11 @@ static void EmitEnergyHud(ImDrawList *dl)
     struct { const char *s; float size; float width; unsigned int col; } rows[4];
     int n = 0;
     rows[n].s = big; rows[n].size = sBig; rows[n].width = mBig.x; rows[n].col = bigCol; n++;
-    rows[n].s = sub; rows[n].size = sSub; rows[n].width = mSub.x; rows[n].col = 0xFFB0B0B0u; n++;
+    if (haveSub)
+    {
+        rows[n].s = sub; rows[n].size = sSub; rows[n].width = mSub.x;
+        rows[n].col = 0xFFB0B0B0u; n++;
+    }
     if (haveClk)
     {
         // Green for a couple of seconds after a save-loc put it back, so the
@@ -2118,10 +2262,11 @@ static void EmitEfficiencyLegend(ImDrawList *dl)
     w += pad * 2.0f;
 
     // Opposite corner to the overlay, in both axes.
-    float m = 18.0f;
+    float m = g_energy.overlayMargin;
     int corner = (~g_energy.overlayCorner) & 3;
     float x = (corner & 1) ? (g_sw - w - m) : m;
     float y = (corner & 2) ? (g_sh - h - m) : m;
+    WrClampToScreen(&x, &y, w, h, m);
 
     dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h), 0xA0000000u, 5.0f);
 
@@ -2235,9 +2380,10 @@ static void EmitEnergyOverlay(ImDrawList *dl)
     float h = lh * n + pad * 2.0f;
     w += pad * 2.0f;
 
-    float m = 18.0f;
+    float m = g_energy.overlayMargin;
     float x = (g_energy.overlayCorner & 1) ? (g_sw - w - m) : m;
     float y = (g_energy.overlayCorner & 2) ? (g_sh - h - m) : m;
+    WrClampToScreen(&x, &y, w, h, m);
 
     dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h), 0xA0000000u, 5.0f);
     for (int i = 0; i < n; i++)
@@ -2430,7 +2576,7 @@ static void UpdatePick(void)
     int projections = 0;
     int drawn = 0;
 
-    for (int i = 0; i < WrRunCount() && drawn < g_render.maxRunsDrawn; i++)
+    for (int i = 0; i < WrRunCount() && drawn < WR_MAX_RUNS_DRAWN; i++)
     {
         WrRun *run = WrRunAt(i);
         // The identical gate the draw loop uses. A run that is not drawn must
@@ -2938,7 +3084,7 @@ void WrRenderWorld(void)
     }
 
     int drawn = 0;
-    for (int i = 0; i < WrRunCount() && drawn < g_render.maxRunsDrawn; i++)
+    for (int i = 0; i < WrRunCount() && drawn < WR_MAX_RUNS_DRAWN; i++)
     {
         WrRun *run = WrRunAt(i);
         if (!run || !run->enabled || run->pointCount < 2)

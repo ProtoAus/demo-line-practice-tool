@@ -33,11 +33,24 @@ static float g_elapsed = 0.0f;
 // whole save-loc timing feature, since it only stamps while the clock runs.
 static bool g_manual = false;
 
+// The save-loc we are currently sitting exactly on top of, and whether we were
+// sitting on one last frame. See the block in WrTimerTick: standing on a
+// save-loc is a state, arriving on one is the event, and the load key holds you
+// in the state for as long as you hold it down.
+static Vec3 g_lastExact = {0.0f, 0.0f, 0.0f};
+static bool g_wasExact = false;
+
+// The save-loc table's version, so a table that changed under a stationary
+// camera is not mistaken for the camera having arrived somewhere.
+static unsigned int g_lastSavelocGen = 0;
+
 void WrTimerReset(void)
 {
     g_running = false;
     g_manual = false;
     g_elapsed = 0.0f;
+    g_wasExact = false;
+    g_lastExact = WrVec(0.0f, 0.0f, 0.0f);
 }
 
 void WrTimerStart(void)
@@ -83,6 +96,93 @@ void WrTimerTick(const Vec3 &cam, float dt)
     bool restart = WrEnergyTakeRestart();
     Vec3 landed;
     bool teleported = WrEnergyTakeTeleport(&landed);
+
+    // A save-loc load that did NOT move you far enough to look like a teleport.
+    //
+    // The restore used to live entirely inside the teleport branch below, so it
+    // only ever fired on a camera jump of more than 400 units. Load a save-loc
+    // you are standing beside -- which is what practising a section IS -- and
+    // the camera moves a few units or none at all, nothing is detected, and the
+    // clock simply keeps counting. That is the whole of "saving a loc time does
+    // not work": not a missing time, a missing event.
+    //
+    // Edge-triggered, because standing on the spot is a state and arriving on it
+    // is the event: holding +mom_savestate_load parks you there for as long as
+    // the key is down, and wr_energy.cpp is meanwhile holding the readout frozen
+    // for exactly the same reason. Latched on WHICH save-loc rather than on "was
+    // exact", so stepping from one to another an inch away still reads as an
+    // arrival.
+    //
+    // Only when the teleport branch did not fire, so the one-lookup rule below
+    // still holds: a given frame is answered by one search, never two.
+    // Whether we are on one is worked out on EVERY frame, including teleport
+    // frames and frames where the table has just changed underneath us. Only
+    // whether to ACT on it is conditional -- see the two suppressions below.
+    // Skipping the test entirely on those frames was the bug: the latch went
+    // false, and the very next frame looked like a fresh arrival.
+    // The table's version is tracked EVERY frame, not only on the frames we are
+    // standing on a save-loc. Reading it inside the block below meant a change
+    // that happened while you were somewhere else was still "new" whenever you
+    // next arrived, and suppressed the arrival that mattered.
+    unsigned int gen = WrSavelocGeneration();
+    bool tableChanged = (gen != g_lastSavelocGen);
+    g_lastSavelocGen = gen;
+
+    bool exactNow = false;
+    WrSavelocHit exact;
+    if (WrSavelocExactMatch(cam, &exact) && exact.fromCps)
+    {
+        exactNow = true;
+
+        // A teleport is the OTHER branch's business, and it has already
+        // answered this frame. Momentum leaves you parked on the restored
+        // origin, so without this the next frame reads as an arrival and fires
+        // again -- re-restoring the clock, and seeding the energy from a
+        // save-loc's velocity on a player a fail trigger has just stopped dead,
+        // which is precisely what the refusal below exists to prevent.
+        //
+        // And a table that changed THIS frame. Making a save-loc where you
+        // stand puts a new entry under a camera that has not moved, which is an
+        // arrival by position and a creation in fact -- it would rewind the
+        // clock by however long the background read took and overwrite "saved
+        // at 12.5s" with "restored to 12.5s".
+        bool suppress = teleported || tableChanged;
+
+        if (suppress)
+        {
+            // Latch it anyway, so the frame after is not an edge either.
+            g_lastExact = exact.pos;
+        }
+        else if (!g_wasExact || WrDist(exact.pos, g_lastExact) > 0.5f)
+        {
+            g_lastExact = exact.pos;
+            if (exact.seconds >= 0.0f)
+            {
+                WrTimerSet(exact.seconds, "loaded a save-loc, without moving");
+                WrSavelocNoteRestore(exact.seconds);
+            }
+            else
+            {
+                // Noticed, and there is nothing to restore. Said out loud,
+                // because silence here looks exactly like not noticing at all,
+                // and not noticing is what this whole block exists to fix.
+                WrSavelocNoteNoTime();
+                WrLogf("timer: landed exactly on a save-loc at (%.0f %.0f %.0f) "
+                       "with no time of ours", exact.pos.x, exact.pos.y,
+                       exact.pos.z);
+            }
+
+            // Same seed the teleport branch does, for the same reason: the
+            // velocity is the GAME's record and exists for effectively every
+            // save-loc, so a near load gets its readout back instantly instead
+            // of waiting for the camera to be differenced. No restart to refuse
+            // here -- a restart is raised by the teleport detector, and this
+            // branch only runs when that did not fire.
+            if (exact.haveVel)
+                WrEnergySeed(cam, exact.vel, "a save-loc loaded in place");
+        }
+    }
+    g_wasExact = exactNow;
 
     // A teleport. One lookup answers two questions, and it has to be one lookup:
     // the clock restores from a time only WE ever recorded, which exists for
@@ -130,7 +230,40 @@ void WrTimerTick(const Vec3 &cam, float dt)
         // start again by itself when you leave the pad.
         g_running = g_manual;   // a hand-started clock stays started
         g_elapsed = 0.0f;
+
+        // And the attempt you just failed is worth keeping until the next one
+        // begins. Left alone, the recorder wipes it on this very frame -- the
+        // trip back to the pad is a long way -- so by the time you have opened
+        // the panel to see what went wrong there is nothing to see, which reads
+        // as the graph clearing itself every time you look at it.
+        //
+        // `restart` rather than raw `teleported`: a mid-map save-loc load should
+        // still break the trail where it was and carry on, which is what it has
+        // always done.
+        //
+        // Only where a start zone is actually known, because leaving one is the
+        // ONLY thing that lets the hold go. With no runs loaded there are no
+        // zones (they are fitted from the run store), nothing could ever release
+        // it, and recording would stop for the session.
+        if (g_start.enabled && WrStartZoneCount() > 0)
+            WrLiveHold(true);
     }
+
+    // The hold's last way out.
+    //
+    // It is normally let go of by leaving the start zone, or by the clock
+    // re-starting from the anchor further down -- both of which are "the next
+    // attempt has begun". Neither is guaranteed: the start machine has strict
+    // re-arming rules and does not fire on every leg, and a hand-started clock
+    // never takes the anchor path because it never stops running. That leaves a
+    // recorder that is switched on and quietly recording nothing, which is a
+    // worse failure than the one the hold fixes.
+    //
+    // So: three seconds of clock since the restart zeroed it is a new attempt
+    // by any reading. Long enough that it cannot pre-empt either proper
+    // release, short enough that nothing is lost.
+    if (WrLiveHeld() && g_running && g_elapsed > 3.0f)
+        WrLiveClear();
 
     // The start-zone machine, fed the flags rather than allowed to take them.
     //
@@ -156,6 +289,13 @@ void WrTimerTick(const Vec3 &cam, float dt)
                         WrTrackNameOf(crossed->trackType, crossed->trackNum));
             WrTimerSet(0.0f, why);
         }
+
+        // The new attempt starts here, so the old one stops being the answer.
+        // Clearing rather than merely un-holding, so what the graph shows is one
+        // attempt from the start line and not a session's worth of them -- and
+        // because the clock was just zeroed a line above, keeping the old points
+        // would put the time axis into reverse.
+        WrLiveClear();
         return;
     }
 
@@ -184,6 +324,19 @@ void WrTimerTick(const Vec3 &cam, float dt)
         {
             g_running = true;
             g_elapsed = 0.0f;
+
+            // NOT a place to release the live hold, and it looked like one.
+            //
+            // This fires as soon as the camera is START_UNITS (32) from the
+            // anchor, and the anchor is the chased run's start point -- which
+            // is a hundred or three from the pad a fail trigger drops you on.
+            // So on essentially every restart the distance is already over 32
+            // on the very frame the hold is taken, and clearing here undid it
+            // in the same WrTimerTick. The buffer was emptied exactly as before
+            // and the graph was still blank when you went to look at it.
+            //
+            // The hold is let go of by leaving the start zone, which is what the
+            // user asked for, and by the clock-based backstop above.
         }
         return;
     }

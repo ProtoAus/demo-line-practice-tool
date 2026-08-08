@@ -7,6 +7,30 @@
 
 struct WrRun;
 
+// Three caps that used to be sliders in the Display tab, and are constants now
+// because none of them was ever a matter of taste.
+//
+// WR_MAX_RUNS_DRAWN -- how many enabled runs are drawn at all. Measured cost is
+// in the WrRenderDefaults comment: 8 runs 0.24 ms/frame, 256 runs 8.1 ms, 1000
+// runs 32.5 ms against a 16.7 ms frame at 60 Hz. Not redundant with the per-run
+// checkboxes: the "All" button can enable up to WR_MAX_RUNS = 1000 in one press,
+// and this is applied in the renderer afterwards. It must be read in BOTH the
+// draw loop and the pick loop or the crosshair readout names a line that is not
+// on screen.
+//
+// WR_MAX_LABELS_PER_FRAME -- numbers on the line, across every run. Not just a
+// clutter limit: labels and name tags share the one WR_MAX_TAG_RECTS pool and
+// numbers register first, so without a cap two or three runs' numbers can take
+// every slot and silently starve every later run's NAME TAG. It also buys about
+// half a millisecond a frame at 256 runs as an early-out.
+//
+// The per-run checkpoint cap is gone entirely rather than made a constant: its
+// slider stopped at 64, WR_MAX_MARKERS is 64, and the loader clamps to it, so
+// the maximum setting already was "no limit" and the setting could not express
+// anything the storage did not already enforce.
+#define WR_MAX_RUNS_DRAWN 256
+#define WR_MAX_LABELS_PER_FRAME 40
+
 struct WrRenderSettings
 {
     float thickness;
@@ -15,7 +39,6 @@ struct WrRenderSettings
     float fadeStartFraction;    // fraction of maxDrawDistance where fade begins
     float pixelTolerance;       // screen-space decimation
     int pointBudget;            // per run, per frame; 0 disables the cap
-    int maxRunsDrawn;
 
     // What varies the colour ALONG a line. One of WrLineColour, because these
     // were three independent booleans with an unwritten precedence -- efficiency
@@ -59,8 +82,6 @@ struct WrRenderSettings
     int maxPeaksPerRun;
     unsigned int peakLabel;     // WR_LABEL_* mask
     unsigned int markerLabel;   // WR_LABEL_* mask
-    int maxMarkersPerRun;
-    int maxLabelsPerFrame;      // across every run; labels crowd faster than lines
 
     // Where you will be in a quarter of a second, drawn from your midsection.
     bool drawVelocity;

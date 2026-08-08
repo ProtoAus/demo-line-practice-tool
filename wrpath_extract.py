@@ -59,6 +59,7 @@ import lzma
 import bisect
 import math
 import os
+import shutil
 import struct
 import sys
 import time
@@ -2167,17 +2168,31 @@ def _download(dest, rows, have, into_game=None):
         if len(blob) < 0x100 or blob[:4] != b"MMTV":
             print("      not a demo (%d bytes); skipped" % len(blob))
             continue
-        with open(os.path.join(dest, r[4] + ".mtv"), "wb") as f:
+        ours = os.path.join(dest, r[4] + ".mtv")
+        with open(ours, "wb") as f:
             f.write(blob)
         if into_game:
             # Written the same way everything else here is: a temp file then an
             # atomic replace, so the game can never see a half-written replay
             # even if it is scanning that directory at the time.
+            #
+            # COPIED FROM OUR OWN FILE, with copy2, rather than written from the
+            # blob a second time -- and that is load-bearing rather than tidy.
+            # copy2 carries the modification time across, so the copy in the
+            # game's folder has a timestamp identical to ours down to the tick.
+            #
+            # That is the DLL's proof of ownership. It has to decide whether a
+            # file already sitting at that destination is one of ours (and so
+            # removable) or one the game downloaded by itself (and so absolutely
+            # not), and "our tree holds a file with the same hash" does not
+            # answer it: the game can download the same run afterwards, and then
+            # both are true. Identical size AND identical write time is an
+            # answer, because the game writes its downloads when IT fetched
+            # them. See ADOPTION in wr_intogame.h.
             try:
                 gpath = os.path.join(into_game, r[4] + ".mtv")
                 tmp = gpath + ".tmp"
-                with open(tmp, "wb") as f:
-                    f.write(blob)
+                shutil.copy2(ours, tmp)
                 os.replace(tmp, gpath)
             except OSError as e:
                 print("      (could not place it in the game folder: %s)" % e)

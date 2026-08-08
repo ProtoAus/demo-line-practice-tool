@@ -25,6 +25,12 @@ static WrPoint g_live[WR_LIVE_POINTS];
 static int g_liveCount = 0;
 static bool g_liveOn = true;
 
+// Recording paused with the buffer intact, so a failed attempt survives to be
+// looked at. Set and cleared from wr_timer.cpp, which is the one place that
+// knows about start zones -- this file is deliberately linked without
+// wr_start.cpp by the rank harness.
+static bool g_liveHold = false;
+
 // Set when a load finishes, cleared by the first WrUpdateNearest with a live
 // camera, which is where the default run selection is actually made.
 static bool g_autoEnablePending = false;
@@ -1275,7 +1281,31 @@ int WrAvailableMapRuns(int i)
 
 bool WrLiveEnabled(void) { return g_liveOn; }
 void WrLiveSetEnabled(bool on) { g_liveOn = on; }
-void WrLiveClear(void) { g_liveCount = 0; }
+
+void WrLiveClear(void)
+{
+    g_liveCount = 0;
+    g_liveHold = false;     // clearing is also how the hold is let go of
+}
+
+bool WrLiveHeld(void) { return g_liveHold; }
+
+// Stop recording without throwing away what has been recorded.
+//
+// The buffer used to be wiped by the teleport branch in WrLiveRecord below, so
+// failing a run erased the attempt you had just made -- and since the graph is
+// something you look at AFTER failing, it always looked as though opening the
+// graph had reset it. Holding keeps the attempt on screen until the next one
+// actually starts, which is when leaving the start zone clears it.
+//
+// A hold rather than "keep appending", and that is not a preference: a live
+// point's t is the run clock, which is zeroed on a restart and again at the
+// start line, so appending across one would send the graph's time axis
+// backwards -- and wr_profile.cpp binary-searches that axis.
+void WrLiveHold(bool on)
+{
+    g_liveHold = on;
+}
 
 const WrPoint *WrLivePoints(int *count)
 {
@@ -1327,7 +1357,7 @@ const WrPoint *WrLiveNearest(const Vec3 &pos, float radius)
 // compare at that point.
 void WrLiveRecord(const Vec3 &pos, const Vec3 &vel, float elapsed)
 {
-    if (!g_liveOn || !WrSaneVec(pos))
+    if (!g_liveOn || g_liveHold || !WrSaneVec(pos))
         return;
 
     Vec3 v = WrSaneVec(vel) ? vel : WrVec(0.0f, 0.0f, 0.0f);
@@ -1346,7 +1376,17 @@ void WrLiveRecord(const Vec3 &pos, const Vec3 &vel, float elapsed)
 
     // A teleport (savestate load, stage restart) should break the line rather
     // than draw a straight bar across the map.
-    if (moved > 512.0f)
+    //
+    // 400 rather than the 512 this used to be, to agree with the one teleport
+    // threshold the rest of the tool uses (TELEPORT_UNITS, wr_energy.cpp). They
+    // disagreed, so a jump between 400 and 512 units was a teleport everywhere
+    // else and ordinary movement here -- drawn as the straight bar the comment
+    // above says cannot happen.
+    //
+    // Reached far less often now: a restart holds the buffer instead of
+    // arriving here, so what is left for this branch is the teleports nobody
+    // called a restart, which is what it was always meant to be for.
+    if (moved > WR_LIVE_TELEPORT_UNITS)
     {
         g_liveCount = 0;
         g_live[0].pos = pos;

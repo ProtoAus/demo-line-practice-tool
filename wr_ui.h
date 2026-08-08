@@ -15,4 +15,8 @@ void WrUiOnMapChanged(const char *map);
 // player has already bound.
 int WrUiHudCycleKey(void);
 
+// And the one that turns the "whose line is this" plate off and on. Defaults to
+// Home. Same list, same caveat: read, never swallowed.
+int WrUiPickToggleKey(void);
+
 #endif // WR_UI_H

@@ -62,7 +62,9 @@ void WrIdleTick(void)
         WrTimerReset();
         WrStartReset();
         WrRenderPickReset();
-        WrIntoGameRefresh();
+        // The prune alone. Adoption needs the numeric map id, which lives in the
+        // map index the panel owns, so it happens there.
+        WrIntoGameRefresh(NULL, 0);
         WrExtractOnMapChanged(map);
     }
 
@@ -158,6 +160,7 @@ static DWORD WINAPI HotkeyThread(LPVOID)
 {
     bool down = false;
     bool cycleDown = false;
+    bool pickDown = false;
     for (;;)
     {
         bool now = (GetAsyncKeyState(TOGGLE_KEY) & 0x8000) != 0;
@@ -176,6 +179,15 @@ static DWORD WINAPI HotkeyThread(LPVOID)
         if (cycNow && !cycleDown)
             WrEnergyCycleHudMode();
         cycleDown = cycNow;
+
+        // And the same for the "whose line is this" plate, Home by default. It
+        // sits over the thing it is naming, so being able to get rid of it
+        // without opening the panel is most of what makes it usable.
+        int pickKey = WrUiPickToggleKey();
+        bool pickNow = pickKey && (GetAsyncKeyState(pickKey) & 0x8000) != 0;
+        if (pickNow && !pickDown)
+            g_render.pickEnabled = !g_render.pickEnabled;
+        pickDown = pickNow;
 
         Sleep(30);
     }

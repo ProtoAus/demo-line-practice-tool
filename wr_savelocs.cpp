@@ -17,6 +17,23 @@
 #define MATCH_RADIUS 24.0f
 #define MATCH_VERTICAL 96.0f
 
+// And how close is close enough to mean "the game just PUT you here".
+//
+// Momentum restores the exact stored origin and the view sits directly above
+// it, so a frame after a load the camera's x and y are the save-loc's x and y
+// to a fraction of a unit. A unit of slack covers the camera interpolating and
+// the tenth-of-a-unit rounding in our own sidecar key, and nothing else: at
+// surf speed the camera crosses fifty units in a frame, so landing inside a
+// one-unit circle by moving is not something that happens by accident.
+//
+// HORIZONTAL, like the test above, and for a better reason than symmetry. The
+// obvious sharper version is cam.z == pos.z + eyeHeight, and it is wrong twice
+// over: eyeHeight is a SETTING with a slider, fixed at 64 because that is the
+// standing view offset, and a save-loc made or loaded while ducked has a
+// different one. Two coordinates agreeing to a fraction of a unit already say
+// everything a third would, and ducking cannot defeat them.
+#define MATCH_EXACT_RADIUS 1.0f
+
 // A velocity out of the game's file past this is not believed. The same number
 // wr_energy.cpp calls MAX_SANE_SPEED, kept separate rather than shared because
 // the two are guarding different things: that one rejects a camera difference
@@ -69,6 +86,29 @@ static long long g_mtime = 0;
 static volatile LONG g_busy = 0;
 static HANDLE g_thread = NULL;
 
+// Has a read for THIS map finished at least once?
+//
+// This used to be inferred as "g_count == 0 && g_timed == 0", meaning "we hold
+// nothing, so this must be the first look". On a map that has no save-locs yet
+// that is true after the first read, and after the second, and for ever -- so
+// the first save-loc you ever make on a map was never stamped, which is exactly
+// the one you make while working out whether the feature works at all.
+static bool g_readOnce = false;
+
+// A change to the game's file that arrived while a read was already running.
+//
+// The mtime used to be committed before the busy guard below, so a change that
+// found the reader busy was recorded as seen and then dropped: the file will
+// not change again by itself, so nothing ever re-read it and that save-loc was
+// never stamped. Two save-locs made in quick succession is all it takes.
+static bool g_rereadPending = false;
+
+// Bumped every time the table is replaced. Read by wr_timer.cpp, which has to
+// tell "the camera arrived on a save-loc" apart from "a save-loc appeared under
+// a camera that has not moved" -- the second being what making one where you
+// stand looks like from the outside.
+static volatile LONG g_generation = 0;
+
 // The run clock as it stood when a change to the game's file was noticed. This
 // is what a newly created save-loc is stamped with, and capturing it here rather
 // than when the read finishes is the point: the read is on a background thread
@@ -79,8 +119,22 @@ static float g_stampGained = 0.0f, g_stampLost = 0.0f, g_stampPeak = 0.0f;
 static bool g_stampEnergy = false;
 
 // Something worth showing on screen for a moment.
+//
+// The age is a real timestamp, not a counter. It used to advance by 1/200 per
+// call and the only caller is once per rendered frame, so "two seconds" was two
+// hundred frames -- 6.7 real seconds at 60 fps and 1.7 at 240. A note that
+// borrows a row on the crosshair readout has to expire in seconds, not in
+// however long a frame happens to take.
 static char g_recent[96] = {0};
-static float g_recentAge = 1e9f;
+static DWORD g_recentAt = 0;
+static WrSavelocNote g_recentKind = WR_NOTE_NONE;
+
+static void NoteNow(void)
+{
+    g_recentAt = GetTickCount();
+    if (!g_recentAt)
+        g_recentAt = 1;         // 0 means "nothing has happened"
+}
 
 static void EnsureCs(void)
 {
@@ -480,7 +534,11 @@ static void SaveSidecar(const char *map, const Saveloc *locs, int count)
 }
 
 // Copy out under the lock, write outside it.
-static void FlushSidecar(void)
+// `forMap` is the map the caller's data belongs to, and NULL means "whatever is
+// current". The background reader passes the map it actually parsed: it takes as
+// long as it takes, and a flush that straddled a map change wrote one map's
+// times into another map's file.
+static void FlushSidecar(const char *forMap)
 {
     static Saveloc snap[MAX_SAVELOCS];
     char map[72];
@@ -489,10 +547,14 @@ static void FlushSidecar(void)
     EnterCriticalSection(&g_cs);
     n = g_count;
     memcpy(snap, g_locs, sizeof(Saveloc) * (size_t)n);
-    strcpy_s(map, sizeof(map), g_map);
+    if (forMap && *forMap)
+        strcpy_s(map, sizeof(map), forMap);
+    else
+        strcpy_s(map, sizeof(map), g_map);
+    bool stillOurs = (strcmp(map, g_map) == 0);
     LeaveCriticalSection(&g_cs);
 
-    if (map[0])
+    if (map[0] && stillOurs)
         SaveSidecar(map, snap, n);
 }
 
@@ -507,6 +569,11 @@ static DWORD WINAPI ReadThread(LPVOID)
     strcpy_s(map, sizeof(map), g_map);
     LeaveCriticalSection(&g_cs);
 
+    // Snapshotted before the parse, because the commit below sets it and the
+    // question "was this the first look at this map" has to be answered with
+    // what was true when the read began.
+    bool readOnceBefore = g_readOnce;
+
     static Saveloc found[MAX_SAVELOCS];
     int n = 0;
     bool ok = map[0] && ParseGameFile(map, found, MAX_SAVELOCS, &n);
@@ -520,9 +587,24 @@ static DWORD WINAPI ReadThread(LPVOID)
 
     bool dirty = false;
     EnterCriticalSection(&g_cs);
+
+    // Did the map change while this read was in flight? If it did, everything
+    // below is about a map we have left: it must not claim to have looked at
+    // the new one, and it must not stamp anything.
+    bool sameMap = (strcmp(map, g_map) == 0);
+    if (sameMap)
+    {
+        // Set even when the read FAILED, a few lines down. "Have we looked
+        // here" is a different question from "was there anything to find", and
+        // on a machine with no savedlocs.txt at all the first read fails, the
+        // first save-loc you ever make creates the file, and treating that read
+        // as the first look means that save-loc is not stamped either.
+        g_readOnce = true;
+    }
+
     if (ok)
     {
-        bool firstForMap = (g_count == 0 && g_timed == 0);
+        bool firstForMap = !readOnceBefore || !sameMap;
 
         // Carry forward times for save-locs that are still there, so a re-read
         // triggered by the user making a new one does not lose the others, and
@@ -567,7 +649,7 @@ static DWORD WINAPI ReadThread(LPVOID)
             // the same file, matches nothing we hold the first time it shows up,
             // and would otherwise be stamped with the clock as though the player
             // had just made a save-loc there.
-            if (!matched && !firstForMap && found[i].fromCps &&
+            if (!matched && !firstForMap && sameMap && found[i].fromCps &&
                 g_stampValid && g_stampClock > 0.0f)
             {
                 found[i].ourTime = g_stampClock;
@@ -587,12 +669,14 @@ static DWORD WINAPI ReadThread(LPVOID)
                        g_stampClock);
                 _snprintf_s(g_recent, sizeof(g_recent), _TRUNCATE,
                             "save-loc saved at %.2fs", g_stampClock);
-                g_recentAge = 0.0f;
+                NoteNow();
+                g_recentKind = WR_NOTE_STAMPED;
             }
         }
 
         memcpy(g_locs, found, sizeof(Saveloc) * (size_t)n);
         g_count = n;
+        InterlockedIncrement(&g_generation);
         g_timed = timed;
         _snprintf_s(g_status, sizeof(g_status), _TRUNCATE,
                     "%d save-loc%s for this map, %d with a time",
@@ -608,7 +692,7 @@ static DWORD WINAPI ReadThread(LPVOID)
     LeaveCriticalSection(&g_cs);
 
     if (dirty)
-        FlushSidecar();
+        FlushSidecar(map);
 
     InterlockedExchange(&g_busy, 0);
     return 0;
@@ -617,8 +701,6 @@ static DWORD WINAPI ReadThread(LPVOID)
 void WrSavelocRefresh(const char *map, float elapsed, bool running)
 {
     EnsureCs();
-    if (g_recentAge < 1e8f)
-        g_recentAge += 1.0f / 200.0f;   // aged approximately; display only
     if (!map || !*map || !WrGameDir()[0])
         return;
 
@@ -633,30 +715,49 @@ void WrSavelocRefresh(const char *map, float elapsed, bool running)
     EnterCriticalSection(&g_cs);
     mapChanged = (strcmp(map, g_map) != 0);
     if (mapChanged)
+    {
         strcpy_s(g_map, sizeof(g_map), map);
+        g_readOnce = false;         // a fresh map has not been looked at yet
+    }
     LeaveCriticalSection(&g_cs);
 
-    if (!mapChanged && mtime == g_mtime)
+    bool changed = mapChanged || mtime != g_mtime;
+    if (!changed && !g_rereadPending)
         return;
-    g_mtime = mtime;
 
-    // Captured HERE, not when the read finishes. The read is on a background
-    // thread and takes as long as it takes; the clock that belongs to a new
-    // save-loc is the one at the instant the file changed.
-    g_stampClock = elapsed;
-    g_stampValid = running && !mapChanged;
+    if (changed)
+    {
+        g_mtime = mtime;
 
-    // And the banked energy from the same instant, for the same reason. The
-    // instantaneous figures do not need this -- they come back out of the game's
-    // own file on the way in -- but what has been GAINED and LOST over the
-    // attempt so far exists nowhere except in here.
-    g_stampGained = WrEnergyGained();
-    g_stampLost = WrEnergyLost();
-    g_stampPeak = WrEnergyPeak();
-    g_stampEnergy = WrEnergyValid();
+        // Captured HERE, not when the read finishes. The read is on a background
+        // thread and takes as long as it takes; the clock that belongs to a new
+        // save-loc is the one at the instant the file changed.
+        //
+        // And captured only on a real change, never on the retry below: a retry
+        // happens some frames later, and re-reading the clock then would stamp
+        // the save-loc with when we got round to it rather than when it was made.
+        g_stampClock = elapsed;
+        g_stampValid = running && !mapChanged;
+
+        // And the banked energy from the same instant, for the same reason. The
+        // instantaneous figures do not need this -- they come back out of the
+        // game's own file on the way in -- but what has been GAINED and LOST over
+        // the attempt so far exists nowhere except in here.
+        g_stampGained = WrEnergyGained();
+        g_stampLost = WrEnergyLost();
+        g_stampPeak = WrEnergyPeak();
+        g_stampEnergy = WrEnergyValid();
+    }
 
     if (InterlockedCompareExchange(&g_busy, 1, 0) != 0)
+    {
+        // A read is already running and this change is not in it. Remember to
+        // come back: the mtime above has already been committed, so without
+        // this the change is seen once, dropped, and never seen again.
+        g_rereadPending = true;
         return;
+    }
+    g_rereadPending = false;
     if (g_thread)
     {
         CloseHandle(g_thread);
@@ -664,7 +765,13 @@ void WrSavelocRefresh(const char *map, float elapsed, bool running)
     }
     g_thread = CreateThread(NULL, 0, ReadThread, NULL, 0, NULL);
     if (!g_thread)
+    {
+        // The mtime is already committed, so without re-arming the pending flag
+        // this change is seen once and never again -- the exact failure the
+        // flag exists to prevent, reached by a different route.
+        g_rereadPending = true;
         InterlockedExchange(&g_busy, 0);
+    }
 }
 
 // The save-loc you just landed on, whether or not we have ever timed it.
@@ -681,13 +788,13 @@ void WrSavelocRefresh(const char *map, float elapsed, bool running)
 // It also fixes a smaller wrong: landing on an untimed save-loc used to restore
 // the clock from a TIMED one up to 24 units away. Nearest wins, then its time is
 // used only if it has one.
-bool WrSavelocMatch(const Vec3 &pos, WrSavelocHit *out)
+static bool MatchWithin(const Vec3 &pos, float radius, WrSavelocHit *out)
 {
     if (!g_csReady)
         return false;
     bool found = false;
     EnterCriticalSection(&g_cs);
-    float bestD = MATCH_RADIUS * MATCH_RADIUS;
+    float bestD = radius * radius;
     for (int i = 0; i < g_count; i++)
     {
         float dz = g_locs[i].pos.z - pos.z;
@@ -706,6 +813,12 @@ bool WrSavelocMatch(const Vec3 &pos, WrSavelocHit *out)
                 out->pos = g_locs[i].pos;
                 out->vel = g_locs[i].vel;
                 out->haveVel = g_locs[i].haveVel;
+                // fromCps and ordinal were the two fields this used to leave
+                // alone, on callers that declare the hit uninitialised -- so
+                // anyone who read them got stack garbage rather than an answer.
+                // Nothing did until the exact matcher below wanted fromCps.
+                out->fromCps = g_locs[i].fromCps;
+                out->ordinal = g_locs[i].ordinal;
                 out->seconds = g_locs[i].ourTime;
                 out->suspect = g_locs[i].suspect;
                 out->byHand = g_locs[i].byHand;
@@ -721,6 +834,46 @@ bool WrSavelocMatch(const Vec3 &pos, WrSavelocHit *out)
     return found;
 }
 
+bool WrSavelocMatch(const Vec3 &pos, WrSavelocHit *out)
+{
+    return MatchWithin(pos, MATCH_RADIUS, out);
+}
+
+// "You are standing exactly where a save-loc says", which is what a load that
+// did not move you far enough to look like a teleport leaves behind.
+//
+// Same loop, one twenty-fourth of the radius. The caller supplies the edge:
+// being here is not an event, ARRIVING here is, and holding the load key parks
+// you on the spot for as long as you hold it.
+bool WrSavelocExactMatch(const Vec3 &pos, WrSavelocHit *out)
+{
+    return MatchWithin(pos, MATCH_EXACT_RADIUS, out);
+}
+
+void WrSavelocInstallForTest(const WrSavelocHit *rows, int n)
+{
+    EnsureCs();
+    EnterCriticalSection(&g_cs);
+    if (n > MAX_SAVELOCS) n = MAX_SAVELOCS;
+    if (n < 0) n = 0;
+    g_count = n;
+    g_timed = 0;
+    InterlockedIncrement(&g_generation);
+    for (int i = 0; i < n; i++)
+    {
+        memset(&g_locs[i], 0, sizeof(g_locs[i]));
+        g_locs[i].pos = rows[i].pos;
+        g_locs[i].vel = rows[i].vel;
+        g_locs[i].haveVel = rows[i].haveVel;
+        g_locs[i].fromCps = rows[i].fromCps;
+        g_locs[i].ourTime = rows[i].seconds;
+        g_locs[i].ordinal = rows[i].ordinal;
+        if (rows[i].seconds >= 0.0f)
+            g_timed++;
+    }
+    LeaveCriticalSection(&g_cs);
+}
+
 bool WrSavelocTimeAt(const Vec3 &pos, float *seconds)
 {
     WrSavelocHit hit;
@@ -728,6 +881,11 @@ bool WrSavelocTimeAt(const Vec3 &pos, float *seconds)
         return false;
     if (seconds) *seconds = hit.seconds;
     return true;
+}
+
+unsigned int WrSavelocGeneration(void)
+{
+    return (unsigned int)InterlockedCompareExchange(&g_generation, 0, 0);
 }
 
 int WrSavelocCount(void) { return g_count; }
@@ -775,7 +933,7 @@ void WrSavelocForget(int index)
     }
     LeaveCriticalSection(&g_cs);
     if (dirty)
-        FlushSidecar();
+        FlushSidecar(NULL);
 }
 
 // A time typed in by hand.
@@ -810,7 +968,7 @@ void WrSavelocSetTime(int index, float seconds)
     LeaveCriticalSection(&g_cs);
     if (dirty)
     {
-        FlushSidecar();
+        FlushSidecar(NULL);
         WrLogf("saveloc: time %.2fs entered by hand for save-loc %d",
                seconds, index + 1);
     }
@@ -830,13 +988,16 @@ void WrSavelocForgetAll(void)
     }
     g_timed = 0;
     LeaveCriticalSection(&g_cs);
-    FlushSidecar();
+    FlushSidecar(NULL);
     WrLogf("saveloc: every time for this map forgotten, on request");
 }
 
 const char *WrSavelocRecent(float *ageSeconds)
 {
-    if (ageSeconds) *ageSeconds = g_recentAge;
+    if (ageSeconds)
+        *ageSeconds = g_recentAt
+                          ? (float)(GetTickCount() - g_recentAt) / 1000.0f
+                          : 1e9f;
     return g_recent;
 }
 
@@ -844,7 +1005,25 @@ void WrSavelocNoteRestore(float seconds)
 {
     _snprintf_s(g_recent, sizeof(g_recent), _TRUNCATE,
                 "clock restored to %.2fs", seconds);
-    g_recentAge = 0.0f;
+    NoteNow();
+    g_recentKind = WR_NOTE_RESTORED;
+}
+
+WrSavelocNote WrSavelocRecentKind(void) { return g_recentKind; }
+
+// A load we DID notice, on a save-loc we have never timed.
+//
+// Worth its own message because the alternative is silence, and silence here is
+// ambiguous in the one way that matters: it looks identical to not having
+// noticed the load at all. That ambiguity is most of why this feature read as
+// broken -- 3098 of the 3239 save-locs on this machine have no time, so the
+// common case was a correct answer that said nothing.
+void WrSavelocNoteNoTime(void)
+{
+    _snprintf_s(g_recent, sizeof(g_recent), _TRUNCATE,
+                "save-loc loaded -- no time saved for that one");
+    NoteNow();
+    g_recentKind = WR_NOTE_NO_TIME;
 }
 
 void WrSavelocShutdown(void) {}

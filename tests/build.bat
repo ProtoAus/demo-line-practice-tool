@@ -70,6 +70,16 @@ cl /nologo /O2 /EHsc /W3 %DEFS% /I. tests\test_saveloc.cpp wr_savelocs.cpp ^
    wr_energy.cpp wr_log.cpp /Fe:tests\test_saveloc.exe /Fo:tests\ >nul
 if errorlevel 1 ( echo [!] test_saveloc FAILED to build & exit /b 1 )
 
+rem test_live links the real timer, the real recorder and the real save-loc
+rem table, because both things it checks are interactions BETWEEN those files
+rem rather than properties of any one of them: a restart holding the recorder,
+rem and a save-loc load that does not move the camera far enough to be seen as a
+rem teleport. Neither can be restated in a harness without restating the bug.
+cl /nologo /O2 /EHsc /W3 %DEFS% /I. tests\test_live.cpp wr_timer.cpp ^
+   wr_savelocs.cpp wr_path.cpp wr_start.cpp wr_profile.cpp wr_energy.cpp ^
+   wr_log.cpp /Fe:tests\test_live.exe /Fo:tests\ >nul
+if errorlevel 1 ( echo [!] test_live FAILED to build & exit /b 1 )
+
 del tests\*.obj >nul 2>&1
 
 set "RC=0"
@@ -81,6 +91,7 @@ tests\test_board.exe      || set "RC=1"
 tests\test_rank.exe       || set "RC=1"
 tests\test_start.exe      || set "RC=1"
 tests\test_saveloc.exe    || set "RC=1"
+tests\test_live.exe       || set "RC=1"
 
 if "%RC%"=="1" ( echo. & echo [!] SOME HARNESSES FAILED & exit /b 1 )
 echo.
