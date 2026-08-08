@@ -84,20 +84,42 @@ void WrTimerTick(const Vec3 &cam, float dt)
     Vec3 landed;
     bool teleported = WrEnergyTakeTeleport(&landed);
 
-    // A teleport. Either it landed on a save-loc we have a time for, in which
-    // case the clock goes back to what it said when that save-loc was made, or
-    // it did not and the clock is left alone -- deliberately, because guessing
-    // is worse than a number the user can see is stale.
+    // A teleport. One lookup answers two questions, and it has to be one lookup:
+    // the clock restores from a time only WE ever recorded, which exists for
+    // about four save-locs in a hundred, while the energy restores from a
+    // velocity the GAME recorded, which exists for effectively all of them. Two
+    // searches with those two different filters could match two different
+    // save-locs and restore a clock from one and a speed from the other.
     if (teleported)
     {
-        float restored = 0.0f;
-        if (WrSavelocTimeAt(landed, &restored))
+        WrSavelocHit hit;
+        if (WrSavelocMatch(landed, &hit))
         {
-            // A save-loc is a more specific answer than "you are near the
-            // start", so it wins over the restart below when both match.
-            WrTimerSet(restored, "loaded a save-loc");
-            WrSavelocNoteRestore(restored);
-            restart = false;
+            if (hit.seconds >= 0.0f)
+            {
+                // A save-loc is a more specific answer than "you are near the
+                // start", so it wins over the restart below when both match.
+                WrTimerSet(hit.seconds, "loaded a save-loc");
+                WrSavelocNoteRestore(hit.seconds);
+                restart = false;
+            }
+
+            // The velocity does not depend on us ever having timed this
+            // save-loc, so this runs on save-locs made years before WrLines
+            // existed. `landed` is the camera, which is what the energy figure
+            // is measured from -- not the origin in the file, which is the feet.
+            //
+            // Refused when this is a restart. A fail trigger drops you back at
+            // the start, and if you keep a save-loc on the start pad -- which is
+            // an ordinary thing to do -- the landing matches it. Seeding then
+            // would claim the speed that save-loc was made at, on a player the
+            // game has just stopped dead. The cost is that an untimed save-loc
+            // within 384 units of the anchor loses its instant readout, and that
+            // is a fair trade: those are spawn-adjacent, and a fifth of all
+            // save-locs are made standing still anyway, where there is nothing
+            // to seed.
+            if (hit.haveVel && !restart)
+                WrEnergySeed(landed, hit.vel, "a save-loc");
         }
     }
 

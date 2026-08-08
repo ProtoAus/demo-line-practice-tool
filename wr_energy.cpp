@@ -79,6 +79,29 @@ static WrArrow g_arrow;
 static WrSwing g_swing;
 static bool g_spliced = false;
 
+// The save-loc seed, and the guard-rail that decides whether to keep it.
+//
+// A seed is a claim about a velocity, made from a file, about a moment nothing
+// on this side witnessed. The very next thing that happens is that the velocity
+// window fills and MEASURES that velocity independently, about 35 ms later --
+// referring to almost the same instant, and therefore the only comparison worth
+// making. Half a second later would compare the seed against half a second of
+// the player actually playing, which says nothing about the seed at all.
+//
+// A seed that survives is kept and filtered from. One that does not is thrown
+// out, and the filters snap to the measurement exactly as they would have if
+// nothing had been seeded -- so a wrong seed costs the 35 ms it was always going
+// to cost, and not the third of a second it would cost if it were allowed to
+// bleed through the filters.
+#define SEED_TOLERANCE_FRAC 0.20f
+#define SEED_TOLERANCE_MIN  150.0f      // u/s; gravity over 35 ms is 28
+static float g_seedEnergy = 0.0f, g_seedSpeed = 0.0f;
+static bool g_seedPending = false;      // a seed is waiting for its first check
+static bool g_seedChecked = false;      // a result exists to report
+static bool g_seedRejected = false;
+static float g_seedErr = 0.0f, g_seedSpeedErr = 0.0f;
+static int g_seedCount = 0, g_seedRejects = 0;
+
 // After a discontinuity, how long the output filter is given to converge before
 // the gain/loss accumulator is allowed to bank anything. Three time constants is
 // 95% converged.
@@ -237,6 +260,10 @@ void WrEnergyReset(void)
     g_spliced = false;
     g_haveShownSpent = false;
     g_haveShownCarried = false;
+    g_seedPending = false;
+    g_seedChecked = false;      // a new map's Diagnostics starts with no claim
+    g_seedRejected = false;
+    g_seedCount = g_seedRejects = 0;
 
     g_valid = false;
     g_havePos = false;
@@ -394,6 +421,12 @@ static void Teleported(const Vec3 &pos)
     g_haveLastSpeed = false;
     g_haveFwd = false;
     g_haveReading = false;      // nothing here yet to hold
+
+    // Abandon a seed still waiting for its check. A second teleport before the
+    // window filled means the measurement that would have judged it is now about
+    // somewhere else entirely, and scoring the seed against that would be a lie
+    // about the one number here whose whole job is to be checkable.
+    g_seedPending = false;
     g_stillFor = 0.0f;
     g_held = false;
     g_speedRate = g_viewTurn = g_velTurn = 0.0f;
@@ -415,6 +448,124 @@ static void Teleported(const Vec3 &pos)
     WrSwingReset(&g_swing, WR_SWING_HYSTERESIS);
     g_spliced = false;
     WrLogf("energy: teleported back to the anchor, treating it as a restart");
+}
+
+// ---------------------------------------------------------------------------
+// Landing on a save-loc with the answer already in hand
+// ---------------------------------------------------------------------------
+//
+// Teleported() above resets every filter, and it is right to: a velocity got by
+// differencing camera positions cannot be carried across a discontinuity, so the
+// only honest thing to do is throw it away and measure again. That costs about a
+// third of a second of the headline figure climbing back to the truth, and 0.9 s
+// before anything is banked.
+//
+// A save-loc load is the one discontinuity where the far side is written down.
+// Momentum's savedlocs.txt records the velocity it is about to restore -- present
+// and finite in all 3239 save-locs on this machine, with 62% of them saved above
+// 250 u/s, which is exactly where the climb is most visible. So instead of
+// re-deriving a number the game already told us, start from it.
+//
+// WHY THIS TAKES A POSITION RATHER THAN USING THE FILE'S
+//
+// The file stores the player ORIGIN -- the feet -- and 78 of those 3239 were
+// saved crouched, with duckAmount missing entirely from 552 of them. Recovering
+// an eye height from that means modelling the duck. The camera position on the
+// landing frame needs no modelling: it is what every other energy figure in this
+// file is measured from, and it is already correct. Energy is a height, and
+// taking z from the file would put a 64-unit error into the one term that is
+// supposed to be exact.
+//
+// WHO MAY CALL THIS
+//
+// WrTimerTick, and only WrTimerTick. Not because of the teleport flags -- this
+// takes no flag and clears nothing -- but because WrTimerTick is the one place
+// that has already consumed them and matched the landing spot to a save-loc.
+// Seeding on a teleport that is NOT a save-loc load would be inventing a
+// velocity, which is the failure this whole file is arranged to avoid.
+void WrEnergySeed(const Vec3 &camPos, const Vec3 &vel, const char *why)
+{
+    if (!WrSaneVec(camPos) || !WrSaneVec(vel) || WrLength(vel) > MAX_SANE_SPEED)
+        return;                 // fall through to measuring it, as before
+
+    float energy = WrEnergyOf(camPos, vel);
+    float speed = WrLength(vel);
+
+    g_vel = vel;
+    WrEmaSeed(&g_velX, vel.x);
+    WrEmaSeed(&g_velY, vel.y);
+    WrEmaSeed(&g_velZ, vel.z);
+
+    g_speed = speed;
+    WrEmaSeed(&g_speedEma, speed);
+
+    g_now = energy;
+    g_nowSmooth = energy;
+    WrEmaSeed(&g_energyEma, energy);
+
+    g_zSmooth = camPos.z;
+    WrEmaSeed(&g_zEma, camPos.z);
+
+    // The live recorder stores whatever pair this publishes, so it has to agree
+    // with the readout rather than nearly agree.
+    g_sampleMid = camPos;
+    g_sampleRaw = vel;
+    g_sampleOk = true;
+
+    // There is something real to show, from this frame.
+    //
+    // g_valid only. NOT g_haveReading, which looks like it belongs here and does
+    // not: it arms the bit-identical hold test, and the comment on that test
+    // names this exact state as the reason it is gated. With no measured reading
+    // yet, a repeated camera frame has to be PUSHED so the window can fill --
+    // and 550 of the 3239 save-locs here were saved standing still, where the
+    // camera legitimately repeats. Arming the hold from a seed would freeze the
+    // readout on the value it was seeded with and stop the window ever filling,
+    // so nothing would ever confirm or correct it.
+    g_valid = true;
+
+    // The pivot starts where the number does, so the first banked change is
+    // measured against the truth rather than against zero.
+    WrSwingSeed(&g_swing, energy);
+
+    // One tau, not three.
+    //
+    // The long hold exists because a filter converging on a fresh value would
+    // otherwise bank the convergence itself as gained energy. Here there is
+    // nothing to converge -- but the velocity window still needs about 30 ms to
+    // span, and the match that produced this velocity could have picked the
+    // wrong save-loc. One tau lets the first measured samples confirm the seed
+    // before anything is committed to the totals.
+    g_settleFor = g_energy.smoothSeconds;
+    g_spliced = true;
+
+    // Checked against the very next measurement -- see the guard-rail in
+    // WrEnergySample. Nothing on this side can verify that the game applies the
+    // velocity its own file records, so this does not assert it, it measures it,
+    // and throws the seed away if it was wrong.
+    g_seedEnergy = energy;
+    g_seedSpeed = speed;
+    g_seedPending = true;
+
+    WrLogf("energy: seeded from %s -- %.0f u/s, energy %.0f", why ? why : "a save-loc",
+           speed, energy);
+}
+
+// What the seeds on this map turned out to be worth. False until one has been
+// checked, so the panel says nothing rather than reporting a zero it has not
+// earned.
+bool WrEnergySeedReport(WrEnergySeedInfo *out)
+{
+    if (!g_seedChecked || !out)
+        return false;
+    out->seedEnergy = g_seedEnergy;
+    out->seedSpeed = g_seedSpeed;
+    out->energyErr = g_seedErr;
+    out->speedErr = g_seedSpeedErr;
+    out->rejected = g_seedRejected;
+    out->seeds = g_seedCount;
+    out->rejects = g_seedRejects;
+    return true;
 }
 
 bool WrEnergyTakeRestart(void)
@@ -534,6 +685,49 @@ void WrEnergySample(const Vec3 &pos, float dt)
         WrVelPush(&g_win, pos.x, pos.y, pos.z, 0.0f);
         g_settledFor = 0.0f;
         return;
+    }
+
+    // --- the save-loc seed's guard-rail -------------------------------------
+    //
+    // This is the first independently measured velocity since a seed was
+    // planted, and it is deliberately checked HERE: before the EMA steps below,
+    // so that throwing the seed out leaves them unseeded and they snap to this
+    // measurement, which is exactly what an unseeded load does.
+    //
+    // Speed, not energy. The file states a velocity and this measures a
+    // velocity; energy is quadratic in it, so a band on energy would have to be
+    // derived from a band on speed anyway. The window spans about 35 ms starting
+    // at the landing, so the honest residual is small: gravity contributes 28
+    // u/s over that, and air acceleration not much more.
+    if (g_seedPending)
+    {
+        float measured = WrLength(raw);
+        float dv = measured - g_seedSpeed;
+        if (dv < 0.0f) dv = -dv;
+        float allow = g_seedSpeed * SEED_TOLERANCE_FRAC;
+        if (allow < SEED_TOLERANCE_MIN) allow = SEED_TOLERANCE_MIN;
+
+        g_seedPending = false;
+        g_seedChecked = true;
+        g_seedCount++;
+        g_seedErr = WrEnergyOf(mid, raw) - g_seedEnergy;
+        g_seedSpeedErr = measured - g_seedSpeed;
+        g_seedRejected = (dv > allow);
+
+        if (g_seedRejected)
+        {
+            g_seedRejects++;
+            WrEmaReset(&g_velX); WrEmaReset(&g_velY); WrEmaReset(&g_velZ);
+            WrEmaReset(&g_speedEma); WrEmaReset(&g_energyEma); WrEmaReset(&g_zEma);
+            WrTrendReset(&g_trend);
+            g_swing.have = false;
+            // And back to the full hold, because from here this is an ordinary
+            // unseeded teleport and the reasoning for three taus applies again.
+            g_settleFor = SETTLE_TAUS * g_energy.smoothSeconds;
+            WrLogf("energy: seed REJECTED -- the file said %.0f u/s, the first "
+                   "measurement says %.0f. Measuring it instead.",
+                   g_seedSpeed, measured);
+        }
     }
 
     g_vel.x = WrEmaStep(&g_velX, raw.x, dt, g_energy.velTau);

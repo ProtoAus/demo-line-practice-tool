@@ -155,6 +155,11 @@ void WrRenderDefaults(void)
     g_render.pickDepthBias = 0.35f;
     g_render.pickThickBoost = 1.8f;
     g_render.pickHoldSeconds = 0.25f;
+    // Clear space between the picked point and the nearest edge of the plate,
+    // which is a promise the old code could not keep -- it offset the box's
+    // CENTRE, so what you actually got depended on how many rows were in it.
+    // 40 against a ring of radius 11 leaves the point and its ring in the open.
+    g_render.pickOffsetPx = 40.0f;
     g_render.pickLabel = WR_LABEL_SPEED | WR_LABEL_ENERGY | WR_LABEL_TIME;
     g_render.pickRing = true;
 
@@ -2557,6 +2562,14 @@ static void EmitPickPlate(ImDrawList *dl)
     const int kMaxLines = 8;
     int n = 0;
 
+    // Ask for this runner's name and picture.
+    //
+    // EmitTag asks too, and used to be the ONLY place that did -- so a run you
+    // aimed at whose name tag was switched off, or too far away to be drawn,
+    // never had its avatar fetched and could only ever show the coloured dot.
+    // The plate has to ask for itself.
+    WrSteamWant(run->steamId);
+
     const char *who = WrSteamPersona(run->steamId);
     if (!who || !*who)
         who = run->player[0] ? run->player : "(unknown)";
@@ -2607,13 +2620,35 @@ static void EmitPickPlate(ImDrawList *dl)
     ImFont *font = WrFontFor(14.0f * g_render.tagScale, &size);
     float lh = size * 1.3f;
     float pad = 6.0f * g_render.tagScale;
+
+    // The avatar sits beside the NAME only, so it changes the shape of the first
+    // row rather than of the plate. Its width is reserved whether or not the
+    // picture has arrived -- Steam answers a request asynchronously, and a plate
+    // that grew by twenty pixels a second after it appeared would be worse than
+    // one that starts the right size and fills in.
+    int avatarSize = 0;
+    void *avatar = NULL;
+    float icon = 0.0f, gap = 0.0f;
+    if (g_render.tagAvatars)
+    {
+        avatar = WrSteamAvatar(run->steamId, &avatarSize);
+        icon = 22.0f * g_render.tagScale;
+        gap = 4.0f * g_render.tagScale;
+    }
+
     float w = 0.0f;
     for (int i = 0; i < n; i++)
     {
         ImVec2 m = font->CalcTextSizeA(size, FLT_MAX, 0.0f, lines[i]);
-        if (m.x > w) w = m.x;
+        float need = m.x + (i == 0 ? icon + gap : 0.0f);
+        if (need > w) w = need;
     }
-    float h = lh * (float)n;
+
+    // The first row is as tall as the taller of the two things in it. Every
+    // other row is a line of text. `h = lh * n` was right only while nothing in
+    // the plate was bigger than a glyph.
+    float row0h = (icon > lh) ? icon : lh;
+    float h = row0h + lh * (float)(n - 1);
 
     // Anchored to the picked point when it is on screen, and to the crosshair
     // when it is not -- which happens while the hold is running out after you
@@ -2621,18 +2656,39 @@ static void EmitPickPlate(ImDrawList *dl)
     float ax = onScreen ? at.x : g_sw * 0.5f;
     float ay = onScreen ? at.y : g_sh * 0.5f;
 
-    // Never on top of the crosshair. Pushed away from screen centre, so the
-    // thing you are aiming at stays visible.
+    // Never on top of the thing it is describing. Pushed away from the centre of
+    // the screen, so aiming up and right puts the plate up and right.
+    //
+    // The distance is to the plate's EDGE, which the old version got wrong: it
+    // pushed by a fixed amount and then centred the box on the pushed point, so
+    // the clearance it actually delivered depended on how tall the box happened
+    // to be. With five rows and a mostly-vertical push, a nominal 26 px of
+    // offset put the near edge nineteen pixels the WRONG side of the point --
+    // the box sat on top of what you were aiming at, and no amount of increasing
+    // that number would have reliably fixed it.
     float dx = ax - g_sw * 0.5f, dy = ay - g_sh * 0.5f;
     float len = sqrtf(dx * dx + dy * dy);
-    if (len < 1.0f) { dx = 0.0f; dy = 1.0f; len = 1.0f; }
-    float ox = dx / len * 26.0f, oy = dy / len * 26.0f;
+    if (len < 1.0f) { dx = 0.70710678f; dy = -0.70710678f; len = 1.0f; }
+    float dirx = dx / len, diry = dy / len;
 
-    float x = ax + ox;
-    float y = ay + oy - h * 0.5f;
-    if (x + w + pad * 2.0f > g_sw) x = g_sw - w - pad * 2.0f;
+    float boxW = w + pad * 2.0f, boxH = h + pad * 2.0f;
+    float hw = boxW * 0.5f, hh = boxH * 0.5f;
+
+    // How far the centre must sit along the push direction for the box's own
+    // boundary to clear the point. This is the push ray clipped against the
+    // box's half-extents -- the same edge the connector below attaches to, so
+    // the two can never disagree about where the boundary is.
+    float ex = dirx < 0.0f ? -dirx : dirx;
+    float ey = diry < 0.0f ? -diry : diry;
+    float tx = ex > 1e-4f ? hw / ex : 1e30f;
+    float ty = ey > 1e-4f ? hh / ey : 1e30f;
+    float half = tx < ty ? tx : ty;
+
+    float x = ax + dirx * (g_render.pickOffsetPx + half) - hw;
+    float y = ay + diry * (g_render.pickOffsetPx + half) - hh;
+    if (x + boxW > g_sw) x = g_sw - boxW;
     if (x < 0.0f) x = 0.0f;
-    if (y + h + pad * 2.0f > g_sh) y = g_sh - h - pad * 2.0f;
+    if (y + boxH > g_sh) y = g_sh - boxH;
     if (y < 0.0f) y = 0.0f;
 
     // Drawn last of everything in the frame, so it is never under a name tag or
@@ -2640,16 +2696,49 @@ static void EmitPickPlate(ImDrawList *dl)
     // before the run loop, and the plate's size is not known until the run has
     // been picked. Being opaque and on top is the cheaper answer to the same
     // problem -- the labels underneath are still readable either side of it.
-    ImVec2 p0(x, y), p1(x + w + pad * 2.0f, y + h + pad * 2.0f);
+    ImVec2 p0(x, y), p1(x + boxW, y + boxH);
+
+    // The leader goes down FIRST, so the plate is painted over it.
+    //
+    // It used to be drawn after the background and before the text, which put a
+    // stroke across the box everywhere it did not happen to cross a glyph. And
+    // its endpoint picked a box edge from the sign of `ox` -- computed before
+    // the on-screen clamp above may have moved `x` -- so near a screen edge it
+    // aimed at the FAR side and cut through the middle.
+    //
+    // Both go away by attaching to the nearest point of the final rect and
+    // letting the fill cover the rest. No edge to pick, and nothing to keep in
+    // step with the clamp.
+    if (onScreen)
+    {
+        ImVec2 attach(WrClampF(at.x, p0.x, p1.x), WrClampF(at.y, p0.y, p1.y));
+        dl->AddLine(at, attach, col, 1.5f);
+    }
+
     dl->AddRectFilled(p0, p1, WithAlpha(0xC0000000u, fade), 5.0f);
     dl->AddRect(p0, p1, col, 5.0f, 0, 1.5f);
-    if (onScreen)
-        dl->AddLine(at, ImVec2(x + (ox < 0.0f ? w + pad * 2.0f : 0.0f),
-                               y + h * 0.5f + pad), col, 1.5f);
+
+    // The avatar, in the first row, left of the name. Same recipe as EmitTag,
+    // including the fallback: a dot in the run's colour while Steam is still
+    // fetching, or for ever if the cache was full when we asked.
+    if (icon > 0.0f)
+    {
+        ImVec2 ic(x + pad, y + pad + (row0h - icon) * 0.5f);
+        if (avatar)
+            dl->AddImage((ImTextureID)avatar, ic, ImVec2(ic.x + icon, ic.y + icon));
+        else
+            dl->AddCircleFilled(ImVec2(ic.x + icon * 0.5f, ic.y + icon * 0.5f),
+                                icon * 0.42f, col, 14);
+    }
 
     for (int i = 0; i < n; i++)
     {
-        ImVec2 tp(x + pad, y + pad + lh * (float)i);
+        // Row 0 is indented past the avatar and centred against it; the rest
+        // stack below the whole of row 0, not below one line height.
+        float tx = x + pad + (i == 0 ? icon + gap : 0.0f);
+        float ty = (i == 0) ? y + pad + (row0h - size) * 0.5f
+                            : y + pad + row0h + lh * (float)(i - 1);
+        ImVec2 tp(tx, ty);
         dl->AddText(font, size, ImVec2(tp.x + 1.0f, tp.y + 1.0f),
                     WithAlpha(0xC0000000u, fade), lines[i]);
         dl->AddText(font, size, tp, cols[i], lines[i]);

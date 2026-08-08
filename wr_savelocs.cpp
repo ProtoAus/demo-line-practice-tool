@@ -1,6 +1,7 @@
 // wr_savelocs.cpp  --  see wr_savelocs.h.
 
 #include "wr_savelocs.h"
+#include "wr_energy.h"      // the banked figures stamped onto a new save-loc
 #include "wr_log.h"
 
 #include <stdio.h>
@@ -16,17 +17,43 @@
 #define MATCH_RADIUS 24.0f
 #define MATCH_VERTICAL 96.0f
 
+// A velocity out of the game's file past this is not believed. The same number
+// wr_energy.cpp calls MAX_SANE_SPEED, kept separate rather than shared because
+// the two are guarding different things: that one rejects a camera difference
+// this one rejects a corrupt field, and neither should quietly change when the
+// other is tuned. The fastest of the 3239 records here is 6058 u/s.
+#define WR_SAVELOC_MAX_SPEED 10000.0f
+
 // Sidecar format version. 1 had no header line and keyed on position alone; its
 // times were also written by the proximity bug, so they load as `suspect`.
-#define SIDECAR_VERSION 2
+// 3 appends the energy the readout had banked when the loc was made, and marks
+// times that were typed in by hand. A v2 file still loads: its rows simply have
+// no energy and were not typed, which is exactly what they were.
+#define SIDECAR_VERSION 3
 #define SIDECAR_TAG "wrlines-savelocs"
+
+// Row flags in a v3 sidecar. A bitfield rather than more columns, so a later
+// version can add one without moving anything already written.
+#define SIDE_BY_HAND     1      // the time was typed in, not stamped
+#define SIDE_HAS_ENERGY  2      // gained/lost/peak on this row mean something
 
 struct Saveloc
 {
     Vec3 pos;
+    Vec3 vel;           // the game's own record of how fast you were going
+    bool haveVel;       // false when it was absent, or not a sane number
+    bool fromCps;       // a real save-loc, not an entry from "startmarks"
     float ourTime;      // seconds, or -1 when we have never timed it
     int ordinal;        // among entries sharing this position, in file order
     bool suspect;       // time came from a v1 sidecar
+    bool byHand;        // time was typed in rather than stamped on creation
+
+    // What the energy readout had banked at the moment this loc was made. Only
+    // ever written by us, so it is absent for every loc made before v0.4.1 --
+    // which is the normal case, and reads as "reset the accumulators", exactly
+    // what happened before this existed.
+    bool haveEnergy;
+    float gained, lost, peak;
 };
 
 static CRITICAL_SECTION g_cs;
@@ -48,6 +75,8 @@ static HANDLE g_thread = NULL;
 // and takes as long as it takes.
 static float g_stampClock = -1.0f;
 static bool g_stampValid = false;
+static float g_stampGained = 0.0f, g_stampLost = 0.0f, g_stampPeak = 0.0f;
+static bool g_stampEnergy = false;
 
 // Something worth showing on screen for a moment.
 static char g_recent[96] = {0};
@@ -81,17 +110,32 @@ static const char *SidecarPath(const char *map)
 // Parsing
 // ---------------------------------------------------------------------------
 //
-// Not a general KeyValues parser, and deliberately so. We need one thing: the
-// "pos" of every entry inside one named map's block. So this tracks brace depth,
-// notes the depth at which the map's block opened, and reads pos lines below it.
-// A malformed file yields no save-locs rather than a crash.
+// Not a general KeyValues parser, and deliberately so. We need two things: the
+// "pos" and the "vel" of every entry inside one named map's block. So this
+// tracks brace depth, notes the depth at which the map's block opened, and reads
+// those two keys below it. A malformed file yields no save-locs rather than a
+// crash.
+//
+// THE VELOCITY WAS ALWAYS THERE
+//
+// Only "pos" was read until v0.4.1, and the rest of the record -- vel, ang,
+// zone, track, gravityScale, crouched -- fell through the tokenizer and was
+// discarded. That made loading a save-loc look, to the energy readout, exactly
+// like any other 400-unit teleport: every filter reset, and about a third of a
+// second of climbing back to a number the file had known all along.
+//
+// Measured across the 3239 save-locs of 261 maps on this machine: "vel" is
+// present and finite in ALL of them, 62% were saved above 250 u/s and 46% above
+// 1000, and "predictedVel" disagrees with "vel" in two records out of 3239. So
+// the field is both universally available and unambiguous. See WrEnergySeed.
 
-static bool ParseGameFile(const char *map, Saveloc *out, int maxOut, int *count)
+static bool ParseFile(const char *path, const char *map, Saveloc *out,
+                      int maxOut, int *count)
 {
     *count = 0;
 
     FILE *f = NULL;
-    if (fopen_s(&f, GamePath(), "r") != 0 || !f)
+    if (fopen_s(&f, path, "r") != 0 || !f)
         return false;
 
     char line[512];
@@ -99,6 +143,30 @@ static bool ParseGameFile(const char *map, Saveloc *out, int maxOut, int *count)
     int mapDepth = -1;
     bool inMap = false;
     char pendingKey[128] = {0};
+
+    // Which record the block currently open created, or -1 for none yet.
+    //
+    // The velocity has to attach to the save-loc it belongs to and to no other.
+    // Valve writes these blocks alphabetically so "pos" does come before "vel"
+    // in every one of the 3239 records here -- but a parser that relies on that
+    // would, on the day it stopped being true, silently hand each save-loc the
+    // PREVIOUS one's velocity. Which is the worst possible failure: a plausible
+    // number, from the wrong place, with nothing on screen to say so.
+    int blockIndex = -1;
+
+    // Which section of the map's block we are inside: "cps", or "startmarks".
+    //
+    // A map block has more than one list of positions in it. Alongside "cps" --
+    // the save-locs -- Momentum keeps "startmarks", the place a run was started
+    // from, and those carry a pos with no vel, no time, no zone and no track.
+    // There are 16 of them across 12 maps here.
+    //
+    // Nothing used to distinguish them, so a startmark has always been read in
+    // as a save-loc. Harmless while only the position was read; not harmless
+    // now, because it is a position that can be landed on and has no velocity to
+    // land with, and because "an entry we have never seen before" is the signal
+    // that stamps a newly created save-loc with the clock.
+    char section[64] = {0};
 
     while (fgets(line, sizeof(line), f))
     {
@@ -115,15 +183,23 @@ static bool ParseGameFile(const char *map, Saveloc *out, int maxOut, int *count)
                 inMap = true;
                 mapDepth = depth;
             }
+            // The block one level inside the map's is the section: "cps" or
+            // "startmarks". One level further in is an entry.
+            if (inMap && depth == mapDepth + 1)
+                strncpy_s(section, sizeof(section), pendingKey, _TRUNCATE);
             pendingKey[0] = '\0';
+            blockIndex = -1;        // a new block owns nothing yet
             continue;
         }
         if (*p == '}')
         {
             if (inMap && depth == mapDepth)
                 break;                  // finished this map's block
+            if (inMap && depth == mapDepth + 1)
+                section[0] = '\0';
             depth--;
             pendingKey[0] = '\0';
+            blockIndex = -1;
             continue;
         }
 
@@ -155,19 +231,102 @@ static bool ParseGameFile(const char *map, Saveloc *out, int maxOut, int *count)
         val[n] = '\0';
         pendingKey[0] = '\0';
 
-        if (inMap && _stricmp(key, "pos") == 0 && *count < maxOut)
+        if (inMap && _stricmp(key, "pos") == 0)
         {
+            // Cleared first, so a commit that fails cannot leave a later "vel"
+            // pointing at the previous record. That matters past maxOut, where
+            // positions stop being committed but the velocity lines keep coming.
+            blockIndex = -1;
+            float x = 0.0f, y = 0.0f, z = 0.0f;
+            if (*count < maxOut && sscanf_s(val, "%f %f %f", &x, &y, &z) == 3)
+            {
+                Vec3 p = WrVec(x, y, z);
+                // sscanf_s reads "-nan(ind)" happily and returns 3 for it, so
+                // the field count is not the guard here; WrSaneFloat's
+                // self-comparison is. This file holds thirteen such values.
+                if (WrSaneVec(p))
+                {
+                    // Zeroed rather than assigned field by field. The caller
+                    // parses into a static array that is reused every read, so
+                    // anything left untouched here would silently inherit
+                    // whatever the LAST parse put at this index -- which for a
+                    // velocity would mean a startmark quietly acquiring the
+                    // speed of whichever save-loc held the slot before it.
+                    memset(&out[*count], 0, sizeof(out[*count]));
+                    out[*count].pos = p;
+                    out[*count].ourTime = -1.0f;
+                    out[*count].fromCps = (_stricmp(section, "cps") == 0);
+                    blockIndex = *count;
+                    (*count)++;
+                }
+            }
+        }
+        else if (inMap && blockIndex >= 0 && _stricmp(key, "vel") == 0)
+        {
+            // _stricmp, not a prefix test: "predictedVel" is a real key in every
+            // one of these blocks and is not the field the game restores from.
             float x = 0.0f, y = 0.0f, z = 0.0f;
             if (sscanf_s(val, "%f %f %f", &x, &y, &z) == 3)
             {
-                out[*count].pos = WrVec(x, y, z);
-                out[*count].ourTime = -1.0f;
-                (*count)++;
+                Vec3 v = WrVec(x, y, z);
+                // Refused rather than clamped. This file genuinely does contain
+                // garbage -- a "stamina" of -nan(ind) turned up in the 3239
+                // records here -- and a refused velocity costs only the old
+                // behaviour, where a wrong one is a wrong readout that looks
+                // exactly as confident as a right one.
+                if (WrSaneVec(v) && WrLength(v) <= WR_SAVELOC_MAX_SPEED)
+                {
+                    out[blockIndex].vel = v;
+                    out[blockIndex].haveVel = true;
+                }
             }
         }
     }
     fclose(f);
     return true;
+}
+
+static bool ParseGameFile(const char *map, Saveloc *out, int maxOut, int *count)
+{
+    return ParseFile(GamePath(), map, out, maxOut, count);
+}
+
+static void AssignOrdinals(Saveloc *locs, int count);
+
+// The same parser, over a file of the caller's choosing, reported in the public
+// struct. Exists so the harness can drive the section and velocity rules against
+// a fixture: those rules are about the SHAPE of Momentum's file, and a test that
+// re-implemented the shape would only ever agree with itself.
+bool WrSavelocParseFile(const char *path, const char *map,
+                        WrSavelocHit *out, int maxOut, int *count)
+{
+    if (count) *count = 0;
+    if (!path || !map || !out || maxOut <= 0 || !count)
+        return false;
+
+    Saveloc *tmp = (Saveloc *)calloc((size_t)maxOut, sizeof(Saveloc));
+    if (!tmp)
+        return false;
+
+    int n = 0;
+    bool ok = ParseFile(path, map, tmp, maxOut, &n);
+    if (ok)
+    {
+        AssignOrdinals(tmp, n);
+        for (int i = 0; i < n; i++)
+        {
+            memset(&out[i], 0, sizeof(out[i]));
+            out[i].pos = tmp[i].pos;
+            out[i].vel = tmp[i].vel;
+            out[i].haveVel = tmp[i].haveVel;
+            out[i].fromCps = tmp[i].fromCps;
+            out[i].seconds = tmp[i].ourTime;
+            out[i].ordinal = tmp[i].ordinal;
+        }
+        *count = n;
+    }
+    free(tmp);
+    return ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -216,8 +375,22 @@ static void LoadSidecar(const char *map, Saveloc *locs, int count, int *timed)
         }
 
         float x, y, z, t;
-        int ord = 0;
-        if (version >= 2)
+        int ord = 0, flags = 0;
+        float gained = 0.0f, lost = 0.0f, peak = 0.0f;
+        if (version >= 3)
+        {
+            // The v2 tail is optional even in a v3 file, so a row that was
+            // written before the energy existed -- or trimmed by hand -- still
+            // loads as a plain time rather than being dropped.
+            int got = sscanf_s(line, "%f %f %f %d %f %d %f %f %f",
+                               &x, &y, &z, &ord, &t, &flags,
+                               &gained, &lost, &peak);
+            if (got < 5)
+                continue;
+            if (got < 9)
+                flags &= ~SIDE_HAS_ENERGY;
+        }
+        else if (version >= 2)
         {
             if (sscanf_s(line, "%f %f %f %d %f", &x, &y, &z, &ord, &t) != 5)
                 continue;
@@ -241,7 +414,20 @@ static void LoadSidecar(const char *map, Saveloc *locs, int count, int *timed)
             if (version >= 2 && locs[i].ordinal != ord)
                 continue;
             locs[i].ourTime = t;
-            locs[i].suspect = (version < SIDECAR_VERSION);
+            // Against 2, not against SIDECAR_VERSION. `suspect` means one exact
+            // thing -- written by v1's proximity bug, so it cannot be trusted --
+            // and testing it against whatever the current version happens to be
+            // would have re-marked every good time on disk as doubtful the next
+            // time this number went up.
+            locs[i].suspect = (version < 2);
+            locs[i].byHand = (flags & SIDE_BY_HAND) != 0;
+            if (flags & SIDE_HAS_ENERGY)
+            {
+                locs[i].haveEnergy = true;
+                locs[i].gained = gained;
+                locs[i].lost = lost;
+                locs[i].peak = peak;
+            }
             (*timed)++;
             break;
         }
@@ -269,7 +455,11 @@ static void SaveSidecar(const char *map, const Saveloc *locs, int count)
     fprintf(f, "# it in, so this is where ours lives. Keyed on position (indices\n");
     fprintf(f, "# renumber when one is deleted) plus an ordinal, because several\n");
     fprintf(f, "# save-locs commonly share a respawn point.\n");
-    fprintf(f, "# x y z ordinal seconds\n");
+    fprintf(f, "# The velocity comes from the game's own file and needs nothing\n");
+    fprintf(f, "# from here; what the energy readout had BANKED does not exist\n");
+    fprintf(f, "# anywhere else, so it is recorded beside the time.\n");
+    fprintf(f, "# x y z ordinal seconds flags gained lost peak\n");
+    fprintf(f, "# flags: 1 = time typed in by hand, 2 = energy columns mean something\n");
     for (int i = 0; i < count; i++)
     {
         // Zero is refused. The clock only starts once you leave the anchor, so
@@ -278,8 +468,13 @@ static void SaveSidecar(const char *map, const Saveloc *locs, int count)
         // for ever afterwards.
         if (locs[i].ourTime <= 0.0f)
             continue;
-        fprintf(f, "%.1f %.1f %.1f %d %.3f\n", locs[i].pos.x, locs[i].pos.y,
-                locs[i].pos.z, locs[i].ordinal, locs[i].ourTime);
+        int flags = 0;
+        if (locs[i].byHand)     flags |= SIDE_BY_HAND;
+        if (locs[i].haveEnergy) flags |= SIDE_HAS_ENERGY;
+        fprintf(f, "%.1f %.1f %.1f %d %.3f %d %.1f %.1f %.1f\n",
+                locs[i].pos.x, locs[i].pos.y, locs[i].pos.z,
+                locs[i].ordinal, locs[i].ourTime, flags,
+                locs[i].gained, locs[i].lost, locs[i].peak);
     }
     fclose(f);
 }
@@ -351,6 +546,11 @@ static DWORD WINAPI ReadThread(LPVOID)
                 {
                     found[i].ourTime = g_locs[j].ourTime;
                     found[i].suspect = g_locs[j].suspect;
+                    found[i].byHand = g_locs[j].byHand;
+                    found[i].haveEnergy = g_locs[j].haveEnergy;
+                    found[i].gained = g_locs[j].gained;
+                    found[i].lost = g_locs[j].lost;
+                    found[i].peak = g_locs[j].peak;
                     timed++;
                 }
                 break;
@@ -363,10 +563,23 @@ static DWORD WINAPI ReadThread(LPVOID)
             //
             // Suppressed on the first read for a map, where "new" only means
             // "we have not looked here before".
-            if (!matched && !firstForMap && g_stampValid && g_stampClock > 0.0f)
+            // `fromCps`, because a startmark is not a save-loc. It appears in
+            // the same file, matches nothing we hold the first time it shows up,
+            // and would otherwise be stamped with the clock as though the player
+            // had just made a save-loc there.
+            if (!matched && !firstForMap && found[i].fromCps &&
+                g_stampValid && g_stampClock > 0.0f)
             {
                 found[i].ourTime = g_stampClock;
                 found[i].suspect = false;
+                found[i].byHand = false;
+                if (g_stampEnergy)
+                {
+                    found[i].haveEnergy = true;
+                    found[i].gained = g_stampGained;
+                    found[i].lost = g_stampLost;
+                    found[i].peak = g_stampPeak;
+                }
                 timed++;
                 dirty = true;
                 WrLogf("saveloc: a NEW save-loc at (%.0f %.0f %.0f) stamped with "
@@ -433,6 +646,15 @@ void WrSavelocRefresh(const char *map, float elapsed, bool running)
     g_stampClock = elapsed;
     g_stampValid = running && !mapChanged;
 
+    // And the banked energy from the same instant, for the same reason. The
+    // instantaneous figures do not need this -- they come back out of the game's
+    // own file on the way in -- but what has been GAINED and LOST over the
+    // attempt so far exists nowhere except in here.
+    g_stampGained = WrEnergyGained();
+    g_stampLost = WrEnergyLost();
+    g_stampPeak = WrEnergyPeak();
+    g_stampEnergy = WrEnergyValid();
+
     if (InterlockedCompareExchange(&g_busy, 1, 0) != 0)
         return;
     if (g_thread)
@@ -445,7 +667,21 @@ void WrSavelocRefresh(const char *map, float elapsed, bool running)
         InterlockedExchange(&g_busy, 0);
 }
 
-bool WrSavelocTimeAt(const Vec3 &pos, float *seconds)
+// The save-loc you just landed on, whether or not we have ever timed it.
+//
+// This replaced a search that skipped untimed entries, and the difference is
+// not cosmetic. Two things now want to know which save-loc was loaded -- the
+// clock, and the energy readout -- and the velocity that seeds the energy is in
+// the GAME's file, so it exists for every save-loc, while our time exists for
+// about four in a hundred. Two independent searches with different filters could
+// therefore land on two different save-locs and restore a clock from one and a
+// speed from the other. One match, both answers, and the caller decides what it
+// can use.
+//
+// It also fixes a smaller wrong: landing on an untimed save-loc used to restore
+// the clock from a TIMED one up to 24 units away. Nearest wins, then its time is
+// used only if it has one.
+bool WrSavelocMatch(const Vec3 &pos, WrSavelocHit *out)
 {
     if (!g_csReady)
         return false;
@@ -454,8 +690,6 @@ bool WrSavelocTimeAt(const Vec3 &pos, float *seconds)
     float bestD = MATCH_RADIUS * MATCH_RADIUS;
     for (int i = 0; i < g_count; i++)
     {
-        if (g_locs[i].ourTime < 0.0f)
-            continue;
         float dz = g_locs[i].pos.z - pos.z;
         if (dz > MATCH_VERTICAL || dz < -MATCH_VERTICAL)
             continue;
@@ -464,12 +698,36 @@ bool WrSavelocTimeAt(const Vec3 &pos, float *seconds)
         if (d < bestD)
         {
             bestD = d;
-            if (seconds) *seconds = g_locs[i].ourTime;
+            if (out)
+            {
+                // Copied out under the lock. The background reader memcpy's over
+                // the whole array, so a pointer into it would be a pointer into
+                // something being rewritten.
+                out->pos = g_locs[i].pos;
+                out->vel = g_locs[i].vel;
+                out->haveVel = g_locs[i].haveVel;
+                out->seconds = g_locs[i].ourTime;
+                out->suspect = g_locs[i].suspect;
+                out->byHand = g_locs[i].byHand;
+                out->haveEnergy = g_locs[i].haveEnergy;
+                out->gained = g_locs[i].gained;
+                out->lost = g_locs[i].lost;
+                out->peak = g_locs[i].peak;
+            }
             found = true;
         }
     }
     LeaveCriticalSection(&g_cs);
     return found;
+}
+
+bool WrSavelocTimeAt(const Vec3 &pos, float *seconds)
+{
+    WrSavelocHit hit;
+    if (!WrSavelocMatch(pos, &hit) || hit.seconds < 0.0f)
+        return false;
+    if (seconds) *seconds = hit.seconds;
+    return true;
 }
 
 int WrSavelocCount(void) { return g_count; }
@@ -489,6 +747,10 @@ bool WrSavelocAt(int index, WrSavelocRow *out)
             out->pos = g_locs[index].pos;
             out->seconds = g_locs[index].ourTime;
             out->suspect = g_locs[index].suspect;
+            out->byHand = g_locs[index].byHand;
+            out->haveVel = g_locs[index].haveVel;
+            out->speed = g_locs[index].haveVel ? WrLength(g_locs[index].vel)
+                                               : 0.0f;
         }
         ok = true;
     }
@@ -506,12 +768,52 @@ void WrSavelocForget(int index)
     {
         g_locs[index].ourTime = -1.0f;
         g_locs[index].suspect = false;
+        g_locs[index].byHand = false;
+        g_locs[index].haveEnergy = false;
         if (g_timed > 0) g_timed--;
         dirty = true;
     }
     LeaveCriticalSection(&g_cs);
     if (dirty)
         FlushSidecar();
+}
+
+// A time typed in by hand.
+//
+// The auto-stamp only ever fires for a save-loc that is CREATED while the clock
+// is running, and deliberately so: the version that stamped whichever untimed
+// save-loc you happened to be standing near put twenty bogus entries at
+// surf_hades2's spawn, one per lap. That cannot be loosened. But it leaves every
+// save-loc made before this tool existed permanently untimed -- 3098 of the 3239
+// on this machine -- and there is no way to work out what those times were.
+//
+// So they are typed. A number the player states is the one kind of answer this
+// file has no business inferring.
+void WrSavelocSetTime(int index, float seconds)
+{
+    if (!g_csReady || !(seconds > 0.0f) || seconds != seconds)
+        return;
+    bool dirty = false;
+    EnterCriticalSection(&g_cs);
+    if (index >= 0 && index < g_count)
+    {
+        if (g_locs[index].ourTime < 0.0f)
+            g_timed++;
+        g_locs[index].ourTime = seconds;
+        g_locs[index].suspect = false;      // stated, not guessed at
+        g_locs[index].byHand = true;
+        // No banked energy goes with a typed time. We were not there.
+        g_locs[index].haveEnergy = false;
+        g_locs[index].gained = g_locs[index].lost = g_locs[index].peak = 0.0f;
+        dirty = true;
+    }
+    LeaveCriticalSection(&g_cs);
+    if (dirty)
+    {
+        FlushSidecar();
+        WrLogf("saveloc: time %.2fs entered by hand for save-loc %d",
+               seconds, index + 1);
+    }
 }
 
 void WrSavelocForgetAll(void)
@@ -523,6 +825,8 @@ void WrSavelocForgetAll(void)
     {
         g_locs[i].ourTime = -1.0f;
         g_locs[i].suspect = false;
+        g_locs[i].byHand = false;
+        g_locs[i].haveEnergy = false;
     }
     g_timed = 0;
     LeaveCriticalSection(&g_cs);

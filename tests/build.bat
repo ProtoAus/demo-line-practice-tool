@@ -62,6 +62,14 @@ cl /nologo /O2 /EHsc /W3 %DEFS% /I. tests\test_start.cpp wr_path.cpp ^
    /Fe:tests\test_start.exe /Fo:tests\ >nul
 if errorlevel 1 ( echo [!] test_start FAILED to build & exit /b 1 )
 
+rem test_saveloc links the real parser and the real energy sampler. The rules it
+rem checks are properties of Momentum's file format and of the order of two
+rem blocks in wr_energy.cpp, neither of which a harness could restate without
+rem simply agreeing with itself.
+cl /nologo /O2 /EHsc /W3 %DEFS% /I. tests\test_saveloc.cpp wr_savelocs.cpp ^
+   wr_energy.cpp wr_log.cpp /Fe:tests\test_saveloc.exe /Fo:tests\ >nul
+if errorlevel 1 ( echo [!] test_saveloc FAILED to build & exit /b 1 )
+
 del tests\*.obj >nul 2>&1
 
 set "RC=0"
@@ -72,6 +80,7 @@ tests\test_profile.exe    || set "RC=1"
 tests\test_board.exe      || set "RC=1"
 tests\test_rank.exe       || set "RC=1"
 tests\test_start.exe      || set "RC=1"
+tests\test_saveloc.exe    || set "RC=1"
 
 if "%RC%"=="1" ( echo. & echo [!] SOME HARNESSES FAILED & exit /b 1 )
 echo.

@@ -65,6 +65,22 @@ static inline float WrEmaStep(WrEma *e, float x, float dt, float tau)
     return e->v;
 }
 
+// Start from a value that is already known to be right.
+//
+// This is the same thing the `!has` branch above does on the first sample after
+// a reset, exposed so a caller who KNOWS the answer can supply it instead of
+// waiting to measure one. There is exactly one such caller: loading a save-loc,
+// where the velocity on the far side of the discontinuity is written down in
+// the game's own file. Everything else has to measure, and should.
+//
+// After this the filter behaves normally -- the next real sample is blended in
+// at the usual rate, from the truth rather than from nothing.
+static inline void WrEmaSeed(WrEma *e, float x)
+{
+    e->v = x;
+    e->has = true;
+}
+
 // ---------------------------------------------------------------------------
 // Velocity over a fixed time window
 // ---------------------------------------------------------------------------

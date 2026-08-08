@@ -92,6 +92,48 @@ static void FormatTime(double t, char *out, int outLen)
         _snprintf_s(out, outLen, _TRUNCATE, "%.3f", secs);
 }
 
+// FormatTime read backwards: "1:02.310" or "62.31", either of which this panel
+// might have printed. Refuses anything it cannot read completely rather than
+// taking the leading digits, because a time that silently became 1 instead of
+// 1:02 would be indistinguishable from one that was entered that way.
+static bool ParseTime(const char *s, float *out)
+{
+    if (!s) return false;
+    while (*s == ' ' || *s == '\t') s++;
+    if (!*s) return false;
+
+    char *end = NULL;
+    double a = strtod(s, &end);
+    if (end == s || a < 0.0) return false;
+
+    double secs;
+    if (*end == ':')
+    {
+        const char *rest = end + 1;
+        char *end2 = NULL;
+        double b = strtod(rest, &end2);
+        if (end2 == rest || b < 0.0 || b >= 60.0) return false;
+        secs = a * 60.0 + b;
+        end = end2;
+    }
+    else
+    {
+        secs = a;
+    }
+
+    while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') end++;
+    if (*end) return false;                 // trailing rubbish
+    if (!(secs > 0.0) || secs > 100.0 * 3600.0) return false;
+    if (out) *out = (float)secs;
+    return true;
+}
+
+// Which save-loc row is having a time typed into it, if any. One at a time, so
+// one buffer.
+static int s_editLoc = -1;
+static bool s_editFocus = false;
+static char s_editBuf[32] = "";
+
 static ImVec4 UnpackColour(unsigned int c)
 {
     return ImVec4(((c >> 0) & 0xFF) / 255.0f,
@@ -1614,6 +1656,18 @@ static void DrawDisplayTab(void)
                            "%.2fx");
         ImGui::SliderFloat("Keep showing for", &g_render.pickHoldSeconds,
                            0.0f, 2.0f, "%.2f s");
+        ImGui::SliderFloat("Plate clearance", &g_render.pickOffsetPx,
+                           8.0f, 160.0f, "%.0f px");
+        ImGui::SameLine();
+        HelpMarker("Clear space between the point you are aiming at and the "
+                   "nearest edge of the box. Which way the box sits does not "
+                   "change -- it is always pushed away from the middle of the "
+                   "screen, so aiming up and right puts it up and right -- only "
+                   "how far.\n\n"
+                   "This used to offset the box's CENTRE, which meant the "
+                   "clearance you actually got depended on how many rows were in "
+                   "it: a tall plate on a mostly-vertical aim ended up sitting "
+                   "on top of the very thing it was labelling.");
         ImGui::Checkbox("Ring the point", &g_render.pickRing);
 
         // Written out rather than passed to LabelPicker: that helper pairs the
@@ -1651,6 +1705,15 @@ static void DrawDisplayTab(void)
     ImGui::Checkbox("Name tags on lines", &g_render.drawTags);
     ImGui::SameLine();
     ImGui::Checkbox("Avatars", &g_render.tagAvatars);
+    ImGui::SameLine();
+    HelpMarker(
+        "One setting for both places a runner is named: the tag on their line, "
+        "and the plate you get for aiming at one.\n\n"
+        "Pictures arrive from the Steam client a moment after they are asked "
+        "for, so a runner shows a dot in their line's colour first and fills in. "
+        "The cache holds 96 and never evicts -- on a map where you meet more "
+        "faces than that, the ones met last keep their dot for the session. The "
+        "space is reserved either way, so nothing shifts when a picture lands.");
     ImGui::SliderFloat("Tag size", &g_render.tagScale, 0.6f, 2.0f, "%.2fx");
     ImGui::SliderInt("Max tags on screen", &g_render.maxTags, 1, 32);
     ImGui::TextDisabled("Tags sit where each line crosses the fade distance, so");
@@ -3474,6 +3537,17 @@ static void DrawEnergyTab(void)
                "at the spawn, each written by a different lap. Times from before "
                "that fix are marked with a ? because a good one cannot be told "
                "from a bad one; forget them and re-drive the route.\n\n"
+               "That rule leaves every save-loc made before WrLines existed "
+               "permanently untimed, and there is no way to work out what those "
+               "times were -- guessing from proximity is the bug above. So they "
+               "can be typed in: press \"set...\" on a row and enter either "
+               "1:02.31 or 62.31. A typed time is marked with a * so it is never "
+               "confused with a measured one.\n\n"
+               "Energy is a different story. The velocity a save-loc was made at "
+               "is in the game's OWN file, for every save-loc ever made, so "
+               "loading one starts the readout at the right number instead of "
+               "working it out again from scratch. That needs nothing from us "
+               "and works on save-locs from years ago.\n\n"
                "Nothing is ever written into the game install.");
 
     {
@@ -3483,7 +3557,34 @@ static void DrawEnergyTab(void)
             ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "%s", recent);
     }
 
+    // What the last loaded save-loc did to the readout. The velocity comes out
+    // of the game's own file, so this fires on save-locs made long before this
+    // tool existed -- unlike the time beside it, which only exists if we were
+    // running when the save-loc was created.
+    {
+        WrEnergySeedInfo si;
+        if (WrEnergySeedReport(&si))
+        {
+            if (si.rejected)
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
+                                   "last load: the file said %.0f u/s and the "
+                                   "first measurement disagreed -- measured it "
+                                   "instead", si.seedSpeed);
+            else
+                ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f),
+                                   "last load: started straight at %.0f u/s from "
+                                   "the file (measured %+.0f u/s off)",
+                                   si.seedSpeed, si.speedErr);
+        }
+    }
+
     int nLocs = WrSavelocCount();
+    // A re-read can shorten the list under an open edit box -- deleting a
+    // save-loc in game renumbers the rest -- and a row index left pointing past
+    // the end would sit there invisibly and commit to the wrong entry the next
+    // time the list grew.
+    if (s_editLoc >= nLocs)
+        s_editLoc = -1;
     if (nLocs > 0)
     {
         if (ImGui::BeginTable("##savelocs", 4,
@@ -3511,18 +3612,56 @@ static void DrawEnergyTab(void)
                 ImGui::Text("%d", i + 1);
 
                 ImGui::TableNextColumn();
-                if (row.seconds >= 0.0f)
+                if (s_editLoc == i)
+                {
+                    // Typing one in. Accepts either form the panel itself
+                    // prints, so a split read off this table can be typed
+                    // straight back into it.
+                    ImGui::SetNextItemWidth(-1.0f);
+                    if (s_editFocus)
+                    {
+                        ImGui::SetKeyboardFocusHere();
+                        s_editFocus = false;
+                    }
+                    if (ImGui::InputTextWithHint("##settime", "m:ss.xx",
+                                                 s_editBuf, sizeof(s_editBuf),
+                                                 ImGuiInputTextFlags_EnterReturnsTrue))
+                    {
+                        float secs = 0.0f;
+                        if (ParseTime(s_editBuf, &secs))
+                            WrSavelocSetTime(i, secs);
+                        s_editLoc = -1;
+                    }
+                    else if (ImGui::IsKeyPressed(ImGuiKey_Escape))
+                    {
+                        s_editLoc = -1;
+                    }
+                }
+                else if (row.seconds >= 0.0f)
                 {
                     char t[32];
                     FormatTime(row.seconds, t, sizeof(t));
+                    // Three provenances, three appearances: stamped when the
+                    // save-loc was made, typed in by hand, or inherited from a
+                    // sidecar written before the stamping bug was fixed.
                     if (row.suspect)
                         ImGui::TextDisabled("%s ?", t);
+                    else if (row.byHand)
+                        ImGui::TextColored(ImVec4(0.75f, 0.85f, 1.0f, 1.0f),
+                                           "%s *", t);
                     else
                         ImGui::Text("%s", t);
+                    if (row.byHand && ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Typed in, not measured.");
                 }
                 else
                 {
-                    ImGui::TextDisabled("--");
+                    if (ImGui::SmallButton("set..."))
+                    {
+                        s_editLoc = i;
+                        s_editFocus = true;
+                        s_editBuf[0] = '\0';
+                    }
                 }
 
                 // Splits, so a chain of save-locs reads as a route rather than
@@ -4099,6 +4238,49 @@ static void DrawDiagnosticsTab(void)
         ImGui::Text("aim         %d chunks, %d points, %.3f ms", pc, pp, pms);
     }
     ImGui::Text("frame       %.1f fps", ImGui::GetIO().Framerate);
+
+    // --- was the save-loc velocity worth believing? --------------------------
+    //
+    // The one number that says whether seeding the readout from Momentum's file
+    // actually works. Nothing on this side can check that the game applies the
+    // velocity its own file records, so this does not claim it does -- it
+    // compares every seed against the first velocity measured after it and
+    // counts the ones that did not survive.
+    {
+        WrEnergySeedInfo si;
+        if (WrEnergySeedReport(&si))
+        {
+            ImGui::SeparatorText("Save-loc seed");
+            ImGui::Text("file said   %.0f u/s, energy %.0f", si.seedSpeed,
+                        si.seedEnergy);
+            ImGui::Text("measured    %+.0f u/s, %+.0f units, 35 ms later",
+                        si.speedErr, si.energyErr);
+            if (si.rejects > 0)
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
+                                   "this map    %d seed%s, %d thrown out",
+                                   si.seeds, si.seeds == 1 ? "" : "s",
+                                   si.rejects);
+            else
+                ImGui::Text("this map    %d seed%s, none thrown out", si.seeds,
+                            si.seeds == 1 ? "" : "s");
+            ImGui::SameLine();
+            HelpMarker(
+                "Loading a save-loc used to leave the readout showing the "
+                "energy you had when you FAILED, for as long as it took to "
+                "measure a new velocity by differencing the camera -- and held "
+                "the banked gain/loss figures for nearly a second on top.\n\n"
+                "Momentum's savedlocs.txt records the velocity it is about to "
+                "restore, so there is nothing to work out. But a number read "
+                "from a file is a claim, and a fast wrong readout is worse than "
+                "a slow right one -- so every seed is checked against the first "
+                "velocity actually measured after it, about 35 ms later, and "
+                "thrown out if the two disagree. A thrown-out seed costs those "
+                "35 ms and nothing more.\n\n"
+                "A few thrown out is fine -- landing near two save-locs at once "
+                "will do it. A lot means the file is not saying what the game "
+                "does, and this should be turned off.");
+        }
+    }
 
     // --- where the frame actually goes --------------------------------------
     ImGui::SeparatorText("Cost, per frame");

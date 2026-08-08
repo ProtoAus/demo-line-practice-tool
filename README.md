@@ -96,7 +96,11 @@ Press **INSERT** in game. Tick runs in the Runs tab. **ESC** closes the panel.
   two runs that sit within a few pixels of each other for the whole visible stretch cannot be
   separated by aiming, so the plate says how many others were equally close instead of picking
   one and sounding sure. About 0.3 ms a frame with 256 lines drawn, against the 8 ms drawing
-  them already costs, and Diagnostics shows the real figure rather than that estimate.
+  them already costs, and Diagnostics shows the real figure rather than that estimate. The
+  runner's Steam avatar sits beside their name, and the plate keeps a set distance from the point
+  it is describing — measured to its **edge**, which is the fix for it having sat on top of what
+  you were aiming at: the offset used to be applied to the box's centre, so the clearance you
+  actually got shrank as rows were added to it.
 - **Lines start where the run starts.** A demo begins recording before the run does — measured
   over 500 demo headers here, the recording runs a median of **2.06 seconds** longer than the
   run, and about three quarters of a second of that survives on the extracted line. That
@@ -1050,11 +1054,50 @@ keyed on anyway.
 ### Save-loc times
 
 `momentum\savedlocs.txt` is plain KeyValues with a `time` field per save-loc. It is `"-1"` in
-**all 3213 entries across 260 maps** — the field exists and is never populated. So WrLines keeps
+**all 3239 entries across 261 maps** — the field exists and is never populated. So WrLines keeps
 its own note in `wrlines_data\savelocs\`, keyed on position rather than index because indices
 renumber when a save-loc is deleted. Load a save-loc and the clock returns to what it said when
 you made it. The game's file is opened read-only and shared; nothing is ever written into the
 game install.
+
+A time is recorded when a save-loc is **created**, and only then. An earlier version stamped
+whichever untimed save-loc you were standing near, which meant *walking past one timed it* — that
+produced 111 stamps here and left surf_hades2 with twenty entries at the spawn, one per lap. That
+rule cannot be loosened, and it leaves every save-loc made before WrLines existed permanently
+untimed: **141 of 3239 have a time, across 11 of 261 maps.** A time that was never recorded cannot
+be recovered and will not be guessed at, so those can be **typed in** instead, and are marked `*`
+so a stated time is never mistaken for a measured one.
+
+### The velocity was in the file all along
+
+Loading a save-loc used to leave the energy readout showing **the energy you had when you failed**,
+until a new velocity could be measured by differencing the camera — and held the banked gain/lost
+figures for a further 0.9 s. WrLines has no entity access, so re-measuring looked like the only
+option.
+
+It was not. Momentum records the velocity it is about to restore, in the same file, and the parser
+was reading only `pos` and discarding the rest. Measured across the 3239 save-locs here: `vel` is
+present and finite in **100% of them**, `predictedVel` disagrees materially in **2**, and **62%
+were saved above 250 u/s** — mid-surf, which is exactly where re-deriving it costs most. Unlike the
+time beside it, this needs nothing WrLines wrote, so it works on save-locs made years before it
+existed.
+
+So the readout is **seeded** from the file and starts at the right number. But a value read from a
+file is a claim about a moment nothing on this side witnessed, and a fast readout that is quietly
+wrong would be worse than the slow one it replaced. Every seed is therefore checked against the
+first velocity actually measured after it — **about 35 ms later, near enough the same instant to be
+a fair comparison**, where half a second later would be comparing it against half a second of you
+playing. A seed that disagrees is thrown out and the filters fall back to measuring, so a wrong
+seed costs the 35 ms it was always going to cost and nothing more. Diagnostics counts the seeds and
+the rejects; if that ratio is ever bad, the file is not saying what the game does and the feature
+should be switched off.
+
+Two things it deliberately refuses. A **restart** is never seeded — a fail trigger drops you at the
+start, and keeping a save-loc on the start pad is ordinary, so the landing matches one and the
+claimed speed would be applied to a player the game just stopped dead. And a `startmarks` entry is
+never treated as a save-loc: that is a second list of positions in the same file, carrying a `pos`
+and no `vel`, **16 of them across 12 maps here**, which had been silently read in as save-locs and
+were eligible to be stamped with your clock.
 
 ### Energy across a whole run
 

@@ -80,6 +80,7 @@ struct WrRenderSettings
     float pickDepthBias;        // how much a far line is penalised, 0 = none
     float pickThickBoost;       // the picked line is drawn this much thicker
     float pickHoldSeconds;      // how long the readout survives looking away
+    float pickOffsetPx;         // how far the plate sits off the picked point
     unsigned int pickLabel;     // WR_LABEL_* mask for the plate
     bool pickRing;
 

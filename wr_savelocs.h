@@ -53,9 +53,35 @@
 // save-loc gets stamped with.
 void WrSavelocRefresh(const char *map, float elapsed, bool running);
 
+// Everything we know about one save-loc. `seconds` is negative when we have
+// never timed it, which is the normal case -- 3098 of the 3239 on this machine.
+//
+// `vel` is the game's own record and is present for effectively all of them, so
+// the two useful fields here have very different coverage on purpose: the clock
+// restores rarely, the velocity restores always.
+struct WrSavelocHit
+{
+    Vec3 pos;
+    Vec3 vel;
+    bool haveVel;
+    bool fromCps;       // a real save-loc, not an entry from "startmarks"
+    float seconds;
+    int ordinal;        // among entries sharing this position, in file order
+    bool suspect;       // time came from a v1 sidecar and may be wrong
+    bool byHand;        // time was typed in rather than stamped on creation
+    bool haveEnergy;    // gained/lost/peak below mean something
+    float gained, lost, peak;
+};
+
+// The save-loc nearest `pos`, timed or not, within a few units. ONE lookup, so
+// the clock and the energy readout can never restore from two different
+// save-locs -- see the comment on the implementation.
+bool WrSavelocMatch(const Vec3 &pos, WrSavelocHit *out);
+
 // Our recorded time for the save-loc nearest `pos`, if there is one within a few
 // units. False when that save-loc has no recorded time -- which is the normal
-// case for every save-loc made before this tool ever ran.
+// case for every save-loc made before this tool ever ran. A thin wrapper over
+// WrSavelocMatch, kept because most callers want only this.
 bool WrSavelocTimeAt(const Vec3 &pos, float *seconds);
 
 // --- for the panel -----------------------------------------------------------
@@ -72,11 +98,28 @@ struct WrSavelocRow
     Vec3 pos;
     float seconds;
     bool suspect;
+    bool byHand;        // typed in, so its provenance is neither stamp nor bug
+    bool haveVel;       // the game recorded a velocity we can restore
+    float speed;        // |vel|, for the panel -- 0 when haveVel is false
 };
 bool WrSavelocAt(int index, WrSavelocRow *out);
 
 void WrSavelocForget(int index);    // drop one time, keep the save-loc
 void WrSavelocForgetAll(void);      // drop every time for this map
+
+// Set a time by hand, for a save-loc made before this tool existed. Refused if
+// not positive: a zero could only mean the clock was not running, which is the
+// bug the stamping rules above exist to prevent. Writes the sidecar.
+void WrSavelocSetTime(int index, float seconds);
+
+// --- for the harness ---------------------------------------------------------
+
+// Parse any savedlocs.txt, not just the game's. The rules being tested -- which
+// section an entry came from, and which entry a velocity belongs to -- are
+// properties of Momentum's file format, so the test drives a fixture through the
+// real parser rather than re-implementing the format and agreeing with itself.
+bool WrSavelocParseFile(const char *path, const char *map,
+                        WrSavelocHit *out, int maxOut, int *count);
 
 // The last thing that happened, for a moment, so a stamp or a restore is visible
 // somewhere other than the log. Empty when nothing recent.

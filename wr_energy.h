@@ -287,6 +287,44 @@ bool WrEnergyHeld(void);
 // teleport, and a slow load is what loading actually looks like.
 bool WrEnergyTakeTeleport(Vec3 *landedAt);
 
+// --- landing on a save-loc with the answer already in hand ---------------------
+
+// Start the readout from a velocity that is KNOWN rather than one that has to be
+// re-derived by differencing the camera over the next third of a second.
+//
+// Every filter here is reset on a teleport, because a camera-differenced velocity
+// cannot cross a discontinuity. A save-loc load is the one discontinuity where
+// the far side is on record: Momentum's savedlocs.txt writes down the velocity it
+// is about to restore, for every save-loc, and threw it away only because nothing
+// here used to read it.
+//
+// `camPos` is the camera on the landing frame, NOT the origin stored in the file
+// -- the file records feet, and a crouched save-loc's eye height is not
+// recoverable from it. `why` goes in the log.
+//
+// Takes no flag and clears none, so it is not a second consumer of the teleport
+// signal. Called by WrTimerTick, which has already consumed that signal and
+// matched the landing spot to a save-loc; seeding on any other teleport would be
+// inventing a velocity.
+void WrEnergySeed(const Vec3 &camPos, const Vec3 &vel, const char *why);
+
+// What the seeds turned out to be worth, measured rather than asserted.
+//
+// A seed is checked against the first independently measured velocity after it,
+// about 35 ms later -- near enough the same instant to be a fair comparison,
+// where half a second later would be comparing it against half a second of the
+// player playing. A seed that disagrees is thrown out and the filters fall back
+// to measuring, so `rejects` is the count of times the file was not to be
+// believed. False until at least one seed has been checked.
+struct WrEnergySeedInfo
+{
+    float seedEnergy, seedSpeed;    // what the file said
+    float energyErr, speedErr;      // measured minus seeded, signed
+    bool rejected;                  // the last one was thrown out
+    int seeds, rejects;             // since the last reset
+};
+bool WrEnergySeedReport(WrEnergySeedInfo *out);
+
 // --- the budget ---------------------------------------------------------------
 
 // False when there is nothing to measure from. The three numbers are quantised
