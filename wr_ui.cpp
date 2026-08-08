@@ -23,6 +23,7 @@
 #include "wr_start.h"
 #include "wr_stress.h"
 #include "wr_hook.h"
+#include "wr_settings.h"
 #include "wr_log.h"
 
 #include "imgui.h"
@@ -37,18 +38,96 @@
 
 static char g_uiMap[72] = {0};
 
-// Which key cycles the crosshair readout. Read by the hotkey thread; a plain
-// int, written only from the panel, so no synchronisation is needed beyond the
-// atomicity of an aligned 32-bit store.
-static int g_hudCycleKey = VK_END;
-
-// And which key turns "say whose line I am looking at" off and on, for the same
-// reason: the plate is in the way exactly when you are trying to see past it,
-// and opening a panel to hide it defeats the point.
-static int g_pickToggleKey = VK_HOME;
+// The four keys that work WITHOUT opening the panel.
+//
+// Read by the hotkey thread; plain ints, written only from the panel, so no
+// synchronisation is needed beyond the atomicity of an aligned 32-bit store.
+// Everything they reach is a thing you want to change mid-run, which is exactly
+// when a panel is the wrong answer -- and each one is rebindable, because we
+// cannot know what the player has bound. The thread READS the key rather than
+// swallowing it, so a collision means the game acts on it too rather than
+// anything being broken.
+static int g_hudCycleKey = VK_NEXT;         // page down: next centre-box mode
+static int g_hudCycleBackKey = VK_PRIOR;    // page up: previous
+static int g_pickToggleKey = VK_HOME;       // the "whose line is this" plate
+static int g_overlayToggleKey = VK_END;     // the corner block
 
 int WrUiHudCycleKey(void) { return g_hudCycleKey; }
+int WrUiHudCycleBackKey(void) { return g_hudCycleBackKey; }
 int WrUiPickToggleKey(void) { return g_pickToggleKey; }
+int WrUiOverlayToggleKey(void) { return g_overlayToggleKey; }
+
+// The one list of bindable keys, and the one place a virtual key is turned into
+// a name. There used to be two near-identical copies of this, one per binding,
+// which is how you end up with a key that is offered in one combo and not the
+// other for no reason anybody chose.
+static const struct { int vk; const char *name; } kBindKeys[] = {
+    { 0,          "(none)"    },
+    { VK_HOME,    "Home"      },
+    { VK_END,     "End"       },
+    { VK_PRIOR,   "Page Up"   },
+    { VK_NEXT,    "Page Down" },
+    { VK_DELETE,  "Delete"    },
+    { VK_F1,      "F1"        },
+    { VK_F2,      "F2"        },
+    { VK_F3,      "F3"        },
+    { VK_F4,      "F4"        },
+    { VK_F6,      "F6"        },
+    { VK_F7,      "F7"        },
+    { VK_F8,      "F8"        },
+    { VK_OEM_3,   "`"         },
+    { VK_OEM_4,   "["         },
+    { VK_OEM_6,   "]"         },
+    { VK_OEM_5,   "\\"        },
+};
+static const int kBindKeyCount = (int)(sizeof(kBindKeys) / sizeof(kBindKeys[0]));
+
+const char *WrUiKeyName(int vk)
+{
+    for (int i = 0; i < kBindKeyCount; i++)
+        if (kBindKeys[i].vk == vk)
+            return kBindKeys[i].name;
+    return "(unlisted)";
+}
+
+// One combo, and one collision check across ALL FOUR bindings rather than the
+// pairwise one this used to be -- with four keys, pairwise means three of the
+// six possible clashes go unmentioned.
+static void KeyBindCombo(const char *label, int *key)
+{
+    int sel = 0;
+    for (int i = 0; i < kBindKeyCount; i++)
+        if (kBindKeys[i].vk == *key) { sel = i; break; }
+
+    const char *names[kBindKeyCount];
+    for (int i = 0; i < kBindKeyCount; i++)
+        names[i] = kBindKeys[i].name;
+
+    ImGui::SetNextItemWidth(140.0f);
+    if (ImGui::Combo(label, &sel, names, kBindKeyCount))
+        *key = kBindKeys[sel].vk;
+
+    if (!*key)
+        return;
+
+    const int *others[3];
+    const char *what[3];
+    int n = 0;
+    if (key != &g_hudCycleKey)     { others[n] = &g_hudCycleKey;     what[n++] = "next mode"; }
+    if (key != &g_hudCycleBackKey) { others[n] = &g_hudCycleBackKey; what[n++] = "previous mode"; }
+    if (key != &g_pickToggleKey)   { others[n] = &g_pickToggleKey;   what[n++] = "the line plate"; }
+    if (key != &g_overlayToggleKey) { others[n] = &g_overlayToggleKey; what[n++] = "the corner block"; }
+
+    for (int i = 0; i < n; i++)
+    {
+        if (*others[i] != *key)
+            continue;
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
+                           "%s is also bound to %s -- one press does both.",
+                           WrUiKeyName(*key), what[i]);
+        break;
+    }
+}
 
 // "Near me" means within this many units of the camera. 4096 comfortably covers
 // one stage of a surf map without reaching into the next one.
@@ -350,11 +429,63 @@ static void WrSendFromRow(WrIntoGameWhere where, const char *map, int mapId,
                  r != WR_SEND_ALREADY_LOCAL);
 }
 
+// Put the console command that plays this demo on the clipboard.
+//
+// This is the mechanism that does not depend on the game's lists agreeing that a
+// demo exists, and it is what Momentum's own end-of-run screen uses. It needs
+// the file to be somewhere the game's filesystem can see, so a run that has not
+// been copied in yet is copied first -- into the LOCAL tree, recorded in the
+// manifest and removable exactly like every other copy, and only ever because
+// this button was pressed.
+static void WrWatchCmdFromRow(const char *map, int mapId, const char *hash,
+                              const char *who, int tab)
+{
+    s_sendTab = tab;
+    strncpy_s(s_sendWho, sizeof(s_sendWho), (who && *who) ? who : "that run",
+              _TRUNCATE);
+
+    // Already somewhere the game's filesystem can name? Then nothing is copied
+    // -- which covers a run that was sent to Downloaded, AND the player's own
+    // recordings, whose names are not hashes at all and which are already in the
+    // local tree under a name only the game chose.
+    char cmd[MAX_PATH + 64];
+    if (!WrIntoGameWatchCommand(map, mapId, hash, cmd, sizeof(cmd)))
+    {
+        // Not there yet. One copy into the local tree, recorded and removable,
+        // and only because this button was pressed.
+        char detail[384];
+        WrIntoGameResult r = WrIntoGameSendTo(WR_INTO_LOCAL, map, mapId, hash,
+                                              detail, sizeof(detail));
+        if (r != WR_SEND_OK && r != WR_SEND_ALREADY &&
+            r != WR_SEND_ALREADY_LOCAL)
+        {
+            strncpy_s(s_sendText, sizeof(s_sendText), detail, _TRUNCATE);
+            s_sendBad = true;
+            return;
+        }
+        if (!WrIntoGameWatchCommand(map, mapId, hash, cmd, sizeof(cmd)))
+        {
+            strncpy_s(s_sendText, sizeof(s_sendText),
+                      "the copy went in but the game has no path for it -- "
+                      "please report this, it should not happen", _TRUNCATE);
+            s_sendBad = true;
+            return;
+        }
+    }
+
+    ImGui::SetClipboardText(cmd);
+    _snprintf_s(s_sendText, sizeof(s_sendText), _TRUNCATE,
+                "copied to the clipboard -- paste it in the console:  %s", cmd);
+    s_sendBad = false;
+}
+
 #define WR_SEND_TAB_RUNS  0
 #define WR_SEND_TAB_BOARD 1
 static void DrawIntoGameLine(const char *map, int mapId, int tab);
 static void WrSendFromRow(WrIntoGameWhere where, const char *map, int mapId,
                           const char *hash, const char *who, int tab);
+static void WrWatchCmdFromRow(const char *map, int mapId, const char *hash,
+                              const char *who, int tab);
 static void WrSendForget(void);
 
 // Does this run match what was typed?
@@ -913,7 +1044,12 @@ static void DrawRunsTab(void)
         ImGui::TableSetupColumn("Near", 0, 0.0f, RUNCOL_NEAR);
         ImGui::TableSetupColumn("Pts", 0, 0.0f, RUNCOL_POINTS);
         ImGui::TableSetupColumn("Splits", 0, 0.0f, RUNCOL_SPLITS);
-        ImGui::TableSetupColumn("Watch", ImGuiTableColumnFlags_NoSort);
+        // Fixed and wide enough for the three buttons a row can carry, because a
+        // table clips its cells: sized to the content, "watch" was drawn cut in
+        // half and looked like a rendering fault rather than a narrow column.
+        ImGui::TableSetupColumn("Watch", ImGuiTableColumnFlags_NoSort |
+                                         ImGuiTableColumnFlags_WidthFixed,
+                                168.0f);
         ImGui::TableHeadersRow();
 
         // The store itself stays sorted by time -- "max runs drawn" means the
@@ -1022,6 +1158,35 @@ static void DrawRunsTab(void)
                 unsigned char kind = (i >= 0 && i < WR_MAX_RUNS)
                                          ? s_runSrc[i]
                                          : (unsigned char)WR_DEMO_NONE;
+                // The one button that works in every state where a demo exists
+                // at all, and the only mechanism here that does not depend on
+                // the game's lists agreeing that it does. Drawn first because it
+                // is the answer -- see its tooltip.
+                bool haveDemo = (kind != WR_DEMO_NONE);
+                if (haveDemo)
+                {
+                    if (ImGui::SmallButton("watch"))
+                        WrWatchCmdFromRow(r->map, mapId, r->srcSha1, r->player,
+                                          WR_SEND_TAB_RUNS);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip(
+                            "Copies the console command that PLAYS this demo:\n"
+                            "  mom_tv_replay_watch \"momtv/local/<map>/<hash>.mtv\"\n"
+                            "Paste it in the console and it plays, whatever the\n"
+                            "Downloaded and Local tabs happen to show.\n\n"
+                            "This is what the game's own end-of-run screen does.\n"
+                            "It takes a PATH, so it needs no leaderboard row and\n"
+                            "no list -- which is the whole problem with the two\n"
+                            "buttons beside it. The Downloaded tab is built from\n"
+                            "online leaderboard rows that have a cached file, not\n"
+                            "from the folder, so a file dropped in there shows up\n"
+                            "only if the game already listed that run.\n\n"
+                            "If the demo is not somewhere the game can see yet,\n"
+                            "one copy goes into the local folder first -- recorded\n"
+                            "like every other, and \"take out\" removes it.");
+                    ImGui::SameLine();
+                }
+
                 if (WrIntoGameMine(mapId, r->srcSha1))
                 {
                     if (ImGui::SmallButton("take out"))
@@ -1068,36 +1233,36 @@ static void DrawRunsTab(void)
                             "game's local replay folder. There is nowhere to send\n"
                             "it that it is not already.");
                 }
-                else if (mapId <= 0)
-                {
-                    ImGui::TextDisabled("-");
-                    if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip(
-                            "No numeric map id for this map, and the game's\n"
-                            "downloaded folder is named by id. Refresh the map\n"
-                            "list in Maps.");
-                }
                 else
                 {
-                    if (ImGui::SmallButton("send"))
-                        WrSendFromRow(WR_INTO_ONLINE, r->map, mapId, r->srcSha1,
-                                      r->player, WR_SEND_TAB_RUNS);
-                    ImGui::SameLine();
+                    // No numeric id is no longer a dead end: it only names the
+                    // ONLINE directory, and the local tree is named by the map.
+                    // So the send button goes and the local one stays.
+                    if (mapId > 0)
+                    {
+                        if (ImGui::SmallButton("send"))
+                            WrSendFromRow(WR_INTO_ONLINE, r->map, mapId,
+                                          r->srcSha1, r->player,
+                                          WR_SEND_TAB_RUNS);
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip(
+                                "Copy it into the game's downloaded folder.\n\n"
+                                "Now known to be the weaker of the two: that tab\n"
+                                "lists online leaderboard rows that have a cached\n"
+                                "file rather than reading the folder, so this only\n"
+                                "lights up a run the game had already listed. Use\n"
+                                "\"watch\" if the row does not appear.");
+                        ImGui::SameLine();
+                    }
                     if (ImGui::SmallButton("local"))
                         WrSendFromRow(WR_INTO_LOCAL, r->map, mapId, r->srcSha1,
                                       r->player, WR_SEND_TAB_RUNS);
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip(
                             "Put this ONE demo in the game's local replay folder\n"
-                            "instead -- the tab that lists the runs you recorded\n"
-                            "yourself.\n\n"
-                            "Worth trying because a local replay has no server\n"
-                            "record, so that list has to be built by reading the\n"
-                            "folder, while the downloaded list may well be built\n"
-                            "from the game's own record of what it fetched -- in\n"
-                            "which case a file we drop in is on disk and never\n"
-                            "listed. That would explain \"send did nothing\"\n"
-                            "exactly.\n\n"
+                            "-- the tab that lists the runs you recorded yourself.\n\n"
+                            "It also puts the file somewhere the game's own\n"
+                            "filesystem can name, which is what \"watch\" needs.\n\n"
                             "It is one press, it is recorded like everything else,\n"
                             "and \"take out\" removes it again.");
                 }
@@ -1135,17 +1300,22 @@ static void DrawIntoGameLine(const char *map, int mapId, int tab)
                            "%d of ours", n);
     ImGui::SameLine();
     HelpMarker(
-        "\"Send\" copies that demo's .mtv into momentum\\momtv\\online\\<map "
-        "id>\\, which is where the game puts what IT downloads -- the "
-        "\"downloaded replays\" tab. It is a copy, so your line stays whatever "
-        "happens to it.\n\n"
-        "WHAT IS NOT KNOWN, said plainly: whether that tab lists a file which "
-        "appears there without the game having downloaded it. It cannot be "
-        "checked from this side. The game's OTHER tree, momtv\\local\\<map>\\, "
-        "holds runs you recorded yourself -- 2591 of them here -- and those have "
-        "no server record at all, so that list must be built by reading the "
-        "folder. If send leaves nothing in the game's list, the \"try local\" "
-        "button on a row is the experiment that settles it.\n\n"
+        "\"Watch\" is the one to reach for. It copies the console command that "
+        "PLAYS a demo -- mom_tv_replay_watch \"momtv/local/<map>/<hash>.mtv\" -- "
+        "which is exactly what the game's own end-of-run screen runs, and it "
+        "takes a PATH. No leaderboard row, no list, nothing to agree with.\n\n"
+        "WHY THAT MATTERS, and this is now known rather than guessed. The "
+        "game's Downloaded tab is not a listing of the folder. Its entries are "
+        "online leaderboard rows that have a cached file -- the game's own UI "
+        "calls that state ONLINE_CACHED -- so a demo copied into "
+        "momentum\\momtv\\online\\<map id>\\ appears there only if the game had "
+        "already listed that run. That is why \"the game already has that one\" "
+        "and \"it is not in my list\" were both true at once.\n\n"
+        "The filename does not matter, incidentally: the engine reads a "
+        "replay's metadata out of the file, and says \"Invalid run metadata for "
+        "replay file\" when it cannot.\n\n"
+        "\"Send\" and \"local\" still copy the .mtv into the game's two replay "
+        "trees. They are copies, so your line stays whatever happens to them.\n\n"
         "REMOVING ONLY EVER TOUCHES OURS. Every file sent is written into "
         "wrlines_data\\into_game.txt first, and nothing outside that list can be "
         "deleted from here. The demos the game downloaded by itself -- 4268 of "
@@ -1153,8 +1323,9 @@ static void DrawIntoGameLine(const char *map, int mapId, int tab)
         "not reachable. A copy already there is adopted into the list only if "
         "our own fetched .mtv of the same hash exists, which is what makes it "
         "ours rather than the game's.\n\n"
-        "Nothing here makes the game play anything. No console command, no "
-        "cvar: it copies a file and the game's own menu does the rest.");
+        "Nothing here runs anything. \"Watch\" puts a command on your clipboard "
+        "for you to paste; WrLines executes no console command and sets no "
+        "cvar, and copying a file is the most it ever does to the game.");
     if (n > 0)
     {
         ImGui::SameLine();
@@ -1901,31 +2072,16 @@ static void DrawDisplayTab(void)
         "The cost is about 0.3 ms a frame with 256 lines drawn, against the "
         "8 ms drawing them already costs. Diagnostics shows the real figure.");
     {
-        static const struct { int vk; const char *name; } kPickKeys[] = {
-            { 0, "none" }, { VK_HOME, "Home" }, { VK_END, "End" },
-            { VK_NEXT, "Page Down" }, { VK_PRIOR, "Page Up" },
-            { VK_DELETE, "Delete" }, { VK_F9, "F9" }, { VK_F10, "F10" },
-        };
-        const int n = (int)(sizeof(kPickKeys) / sizeof(kPickKeys[0]));
-        int sel = 0;
-        for (int i = 0; i < n; i++)
-            if (kPickKeys[i].vk == g_pickToggleKey) { sel = i; break; }
-        const char *names[8];
-        for (int i = 0; i < n; i++) names[i] = kPickKeys[i].name;
-        if (ImGui::Combo("Toggle key", &sel, names, n))
-            g_pickToggleKey = kPickKeys[sel].vk;
+        KeyBindCombo("Toggle key", &g_pickToggleKey);
         ImGui::SameLine();
         HelpMarker(
             "Turns the plate off and on without opening this panel, which is the "
             "only way it is useful: the plate sits over the thing it is naming, "
-            "so wanting it gone is a mid-run thought.\n\n"
+            "so wanting it gone is a mid-run thought. It is OFF by default and "
+            "this is how you get it.\n\n"
             "A list rather than a fixed key, because WrLines cannot see what you "
             "have bound. The key is read, not swallowed -- a collision means the "
             "game acts on it too.");
-        if (g_pickToggleKey && g_pickToggleKey == g_hudCycleKey)
-            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
-                               "Same key as the readout cycle in Energy -- one "
-                               "press will do both.");
     }
     if (g_render.pickEnabled)
     {
@@ -2455,6 +2611,28 @@ static void DrawGraphsTab(void)
         "Changing it rebuilds the curves, a few per frame, so the plot settles "
         "over the next moment rather than instantly.");
 
+    ImGui::SetNextItemWidth(160.0f);
+    ImGui::SliderFloat("Smooth my curve", &g_wrProfileLiveSmooth, 0.0f, 0.50f,
+                       "%.2f s", ImGuiSliderFlags_AlwaysClamp);
+    ImGui::SameLine();
+    HelpMarker(
+        "Your curve only. Nothing here touches a stored run.\n\n"
+        "The two are built by identical rules and still do not look alike, and "
+        "the reason is the velocity rather than the arithmetic. A demo carries "
+        "the velocity Momentum recorded, which is exact. Yours is estimated by "
+        "differencing camera positions, and that error is broadband -- a "
+        "continuous wobble rather than the occasional two-tick lie the spike "
+        "filter below is aimed at. Five frames at 200 fps is 25 ms, which is far "
+        "too short a window to touch it, so the spike filter leaves your curve "
+        "exactly as jumpy as it found it.\n\n"
+        "A mean over a span of TIME is the matching tool. Time and not samples, "
+        "because the recorder's rate is your frame rate gated on two units of "
+        "movement -- a fixed sample count would be a different window at every "
+        "speed.\n\n"
+        "It also rounds off real ramp exits, which is why the legend says the "
+        "curve is smoothed whenever this is above zero. Set it to 0 for the raw "
+        "curve.");
+
     ImGui::Checkbox("Take out transient spikes", &g_wrProfileDespike);
     ImGui::SameLine();
     HelpMarker(
@@ -2530,7 +2708,22 @@ static void DrawGraphsTab(void)
             series[nSeries].p = lp;
             series[nSeries].run = NULL;
             series[nSeries].colour = g_render.liveColour;
-            series[nSeries].name = "you";
+
+            // Named for what it IS. A smoothed curve laid over unsmoothed ones
+            // that does not say so is a comparison nobody can check, and the
+            // filter rounds off exactly the ramp exits this graph is read for.
+            // Static because `name` is a borrowed pointer, kept for the frame.
+            static char liveName[40];
+            if (lp->builtSmooth > 1e-4f)
+            {
+                _snprintf_s(liveName, sizeof(liveName), _TRUNCATE,
+                            "you (smoothed %.2f s)", lp->builtSmooth);
+                series[nSeries].name = liveName;
+            }
+            else
+            {
+                series[nSeries].name = "you";
+            }
             nSeries++;
         }
     }
@@ -3396,12 +3589,12 @@ static void DrawBoardTab(void)
                                 82.0f, BCOL_DATE);
         ImGui::TableSetupColumn("have", ImGuiTableColumnFlags_WidthFixed,
                                 44.0f, BCOL_HAVE);
-        // Wide enough for BOTH buttons. It was 66 when the cell held one, and
-        // an ImGui table clips its cells, so "local" was drawn cut in half and
-        // only the visible part of it was clickable -- on the tab where trying
-        // it is the natural thing to do.
+        // Wide enough for ALL THREE buttons. It was 66 when the cell held one,
+        // and an ImGui table clips its cells, so "local" was drawn cut in half
+        // and only the visible part of it was clickable -- on the tab where
+        // trying it is the natural thing to do.
         ImGui::TableSetupColumn("watch", ImGuiTableColumnFlags_WidthFixed |
-                                         ImGuiTableColumnFlags_NoSort, 118.0f);
+                                         ImGuiTableColumnFlags_NoSort, 168.0f);
         ImGui::TableHeadersRow();
 
         ImGuiTableSortSpecs *specs = ImGui::TableGetSortSpecs();
@@ -3475,25 +3668,40 @@ static void DrawBoardTab(void)
                 // already sitting above this table.
                 ImGui::TableNextColumn();
                 int bMapId = WrBoardMapId();
-                if (!r->have || bMapId <= 0)
+                if (!r->have)
                     ImGui::TextDisabled("-");
-                else if (WrIntoGameMine(bMapId, r->hash))
-                {
-                    if (ImGui::SmallButton("take out"))
-                    {
-                        WrIntoGameRemoveOne(bMapId, r->hash);
-                        WrSendForget();
-                    }
-                }
                 else
                 {
-                    if (ImGui::SmallButton("send"))
-                        WrSendFromRow(WR_INTO_ONLINE, WrBoardMap(), bMapId,
-                                      r->hash, r->alias, WR_SEND_TAB_BOARD);
+                    // The path-based command works here for exactly the reason
+                    // it works in Runs, and it needs no map id -- the local tree
+                    // is named by the map.
+                    if (ImGui::SmallButton("watch"))
+                        WrWatchCmdFromRow(WrBoardMap(), bMapId, r->hash,
+                                          r->alias, WR_SEND_TAB_BOARD);
                     ImGui::SameLine();
-                    if (ImGui::SmallButton("local"))
-                        WrSendFromRow(WR_INTO_LOCAL, WrBoardMap(), bMapId,
-                                      r->hash, r->alias, WR_SEND_TAB_BOARD);
+
+                    if (WrIntoGameMine(bMapId, r->hash))
+                    {
+                        if (ImGui::SmallButton("take out"))
+                        {
+                            WrIntoGameRemoveOne(bMapId, r->hash);
+                            WrSendForget();
+                        }
+                    }
+                    else
+                    {
+                        if (bMapId > 0)
+                        {
+                            if (ImGui::SmallButton("send"))
+                                WrSendFromRow(WR_INTO_ONLINE, WrBoardMap(),
+                                              bMapId, r->hash, r->alias,
+                                              WR_SEND_TAB_BOARD);
+                            ImGui::SameLine();
+                        }
+                        if (ImGui::SmallButton("local"))
+                            WrSendFromRow(WR_INTO_LOCAL, WrBoardMap(), bMapId,
+                                          r->hash, r->alias, WR_SEND_TAB_BOARD);
+                    }
                 }
 
                 ImGui::PopID();
@@ -3644,33 +3852,67 @@ static void DrawEnergyTab(void)
 
     ImGui::Spacing();
     const char *kModes[WR_HUD_MODE_COUNT] = {
-        "net energy", "carried %", "spent / banked", "gained / lost"
+        "net energy", "carried %", "spent / banked", "gained / lost",
+        "strafe quality"
     };
     if (g_energy.hudMode < 0 || g_energy.hudMode >= WR_HUD_MODE_COUNT)
         g_energy.hudMode = 0;
     ImGui::Combo("Crosshair shows", &g_energy.hudMode, kModes,
                  WR_HUD_MODE_COUNT);
 
-    static const struct { int vk; const char *name; } kKeys[] = {
-        { 0, "none" }, { VK_END, "End" }, { VK_HOME, "Home" },
-        { VK_NEXT, "Page Down" }, { VK_PRIOR, "Page Up" },
-        { VK_DELETE, "Delete" }, { VK_F9, "F9" }, { VK_F10, "F10" },
-    };
-    const int kKeyCount = (int)(sizeof(kKeys) / sizeof(kKeys[0]));
-    int sel = 0;
-    for (int i = 0; i < kKeyCount; i++)
-        if (kKeys[i].vk == g_hudCycleKey) { sel = i; break; }
-    const char *names[8];
-    for (int i = 0; i < kKeyCount; i++) names[i] = kKeys[i].name;
-    if (ImGui::Combo("Cycle key", &sel, names, kKeyCount))
-        g_hudCycleKey = kKeys[sel].vk;
+    if (g_energy.hudMode == WR_HUD_STRAFE)
+    {
+        ImGui::SetNextItemWidth(160.0f);
+        ImGui::SliderFloat("Gauge window", &g_energy.gaugeSeconds, 0.5f, 5.0f,
+                           "%.1f s", ImGuiSliderFlags_AlwaysClamp);
+        ImGui::SameLine();
+        HelpMarker(
+            "How close your strafing is to the most air acceleration could "
+            "physically add: +100% is the ceiling, 0 is free flight, negative is "
+            "energy being destroyed. The same scale, and the same red and green, "
+            "as the demo line colours -- so the two can never disagree.\n\n"
+            "IT IS NOT A TURN-RATE METER, AND IT DOES NOT NEED THE RAMP'S ANGLE. "
+            "Turn rate was the first attempt at this and it fires on a tenth to "
+            "a quarter of the samples of RECORD-CLASS runs, because a ramp turns "
+            "your velocity through its surface normal far faster than air "
+            "acceleration ever can. What is measured instead is the consequence "
+            "-- dE/dt -- against a ceiling of 37.5 energy units a second, which "
+            "is the same at 500 u/s as at 3500 and the same on every angle of "
+            "ramp. There is nothing about the geometry left to compensate for.\n\n"
+            "Nor does the deadstrafe period need compensating at these settings. "
+            "Source quarters your surface friction while you are airborne rising "
+            "SLOWER than 140 u/s over a ramp, but that only bites if it drops "
+            "acceleration below the 30 u/s wishspeed cap: at air accelerate 150 "
+            "it goes 562 to 141, still miles above it. Measured on the demos "
+            "here, p95 of energy gain is 38.07 inside that window across 69,916 "
+            "samples and 37.99 outside it across 795,096.\n\n"
+            "WHY THE WINDOW IS SO LONG. Your velocity is estimated by "
+            "differencing camera positions, and against a 37-unit ceiling that "
+            "estimate is coarse. Simulated against twelve real runs: at 0.25 s "
+            "the reading agrees with the truth 45% of the time and points the "
+            "WRONG WAY 26% of the time; at 0.40 s, 58% and 24%; at 2 s, 81.5% "
+            "and 8.5%. Airborne only -- which is where it means strafing rather "
+            "than a ramp collision -- 0.40 s is 45% and 32%. So this is one slow "
+            "rolling number and your own drawn line stays uncoloured. Demo lines "
+            "do not have the problem: their velocity is what Momentum recorded.\n\n"
+            "Read it as a rolling average, never as a verdict on this instant.");
+    }
+
+    KeyBindCombo("Next mode", &g_hudCycleKey);
+    KeyBindCombo("Previous mode", &g_hudCycleBackKey);
     ImGui::SameLine();
-    HelpMarker("Switches the crosshair readout without opening this panel, "
-               "which is the only way it is useful mid-run.\n\n"
-               "It is a list rather than a fixed key because WrLines cannot see "
-               "what you have bound. The key is read, not swallowed -- if it "
-               "collides with something, the game still acts on it, so set this "
-               "to none and use the box above instead.");
+    HelpMarker("Page Down and Page Up switch the box's mode without opening this "
+               "panel, which is the only way it is useful mid-run. Two keys "
+               "rather than one, because there are five modes now and cycling "
+               "forward past the one you wanted means four more presses.\n\n"
+               "A list rather than a fixed key, because WrLines cannot see what "
+               "you have bound. The key is read, not swallowed -- if it collides "
+               "with something, the game still acts on it, so set this to (none) "
+               "and use the box above instead.");
+    KeyBindCombo("Corner block", &g_overlayToggleKey);
+    ImGui::SameLine();
+    HelpMarker("Turns the corner block off and on. It is off by default, so this "
+               "is how you get it without opening the panel.");
 
     // --- the anchor ---------------------------------------------------------
     ImGui::SeparatorText("Anchor");
@@ -4154,27 +4396,17 @@ static void DrawEnergyTab(void)
 
     ImGui::SeparatorText("Settings");
     ImGui::Checkbox("Also show the corner block", &g_energy.showOverlay);
+    ImGui::SameLine();
+    HelpMarker("Off by default, and END turns it on and off without opening this "
+               "panel.\n\n"
+               "There was an edge-padding slider here. It was added for a block "
+               "that looked cut off at the bottom of the screen and turned out "
+               "not to be, so it is gone again -- the padding is back to the 18 "
+               "pixels it always was. Both corner blocks are still clamped "
+               "inside the screen, which costs nothing and does nothing at all "
+               "unless a block genuinely would not fit.");
     const char *corners[] = { "top left", "top right", "bottom left", "bottom right" };
     ImGui::Combo("Corner", &g_energy.overlayCorner, corners, 4);
-    ImGui::SliderFloat("Edge padding", &g_energy.overlayMargin, 0.0f, 200.0f,
-                       "%.0f px");
-    ImGui::SameLine();
-    {
-        int bw = 0, bh = 0;
-        WrBackbufferSize(&bw, &bh);
-        char tip[512];
-        _snprintf_s(tip, sizeof(tip), _TRUNCATE,
-            "How far the corner block and the key are kept from the edge of the "
-            "screen.\n\n"
-            "It was a hard 18 pixels and nothing checked the result, so a block "
-            "in a bottom corner could hang off the bottom of the screen. Both "
-            "blocks are now clamped inside the screen as well, so this is "
-            "padding rather than the only thing holding them on.\n\n"
-            "If a block still looks cut off after this, the screen size itself "
-            "is wrong rather than the padding. WrLines measures it as %d x %d "
-            "right now -- if that is not your resolution, say so.", bw, bh);
-        HelpMarker(tip);
-    }
     ImGui::Checkbox("Compare against the fastest enabled run nearby",
                     &g_energy.compareToRun);
     ImGui::SliderFloat("Compare radius", &g_energy.compareRadius, 64.0f, 4096.0f,
@@ -4855,8 +5087,15 @@ static void DrawAboutTab(void)
     ImGui::Unindent();
     ImGui::Spacing();
     ImGui::TextWrapped(
-        "It writes nothing into the game install, sets no cvars, and never "
-        "touches sv_cheats. All its files live in wrlines_data next to the DLL.");
+        "It sets no cvars, runs no console commands, and never touches "
+        "sv_cheats. Its own files all live in wrlines_data next to the DLL.");
+    ImGui::TextWrapped(
+        "One exception, and it is opt-in: pressing \"send\", \"local\" or "
+        "\"watch\" on a run copies that one demo into the game's replay folder "
+        "so the game can play it. Every copy is written into "
+        "wrlines_data\\into_game.txt first, and nothing outside that list can be "
+        "deleted from here -- the demos the game downloaded itself are not "
+        "reachable. \"Take out\" removes ours again.");
 
     ImGui::SeparatorText("What it deliberately doesn't do");
     ImGui::BulletText("It never unloads. Restart the game to update the DLL.");
@@ -4867,11 +5106,89 @@ static void DrawAboutTab(void)
     ImGui::BulletText("Lines have no depth test -- they draw through walls.");
 
     ImGui::SeparatorText("Keys");
+    ImGui::TextDisabled("Read from the current bindings, not from the defaults,");
+    ImGui::TextDisabled("so a key you have changed is shown as it is now.");
+    ImGui::Spacing();
     ImGui::BulletText("INSERT  -  show / hide this panel");
     ImGui::BulletText("ESC     -  close this panel");
+    ImGui::BulletText("%-7s -  the box at your crosshair: next mode",
+                      WrUiKeyName(WrUiHudCycleKey()));
+    ImGui::BulletText("%-7s -  ... and the previous one",
+                      WrUiKeyName(WrUiHudCycleBackKey()));
+    ImGui::BulletText("%-7s -  \"whose line am I looking at\" -- off by default",
+                      WrUiKeyName(WrUiPickToggleKey()));
+    ImGui::BulletText("%-7s -  the corner block -- off by default",
+                      WrUiKeyName(WrUiOverlayToggleKey()));
+    ImGui::Spacing();
+    ImGui::TextDisabled("All four are rebindable -- the plate's in Display, the");
+    ImGui::TextDisabled("other three in Energy. They are READ, never swallowed,");
+    ImGui::TextDisabled("so a collision means the game still acts on the key.");
+
+    ImGui::SeparatorText("Settings");
+    if (WrSettingsPending())
+        ImGui::TextColored(ImVec4(0.6f, 0.9f, 1.0f, 1.0f),
+                           "%d settings, a change waiting to be written",
+                           WrSettingsFieldCount());
+    else if (WrSettingsSinceSave() >= 0.0f)
+        ImGui::TextDisabled("%d settings, saved %.0f s ago",
+                            WrSettingsFieldCount(), WrSettingsSinceSave());
+    else
+        ImGui::TextDisabled("%d settings, nothing written yet this session",
+                            WrSettingsFieldCount());
+
+    if (ImGui::Button("Save now"))
+        WrSettingsSave();
+    ImGui::SameLine();
+    if (ImGui::Button("Reload"))
+        WrSettingsLoad();
+    ImGui::SameLine();
+    if (ImGui::Button("Reset everything"))
+        WrSettingsResetAll();
+    ImGui::SameLine();
+    HelpMarker(
+        "Saved by itself, a couple of seconds after you stop changing things, "
+        "so a slider being dragged writes once rather than every frame.\n\n"
+        "The file is plain text and safe to edit or delete -- deleting it puts "
+        "everything back to its defaults. A key this build does not know is "
+        "ignored and a missing key keeps its default, so an old file loads into "
+        "a new build and the other way round, and every value is clamped to the "
+        "range its own slider has.\n\n"
+        "Display settings only: no names, no SteamIDs, no map or run data, no "
+        "record of what you watched. Safe to paste into a bug report.\n\n"
+        "The panel's own position and size are saved beside it, in imgui.ini -- "
+        "ours, in our folder, never the game's momentum\\cfg\\imgui.ini.");
+
+    if (WrSettingsUnknownKeys() > 0)
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
+                           "%d key%s in the file this build does not know -- "
+                           "written by a different version, and ignored.",
+                           WrSettingsUnknownKeys(),
+                           WrSettingsUnknownKeys() == 1 ? "" : "s");
 
     ImGui::SeparatorText("Files");
     ImGui::TextDisabled("%s", WrDataPath(""));
+}
+
+// The settings the PANEL owns, registered here rather than in wr_settings.cpp so
+// that each one sits in the file that declares the variable. Adding a setting is
+// one line, next to the setting; a table maintained somewhere else goes out of
+// step the first time somebody adds a field and edits only one of the two.
+void WrUiRegisterSettings(void)
+{
+    WrSettingsInt("key.hudCycleNext", &g_hudCycleKey, 0, 255);
+    WrSettingsInt("key.hudCyclePrev", &g_hudCycleBackKey, 0, 255);
+    WrSettingsInt("key.pickToggle", &g_pickToggleKey, 0, 255);
+    WrSettingsInt("key.overlayToggle", &g_overlayToggleKey, 0, 255);
+
+    WrSettingsBool("graph.byTime", &g_gByTime);
+    WrSettingsBool("graph.normalise", &g_gNormalise);
+    WrSettingsBool("graph.band", &g_gBand);
+    WrSettingsBool("graph.turns", &g_gTurns);
+    WrSettingsBool("graph.live", &g_gLive);
+    WrSettingsInt("graph.maxSeries", &g_gMaxSeries, 1, G_MAX_SERIES);
+
+    WrSettingsFloat("runs.nearRadius", &s_nearRadius, 256.0f, 65536.0f);
+    WrSettingsBool("runs.nearOnly", &s_nearOnly);
 }
 
 void WrUiDraw(void)

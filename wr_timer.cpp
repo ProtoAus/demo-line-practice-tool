@@ -44,6 +44,37 @@ static bool g_wasExact = false;
 // camera is not mistaken for the camera having arrived somewhere.
 static unsigned int g_lastSavelocGen = 0;
 
+// Where a restart put us, and whether we are still standing in it.
+//
+// A fail drops you ABOVE the pad and you fall in, so the teleport flag is
+// consumed one or more frames before the camera is anywhere near a save-loc --
+// which is why suppressing on `teleported` alone let the exact-match path fire
+// 125 ms later and restore a start-pad save-loc's clock on every single fail.
+// See the block in WrTimerTick.
+static bool g_afterRestart = false;
+static Vec3 g_restartAt = {0.0f, 0.0f, 0.0f};
+static float g_sinceRestart = 0.0f;
+
+// How far from the restart landing counts as having left it, and how long the
+// quarantine may last at most. The distance is the real test; the timeout only
+// exists so that a deliberate load right where you landed is not locked out for
+// the rest of the session.
+#define QUARANTINE_UNITS 96.0f
+#define QUARANTINE_SECONDS 3.0f
+
+// The start zone the live hold is waiting to leave, latched when the hold is
+// taken. Latched rather than looked up each frame so the release cannot be
+// moved by the zone list being rebuilt underneath it.
+static bool g_holdZone = false;
+static Vec3 g_holdCentre = {0.0f, 0.0f, 0.0f};
+static float g_holdRadius = 0.0f;
+
+static float HorizDist(const Vec3 &a, const Vec3 &b)
+{
+    float dx = a.x - b.x, dy = a.y - b.y;
+    return sqrtf(dx * dx + dy * dy);
+}
+
 void WrTimerReset(void)
 {
     g_running = false;
@@ -51,6 +82,10 @@ void WrTimerReset(void)
     g_elapsed = 0.0f;
     g_wasExact = false;
     g_lastExact = WrVec(0.0f, 0.0f, 0.0f);
+    g_afterRestart = false;
+    g_sinceRestart = 0.0f;
+    g_holdZone = false;
+    g_holdRadius = 0.0f;
 }
 
 void WrTimerStart(void)
@@ -96,6 +131,34 @@ void WrTimerTick(const Vec3 &cam, float dt)
     bool restart = WrEnergyTakeRestart();
     Vec3 landed;
     bool teleported = WrEnergyTakeTeleport(&landed);
+
+    // The quarantine, and it has to be updated BEFORE the save-loc block below
+    // reads it.
+    //
+    // A fail trigger does not put you on the pad, it puts you above it and lets
+    // you fall. So `teleported` and `restart` are both consumed on the frame of
+    // the jump, and the camera does not reach any save-loc's height until one or
+    // more frames later -- measured at 125 ms in the log this was diagnosed
+    // from. Suppressing the exact-match path on `teleported` alone therefore
+    // missed it completely, and a start-pad save-loc's time was restored on
+    // every single fail.
+    //
+    // Cleared by MOVING, with the timeout only as a floor: standing on the pad
+    // for a while and then deliberately loading a save-loc you keep right there
+    // should still work.
+    if (restart)
+    {
+        g_afterRestart = true;
+        g_restartAt = cam;
+        g_sinceRestart = 0.0f;
+    }
+    else if (g_afterRestart)
+    {
+        g_sinceRestart += dt;
+        if (HorizDist(cam, g_restartAt) > QUARANTINE_UNITS ||
+            g_sinceRestart > QUARANTINE_SECONDS)
+            g_afterRestart = false;
+    }
 
     // A save-loc load that did NOT move you far enough to look like a teleport.
     //
@@ -146,7 +209,12 @@ void WrTimerTick(const Vec3 &cam, float dt)
         // arrival by position and a creation in fact -- it would rewind the
         // clock by however long the background read took and overwrite "saved
         // at 12.5s" with "restored to 12.5s".
-        bool suppress = teleported || tableChanged;
+        //
+        // And the frames after a restart, until you have actually moved off the
+        // pad -- see the quarantine above. This is the suppression that was
+        // missing, and it is the whole of "a timer shows up for a second when I
+        // fail".
+        bool suppress = teleported || tableChanged || g_afterRestart;
 
         if (suppress)
         {
@@ -195,13 +263,34 @@ void WrTimerTick(const Vec3 &cam, float dt)
         WrSavelocHit hit;
         if (WrSavelocMatch(landed, &hit))
         {
-            if (hit.seconds >= 0.0f)
+            // A RESTART OUTRANKS A SAVE-LOC, AND THIS USED TO BE THE OTHER WAY
+            //
+            // The old comment here argued that a save-loc is "a more specific
+            // answer than you are near the start". It is not, because of where
+            // `restart` comes from: it is raised only when the landing is within
+            // RESTART_UNITS of the anchor (wr_energy.cpp), which is the start
+            // pad -- and a save-loc kept on the start pad is exactly the one
+            // that will always match there. So the specific answer was being
+            // read off the least specific event there is.
+            //
+            // The cost was not cosmetic. Setting the clock also fires
+            // WrSavelocNoteRestore, which the HUD shows for two seconds, so a
+            // number appeared and vanished on every fail; and clearing `restart`
+            // skipped the whole block below, so the live recorder never took its
+            // hold and the graph was wiped on the trip back to the pad. Both
+            // reported symptoms, one line.
+            //
+            // The velocity seed below has refused restarts since v0.4.2 for the
+            // same reason. This makes the clock agree with it.
+            if (hit.seconds >= 0.0f && !restart)
             {
-                // A save-loc is a more specific answer than "you are near the
-                // start", so it wins over the restart below when both match.
                 WrTimerSet(hit.seconds, "loaded a save-loc");
                 WrSavelocNoteRestore(hit.seconds);
-                restart = false;
+            }
+            else if (hit.seconds >= 0.0f)
+            {
+                WrLogf("timer: a %.2fs save-loc matched where the restart put "
+                       "us -- ignored, a fail is not a load", hit.seconds);
             }
 
             // The velocity does not depend on us ever having timed this
@@ -245,25 +334,57 @@ void WrTimerTick(const Vec3 &cam, float dt)
         // ONLY thing that lets the hold go. With no runs loaded there are no
         // zones (they are fitted from the run store), nothing could ever release
         // it, and recording would stop for the session.
+        // Latched FIRST, and the hold is only taken if the latch succeeded.
+        //
+        // That ordering is the whole safety argument: the circle is what lets
+        // the hold go, so a hold taken without one could only ever be released
+        // by a start crossing that may not come, and a recorder that is switched
+        // on and silently recording nothing is a worse failure than the one the
+        // hold fixes. Taken this way, "held" implies "has somewhere to leave".
+        //
+        // Nearest by horizontal distance, which is what WrStartZoneNearest
+        // already answers -- and horizontal is right here for the same reason it
+        // is right everywhere else in this file: a fail leaves you above the pad
+        // and you fall in, so a vertical term would say you were somewhere else.
         if (g_start.enabled && WrStartZoneCount() > 0)
-            WrLiveHold(true);
+        {
+            float d = 0.0f;
+            const WrStartZone *z = WrStartZoneNearest(&d);
+            if (z)
+            {
+                g_holdZone = true;
+                g_holdCentre = z->centre;
+                g_holdRadius = WrStartZoneRadius(z);
+                WrLiveHold(true);
+            }
+        }
     }
 
-    // The hold's last way out.
+    // The hold's last way out, and it used to be a stopwatch.
     //
-    // It is normally let go of by leaving the start zone, or by the clock
-    // re-starting from the anchor further down -- both of which are "the next
-    // attempt has begun". Neither is guaranteed: the start machine has strict
-    // re-arming rules and does not fire on every leg, and a hand-started clock
-    // never takes the anchor path because it never stops running. That leaves a
-    // recorder that is switched on and quietly recording nothing, which is a
-    // worse failure than the one the hold fixes.
+    // It was `g_running && g_elapsed > 3.0f`, which sounds like a backstop and
+    // is not one: the anchor test further down starts the clock as soon as you
+    // are 32 units from the anchor, and a fail drops you hundreds of units from
+    // it -- the comment down there says so itself. So the clock started within a
+    // frame or two of every fail and this fired three seconds later, which is
+    // before anybody has finished falling, let alone opened the panel. The v0.4.3
+    // hold worked and then threw its own work away.
     //
-    // So: three seconds of clock since the restart zeroed it is a new attempt
-    // by any reading. Long enough that it cannot pre-empt either proper
-    // release, short enough that nothing is lost.
-    if (WrLiveHeld() && g_running && g_elapsed > 3.0f)
+    // What the user actually asked for is positional, so measure position:
+    // held until you leave the start you were put back in. The crossing edge
+    // below stays the PRIMARY release -- it fires at the right moment, when you
+    // leave the plane at speed -- and this is only for legs where the start
+    // machine never arms and so never fires.
+    //
+    // The cost, stated: released this way, the fraction of a second of the new
+    // attempt spent inside the circle is not recorded. Released by the crossing,
+    // which is the normal path, there is no gap at all.
+    if (WrLiveHeld() && g_holdZone &&
+        HorizDist(cam, g_holdCentre) > g_holdRadius)
+    {
+        g_holdZone = false;
         WrLiveClear();
+    }
 
     // The start-zone machine, fed the flags rather than allowed to take them.
     //
@@ -295,6 +416,7 @@ void WrTimerTick(const Vec3 &cam, float dt)
         // attempt from the start line and not a session's worth of them -- and
         // because the clock was just zeroed a line above, keeping the old points
         // would put the time axis into reverse.
+        g_holdZone = false;
         WrLiveClear();
         return;
     }

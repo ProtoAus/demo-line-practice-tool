@@ -426,6 +426,117 @@ int main(void)
         WrProfileShutdown();
     }
 
+    // -----------------------------------------------------------------------
+    printf("\nsmoothing is the LIVE curve's alone, and it keeps the axis sane\n");
+    {
+        // The two series are built by identical rules and still do not look
+        // alike, because a demo's velocity is exact and yours is differenced
+        // from camera positions. The median-of-five above is aimed at two-tick
+        // lies and is far too short a window to touch broadband noise, so the
+        // live curve gets a mean over a span of TIME instead -- and only the
+        // live curve, which is what these first checks are for.
+        const int N = 400;
+        WrPoint *pts = (WrPoint *)calloc(N, sizeof(WrPoint));
+
+        // A ramp of energy with a fast wobble laid over it. The wobble is what
+        // should go; the ramp is what must stay.
+        for (int i = 0; i < N; i++)
+        {
+            float t = (float)i * 0.005f;            // 200 Hz, a real frame rate
+            float wob = ((i & 1) ? 60.0f : -60.0f);
+            pts[i].pos = WrVec((float)i * 8.0f, 0.0f, 500.0f + t * 100.0f + wob);
+            pts[i].vel = WrVec(1000.0f, 0.0f, 0.0f);
+            pts[i].t = t;
+        }
+        g_stubLive = pts;
+        g_stubLiveCount = N;
+
+        // A stored run of the same shape, to prove the setting cannot reach it.
+        WrRun run;
+        memset(&run, 0, sizeof(run));
+        run.points = (WrPoint *)calloc(N, sizeof(WrPoint));
+        memcpy(run.points, pts, sizeof(WrPoint) * N);
+        run.pointCount = N;
+        run.tickInterval = TICK;
+        run.timingTrusted = true;
+        run.timeScale = 1.0f;
+        run.enabled = true;
+        g_stubRuns = &run;
+        g_stubRunCount = 1;
+
+        g_wrProfileLiveSmooth = 0.0f;
+        const WrProfile *raw = WrProfileLive();
+        float rawSwing = 0.0f;
+        if (raw)
+            for (int k = 1; k < raw->n; k++)
+            {
+                float d = raw->b[k].e - raw->b[k - 1].e;
+                if (d < 0.0f) d = -d;
+                if (d > rawSwing) rawSwing = d;
+            }
+
+        g_wrProfileLiveSmooth = 0.20f;
+        const WrProfile *sm = WrProfileLive();
+        Check(sm && sm->builtSmooth > 0.19f,
+              "the live profile rebuilt when the setting moved");
+
+        float smSwing = 0.0f;
+        if (sm)
+            for (int k = 1; k < sm->n; k++)
+            {
+                float d = sm->b[k].e - sm->b[k - 1].e;
+                if (d < 0.0f) d = -d;
+                if (d > smSwing) smSwing = d;
+            }
+        Check(smSwing < rawSwing * 0.5f,
+              "and the frame-to-frame wobble is more than halved");
+
+        // The ramp survives. 400 samples at 200 Hz is 2 s at 100 units a second,
+        // so end minus start is about 200 whatever the filter does.
+        if (sm && sm->n > 2)
+        {
+            float rise = sm->b[sm->n - 1].e - sm->b[0].e;
+            Check(rise > 140.0f, "the real trend is still there underneath it");
+        }
+
+        // A time axis that goes backwards would break the binary search the
+        // hover readout uses, and a smoothing pass over t is exactly where that
+        // could be introduced.
+        bool monotonic = true;
+        if (sm)
+            for (int k = 1; k < sm->n; k++)
+                if (sm->b[k].t < sm->b[k - 1].t)
+                    monotonic = false;
+        Check(monotonic, "the time axis is still non-decreasing");
+
+        // And the stored run is untouched, at any setting.
+        WrProfilePending();
+        const WrProfile *a = WrProfileFor(&run);
+        float aFirst = a ? a->b[0].e : 0.0f;
+        float aLast = a ? a->b[a->n - 1].e : 0.0f;
+        int aN = a ? a->n : 0;
+        Check(a && a->builtSmooth == 0.0f,
+              "a stored run always builds with no smoothing");
+
+        g_wrProfileLiveSmooth = 0.5f;
+        WrProfileFree(&run);
+        WrProfilePending();
+        const WrProfile *b = WrProfileFor(&run);
+        Check(b && b->n == aN && b->b[0].e == aFirst &&
+              b->b[b->n - 1].e == aLast,
+              "and is bit-identical however the live setting is set");
+
+        g_wrProfileLiveSmooth = 0.20f;
+        WrProfileFree(&run);
+        free(run.points);
+        free(pts);
+        g_stubLive = NULL;
+        g_stubLiveCount = 0;
+        g_stubRuns = NULL;
+        g_stubRunCount = 0;
+        WrProfileShutdown();
+    }
+
     printf("\n%s\n\n", g_failures ? "SOME CHECKS FAILED" : "all checks passed");
     return g_failures ? 1 : 0;
 }

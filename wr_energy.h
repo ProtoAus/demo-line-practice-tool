@@ -176,6 +176,13 @@ struct WrEnergySettings
     float velTau;
     float speedTau;
     float powerSeconds;     // window dE/dt is measured over
+
+    // And the window the STRAFE GAUGE measures over, which is a different and
+    // much longer one on purpose. See WrEnergyEta: at 0.40 s a reading taken
+    // from a camera-differenced velocity points the wrong way a quarter of the
+    // time, and at 2 s it does so 8.5% of the time. Two seconds is the shortest
+    // window where the number is worth putting on screen.
+    float gaugeSeconds;
     float arrowBand;        // trend inside +-this shows no arrow at all
 
     // Anchor the readout to the start of the run being compared against, so its
@@ -244,6 +251,7 @@ enum WrHudMode
     WR_HUD_CARRIED,     // the share of the height you spent that is still speed
     WR_HUD_BUDGET,      // spent / banked / wasted
     WR_HUD_GAINED,      // gross gained and gross lost since the anchor
+    WR_HUD_STRAFE,      // how close to the physical best your strafing is
     WR_HUD_MODE_COUNT
 };
 
@@ -396,7 +404,9 @@ float WrEnergyLost(void);
 bool WrEnergyBudgetSpliced(void);
 
 // Cycle the crosshair readout. Bound to a key so it can be changed mid-run.
-void WrEnergyCycleHudMode(void);
+// Step the centre box's mode. +1 for the next, -1 for the previous; wraps both
+// ways. Page Down and Page Up, from the hotkey thread.
+void WrEnergyCycleHudMode(int step);
 
 // Convert a position and velocity into an absolute energy height.
 float WrEnergyOf(const Vec3 &pos, const Vec3 &vel);
@@ -445,6 +455,27 @@ bool WrEnergyVelocity(Vec3 *out);   // smoothed velocity, for the world vector
 // average, never as a per-frame verdict: the residual noise is comparable to the
 // largest genuine excursion over the window.
 float WrEnergyPower(void);
+
+// How close your strafing is to the most air acceleration could physically add,
+// in [-1, +1]. +1 is the ceiling, 0 is free flight, negative is energy being
+// destroyed -- the same scale the demo lines are coloured on, so the two can
+// never disagree.
+//
+// `tickInterval` is the tick the ceiling is computed at; use the compared run's
+// when there is one, 0.015 otherwise. It is a parameter because the run store
+// lives on the other side of a link boundary from this file -- see the note in
+// the definition.
+//
+// `noReading` comes back true when there is nothing honest to show: too little
+// history yet, or a rate too large to have come from a player, which is a map
+// booster and not perfect play. Draw that as a gap, never as zero -- zero also
+// means free flight, and drawing the two the same is what made the first version
+// of the line colours unreadable.
+float WrEnergyEta(float tickInterval, bool *noReading);
+
+// How long a span the gauge's answer actually covered, which is less than the
+// window for the first couple of seconds after a reset or a load.
+float WrEnergyGaugeSpan(void);
 
 float WrEnergyViewTurnRate(void);
 float WrEnergyVelTurnRate(void);

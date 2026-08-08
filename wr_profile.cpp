@@ -23,6 +23,58 @@ static bool g_liveInit = false;
 
 int g_wrProfileBuckets = WR_PROFILE_BUCKETS;
 bool g_wrProfileDespike = true;
+float g_wrProfileLiveSmooth = 0.20f;
+
+// Scratch for the smoothing pass, grown once and kept.
+//
+// Two floats per point over a 32 768-point live buffer is 256 KB, and
+// WrProfileLive rebuilds every frame while you are recording -- so this is
+// allocated once rather than malloc'd and freed sixty to three hundred times a
+// second. Single-threaded by the same rule as everything else here: profiles are
+// built from the render thread and nowhere else.
+static float *g_scratch = NULL;
+static int g_scratchCap = 0;
+
+static bool ScratchEnsure(int floats)
+{
+    if (floats <= g_scratchCap)
+        return true;
+    int want = floats + floats / 2;
+    float *grown = (float *)realloc(g_scratch, sizeof(float) * (size_t)want);
+    if (!grown)
+        return false;
+    g_scratch = grown;
+    g_scratchCap = want;
+    return true;
+}
+
+// A centred mean over a fixed span of time.
+//
+// Two pointers and a running sum, so it is one pass whatever the window. The
+// pointers only ever move forward, which is what keeps it linear -- and it is
+// also what makes it safe when `t` is not monotone, which the live series can
+// briefly fail to be when a save-loc that did not move you puts the clock back.
+// At such a point the window is simply whichever samples the pointers were
+// holding rather than the exact span asked for; it cannot read out of range and
+// it cannot loop. The forced expansion below guarantees the window always
+// contains the sample being smoothed.
+static void SmoothOverTime(const float *in, float *out, const WrPoint *pts,
+                           int n, float seconds)
+{
+    float half = seconds * 0.5f;
+    int a = 0, b = 0;
+    double sum = 0.0;
+
+    for (int i = 0; i < n; i++)
+    {
+        while (b < n && pts[b].t <= pts[i].t + half) { sum += in[b]; b++; }
+        while (b <= i)                  { sum += in[b]; b++; }
+        while (a < i && pts[a].t < pts[i].t - half) { sum -= in[a]; a++; }
+
+        int cnt = b - a;
+        out[i] = (cnt > 0) ? (float)(sum / (double)cnt) : in[i];
+    }
+}
 
 // ---------------------------------------------------------------------------
 
@@ -117,7 +169,7 @@ static float EnergyAt(const WrPoint *pts, int count, int i, int lo, float e0)
 
 static bool Build(WrProfile *out, const WrPoint *pts, int count, int first,
                   const int *breaks, int breakCount,
-                  float timeScale, bool timeUsable)
+                  float timeScale, bool timeUsable, float smoothSeconds)
 {
     FreeProfile(out);
     memset(out, 0, sizeof(*out));
@@ -127,6 +179,7 @@ static bool Build(WrProfile *out, const WrPoint *pts, int count, int first,
     out->builtStart = first;
     out->builtBuckets = WrClampI(g_wrProfileBuckets, 16, WR_PROFILE_BUCKETS);
     out->builtDespike = g_wrProfileDespike;
+    out->builtSmooth = smoothSeconds;
     out->despiked = 0;
     if (!pts || count < 4)
         return false;
@@ -145,6 +198,25 @@ static bool Build(WrProfile *out, const WrPoint *pts, int count, int first,
     const float t0 = pts[first].t;
     float d = 0.0f;
     int nextBreak = 0;
+
+    // The optional low-pass, built once over the whole series before bucketing
+    // rather than inside the bucket loop -- a centred window needs neighbours on
+    // both sides, and a bucket does not have them at its edges.
+    //
+    // Applied on top of the despike filter, not instead of it: they answer
+    // different questions. The median removes two-tick lies; this reduces the
+    // width of an estimate. A stored run passes 0 here and is bit-identical to
+    // what it was before this existed.
+    const float *smoothed = NULL;
+    if (smoothSeconds > 1e-4f && span >= 3 && ScratchEnsure(span * 2))
+    {
+        float *raw = g_scratch;
+        float *sm = g_scratch + span;
+        for (int i = 0; i < span; i++)
+            raw[i] = EnergyAt(pts, count, first + i, first, e0);
+        SmoothOverTime(raw, sm, pts + first, span, smoothSeconds);
+        smoothed = sm;
+    }
 
     out->eMin = 0.0f;
     out->eMax = 0.0f;
@@ -194,7 +266,8 @@ static bool Build(WrProfile *out, const WrPoint *pts, int count, int first,
             // faint envelope around each curve is min/max within the bucket, so
             // it is where a two-tick spike shows most -- `last` can miss one
             // entirely while the band cannot.
-            float e = EnergyAt(pts, count, i, first, e0);
+            float e = smoothed ? smoothed[i - first]
+                               : EnergyAt(pts, count, i, first, e0);
             if (g_wrProfileDespike)
             {
                 float raw = WrEnergyOf(pts[i].pos, pts[i].vel) - e0;
@@ -239,6 +312,9 @@ const WrProfile *WrProfileFor(WrRun *run)
         // themselves. Rebuilding on those four is what lets this be cached at
         // all -- and a toggle that did not appear here would leave the old curve
         // on screen while the checkbox said otherwise.
+        // builtSmooth is NOT tested here, and deliberately: a stored run always
+        // builds with 0, so the field can never differ and testing it would only
+        // invite the belief that the live smoothing reaches these curves.
         if (run->profile->b && run->profile->gravity == g_energy.gravity &&
             run->profile->builtStart == run->startIndex &&
             run->profile->builtDespike == g_wrProfileDespike &&
@@ -260,7 +336,7 @@ const WrProfile *WrProfileFor(WrRun *run)
     if (!Build(run->profile, run->points, run->pointCount, run->startIndex,
                run->breaks, run->breakCount,
                run->timingTrusted ? run->timeScale : 1.0f,
-               run->timingTrusted))
+               run->timingTrusted, 0.0f))
         return NULL;
     return run->profile;
 }
@@ -305,16 +381,21 @@ const WrProfile *WrProfileLive(void)
     // whole buffer is 32 768 points and a rebuild is a fraction of a
     // millisecond; keeping an incremental version in step with a ring buffer
     // that also gets cleared on a map change is not worth that.
+    float smooth = g_wrProfileLiveSmooth;
+    if (!(smooth > 0.0f)) smooth = 0.0f;
+    if (smooth > 2.0f)    smooth = 2.0f;
+
     if (g_live.b && g_live.builtFrom == count &&
         g_live.gravity == g_energy.gravity &&
         g_live.builtDespike == g_wrProfileDespike &&
+        g_live.builtSmooth == smooth &&
         g_live.builtBuckets == WrClampI(g_wrProfileBuckets, 16, WR_PROFILE_BUCKETS))
         return &g_live;
 
     // No break list: the live recorder keeps none, so the distance test stands
     // in. Your own save-loc loads are exactly the jumps it has to catch.
     // first = 0: your own line starts when you start it, and has no pre-roll.
-    if (!Build(&g_live, pts, count, 0, NULL, 0, 1.0f, true))
+    if (!Build(&g_live, pts, count, 0, NULL, 0, 1.0f, true, smooth))
         return NULL;
     return &g_live;
 }
@@ -332,6 +413,9 @@ void WrProfileShutdown(void)
 {
     FreeProfile(&g_live);
     g_liveInit = false;
+    free(g_scratch);
+    g_scratch = NULL;
+    g_scratchCap = 0;
 }
 
 bool WrProfileAt(const WrProfile *p, float x, bool byTime, float *e)

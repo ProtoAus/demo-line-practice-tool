@@ -92,6 +92,33 @@ bool WrIntoGamePathAt(WrIntoGameWhere where, const char *map, int mapId,
 bool WrIntoGameHasFileAt(WrIntoGameWhere where, const char *map, int mapId,
                          const char *hash);
 
+// The same destination written the way the GAME's filesystem names it -- forward
+// slashes, relative to momentum\ -- and the console command that plays it.
+//
+// This is the way in that does not depend on a list. Momentum's own end-of-run
+// screen runs `mom_tv_replay_watch ${baseRun.filePath}`, so the command takes a
+// PATH: any .mtv the game's filesystem can see will play, whether or not the
+// Downloaded or Local tab has ever heard of it. Which matters, because the
+// Downloaded tab is built from online leaderboard rows that have a cached file
+// (LeaderboardEntryType.ONLINE_CACHED, panorama/scripts/common/leaderboard.ts)
+// rather than from the folder -- so a file dropped in there appears only if the
+// game already listed that run.
+//
+// False when the hash is not shaped like a replay name, or the tree needs an id
+// or a map name that was not given.
+bool WrIntoGameGamePathAt(WrIntoGameWhere where, const char *map, int mapId,
+                          const char *hash, char *out, int outLen);
+
+// The command for wherever the demo ACTUALLY is. False when it is only in our
+// own folder -- which the game's filesystem cannot see, so the caller has to
+// copy it in first -- or when there is no demo at all.
+//
+// Built from where the file is rather than from the hash, because the player's
+// own recordings are named by the game and not by a hash, and those are exactly
+// the ones most worth being able to replay.
+bool WrIntoGameWatchCommand(const char *map, int mapId, const char *hash,
+                            char *out, int outLen);
+
 // Where this run's .mtv actually is, which is a different question from where it
 // would go, and the one the Runs list needs: 202 of the 1,749 .wrpath files on
 // this machine came from the player's OWN recordings in the game's local tree,

@@ -75,6 +75,7 @@ struct WrProfile
     int builtStart;     // startIndex at build time; the store can reload
     int builtBuckets;   // g_wrProfileBuckets at build time
     bool builtDespike;  // g_wrProfileDespike at build time
+    float builtSmooth;  // smoothSeconds at build time; 0 for every stored run
 
     // How many samples the transient filter actually moved. Reported rather
     // than kept quiet: a filter that rewrites the picture without saying how
@@ -106,6 +107,25 @@ extern int g_wrProfileBuckets;
 // This changes the PICTURE and never the stored run. Off restores the raw curve
 // exactly, and WrProfile::despiked says how many samples it moved.
 extern bool g_wrProfileDespike;
+
+// Low-pass YOUR OWN curve, in seconds. 0 is the raw curve. Stored runs are never
+// touched by this and always build with 0.
+//
+// The two series are built by identical rules and still do not look alike, and
+// the reason is the velocity rather than the arithmetic. A demo carries the
+// velocity Momentum recorded, which is exact; your line carries one estimated by
+// differencing camera positions, whose error is broadband rather than spiky. The
+// median-of-five in EnergyAt is aimed at the spikes -- deliberately, see its
+// header -- and five FRAMES at 200 fps is 25 ms, far too short a window to touch
+// broadband noise. So the despike filter leaves your curve exactly as jumpy as
+// it found it.
+//
+// A mean over a fixed span of TIME is the matching tool, and it has to be time
+// rather than samples because the live recorder's rate is your frame rate gated
+// on two units of movement -- a sample count would be a different window at
+// every speed. It also rounds off genuine ramp exits, which is why it says so on
+// the legend whenever it is on.
+extern float g_wrProfileLiveSmooth;
 
 // How far a sample has to move before it counts as one the filter changed. Well
 // above the ordinary tick-to-tick wobble of a smooth run and far below a real

@@ -75,6 +75,12 @@ static WrEma g_velX, g_velY, g_velZ;
 static WrEma g_speedEma, g_energyEma, g_viewTurnEma, g_velTurnEma, g_accelEma;
 static WrEma g_zEma;                // the height alone, so K can be separated
 static WrTrendWindow g_trend;
+
+// The strafe gauge's ring and its 20 Hz clock. See the push in WrEnergySample
+// for why it cannot share g_trend.
+#define GAUGE_INTERVAL 0.05f
+static WrTrendWindow g_gauge;
+static float g_gaugeClock = 0.0f;
 static WrArrow g_arrow;
 static WrSwing g_swing;
 static bool g_spliced = false;
@@ -214,10 +220,16 @@ void WrEnergyDefaults(void)
     g_energy.showHudSpeed = false;
     g_energy.hudWidth = 0.0f;       // as wide as the reserved rows need
 
-    g_energy.showOverlay = true;
+    // The corner block; OFF by default, and reachable with END without opening
+    // the panel. It is the detailed readout rather than the glanceable one --
+    // the centre box is what you play with.
+    g_energy.showOverlay = false;
     g_energy.overlayCorner = 3;
     g_energy.overlayScale = 1.0f;
-    g_energy.overlayMargin = 24.0f;
+    // 18, which is where it was before v0.4.3 raised it to 24 for a cut-off
+    // block that turned out not to be cut off. The clamp in wr_render.cpp stays
+    // -- it costs nothing and it is a no-op whenever the block already fits.
+    g_energy.overlayMargin = 18.0f;
 
     g_energy.compareToRun = true;
     g_energy.compareRadius = 384.0f;
@@ -236,6 +248,7 @@ void WrEnergyDefaults(void)
     g_energy.velTau = VEL_TAU;
     g_energy.speedTau = SPEED_TAU;
     g_energy.powerSeconds = POWER_WINDOW;
+    g_energy.gaugeSeconds = 2.0f;
     g_energy.arrowBand = ARROW_BAND;
     g_energy.anchorToRunStart = true;
     g_energy.hudMode = WR_HUD_NET;
@@ -258,9 +271,16 @@ void WrEnergyDefaults(void)
     g_energy.comparePointLeader = true;
 }
 
-void WrEnergyCycleHudMode(void)
+void WrEnergyCycleHudMode(int step)
 {
-    g_energy.hudMode = (g_energy.hudMode + 1) % WR_HUD_MODE_COUNT;
+    // Both directions, because there are five modes now and cycling forward past
+    // the one you wanted costs four more presses mid-ramp. The double modulus is
+    // the usual guard against C's truncating negative remainder.
+    int n = WR_HUD_MODE_COUNT;
+    int m = g_energy.hudMode;
+    if (m < 0 || m >= n)
+        m = 0;
+    g_energy.hudMode = ((m + step) % n + n) % n;
 }
 
 float WrEnergyOf(const Vec3 &pos, const Vec3 &vel)
@@ -279,6 +299,8 @@ void WrEnergyReset(void)
     WrEmaReset(&g_speedEma); WrEmaReset(&g_energyEma); WrEmaReset(&g_zEma);
     WrEmaReset(&g_viewTurnEma); WrEmaReset(&g_velTurnEma); WrEmaReset(&g_accelEma);
     WrTrendReset(&g_trend);
+    WrTrendReset(&g_gauge);
+    g_gaugeClock = 0.0f;
     WrArrowReset(&g_arrow);
     WrSwingReset(&g_swing, WR_SWING_HYSTERESIS);
     g_settleFor = 0.0f;
@@ -412,6 +434,8 @@ static void Teleported(const Vec3 &pos)
     WrEmaReset(&g_speedEma); WrEmaReset(&g_energyEma); WrEmaReset(&g_accelEma);
     WrEmaReset(&g_velTurnEma); WrEmaReset(&g_zEma);
     WrTrendReset(&g_trend);
+    WrTrendReset(&g_gauge);
+    g_gaugeClock = 0.0f;
     WrArrowReset(&g_arrow);
 
     // The accumulators are SEEDED at the far end, not stepped across the gap. A
@@ -790,6 +814,8 @@ void WrEnergySample(const Vec3 &pos, float dt)
             WrEmaReset(&g_velX); WrEmaReset(&g_velY); WrEmaReset(&g_velZ);
             WrEmaReset(&g_speedEma); WrEmaReset(&g_energyEma); WrEmaReset(&g_zEma);
             WrTrendReset(&g_trend);
+            WrTrendReset(&g_gauge);
+            g_gaugeClock = 0.0f;
             g_swing.have = false;
             // And back to the full hold, because from here this is an ordinary
             // unseeded teleport and the reasoning for three taus applies again.
@@ -829,6 +855,23 @@ void WrEnergySample(const Vec3 &pos, float dt)
     // so the arrow, the peak and the plot all agree with what is on screen.
     g_nowSmooth = WrEmaStep(&g_energyEma, g_now, dt, g_energy.smoothSeconds);
     WrTrendPush(&g_trend, g_nowSmooth, dt);
+
+    // The strafe gauge's own ring, fed at about 20 Hz.
+    //
+    // It cannot share the one above. That ring is 256 samples of every frame,
+    // which is 0.85 s at 300 fps and 1.28 s at 200 -- and the gauge's whole
+    // justification is a window of about two seconds, because that is where a
+    // camera-differenced velocity starts agreeing with the truth (81.5% at 2 s
+    // against 45% at 0.4; see wr_stress.h). Asking WrTrendOverSpan for 2 s from
+    // the fast ring returns the change over 1.3 s and calls it 2 s, which reads
+    // the RATE low by the ratio it was short by. At 20 Hz the same 256 slots
+    // hold 12.8 seconds, so the window always fits at any frame rate.
+    g_gaugeClock += dt;
+    if (g_gaugeClock >= GAUGE_INTERVAL)
+    {
+        WrTrendPush(&g_gauge, g_nowSmooth, g_gaugeClock);
+        g_gaugeClock = 0.0f;
+    }
 
     // The height alone, through the SAME filter and from the SAME instant --
     // mid.z, not pos.z. Because an EMA is linear, subtracting it from the
@@ -1036,6 +1079,71 @@ float WrEnergyPower(void)
     if (span < 1e-3f)
         return 0.0f;
     return d / span;
+}
+
+// ---------------------------------------------------------------------------
+// The strafe gauge
+// ---------------------------------------------------------------------------
+//
+// The same metric that colours the demo lines -- dE/dt against the most air
+// strafing could physically add -- measured live, over a window long enough for
+// a camera-differenced velocity to be worth reading.
+//
+// THE THING IT IS NOT
+//
+// It is not a turn-rate meter, and it does not need the ramp's angle. Turn rate
+// was the first attempt and it fires on a tenth to a quarter of the samples of
+// record-class runs, because a ramp turns the velocity through the surface
+// normal far faster than air acceleration ever can. The ceiling below bounds the
+// CONSEQUENCE instead -- how much energy could have been added -- and that bound
+// is ws^2 / (2*g*tick), independent of speed and of the geometry you are on. See
+// wr_stress.h for the derivation and the measurements.
+//
+// It is also not per-segment. The window is the whole point: at 0.40 s a
+// camera-derived reading agrees with the truth 58% of the time and points the
+// wrong way 24% of the time, and airborne -- where it would actually mean
+// strafing rather than a ramp collision -- it is 45% and 32%. At 2 s it is 81.5%
+// and 8.5%. So this is one rolling number and the line stays uncoloured.
+//
+// The tick comes in as a parameter rather than being looked up here, and that is
+// a link constraint rather than taste: the tick that matters is the one the
+// COMPARED RUN was recorded at (482 of the 503 demos here are 0.015, but all 21
+// bhop_futile runs are 0.01), and WrEnergyReferenceRun lives in wr_render.cpp,
+// which six of the nine harnesses do not link. Passing it in also makes the
+// whole function drivable from a test.
+float WrEnergyEta(float tickInterval, bool *noReading)
+{
+    if (noReading)
+        *noReading = true;
+
+    float w = g_energy.gaugeSeconds > 0.25f ? g_energy.gaugeSeconds : 2.0f;
+
+    float span = 0.0f;
+    float d = WrTrendOverSpan(&g_gauge, w, &span);
+    if (span < 0.25f)
+        return 0.0f;            // not enough history yet, e.g. just after a load
+
+    float rate = d / span;
+    float ceiling = WrAirPowerCeilingEx(g_energy.gravity, tickInterval,
+                                        g_energy.airAccelerate,
+                                        g_energy.maxSpeed, 1.0f);
+
+    // A booster is not perfect play, and reporting it as 0 would put it in the
+    // same bucket as free flight. Asked first, exactly as wr_path.cpp does.
+    if (WrEtaIsNoData(rate, ceiling))
+        return 0.0f;
+
+    if (noReading)
+        *noReading = false;
+    return WrEfficiency(rate, ceiling);
+}
+
+float WrEnergyGaugeSpan(void)
+{
+    float w = g_energy.gaugeSeconds > 0.25f ? g_energy.gaugeSeconds : 2.0f;
+    float span = 0.0f;
+    WrTrendOverSpan(&g_gauge, w, &span);
+    return span;
 }
 
 float WrEnergyViewTurnRate(void) { return g_viewTurn; }

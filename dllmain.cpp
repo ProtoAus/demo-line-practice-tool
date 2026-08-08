@@ -28,6 +28,7 @@
 #include "wr_savelocs.h"
 #include "wr_start.h"
 #include "wr_intogame.h"
+#include "wr_settings.h"
 
 #include "imgui.h"
 
@@ -137,6 +138,11 @@ void WrIdleTick(void)
         }
     }
 
+    // Notice a changed setting and write it once it has settled. Here rather
+    // than in the draw path, because settings are changed from the panel and the
+    // panel being shut is exactly when a write is safe and wanted.
+    WrSettingsTick(dt);
+
     // Advance a couple of pending Steam avatar lookups. Does nothing unless a
     // tag asked for one, which only happens while drawing.
     WrSteamTick();
@@ -156,38 +162,45 @@ void WrIdleTick(void)
     }
 }
 
+// One edge latch. Every key here is a thing you want to change mid-run, which is
+// exactly when a panel is the wrong answer -- and all of them are settable (and
+// clearable) from the panel, since we cannot know what the player has bound.
+// This READS the key, it does not swallow it, so a collision means the game acts
+// on it too rather than anything being broken.
+static bool Pressed(int vk, bool *wasDown)
+{
+    bool now = vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
+    bool edge = now && !*wasDown;
+    *wasDown = now;
+    return edge;
+}
+
 static DWORD WINAPI HotkeyThread(LPVOID)
 {
     bool down = false;
-    bool cycleDown = false;
-    bool pickDown = false;
+    bool cycleDown = false, cycleBackDown = false;
+    bool pickDown = false, overlayDown = false;
     for (;;)
     {
-        bool now = (GetAsyncKeyState(TOGGLE_KEY) & 0x8000) != 0;
-        if (now && !down)
+        if (Pressed(TOGGLE_KEY, &down))
             WrSetMenuOpen(!WrMenuOpen());
-        down = now;
 
-        // Cycling the crosshair readout has to work WITHOUT opening the panel,
-        // because the whole point of it is to be changed mid-run. The key is
-        // settable (and clearable) from the Energy tab, since we cannot know
-        // what the player has bound: this reads the key, it does not swallow it,
-        // so a collision means the game acts on it too rather than anything
-        // being broken.
-        int cycleKey = WrUiHudCycleKey();
-        bool cycNow = cycleKey && (GetAsyncKeyState(cycleKey) & 0x8000) != 0;
-        if (cycNow && !cycleDown)
-            WrEnergyCycleHudMode();
-        cycleDown = cycNow;
+        // Page Down and Page Up step the centre box's mode.
+        if (Pressed(WrUiHudCycleKey(), &cycleDown))
+            WrEnergyCycleHudMode(+1);
+        if (Pressed(WrUiHudCycleBackKey(), &cycleBackDown))
+            WrEnergyCycleHudMode(-1);
 
-        // And the same for the "whose line is this" plate, Home by default. It
-        // sits over the thing it is naming, so being able to get rid of it
-        // without opening the panel is most of what makes it usable.
-        int pickKey = WrUiPickToggleKey();
-        bool pickNow = pickKey && (GetAsyncKeyState(pickKey) & 0x8000) != 0;
-        if (pickNow && !pickDown)
+        // Home: the "whose line is this" plate. It sits over the thing it is
+        // naming, so being able to get rid of it without opening the panel is
+        // most of what makes it usable -- and it is off by default now, so this
+        // is also how you get it in the first place.
+        if (Pressed(WrUiPickToggleKey(), &pickDown))
             g_render.pickEnabled = !g_render.pickEnabled;
-        pickDown = pickNow;
+
+        // End: the corner block, off by default for the same reason.
+        if (Pressed(WrUiOverlayToggleKey(), &overlayDown))
+            g_energy.showOverlay = !g_energy.showOverlay;
 
         Sleep(30);
     }
@@ -200,6 +213,12 @@ static DWORD WINAPI InitThread(LPVOID)
     WrEnergyDefaults();
     WrStartDefaults();
     WrLimitDefaults();
+
+    // AFTER the defaults, never before: the file is read OVER them, so a key it
+    // does not carry keeps whatever the default put there. That is what lets an
+    // old settings file load into a new build without resetting the settings the
+    // build has added since.
+    WrSettingsInit();
 
     if (!WrProbeInit())
         WrLogf("[!] probe layer unavailable -- engine access will not be attempted");

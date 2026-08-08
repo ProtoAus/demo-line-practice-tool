@@ -80,6 +80,18 @@ cl /nologo /O2 /EHsc /W3 %DEFS% /I. tests\test_live.cpp wr_timer.cpp ^
    wr_log.cpp /Fe:tests\test_live.exe /Fo:tests\ >nul
 if errorlevel 1 ( echo [!] test_live FAILED to build & exit /b 1 )
 
+rem test_settings links the real table and the real settings structs. A harness
+rem with its own private table would agree with itself and say nothing about
+rem what ships -- and "one field silently stopped persisting" is precisely the
+rem failure that has no other way of being noticed.
+rem wr_render.cpp is deliberately NOT here: it is the draw layer and pulls in
+rem ImGui, Steam and the engine. Only its DEFAULTS are stubbed -- the struct is
+rem the real one, so the table is still checked against the real fields.
+cl /nologo /O2 /EHsc /W3 %DEFS% /I. tests\test_settings.cpp wr_settings.cpp ^
+   wr_energy.cpp wr_start.cpp wr_limit.cpp wr_profile.cpp ^
+   wr_path.cpp wr_log.cpp user32.lib /Fe:tests\test_settings.exe /Fo:tests\ >nul
+if errorlevel 1 ( echo [!] test_settings FAILED to build & exit /b 1 )
+
 del tests\*.obj >nul 2>&1
 
 set "RC=0"
@@ -92,6 +104,7 @@ tests\test_rank.exe       || set "RC=1"
 tests\test_start.exe      || set "RC=1"
 tests\test_saveloc.exe    || set "RC=1"
 tests\test_live.exe       || set "RC=1"
+tests\test_settings.exe   || set "RC=1"
 
 if "%RC%"=="1" ( echo. & echo [!] SOME HARNESSES FAILED & exit /b 1 )
 echo.

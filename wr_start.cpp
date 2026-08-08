@@ -327,7 +327,11 @@ void WrStartDefaults(void)
     g_start.enabled = true;
     g_start.autoAnchor = true;
     g_start.autoZeroClock = true;
-    g_start.showZone = true;
+    // OFF by default. The ring, the arrow and the plane are a diagnostic for
+    // checking that the fitted zone sits where the real one does; once it does,
+    // they are three large pieces of geometry drawn over the part of the map you
+    // spend the most time looking at.
+    g_start.showZone = false;
     g_start.radiusScale = 1.0f;
     g_start.leaveSpeed = 150.0f;
     g_start.stillSpeed = 200.0f;

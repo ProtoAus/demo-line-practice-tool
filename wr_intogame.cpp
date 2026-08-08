@@ -247,6 +247,82 @@ bool WrIntoGamePathAt(WrIntoGameWhere where, const char *map, int mapId,
     return true;
 }
 
+// The same file, written the way the GAME's own filesystem names it.
+//
+// This is what mom_tv_replay_watch takes. Momentum's end-of-run screen runs
+// `mom_tv_replay_watch ${baseRun.filePath}` (panorama/scripts/pages/end-of-run/
+// end-of-run.ts), so the command plays a replay BY PATH, with no leaderboard row
+// and no list involved -- which is the only mechanism here that does not depend
+// on the game agreeing that a demo exists.
+//
+// Forward slashes and relative to `momentum\`, which is how every other path in
+// that filesystem is written, and how the game's own local recordings appear.
+bool WrIntoGameGamePathAt(WrIntoGameWhere where, const char *map, int mapId,
+                          const char *hash, char *out, int outLen)
+{
+    if (!HashLooksSane(hash) || !out || outLen < 8)
+        return false;
+
+    if (where == WR_INTO_LOCAL)
+    {
+        if (!map || !*map)
+            return false;
+        _snprintf_s(out, (size_t)outLen, _TRUNCATE, "momtv/local/%s/%s.mtv",
+                    map, hash);
+        return true;
+    }
+
+    if (mapId <= 0)
+        return false;
+    _snprintf_s(out, (size_t)outLen, _TRUNCATE, "momtv/online/%d/%s.mtv",
+                mapId, hash);
+    return true;
+}
+
+// The command for wherever this run's demo ACTUALLY is, rather than for where
+// one would go.
+//
+// Built from WrIntoGameSourceOf's answer and not from the hash, because for 202
+// of the 1,749 .wrpath files here the "hash" is a filename stem like
+// "104455274-surf_fiellu-1781797367-main-nrm-60.990" -- the player's own
+// recordings, which are the ones most worth being able to replay and the ones
+// HashLooksSane rejects. Those are already in the game's local tree under that
+// exact name, so the path is known even though the name is not a hash.
+//
+// Returns false when the demo is only in OUR folder, which the game's filesystem
+// cannot see: the caller has to copy it in first. And when there is no demo at
+// all, which is 35 more of them.
+bool WrIntoGameWatchCommand(const char *map, int mapId, const char *hash,
+                            char *out, int outLen)
+{
+    char path[MAX_PATH];
+    WrIntoGameSource src = WrIntoGameSourceOf(map, mapId, hash, path,
+                                              sizeof(path));
+    if (src != WR_DEMO_GAME_LOCAL && src != WR_DEMO_GAME_ONLINE)
+        return false;
+
+    // Absolute to game-relative. Everything under momentum\ is addressable by
+    // the game's filesystem and nothing above it is, so the split is at that
+    // directory -- searched from the RIGHT, since an install can perfectly well
+    // live in a path that already contains the word.
+    const char *tail = NULL;
+    for (const char *p = path; *p; p++)
+        if (_strnicmp(p, "\\momentum\\", 10) == 0)
+            tail = p + 10;
+    if (!tail || !*tail)
+        return false;
+
+    char rel[MAX_PATH];
+    strcpy_s(rel, sizeof(rel), tail);
+    for (char *p = rel; *p; p++)
+        if (*p == '\\')
+            *p = '/';
+
+    _snprintf_s(out, (size_t)outLen, _TRUNCATE, "mom_tv_replay_watch \"%s\"",
+                rel);
+    return true;
+}
+
 bool WrIntoGameHasFileAt(WrIntoGameWhere where, const char *map, int mapId,
                          const char *hash)
 {

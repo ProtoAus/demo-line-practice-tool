@@ -118,7 +118,19 @@ bool WrImGuiInit(HWND hwnd, ID3D11Device *device, ID3D11DeviceContext *context)
     ImGui::SetCurrentContext(g_ctx);
 
     ImGuiIO &io = ImGui::GetIO();
-    io.IniFilename = NULL;      // never touch the game's momentum\cfg\imgui.ini
+
+    // OUR ini, in OUR folder. It was NULL, which kept ImGui away from the game's
+    // momentum\cfg\imgui.ini -- ImGui's default is a bare "imgui.ini" relative
+    // to the working directory, which for an injected DLL is the game's, and
+    // that file is the game's own devui's. Pointing it at an absolute path under
+    // wrlines_data keeps that promise and also stops the panel forgetting where
+    // it was every time the game restarts.
+    //
+    // Static, because ImGui keeps the POINTER rather than copying the string and
+    // WrDataPath returns a rotating internal buffer.
+    static char iniPath[MAX_PATH];
+    strcpy_s(iniPath, sizeof(iniPath), WrDataPath("imgui.ini"));
+    io.IniFilename = iniPath;
     io.LogFilename = NULL;
 
     // Draw our own cursor. The OS cursor is useless to us: Source hides it and

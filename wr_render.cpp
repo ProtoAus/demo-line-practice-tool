@@ -163,7 +163,10 @@ void WrRenderDefaults(void)
     g_render.effColourblind = false;
     g_render.lineKey = true;
 
-    g_render.pickEnabled = true;
+    // OFF by default, and toggled with HOME without opening the panel. The plate
+    // sits over the thing it is naming, which is the right place for it and the
+    // wrong place for it to be when you did not ask.
+    g_render.pickEnabled = false;
     // 48 px on a 1080p screen is about 2.5 degrees of arc at a 90 degree fov --
     // a bit wider than a crosshair, which is what you want when the thing being
     // aimed at is a two-pixel line that may be moving across the view.
@@ -1544,6 +1547,39 @@ static void EmitEnergyHud(ImDrawList *dl)
             wideBig = "+99999 v";
             wideSub = "lost 99999  spliced";
             break;
+
+        case WR_HUD_STRAFE:
+        {
+            // The one mode whose colour is NOT the rise/fall arrow, and it says
+            // so by being the same red-and-green ramp the demo lines use. Those
+            // two signals disagree on purpose: on a ramp you can be strafing at
+            // very nearly the physical maximum while your total energy falls,
+            // because the ramp is taking more than you can put in.
+            const WrRun *tr = WrEnergyReferenceRun();
+            float tick = (tr && tr->tickInterval > 1e-4f) ? tr->tickInterval
+                                                          : 0.015f;
+            bool noReading = false;
+            float eta = WrEnergyEta(tick, &noReading);
+
+            if (noReading)
+            {
+                bigCol = 0xFF909090u;
+                _snprintf_s(big, sizeof(big), _TRUNCATE, "--");
+                _snprintf_s(sub, sizeof(sub), _TRUNCATE, "no reading");
+            }
+            else
+            {
+                bigCol = EfficiencyColour(eta * g_render.effSaturation,
+                                          0xFFB0B0B0u);
+                _snprintf_s(big, sizeof(big), _TRUNCATE, "%+.0f%%",
+                            eta * 100.0f);
+                _snprintf_s(sub, sizeof(sub), _TRUNCATE, "strafe / %.1fs",
+                            WrEnergyGaugeSpan());
+            }
+            wideBig = "-100%";
+            wideSub = "strafe / 12.8s";
+            break;
+        }
 
         default:
             _snprintf_s(big, sizeof(big), _TRUNCATE, "%.0f%s", rel, arrow);

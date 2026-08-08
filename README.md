@@ -46,6 +46,17 @@ wrinject.exe
 
 Press **INSERT** in game. Tick runs in the Runs tab. **ESC** closes the panel.
 
+Four more keys work without opening it, all rebindable and all listed on the **About** tab as they
+are currently bound:
+
+| key | |
+| --- | --- |
+| `Page Down` / `Page Up` | next / previous mode on the box at your crosshair |
+| `Home` | *whose line am I looking at* — off by default |
+| `End` | the corner block — off by default |
+
+They are **read, never swallowed**, so a collision means the game still acts on the key.
+
 ---
 
 ## What it does
@@ -85,8 +96,15 @@ Press **INSERT** in game. Tick runs in the Runs tab. **ESC** closes the panel.
   a rise/fall arrow, and as a gap against the record's energy at the same point on the route.
   A **fixed width**, so the box and the lean bar under it stay the same size whoever you are
   nearest — the compared player's name used to set the width, which meant the bar's scale
-  depended on how long somebody's Steam name was. `Home` turns the aim-at-a-line plate off and on
+  depended on how long somebody's Steam name was. `Page Down` and `Page Up` change what it shows
   without opening the panel.
+- **A live strafe gauge**, green to red, on how close you are to the most energy air strafing
+  could physically add. The same metric that colours the demo lines, and deliberately slow: your
+  own velocity is estimated from camera positions, and at a 0.4 s window a reading taken that way
+  points the *wrong way* a quarter of the time. At 2 seconds it is 8.5%. See **A live strafe
+  gauge, and why it is slow**.
+- **Settings that survive a restart**, in `wrlines_data\settings.cfg` — including the panel's own
+  window position. Display settings only, and nothing in it identifies anybody.
 - Puts **split markers** on the line where each checkpoint was reached, labelled with
   the split time.
 - **Colour along each line** by speed, by **energy**, or by strafing efficiency — one at a
@@ -169,11 +187,14 @@ Press **INSERT** in game. Tick runs in the Runs tab. **ESC** closes the panel.
   while another thread is inside the trampoline is the classic injected-DLL
   crash-on-exit. Restart the game to load a rebuilt DLL; the injector refuses to inject
   twice for the same reason.
-- **It writes nothing into the game install unless you turn one thing on**, sets no cvars, and
-  never touches `sv_cheats`. Everything it writes lives in `wrlines_data\` next to the DLL —
-  with a single exception you have to enable by hand: *Also put them where the game can play
-  them*, which copies downloaded demos into the game's own replay folder so you can watch them.
-  Off by default, and described under **Watching what you download** below.
+- **It writes nothing into the game install unless you turn one thing on**, sets no cvars,
+  **runs no console commands**, and never touches `sv_cheats`. Everything it writes lives in
+  `wrlines_data\` next to the DLL — with a single exception you have to press for: *send*,
+  *local* and *watch* each copy one demo into the game's own replay folder so the game can play
+  it. Every copy is recorded in `wrlines_data\into_game.txt` first and nothing outside that list
+  can be deleted from the panel. Described under **Watching what you download** below. The
+  **watch** button puts a console command on your clipboard for you to paste; WrLines does not
+  execute it.
 - **In its default configuration it makes zero calls into the game.** It hooks `Present` to
   draw, reads memory read-only, and reads two files.
 - **It reaches outside your machine in exactly two places, both behind a checkbox, both off
@@ -296,6 +317,38 @@ DLL** acceptable alongside submitted runs. Check that before using it on anythin
 to submit. Treat it as a practice tool.
 
 ---
+
+## Settings, and where they live
+
+Until 0.4.4 nothing was persisted at all: four `*Defaults()` calls ran once at startup and that was
+the whole story, so every restart of the game was a fresh install. Settings now live in
+`wrlines_data\settings.cfg`, written a couple of seconds after you stop changing something — so a
+slider being dragged writes once when you let go rather than on every frame of the drag.
+
+**One table, populated by the file that owns each variable.** Every persisted field is registered
+once, next to its declaration, and the writer and the reader both walk that list. A serialiser
+written out by hand over a hundred-odd fields goes out of step with the struct the first time
+somebody adds a field and edits only one of the two halves; there is only one half here, and adding
+a setting is one line. `tests\test_settings.cpp` round-trips every registered field against the real
+structs, because *one setting silently stopped persisting* is a failure with no other way of being
+noticed.
+
+- **An unknown key is ignored and a missing key keeps its default**, so an old file loads into a new
+  build and a new file into an old one. There is no version number to get wrong.
+- **Every value is clamped to the range its own slider has**, on read. It is a text file people will
+  edit, so it is an untrusted input — including `NaN`, which fails every comparison and would
+  otherwise propagate into the geometry and draw nothing at all, silently.
+- **Reset everything** restores a snapshot taken at registration, so it reaches every field and not
+  only the ones that happen to live in a struct with a `Defaults()` function.
+- **Display settings only.** No names, no SteamID64s, no map or run data, no paths, no record of
+  what you watched. It is safe to paste into a bug report — unlike the rest of `wrlines_data\`,
+  which is gitignored precisely because it is not.
+
+The panel's own position and size are saved beside it, in `wrlines_data\imgui.ini`. ImGui's default
+is a bare `imgui.ini` relative to the working directory, which for an injected DLL is the game's and
+belongs to the game's own devui — so that was set to `NULL`, and the cost was the panel forgetting
+where it was every session. An absolute path under our folder keeps the promise and fixes the
+forgetting.
 
 ## Build
 
@@ -742,8 +795,6 @@ gain under 500 in total, and every one of those is slower than 37.8 s.
 
 ### Strafing efficiency, and the metric that had to be thrown away
 
-### Strafing efficiency, and the metric that had to be thrown away
-
 The obvious way to show "you turned too fast" is to colour the line by how fast the velocity is
 turning. **The data says that fires on perfect play.** Air acceleration can turn a velocity by
 at most `wishspeed/|v|` radians per tick — 57°/s at 2000 u/s — but a surf ramp turns it too,
@@ -914,6 +965,56 @@ the achievable *gain* is not reduced. It cannot show whether the friction was se
 at these settings both branches predict the same ceiling — but the achievable gain is the only
 thing the tool uses. The ceiling takes `sv_airaccelerate` and `sv_maxspeed` as settings now, and
 the Energy tab says whether the quarter would bite at whatever they are set to.
+
+### A live strafe gauge, and why it is slow
+
+Asked for as *"green to red based on whether it's the optimal strafe"* — green when you are turning
+ideally on a ramp and gaining maximum energy, redder as the curvature drifts off. Two things the
+question assumed, both already answered above:
+
+**The ramp's angle needs no compensating.** Turn rate was the first attempt at this and it fires on
+a tenth to a quarter of the samples of *record-class* runs, for the reason in the section above: a
+ramp turns your velocity through its surface normal far faster than air acceleration can. What is
+measured instead is the consequence — `dE/dt` against a ceiling of `ws²/(2·g·tick)` = 37.5 energy
+units a second — and that bound is the same at 500 u/s as at 3500 and the same on every angle of
+ramp. There is no geometry left in it to correct for.
+
+**The quarter needs none either**, at these settings, and it is `0 < vz ≤ 140` — rising *slower*
+than 140, not above 140 units of height. See the table above: at `sv_airaccelerate 150` the
+quartered acceleration is still 141, four and a half times the wishspeed cap, so the ceiling does
+not move. `WrAirPowerCeilingEx(..., 0.25f)` exists for the settings where it *would*, and the Energy
+tab warns when they are.
+
+So the metric was already there; what was missing was a live reading of it. That is a **fifth mode
+on the centre box**, reached with Page Up / Page Down, showing one number and colouring it off the
+same red-green ramp the demo lines use, so the two can never disagree.
+
+It is deliberately **slow**, and the window is the entire design. Your own velocity is estimated by
+differencing camera positions, and against a 37-unit ceiling that estimate is coarse — simulated
+against twelve real runs, resampled and pushed through the actual estimator:
+
+| window | agrees with the truth | points the wrong way |
+| --- | --- | --- |
+| 0.25 s | 45.2% | 26.0% |
+| 0.40 s | 58.2% | 24.1% |
+| 0.60 s | 63.5% | 21.8% |
+| 2.00 s | 81.5% | 8.5% |
+
+So the default window is **2 seconds** and your own drawn line stays uncoloured. Restricted to
+airborne samples — where the number means strafing rather than a ramp collision — 0.40 s agrees
+45.5% and points the wrong way 32.1%, and barely improves with a longer window. A quarter of a line
+drawn backwards is not a metric. Demo lines do not have the problem: their velocity is what Momentum
+recorded, and it is exact.
+
+The gauge needs its own history ring for the same reason `WrEnergyPower` divides by the span the ring
+*could* give rather than the one asked for. The trend ring is 256 samples of every frame — 0.85 s at
+300 fps — so asking it for two seconds returns the change over 1.3 and reads the rate low by the
+ratio it was short by, silently, and only at high frame rates. The gauge samples at 20 Hz instead, so
+the same 256 slots hold 12.8 seconds and the window always fits.
+
+A rate too large to have come from a player is a **booster**, and it is drawn as *no reading* rather
+than as zero — zero also means free flight, and drawing those two the same is what made the first
+version of the line colours unreadable.
 
 ### Downloading demos
 
@@ -1091,20 +1192,52 @@ and its leaderboard panel has a tab for each — `Leaderboards_Error_NoLocalRepl
 `Leaderboards_Error_NoDownloadedReplays` in `momentum_english.txt`. `engine.dll` carries the literals
 `momtv/local`, `momtv/online` and a `momtv/local/*%s` glob.
 
-Send writes the **online** tree. Whether the Downloaded tab lists a file that appears there without
-the game having downloaded it cannot be checked from this side, and the honest reading of the
-evidence is that it may not: a *local* replay has no server record of any kind, so that list must be
-built by reading the folder, while the downloaded list may well be the game's own record of what it
-fetched — which would explain the symptom exactly, a file that is present on disk (hence "already has
-that one") and never listed.
-
 So each row also has a **local** button, which puts that one demo in the local tree instead. It is
 one press per demo rather than a default, because those are other people's runs going in among 2,591
-of your own recordings, and it is recorded and removable like everything else. It is the experiment
-that settles the question.
+of your own recordings, and it is recorded and removable like everything else.
 
-Nothing here makes the game *play* anything. No console command, no cvar, no call into the
-game: it copies a file, and the game's own menu does the rest.
+### The Downloaded tab is not a listing of the folder
+
+That was the open question above, and the game's own files answer it. Momentum ships its UI as
+Panorama source, and `panorama/scripts/common/leaderboard.ts` declares:
+
+```ts
+export enum LeaderboardEntryType { INVALID = -1, LOCAL = 0, ONLINE = 1, ONLINE_CACHED = 2 }
+export enum LeaderboardType { LOCAL = 0, LOCAL_DOWNLOADED = 1, TOP10 = 2, ... }
+```
+
+**`ONLINE_CACHED`** — an online leaderboard row whose replay is cached locally. So the Downloaded tab
+enumerates *leaderboard rows that have a file*, not *files that exist*. A demo copied into
+`momtv\online\<map id>\` lights up only a run the game had already listed, which is exactly why *"the
+game already has that one"* and *"it is not in my list"* were both true at the same time. Copying
+harder was never going to fix it.
+
+**The way in is the one the game itself uses.** `panorama/scripts/pages/end-of-run/end-of-run.ts`
+runs, on its own Watch button:
+
+```ts
+GameInterfaceAPI.ConsoleCommand(`mom_tv_replay_watch ${this.baseRun.filePath}`);
+```
+
+It takes a **path**. No leaderboard row, no list, nothing to agree with. `client.dll` carries both
+`mom_tv_replay_watch "%s"` and `Invalid run metadata for replay file %s` — so the engine reads a
+replay's metadata out of the file and the filename is not parsed for anything.
+
+So every row now has a **watch** button. It copies
+
+```
+mom_tv_replay_watch "momtv/local/<map>/<hash>.mtv"
+```
+
+to the clipboard; paste it in the console and the demo plays, whatever the two tabs show. The path is
+taken from where the file actually *is* rather than rebuilt from the hash, which matters for the 202
+runs extracted from your own recordings: those are already in the local tree under a name the game
+chose, and a hash-shaped path would have missed every one of them. If the demo is not yet anywhere
+the game's filesystem can name, one copy goes into the local tree first — recorded and removable,
+and only because the button was pressed.
+
+WrLines still runs nothing. The command goes on your clipboard for you to paste; no console command
+is executed, no cvar is set, and copying a file remains the most it ever does to the game.
 
 **Names are not ASCII.** Printing them was: Python takes stdout's encoding from the locale, and
 under the DLL that locale is cp1252, so the first alias outside it raised `UnicodeEncodeError`
@@ -1179,6 +1312,60 @@ without leaving its one-unit circle** is genuinely invisible: nothing observable
 clock is not put back the second time. Step off it and back and it works; that is what practising
 actually looks like, but it is a limit rather than an oversight.
 
+### A fail is not a load, and it was being read as one
+
+The fix above shipped and the next report was *"a timer shows up for about a second when I fail, then
+disappears"* — plus the graph still clearing. Those are one bug, and the log proves it without
+needing to reproduce anything:
+
+```
+[237.985] energy: teleported back to the anchor, treating it as a restart
+[238.110] timer: set to 5.47s (loaded a save-loc, without moving)
+[244.281] energy: teleported back to the anchor, treating it as a restart
+[244.281] timer: set to 5.47s (loaded a save-loc)
+```
+
+Two fails, and each restored 5.47 s from a save-loc kept **on the start pad** — which is an entirely
+ordinary thing to keep there. The restore called `WrSavelocNoteRestore`, the HUD borrows the clock row
+for two seconds when that note is fresh, and with the clock row off by default that borrowed row is
+the only clock you ever see: a number appears when you fail and vanishes. And restoring also cleared
+the `restart` flag, on the reasoning that *a save-loc is a more specific answer than "you are near the
+start"*. It is not — `restart` is raised **only** when the landing is within 384 units of the anchor,
+which is the start pad, so the specific answer was being read off the least specific event there is.
+Clearing the flag skipped the block that holds the recording, so the graph was wiped exactly as
+before. **A restart now outranks a save-loc**, which is what the velocity seed beside it had always
+done.
+
+The 125 ms between those two log lines is the other half. A fail does not put you *on* the pad, it
+puts you above it and lets you fall — and the exact matcher is horizontal only over a 96-unit band, so
+it fires on whichever frame the fall brings `z` into range, by which time the teleport flag has long
+been consumed and "was this a teleport" answers no. So a restart now starts a short **quarantine**:
+save-loc clock restores are refused until you have moved 96 units from where you landed, or three
+seconds have passed, whichever comes first. Distance is the real test; the timeout only exists so
+that standing on the pad and then deliberately loading a loc you keep right there still works.
+
+### The stopwatch that threw the held line away
+
+The hold from the previous release was correct and then undid its own work. Its last-resort release
+was *"held, and the clock has passed three seconds"* — and the clock starts as soon as you are 32
+units from the anchor, while a fail drops you **hundreds** of units from it, because the game
+respawns you at the start trigger and the anchor is where the chased run's recording begins. So the
+clock started on essentially the next frame and the buffer was thrown away three seconds after every
+fail: before you have finished falling, let alone opened the panel.
+
+The release is now positional, which is what was asked for in the first place. When the hold is
+taken, the start zone you were put back in is latched — centre and radius — and the hold is released
+when you leave that circle. The crossing edge stays the primary release, because it fires at the
+right moment, when you leave the plane at speed; the circle is only for legs where the start machine
+never arms. The latch is taken **first** and the hold only if it succeeded, so "held" implies "has
+somewhere to leave" and a stranded recorder is not reachable.
+
+`tests\test_live.cpp` drives all three of these against the real timer, recorder, zone fit and
+save-loc table. Each was checked by putting the bug back: reverting the precedence, dropping the
+quarantine, and restoring the stopwatch each fail exactly one assertion, and two of those checks
+were rewritten when the first version of them survived the mutation — the landing geometry was wrong,
+so the code under test was never reached.
+
 ### Your own line, after you fail
 
 *Record my path* was being wiped by the fail trigger, not by the graph. The recorder clears its
@@ -1195,8 +1382,8 @@ line, so appending across one would send the graph's time axis backwards, and `w
 searches that axis.
 
 The hold is only ever taken when a start zone is actually known, because leaving one is what releases
-it; and the clock restarting from the anchor releases it too, so a leg whose zone never fires cannot
-strand the recorder. While in there, the recorder's own teleport threshold moved from 512 to **400**,
+it — see the two sections above for how that release was got wrong first. While in there, the
+recorder's own teleport threshold moved from 512 to **400**,
 to agree with the one every other part of the tool uses — a 450-unit jump used to be a teleport
 everywhere except here, which drew the straight bar across the map that the recorder exists to
 prevent.
@@ -1682,21 +1869,27 @@ wr_savelocs         our own times for the game's save-locs
 wr_timer            the run clock
 wr_limit            the frame cap
 wr_extract          counting unextracted demos, running the extractor
+wr_intogame         copies into the game's replay folder, and the manifest that
+                    makes them the only thing removable from the panel
+wr_settings         one registration table, walked by both the reader and the
+                    writer -- see "Settings, and where they live"
 wr_matrixlife.h     when a chosen matrix has died -- pure logic, tested
 wr_pacing.h         when the next frame may be presented -- pure logic, tested
 wr_budget.h         gross gain/loss without counting noise -- pure logic, tested
 wr_stress.h         the air-strafing ceiling and efficiency -- pure logic, tested
 wr_ui               the panel
 tests\              standalone harnesses -- tests\build.bat builds and runs all
-                    nine. test_energy, test_profile, test_board, test_rank,
-                    test_start, test_saveloc and test_live link the real .cpp
-                    files, because the defects they cover were in those files
-                    rather than in the headers. test_live links the timer, the
-                    recorder and the save-loc table together, because both
-                    things it checks are interactions BETWEEN them: a restart
-                    that must hold the recording rather than wipe it, and a
-                    save-loc load that does not move the camera far enough to
-                    look like a teleport.
+                    ten. All but two link the real .cpp files, because the
+                    defects they cover were in those files rather than in the
+                    headers. test_live links the timer, the recorder, the zone
+                    fit and the save-loc table together, because everything it
+                    checks is an interaction BETWEEN them: a fail that must hold
+                    the recording rather than wipe it, a fail that must not be
+                    read as a save-loc load, and a save-loc load that does not
+                    move the camera far enough to look like a teleport. Its
+                    three newest checks were each verified by putting the bug
+                    back -- two of them survived that and had to be rewritten,
+                    because the landing geometry never reached the code.
 ```
 
 Everything the tool writes lives under `wrlines_data\`, next to the DLL:
@@ -1709,7 +1902,17 @@ wrlines_offsets.ini       remembered vtable indices (probing only, off by defaul
 wrlines_matrix.ini        remembered world->screen matrix, as module + offset
 into_game.txt             demos copied into the game's replay folder -- the only
                           thing the removal button is allowed to delete
+settings.cfg              the panel's settings; display only, safe to share
+imgui.ini                 the panel's own window position and size
+savelocs\<map>.txt        our own time at each of the game's save-locs
+demos\<map>\*.mtv         demos fetched from the public leaderboard
+boards\                   cached leaderboard pages
+friends.txt               your friends' SteamID64s, for the friends filter
+maps.txt                  the map catalogue
 ```
+
+Everything in there apart from `settings.cfg` and the two `.ini` files carries other people's
+names, SteamID64s or run data, which is why the whole directory is gitignored.
 
 ---
 
