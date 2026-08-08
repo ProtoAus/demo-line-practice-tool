@@ -25,6 +25,8 @@ points.
 
 **Requires:** Windows x64, Momentum Mod Playtest (Strata Source), D3D11 or DXVK, Python 3.8+
 for the extractor. There is no 32-bit path anywhere in the game, so both binaries are x64.
+**Linux works, through Proton** — see [Linux](#linux) below for why that is the answer rather
+than a native build.
 
 ---
 
@@ -81,8 +83,37 @@ Press **INSERT** in game. Tick runs in the Runs tab. **ESC** closes the panel.
   a rise/fall arrow, and as a gap against the record's energy at the same point on the route.
 - Puts **split markers** on the line where each checkpoint was reached, labelled with
   the split time.
-- Optional **colour-by-speed** — blue slow through to red fast, which for surf and bhop
-  is the mode you actually want.
+- **Colour along each line** by speed, by **energy**, or by strafing efficiency — one at a
+  time, because a line has one colour. Energy is height plus speed squared over 2g: what the
+  run actually had to spend, whether it was holding it as altitude or as pace. It is an
+  absolute figure, so the same colour is the same energy on every line and two runs can be
+  read against each other directly; a button fits the range to the map.
+- **Aim at a line and it tells you whose it is** — the line thickens, a ring marks the point
+  you are pointing at, and a plate gives the name, the track, the placing, and what that run
+  was carrying right there. It uses the crosshair rather than the mouse, because there is no
+  mouse while you are playing. Two honest limits, both said in the tooltip: lines draw through
+  walls, so one behind the ramp you are stood on is just as pickable as one in front of it; and
+  two runs that sit within a few pixels of each other for the whole visible stretch cannot be
+  separated by aiming, so the plate says how many others were equally close instead of picking
+  one and sounding sure. About 0.3 ms a frame with 256 lines drawn, against the 8 ms drawing
+  them already costs, and Diagnostics shows the real figure rather than that estimate.
+- **Lines start where the run starts.** A demo begins recording before the run does — measured
+  over 500 demo headers here, the recording runs a median of **2.06 seconds** longer than the
+  run, and about three quarters of a second of that survives on the extracted line. That
+  approach is what made a replay look like it began somewhere odd, and it was also the graph's
+  zero: the energy origin and both axes came from a point where the run had not started. See
+  **Where a run starts** below for how it is recovered and how often that works.
+- **It notices when you leave the start.** Not by reading the mapper's zone — it cannot see one
+  — but by fitting a start to where a few hundred loaded runs actually began, which is a better
+  sample and comes with a measured spread. The circle, the way out and the trigger line are
+  drawn in the world with the uncertainty band to scale, so it is visible guesswork rather than
+  magic. Details under **The start zone**.
+- **Search and filter the run list**, by player, by their current Steam name, or by track. One
+  button per leg turns all of *bonus 4* on at once, and **All**/**None** work on whatever the
+  filter left rather than on the whole store.
+- **Send one demo to the game's replay viewer.** Momentum lists ten, and it finds them by
+  scanning its own folder, so choosing which ten is the whole workaround. Removal only ever
+  touches files this put there — see **Watching what you download**.
 - Records **your own path** live, so you can see your line next to theirs.
 - Distance culling, distance fade, screen-space decimation and per-run point budgets, so
   eight full runs on screen cost a fraction of a millisecond.
@@ -990,9 +1021,21 @@ see a half-written replay.
 **Off by default**, because it is the one thing here that writes into the game install, and the
 promise at the top of this file is qualified rather than quietly dropped.
 
-Honest limit: this puts the file exactly where the game keeps its own downloads, but whether the
-in-game replay menu *lists* it or only finds it already present when you pick that run from the
-leaderboard is not something this side can verify.
+**The viewer lists ten.** That is not a wall, because it finds them by scanning the directory:
+which ten it lists is decided entirely by which files are there. So there is also a **send**
+button on each row of the Runs and Board tabs, which copies that one demo in, and a count of
+how many of ours are currently sitting in that folder.
+
+Removal is where the care goes. That directory is the game's, not ours — it holds replays the
+game downloaded by itself, 4,268 of them on this machine — so a *clear* that removed `*.mtv`
+would take all of it. Every file sent is written into `wrlines_data\into_game.txt` **before**
+the copy, and **removal only ever touches paths in that file**. A demo the game downloaded is
+not in the list and cannot be reached from the panel. The list is re-checked against disk each
+time it is shown, so a game cache clear that took our copies with it shows up as a smaller
+count rather than as a stale claim.
+
+Nothing here makes the game *play* anything. No console command, no cvar, no call into the
+game: it copies a file, and the game's own menu does the rest.
 
 **Names are not ASCII.** Printing them was: Python takes stdout's encoding from the locale, and
 under the DLL that locale is cp1252, so the first alias outside it raised `UnicodeEncodeError`
@@ -1040,6 +1083,130 @@ Time is offered as an axis but only for runs whose recovered clock passed its tr
 times are derived from the sample index, and on the worst map measured that ran from 0.36× to
 10.32×. Runs that fail it are **left out of a time plot and counted on screen**, rather than
 drawn wrong.
+
+---
+
+## Where a run starts
+
+A `.mtv` starts recording before the run does. Measured across 500 demo headers on this
+machine, `ticks × tick_interval` exceeds `run_time` by a **median of 2.06 seconds** — min 1.02,
+max 4.11 — which is the player walking into the start zone while the recorder is already
+running. The extractor keeps whatever of that it recovers and writes `t = index × dt` from
+index 0, so **point 0 is somewhere in the approach**, and about three quarters of a second of
+it survives on the finished line.
+
+Everything downstream inherited that. The energy profile took its zero and both its axes from
+point 0; the live energy readout anchored there; the clock started 32 units from there. One
+root cause, four symptoms, and the visible one was "the graph looks wrong for a run that is
+fine".
+
+**How it is recovered.** Three routes, in decreasing order of authority:
+
+| | |
+| --- | --- |
+| the extractor's stored index | matched against the demo JSON's `effectiveStartVelocity` — three full-precision floats, the same kind of fingerprint the split markers are anchored on. Does not care whether the point stream is complete. |
+| the split markers | extrapolated back from the first split, whose `timeReached` the **game** measured. A measurement, not an inference. |
+| the back-solve | `(pointCount-1) − runTime/tick`. Valid because the extracted stream ends *at* the finish: implied post-roll is a median 0.00 s over every file here that can be checked. |
+
+Agreement between the last two is what earns *trusted*; neither available leaves the run at
+index 0, which is exactly what it did before any of this existed.
+
+**How often it works.** Over the 1,735 `.wrpath` files on this machine:
+
+```
+marker-derived pre-roll        median 0.72 s, p90 1.11, max 1.74, never negative
+first-to-last marker drift     median 0.00 s; only 2.4% exceed 0.10 s
+back-solve vs marker truth     99.4% within 0.05 s, 100% within 0.15 s
+recoverable without re-extract 1,059 of 1,735  (61%)
+```
+
+The other 39% are files whose extracted point stream came out **incomplete**, and there the
+back-solve does not go slightly wrong — it goes to −1089 seconds. That is why the plausibility
+range is really a completeness test, and why those files are left alone rather than handed a
+confident wrong number.
+
+Re-extracting fixes them: `find_start` matches a velocity rather than counting ticks, so a
+fragmented stream does not defeat it. Tested on 100 of the 676 files the DLL alone cannot
+place, it **rescued 98**, at pre-rolls of 0.39–1.39 s. The extractor revision is bumped, so
+the next *Extract new demos* re-does the library by itself.
+
+**On disk.** The index goes in bytes `0xE8`–`0xEF` of the `.wrpath` header, which were
+`minSampleDist` and `minSampleAngleDeg`: written as `0.0` since the format existed and never
+read by anything. Verified zero across all 1,735 files here. So this needs **no format version
+bump and no branch in the reader** — an older file reads 0, and 0 already means "unknown",
+which is what an older file genuinely is.
+
+---
+
+## The start zone
+
+Momentum starts your clock when you leave a mapper-tagged trigger brush having been on the
+ground inside it. **This tool cannot see that brush.** It has no entity list, no netvars, no
+sight of the game's timer — it knows a world-to-screen matrix found by scanning memory, a
+camera solved out of it, and some files on disk. That is not going to change; the history of
+the one time this project called into the engine is in `wr_engine.cpp`.
+
+What it has instead is better than it sounds. Once each run knows where its *run* began, a map
+with two hundred loaded runs carries **two hundred independent observations of where the start
+is**, recorded by two hundred different players — and, unlike a trigger read, it comes with a
+measured spread.
+
+Two details decide the design:
+
+- **The medoid, not the mean.** One run whose start was recovered wrongly lands in the middle
+  of the map and would drag a mean thousands of units toward it. A medoid needs no scratch
+  array, ignores that, and — the part that matters — is always a *real recorded player origin*,
+  so anchoring to it is directly comparable with a run's own t = 0.
+- **The trigger is a plane, not the edge of the circle.** `points[startIndex]` is where the
+  timer started, which is on the way *out* of the real zone rather than in the middle of it.
+  Fitting a circle to those points centres it on the exit. Firing when you leave that circle
+  would start the clock late by radius ÷ speed — half a second at 256 units and 500 u/s, which
+  is enormous here. So the circle only decides when you count as *standing in* the start; the
+  moment that fires is crossing the plane through those points, outward.
+
+Arming needs you inside, on the ground and slow, which is what stops a route that loops back
+over the start line at speed from re-firing it. `WrEnergyOnGround` also fires at the apex of
+every arc — its own header says so — and it is safe here precisely because it is only an arming
+condition: an apex inside a 512-unit cylinder at under 200 u/s is a hop on the start pad, so
+the wrong answer and the right answer are the same answer.
+
+The circle, the way out and the trigger line are drawn in the world, with a band either side of
+the line that is the **measured p90 spread** of where those clocks started. Anything that
+infers a place from data ought to show its error bars.
+
+With no runs loaded there are no zones, nothing fires, and everything falls back to the manual
+anchor and the move-32-units clock that existed before. There is deliberately **no matching
+finish detector**: a finish is a line crossed once at speed rather than a place you wait in, so
+the same machinery would be far less reliable while looking equally confident.
+
+---
+
+## Linux
+
+**It works, through Proton, and that is the answer rather than a shortcoming.**
+
+There is no native Linux build to make. The Momentum install ships `bin\win64` and **zero
+`.so` files** — checked on this machine — so there is no native Linux game for a native Linux
+tool to attach to. Proton runs the Windows game, which is why the Windows DLL loaded into it
+and worked. A `.so` would have nothing to hook.
+
+What that means in practice:
+
+- Inject **inside the same Wine prefix** as the game. `wrinject.exe` uses Toolhelp32,
+  `VirtualAllocEx` and `CreateRemoteThread`, all of which Wine implements; run it through the
+  game's own prefix (`protontricks`, or `WINEPREFIX=... proton run wrinject.exe`).
+- The panel's **Diagnostics** tab reports `platform  Wine/Proton` when it detects one, because
+  that changes what several other lines on that tab mean — which `d3d11.dll` is loaded, whether
+  a Python is reachable, and whether a path the game printed is a Windows path or a `Z:` view
+  of a Linux one.
+- **Python has to be reachable from inside the prefix.** A Python installed on the Linux side
+  is not on the prefix's `PATH`, and the extractor is launched as a child process from inside
+  the game. `py.exe`, `python.exe` and `python3.exe` are all searched for; when none is found
+  under Wine the panel says so naming the prefix rather than giving the generic message. The
+  fallback is to run `wrpath_extract.py` yourself on the Linux side — it is pure stdlib, has no
+  Windows dependency, and its default game path is platform-aware.
+- Everything else is unchanged. The lines, the panel and the leaderboard have no platform
+  surface at all; the whole D3D11 dependency lives in two files.
 
 ---
 
@@ -1301,9 +1468,9 @@ wr_budget.h         gross gain/loss without counting noise -- pure logic, tested
 wr_stress.h         the air-strafing ceiling and efficiency -- pure logic, tested
 wr_ui               the panel
 tests\              standalone harnesses -- tests\build.bat builds and runs all
-                    six. test_energy, test_profile, test_board and test_rank
-                    link the real .cpp files, because the defects they cover
-                    were in those files rather than in the headers.
+                    seven. test_energy, test_profile, test_board, test_rank and
+                    test_start link the real .cpp files, because the defects
+                    they cover were in those files rather than in the headers.
 ```
 
 Everything the tool writes lives under `wrlines_data\`, next to the DLL:
@@ -1314,6 +1481,8 @@ paths\<map>\_failed.txt   demos that could not be extracted, and why
 wrlines.log               everything, flushed per line
 wrlines_offsets.ini       remembered vtable indices (probing only, off by default)
 wrlines_matrix.ini        remembered world->screen matrix, as module + offset
+into_game.txt             demos copied into the game's replay folder -- the only
+                          thing the removal button is allowed to delete
 ```
 
 ---

@@ -16,8 +16,23 @@ struct WrRenderSettings
     float pixelTolerance;       // screen-space decimation
     int pointBudget;            // per run, per frame; 0 disables the cap
     int maxRunsDrawn;
-    bool colourBySpeed;
+
+    // What varies the colour ALONG a line. One of WrLineColour, because these
+    // were three independent booleans with an unwritten precedence -- efficiency
+    // beat speed beat flat -- and the only place that said so was a sentence in
+    // the panel. Turning on a second one silently did nothing, which is a poor
+    // way for a checkbox to behave.
+    int lineColour;             // WrLineColour
     float speedMin, speedMax;
+    float energyMin, energyMax;
+
+    // Skip the pre-roll: start each line where the run starts rather than where
+    // the recording does. See startIndex in wr_path.h -- there is roughly three
+    // quarters of a second of walking into the start zone in front of every
+    // extracted demo, and it is what makes a replay appear to begin in an odd
+    // place. Runs whose start could not be recovered draw in full either way.
+    bool hidePreRoll;
+
     bool drawMarkers;
     float markerRadius;
     bool drawLive;
@@ -45,16 +60,28 @@ struct WrRenderSettings
     // Where you will be in a quarter of a second, drawn from your midsection.
     bool drawVelocity;
 
-    // Colour lines by how much of the physically available energy the strafing
-    // actually captured. See wr_stress.h -- this is NOT a turn-rate metric, and
-    // the reason why is measured.
-    bool colourByEfficiency;
+    // Settings for WR_LINE_EFFICIENCY: how much of the physically available
+    // energy the strafing actually captured. See wr_stress.h -- this is NOT a
+    // turn-rate metric, and the reason why is measured.
     float effSaturation;        // |eta| that reaches full colour, both ways
     float effNeutralBand;       // |eta| under this keeps the run's own colour
     float effNeutralMix;        // how far neutral is pulled toward grey
     float effNoDataAlpha;       // multiplier where there is no reading at all
     bool effColourblind;        // blue/orange instead of red/green
-    bool effLegend;             // draw the key on screen while the mode is on
+    bool lineKey;               // draw the key on screen for whichever mode is on
+
+    // Aim at a line and be told whose it is.
+    //
+    // The crosshair is screen centre, not the mouse: wr_imgui.cpp clears ImGui's
+    // mouse position whenever the panel is shut, which is exactly when you are
+    // playing. So this runs off the world-to-screen matrix and nothing else.
+    bool pickEnabled;
+    float pickRadiusPx;         // how near the crosshair a line has to come
+    float pickDepthBias;        // how much a far line is penalised, 0 = none
+    float pickThickBoost;       // the picked line is drawn this much thicker
+    float pickHoldSeconds;      // how long the readout survives looking away
+    unsigned int pickLabel;     // WR_LABEL_* mask for the plate
+    bool pickRing;
 
     // Colour each whole run by where it placed on its own leg. Per RUN, unlike
     // the two above -- it replaces the palette colour a run was given, so the
@@ -62,6 +89,21 @@ struct WrRenderSettings
     int rankColour;             // WrRankColour
     float rankFullBehind;       // WR_RANK_BY_TIME: +% off the best that reads red
     bool rankLegend;            // its rows go in the same key the efficiency uses
+};
+
+// What varies along a line. Mutually exclusive by construction: exactly one
+// quantity can be mapped onto a single line's colour, and pretending otherwise
+// is how the old pair of booleans ended up with a precedence nobody could see.
+//
+// Rank colour is separate and composes with these: it sets what a run's BASE
+// colour is, and WR_LINE_EFFICIENCY modulates from that base.
+enum WrLineColour
+{
+    WR_LINE_FLAT = 0,       // one colour per run
+    WR_LINE_SPEED,          // speedMin..speedMax
+    WR_LINE_ENERGY,         // energyMin..energyMax, z + |v|^2/2g
+    WR_LINE_EFFICIENCY,     // dE/dt against what air accel could have added
+    WR_LINE_MODE_COUNT
 };
 
 enum WrRankColour
@@ -103,6 +145,16 @@ unsigned int WrRunColour(const WrRun *run);
 extern WrRenderSettings g_render;
 
 void WrRenderDefaults(void);
+
+// The run currently under the crosshair, or NULL. `pointIndex` is which point of
+// it, `screenPx` how far off the crosshair it was, `tied` how many other runs
+// were close enough that the choice between them was near-arbitrary -- shown so
+// a coin toss is visible rather than trusted.
+const WrRun *WrPickedRun(int *pointIndex, float *screenPx, int *tied);
+void WrRenderPickReset(void);
+
+// For Diagnostics: what the pick pass actually cost this frame.
+void WrPickStats(int *chunksTested, int *pointsTested, float *millis);
 
 // Called once per frame from inside the ImGui frame, before the panel is drawn.
 // Emits into ImGui's background draw list so lines composite beneath the UI.

@@ -41,6 +41,19 @@ const char *WrModuleDir(void)
     return g_moduleDir;
 }
 
+bool WrIsWine(void)
+{
+    // Cached: the answer cannot change inside a process, and this is read from
+    // the panel every frame the Diagnostics tab is open.
+    static int cached = -1;
+    if (cached < 0)
+    {
+        HMODULE nt = GetModuleHandleA("ntdll.dll");
+        cached = (nt && GetProcAddress(nt, "wine_get_version")) ? 1 : 0;
+    }
+    return cached != 0;
+}
+
 const char *WrGameDir(void)
 {
     if (g_gameDir[0])

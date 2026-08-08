@@ -60,6 +60,23 @@ struct WrPoint
     float t;
 };
 
+// A bounding sphere over 64 consecutive points, so a stretch of path can be
+// rejected without being read.
+//
+// 16 bytes covering 1792 bytes of WrPoint. That ratio is the entire reason this
+// array exists: aiming at a line has to consider every drawn run every frame,
+// and the arithmetic was never what cost -- the cache lines were. EmitPath
+// measures at about 21 ns per chord, which is one miss. Four chunks fit in a
+// cache line, so the reject pass streams 112 times less memory than a strided
+// walk of the points would.
+#define WR_PICK_CHUNK 64
+
+struct WrChunk
+{
+    Vec3 c;
+    float r;
+};
+
 struct WrMarker
 {
     unsigned int pointIndex;
@@ -92,9 +109,29 @@ struct WrRun
     unsigned char trackType;    // 0 main, 1 stage, 2 bonus
     unsigned char trackNum;
 
-    Vec3 startPos;              // first recorded point, i.e. where this leg begins
+    Vec3 startPos;              // points[startIndex], i.e. where the RUN begins
     float nearestDist;          // to the camera, refreshed each frame
     int nearestIndex;           // which point that was, for the energy readout
+
+    // Where the run starts, as opposed to where the recording does.
+    //
+    // A .mtv carries pre-roll. Measured over 500 demo headers on this machine,
+    // ticks * tick_interval exceeds run_time by a median of 2.06 seconds -- the
+    // player walking into the start zone before the timer starts -- and the
+    // extractor writes t = index * tick_interval from index 0. So points[0] is
+    // somewhere in the approach, and everything that read it as t = 0 was off by
+    // about three quarters of a second: the graph's origin and energy zero, the
+    // live anchor, and the clock.
+    //
+    // An OFFSET rather than a re-sliced array, on purpose. breaks, dips, peaks,
+    // eff and markers[].pointIndex all index points[], and every one of them
+    // stays correct untouched this way.
+    //
+    // 0 with startTrusted false means "not recovered", which is precisely what
+    // every run did before this field existed. Unknown is today's behaviour
+    // wearing a label, not a regression.
+    int startIndex;
+    bool startTrusted;
 
     // Where this run's name tag sits, carried between frames. The anchor is the
     // point at the fade distance, and picking it fresh every frame from a
@@ -142,6 +179,15 @@ struct WrRun
     // Computed once at load at full resolution, like breaks and dips, so the
     // renderer only ever does a lookup.
     signed char *eff;
+    int effWindow;              // what it was built with; see WrPathRefreshEff
+
+    // Bounds, for aiming at a line. Built once at load; see WrChunk above.
+    // boundRadius is 0 when there is nothing to bound, which reads as "cannot
+    // be aimed at" rather than as a point at the origin.
+    Vec3 boundCentre;
+    float boundRadius;
+    WrChunk *chunks;
+    int chunkCount;
 
     // Whether this run's stored per-point times can be used as a clock.
     //
@@ -199,11 +245,22 @@ bool WrPathLoading(int *done, int *total);
 
 int WrRunCount(void);
 WrRun *WrRunAt(int i);
+
+// Bumped whenever the store changes identity: a new map, or a load finishing.
+//
+// So that anything derived from the WHOLE store -- the start zones, for one --
+// can rebuild lazily off a single integer comparison, without wr_path.cpp having
+// to know what those things are or call into them.
+unsigned int WrRunStoreGeneration(void);
 const char *WrPathLoadedMap(void);
 int WrRunEnabledCount(void);
 
 // "main", "stage 3", "bonus 1".
+//
+// Both return a pointer into ONE shared static buffer, so two calls in a single
+// expression clobber each other -- copy the result before calling again.
 const char *WrTrackName(const WrRun *run);
+const char *WrTrackNameOf(int trackType, int trackNum);
 
 // Where a run places among the loaded runs of its OWN leg, 1 being fastest, and
 // how many runs that leg has. Ranking across legs would award first place to a
@@ -213,6 +270,18 @@ const char *WrTrackName(const WrRun *run);
 // points to be one. Callers treat that as unranked rather than as last.
 int WrRunRankInTrack(const WrRun *run, int *outOf);
 
+// Elapsed time at one point of a run, on the run's own clock.
+//
+// ONE function because there were three copies of this arithmetic and two of
+// them were wrong. A stored point's `t` is measured from the first RECORDED
+// sample, and everything a user sees is measured from the first sample of the
+// RUN -- so the pre-roll has to come off before timeScale is applied, or a
+// finish label reads runTime * (1 + preroll/span) instead of runTime.
+//
+// Returns seconds from the run's own start. Meaningless unless timingTrusted,
+// which every caller already checks.
+float WrRunTimeAt(const WrRun *run, int index);
+
 // Refresh every run's distance-to-camera. Cheap: samples the path rather than
 // walking every point, which is plenty to answer "is this run near me".
 void WrUpdateNearest(const Vec3 &cam);
@@ -220,6 +289,16 @@ void WrUpdateNearest(const Vec3 &cam);
 // Enable the fastest `count` runs *on the leg you are standing in*, which is
 // almost always what "show me the route" means on a staged map.
 void WrEnableBestNearby(int count, float radius);
+
+// How many points either side the efficiency figure is differenced over, and a
+// rebuild of every run's eff[] when it changes.
+//
+// A setting rather than a constant because it is the averaging window behind the
+// efficiency colours, and how wide it wants to be depends on what is being
+// looked at. The rebuild is a full pass over every loaded run, so it is called
+// when the slider is RELEASED, not while it is being dragged.
+extern int g_wrEffWindow;
+void WrPathRefreshEfficiency(void);
 
 // Live self-recording. Feed it the player's FEET each frame, along with the
 // smoothed velocity and the run clock, so a live point carries the same three

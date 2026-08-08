@@ -19,6 +19,11 @@
 # name and SteamID64. They are yours to generate locally, not to publish.
 # wrlines.log and wrlines_offsets.ini are per-machine too.
 #
+# wrlines_data\into_game.txt lists the demos copied into the game's own replay
+# folder, and it is the ONLY thing the removal button will delete -- so it is
+# per-machine state that must not be shared, and losing it strands those copies
+# rather than corrupting anything.
+#
 # wrlines_data\friends.txt is the SteamID64 of every one of YOUR Steam friends,
 # written so the fetch script can ask the leaderboard about them. That is other
 # people's identities, in a file, for your convenience -- it does not leave your

@@ -379,6 +379,24 @@ static void FindInterpreter(void)
         g_interpIsPy = false;
         g_interpFound = true;
     }
+    // python3.exe last, and it is here for Wine. A Proton prefix has no Windows
+    // Python launcher in it, and whatever Python is reachable from inside the
+    // prefix is as likely to be named this as anything else. It costs one more
+    // PATH search on a machine that has neither of the two above.
+    else if (SearchPathA(NULL, "python3.exe", NULL, MAX_PATH, found, NULL))
+    {
+        strcpy_s(g_interp, sizeof(g_interp), found);
+        g_interpIsPy = false;
+        g_interpFound = true;
+    }
+    else if (WrIsWine())
+    {
+        strcpy_s(g_interp, sizeof(g_interp),
+                 "no Python inside this Wine prefix -- the game's prefix needs "
+                 "its own; a Python installed on the Linux side is not on this "
+                 "PATH. See the README's Linux section.");
+        g_interpFound = false;
+    }
     else
     {
         strcpy_s(g_interp, sizeof(g_interp),
@@ -386,7 +404,7 @@ static void FindInterpreter(void)
                  "script yourself");
         g_interpFound = false;
     }
-    WrLogf("extract: interpreter %s", g_interp);
+    WrLogf("extract: interpreter %s%s", g_interp, WrIsWine() ? " (under Wine)" : "");
 }
 
 const char *WrExtractInterpreter(void) { return g_interp; }

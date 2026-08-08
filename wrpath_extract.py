@@ -73,7 +73,22 @@ except ImportError:
 # Locations
 # ---------------------------------------------------------------------------
 
-DEFAULT_GAME = r"C:\Program Files (x86)\Steam\steamapps\common\Momentum Mod Playtest"
+# Only a fallback for running this by hand: the DLL always passes --game, worked
+# out from the path of the running executable.
+#
+# There is no native Linux build of Momentum -- the install ships bin\win64 and
+# no .so -- so a Linux user runs the Windows game under Proton. Two cases follow.
+# A Python running INSIDE the prefix sees the Windows path and needs no help. A
+# Python running natively on Linux sees the Steam library where Steam actually
+# put it, so that is what the Linux branch guesses at.
+def _default_game():
+    if os.name == "nt":
+        return r"C:\Program Files (x86)\Steam\steamapps\common\Momentum Mod Playtest"
+    return os.path.expanduser(
+        "~/.steam/steam/steamapps/common/Momentum Mod Playtest")
+
+
+DEFAULT_GAME = _default_game()
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_OUT = os.path.join(SCRIPT_DIR, "wrlines_data", "paths")
 
@@ -91,7 +106,11 @@ DEFAULT_OUT = os.path.join(SCRIPT_DIR, "wrlines_data", "paths")
 # simply falls back to treating those demos as unprocessed, which is the safe
 # direction: it offers to do work that has already been done, rather than hiding
 # work that has not.
-EXTRACTOR_REVISION = 2
+#
+# 3: records where the RUN starts, matched against the demo's own
+#    effectiveStartVelocity. Every file written before this one has a zero there,
+#    which reads as "unknown" and falls back to the DLL's own estimate.
+EXTRACTOR_REVISION = 3
 FAILURES_FILE = "_failed.txt"
 
 # ---------------------------------------------------------------------------
@@ -968,6 +987,71 @@ def anchor_markers(points, h, segment_count=1):
 
 
 # ---------------------------------------------------------------------------
+# Where the run starts
+# ---------------------------------------------------------------------------
+
+# A demo starts recording before the run does. Measured over 500 demo headers,
+# ticks * tick_interval exceeds run_time by a median of 2.06 seconds and by as
+# much as 4.11 -- the player walking into the start zone while the recorder is
+# already running. Nothing in the written file used to say where that ended, so
+# every consumer treated point 0 as t = 0 and was about three quarters of a
+# second early.
+#
+# The JSON says so exactly. Each segment carries effectiveStartVelocity: the
+# player's velocity at the instant the timer started, as three full-precision
+# floats. That is the same kind of fingerprint anchor_markers already matches the
+# split points on, and matching it is the only way to answer the question from
+# the file itself rather than by inference.
+#
+# wr_path.cpp can also back-solve the start from the run's duration, and on a
+# complete point stream the two agree to within a twentieth of a second. This
+# exists for the streams that are NOT complete -- 39% of the files on this
+# machine -- where a tick count proves nothing and a velocity fingerprint still
+# works.
+START_MIN_SPEED = 40.0          # below this the fingerprint is not distinctive
+START_SEARCH_SECONDS = 6.0      # the worst pre-roll measured is 4.11 s
+
+
+def find_start(points, h):
+    """Index of the first point of the run. Returns (index, ok)."""
+    js = h.get("json") or {}
+    segs = js.get("segments") or []
+    n = len(points)
+    dt = h.get("tick_interval") or 0.0
+    if n < 8 or not segs or dt <= 0.0:
+        return 0, False
+
+    v = (segs[0] or {}).get("effectiveStartVelocity")
+    if not isinstance(v, list) or len(v) != 3:
+        return 0, False
+    tv = (float(v[0]), float(v[1]), float(v[2]))
+    speed = math.dist((0.0, 0.0, 0.0), tv)
+    if speed < START_MIN_SPEED:
+        # A standing start -- a bhop map, or a hold in the zone. Every pre-roll
+        # sample looks like this one, so the match would be a coin toss and
+        # saying nothing is the honest answer.
+        return 0, False
+
+    # Only the front of the path. Searching the whole of it would let a
+    # coincidental velocity match halfway round the map win, and the run start
+    # is by definition near the beginning.
+    hi = min(n, int(START_SEARCH_SECONDS / dt) + 1)
+    best, best_err = -1, None
+    for i in range(hi):
+        p = points[i]
+        e = math.dist((p[3], p[4], p[5]), tv)
+        if best_err is None or e < best_err:
+            best_err, best = e, i
+
+    # Same relative tolerance as the split markers, and for the same reason: the
+    # stored velocity is a central difference of positions while the JSON's is
+    # exact, so they agree closely rather than exactly.
+    if best < 0 or best_err / speed > MARKER_TOL:
+        return 0, False
+    return best, True
+
+
+# ---------------------------------------------------------------------------
 # .wrpath writer
 # ---------------------------------------------------------------------------
 
@@ -994,7 +1078,11 @@ def _fixed(s, size):
     return raw + b"\0" * (size - len(raw))
 
 
-def write_wrpath(out_path, h, points, markers, src_sha1, flags):
+START_FLAG_FOUND = 1 << 0       # the index at 0xE8 means something
+
+
+def write_wrpath(out_path, h, points, markers, src_sha1, flags,
+                 start_index=0, start_ok=False):
     dt = h["tick_interval"]
     head = bytearray(WRPATH_HEADER)
     head[0:8] = WRPATH_MAGIC
@@ -1011,8 +1099,14 @@ def write_wrpath(out_path, h, points, markers, src_sha1, flags):
     head[0x9C:0xC4] = _fixed(src_sha1, 40)
     head[0xC4:0xE4] = _fixed(h["player"], 32)
     struct.pack_into("<f", head, 0xE4, 1.0)     # captureTimescale (n/a offline)
-    struct.pack_into("<f", head, 0xE8, 0.0)     # minSampleDist
-    struct.pack_into("<f", head, 0xEC, 0.0)     # minSampleAngleDeg
+    # 0xE8 and 0xEC were minSampleDist and minSampleAngleDeg: written as 0.0
+    # since the format existed, and never read by anything. Verified zero across
+    # all 1735 .wrpath files on the development machine, which is what makes
+    # claiming them free -- an older file reads 0 here, and 0 already means "no
+    # start recorded". So this needs no WRPATH_VERSION bump and no branch in the
+    # reader, whose version check is a hard reject with no migration path.
+    struct.pack_into("<I", head, 0xE8, start_index if start_ok else 0)
+    struct.pack_into("<I", head, 0xEC, START_FLAG_FOUND if start_ok else 0)
     struct.pack_into("<f", head, 0xF0, 0.0)     # eyeHeightOffset: true origin
     struct.pack_into("<I", head, 0xF4, int(time.time()))
     struct.pack_into("<B", head, 0xF8, h.get("gamemode", 0))
@@ -1160,9 +1254,16 @@ def process_one(path, args):
 
     info["markers"] = len(markers)
     info["markers_ok"] = mok
+
+    start_index, start_ok = find_start(pts, h)
+    info["start_index"] = start_index
+    info["start_ok"] = start_ok
+    info["preroll"] = start_index * h["tick_interval"] if start_ok else -1.0
+
     if not args.verify:
         out = os.path.join(args.out, h["map"], sha1 + ".wrpath")
-        info["bytes"] = write_wrpath(out, h, pts, markers if mok else [], sha1, flags)
+        info["bytes"] = write_wrpath(out, h, pts, markers if mok else [], sha1,
+                                     flags, start_index, start_ok)
     return ("ok", name, "", (h, info))
 
 
@@ -1519,7 +1620,7 @@ def cmd_extract(args):
 
 API_BASE = "https://api.momentum-mod.org/v1"
 USER_AGENT = ("WrLines/%s (+https://github.com/ProtoAus/demo-line-practice-tool)"
-              % "0.3.0")
+              % "0.4.0")
 FETCH_DELAY = 0.4          # seconds between requests
 FETCH_PAGE = 100           # leaderboard entries per request; the API's own max
 FETCH_MAX_DEFAULT = 50     # demos per invocation unless asked otherwise

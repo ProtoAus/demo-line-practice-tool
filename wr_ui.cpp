@@ -19,6 +19,8 @@
 #include "wr_maps.h"
 #include "wr_board.h"
 #include "wr_profile.h"
+#include "wr_intogame.h"
+#include "wr_start.h"
 #include "wr_stress.h"
 #include "wr_hook.h"
 #include "wr_log.h"
@@ -65,6 +67,19 @@ static void HelpMarker(const char *text)
         ImGui::PopTextWrapPos();
         ImGui::EndTooltip();
     }
+}
+
+// Case-insensitive substring. Up here rather than beside its first user because
+// three different lists filter with it now.
+static bool StrIContains(const char *hay, const char *needle)
+{
+    if (!needle || !*needle)
+        return true;
+    size_t n = strlen(needle);
+    for (const char *p = hay; *p; p++)
+        if (_strnicmp(p, needle, n) == 0)
+            return true;
+    return false;
 }
 
 static void FormatTime(double t, char *out, int outLen)
@@ -196,6 +211,139 @@ static WrRun *BestOfSameTrack(const WrRun *r)
     return NULL;
 }
 
+static char s_runFilter[64] = "";
+
+// Defined below; shared by the Runs and Board tabs.
+static void DrawIntoGameLine(void);
+
+// Does this run match what was typed?
+//
+// Three fields, because all three are things you would search for and only one
+// of them is on the row. The Steam name matters in particular: the name tags in
+// the world show the CURRENT persona, so filtering only on the name recorded in
+// the demo would fail to find the player you can see written on the line.
+static bool RunMatchesFilter(const WrRun *r, const char *needle)
+{
+    if (!needle || !*needle)
+        return true;
+    if (StrIContains(r->player, needle))
+        return true;
+    const char *persona = WrSteamPersona(r->steamId);
+    if (persona && *persona && StrIContains(persona, needle))
+        return true;
+    // WrTrackName hands back a pointer into one shared static buffer, so this
+    // has to be the last thing done with it and nothing may call it in between.
+    return StrIContains(WrTrackName(r), needle);
+}
+
+// One button per leg the store holds, with a count and a tick when all of that
+// leg is already on.
+//
+// Grouped on (trackType, trackNum), the same pair ComputeRanks places within, so
+// "bonus 4" here means exactly what "bonus 4" means everywhere else in the tool.
+static void DrawTrackChips(void)
+{
+    struct Group { unsigned char type, num; int total, on; };
+    Group g[64];
+    int nGroups = 0;
+
+    for (int i = 0; i < WrRunCount(); i++)
+    {
+        const WrRun *r = WrRunAt(i);
+        if (!r || r->pointCount < 2)
+            continue;
+        int k = 0;
+        for (; k < nGroups; k++)
+            if (g[k].type == r->trackType && g[k].num == r->trackNum)
+                break;
+        if (k == nGroups)
+        {
+            if (nGroups >= (int)ARRAYSIZE(g))
+                continue;       // more than 64 distinct legs is not a real map
+            g[nGroups].type = r->trackType;
+            g[nGroups].num = r->trackNum;
+            g[nGroups].total = 0;
+            g[nGroups].on = 0;
+            nGroups++;
+        }
+        g[k].total++;
+        if (r->enabled)
+            g[k].on++;
+    }
+
+    if (nGroups < 2)
+        return;             // one leg, so a group button is the All button
+
+    // Main first, then stages in order, then bonuses. Insertion sort: this runs
+    // once a frame over at most a few dozen entries.
+    for (int i = 1; i < nGroups; i++)
+    {
+        Group key = g[i];
+        int j = i - 1;
+        while (j >= 0 && (g[j].type > key.type ||
+                          (g[j].type == key.type && g[j].num > key.num)))
+        {
+            g[j + 1] = g[j];
+            j--;
+        }
+        g[j + 1] = key;
+    }
+
+    ImGui::TextUnformatted("Turn on a whole leg:");
+    ImGui::SameLine();
+    HelpMarker(
+        "Every leg the loaded runs cover, with how many of it are on. Pressing "
+        "one turns that leg on; pressing it again when all of it is already on "
+        "turns it off. They add up, so two legs is two presses.\n\n"
+        "Momentum records a separate run per stage and per bonus, so on a "
+        "staged map most of what you have is not the full-map track. That is "
+        "why these are worth having: \"bonus 4\" is otherwise sixteen "
+        "individual checkboxes.");
+
+    float avail = ImGui::GetContentRegionAvail().x;
+    float x = 0.0f;
+    for (int k = 0; k < nGroups; k++)
+    {
+        char label[48];
+        // WrTrackName's static buffer again: copied into label immediately, and
+        // the only call in this expression.
+        const WrRun *any = NULL;
+        for (int i = 0; i < WrRunCount() && !any; i++)
+        {
+            const WrRun *r = WrRunAt(i);
+            if (r && r->trackType == g[k].type && r->trackNum == g[k].num)
+                any = r;
+        }
+        _snprintf_s(label, sizeof(label), _TRUNCATE, "%s %d/%d",
+                    any ? WrTrackName(any) : "?", g[k].on, g[k].total);
+
+        float w = ImGui::CalcTextSize(label).x + ImGui::GetStyle().FramePadding.x * 2.0f;
+        if (k > 0 && x + w < avail)
+            ImGui::SameLine();
+        else
+            x = 0.0f;
+        x += w + ImGui::GetStyle().ItemSpacing.x;
+
+        bool allOn = (g[k].on == g[k].total);
+        if (allOn)
+            ImGui::PushStyleColor(ImGuiCol_Button,
+                                  ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+        ImGui::PushID(k);
+        if (ImGui::Button(label))
+        {
+            for (int i = 0; i < WrRunCount(); i++)
+            {
+                WrRun *r = WrRunAt(i);
+                if (r && r->trackType == g[k].type && r->trackNum == g[k].num)
+                    r->enabled = !allOn;
+            }
+        }
+        ImGui::PopID();
+        if (allOn)
+            ImGui::PopStyleColor();
+    }
+}
+
 static void DrawRunsTab(void)
 {
     const char *map = WrLevelName();
@@ -238,10 +386,20 @@ static void DrawRunsTab(void)
     {
         ImGui::TextDisabled("maps with extracted paths");
         ImGui::Separator();
+        // The list runs to 256 entries once a library has been built up, which
+        // is more than a popup can usefully scroll through.
+        static char pickFilter[64] = "";
+        ImGui::SetNextItemWidth(220.0f);
+        ImGui::InputTextWithHint("##pickfilter", "filter", pickFilter,
+                                 sizeof(pickFilter));
         if (WrAvailableMapCount() == 0)
             ImGui::TextDisabled("(none yet -- run wrpath_extract.py)");
+        int matched = 0;
         for (int i = 0; i < WrAvailableMapCount(); i++)
         {
+            if (!StrIContains(WrAvailableMapAt(i), pickFilter))
+                continue;
+            matched++;
             char label[128];
             _snprintf_s(label, sizeof(label), _TRUNCATE, "%s  (%d)",
                         WrAvailableMapAt(i), WrAvailableMapRuns(i));
@@ -252,6 +410,8 @@ static void DrawRunsTab(void)
                 ImGui::CloseCurrentPopup();
             }
         }
+        if (matched == 0 && WrAvailableMapCount() > 0)
+            ImGui::TextDisabled("(nothing matches \"%s\")", pickFilter);
         if (overridden)
         {
             ImGui::Separator();
@@ -474,6 +634,52 @@ static void DrawRunsTab(void)
 
     ImGui::Separator();
 
+    // The filtered set, built once and shared by the bulk buttons, the track
+    // chips and the table below.
+    //
+    // It used to live inside the table, which meant "All" turned on every run in
+    // the store while the list in front of you showed six. Board's tick-all has
+    // always worked over its filtered order for exactly this reason; this brings
+    // the two into line.
+    static int order[WR_MAX_RUNS];
+    int shown = 0;
+    for (int i = 0; i < WrRunCount(); i++)
+    {
+        WrRun *r = WrRunAt(i);
+        if (!r)
+            continue;
+        if (s_nearOnly && !(r->nearestDist >= 0.0f &&
+                            r->nearestDist <= s_nearRadius))
+            continue;
+        if (s_runFilter[0] && !RunMatchesFilter(r, s_runFilter))
+            continue;
+        order[shown++] = i;
+    }
+
+    ImGui::SetNextItemWidth(200.0f);
+    ImGui::InputTextWithHint("##runfilter", "find a player, or a track",
+                             s_runFilter, sizeof(s_runFilter));
+    ImGui::SameLine();
+    if (ImGui::Button("Clear##runfilter"))
+        s_runFilter[0] = '\0';
+    ImGui::SameLine();
+    HelpMarker(
+        "Matches the player's name, their current Steam name if it is known, "
+        "and the track -- so \"bonus 4\" narrows the list to that leg and "
+        "\"stage\" to every stage run.\n\n"
+        "Everything below works on what the filter leaves: All, None, and the "
+        "track buttons. Filter to a name, press All, and you are watching that "
+        "player's lines and nobody else's.");
+
+    // One button per leg the store actually holds.
+    //
+    // Ticking sixteen bonus-4 runs by hand was the reported problem, and the
+    // information needed to fix it was already there -- ComputeRanks groups on
+    // exactly this pair. A button turns its whole group on, or off again if all
+    // of it is already on, so two legs at once is two clicks rather than a fight
+    // with the exclusive helpers below.
+    DrawTrackChips();
+
     // Staged maps are the normal case, and they break the obvious behaviour.
     // Momentum records a separate demo per stage, so on surf_tensor2 only 2 of
     // 32 downloaded runs are full-map runs -- the rest are individual stages and
@@ -497,28 +703,37 @@ static void DrawRunsTab(void)
         }
     }
     ImGui::SameLine();
+    // All and None act on what the filter left, not on the store. Anything else
+    // means a button that says "All" changes runs you cannot see.
     if (ImGui::Button("All"))
     {
-        for (int i = 0; i < WrRunCount(); i++)
+        for (int k = 0; k < shown; k++)
         {
-            WrRun *r = WrRunAt(i);
+            WrRun *r = WrRunAt(order[k]);
             if (r) r->enabled = true;
         }
     }
     ImGui::SameLine();
     if (ImGui::Button("None"))
     {
-        for (int i = 0; i < WrRunCount(); i++)
+        for (int k = 0; k < shown; k++)
         {
-            WrRun *r = WrRunAt(i);
+            WrRun *r = WrRunAt(order[k]);
             if (r) r->enabled = false;
         }
+    }
+    if (shown != WrRunCount())
+    {
+        ImGui::SameLine();
+        ImGui::TextDisabled("(of the %d shown)", shown);
     }
 
     ImGui::Checkbox("Only show runs near me", &s_nearOnly);
     ImGui::SameLine();
     ImGui::SetNextItemWidth(160.0f);
     ImGui::SliderFloat("within", &s_nearRadius, 512.0f, 16384.0f, "%.0f u");
+
+    DrawIntoGameLine();
 
     // The list takes whatever height is left, so dragging the window taller
     // shows more runs instead of a taller empty panel around a fixed 320-pixel
@@ -530,10 +745,17 @@ static void DrawRunsTab(void)
     if (tableHeight < 140.0f)
         tableHeight = 140.0f;    // below this the header eats the whole list
 
+    // Momentum's numeric map id, which is what names the replay directory. Not
+    // derivable from the map name, so without the map index the Watch column has
+    // nowhere to write and says so per row rather than failing on the press.
+    int mapIdx = WrMapsFind(map);
+    const WrMapInfo *mapInfo = (mapIdx >= 0) ? WrMapsAt(mapIdx) : NULL;
+    int mapId = mapInfo ? mapInfo->id : 0;
+
     ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                             ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit |
                             ImGuiTableFlags_Sortable | ImGuiTableFlags_SortMulti;
-    if (ImGui::BeginTable("runs", 9, flags, ImVec2(0.0f, tableHeight)))
+    if (ImGui::BeginTable("runs", 10, flags, ImVec2(0.0f, tableHeight)))
     {
         ImGui::TableSetupScrollFreeze(0, 1);
         // Sorting is on the columns where an order means something. "On" and
@@ -549,24 +771,14 @@ static void DrawRunsTab(void)
         ImGui::TableSetupColumn("Near", 0, 0.0f, RUNCOL_NEAR);
         ImGui::TableSetupColumn("Pts", 0, 0.0f, RUNCOL_POINTS);
         ImGui::TableSetupColumn("Splits", 0, 0.0f, RUNCOL_SPLITS);
+        ImGui::TableSetupColumn("Watch", ImGuiTableColumnFlags_NoSort);
         ImGui::TableHeadersRow();
 
         // The store itself stays sorted by time -- "max runs drawn" means the
         // fastest N, and the delta column looks up the best of each track by
         // taking the first match. So the click-to-sort order is a separate list
-        // of indices used only for display.
-        int order[WR_MAX_RUNS];
-        int shown = 0;
-        for (int i = 0; i < WrRunCount(); i++)
-        {
-            WrRun *r = WrRunAt(i);
-            if (!r)
-                continue;
-            if (s_nearOnly && !(r->nearestDist >= 0.0f &&
-                                r->nearestDist <= s_nearRadius))
-                continue;
-            order[shown++] = i;
-        }
+        // of indices used only for display, filtered above and sorted here,
+        // because the sort specs only exist inside the table.
         SortRunOrder(order, shown, ImGui::TableGetSortSpecs());
 
         // A clipper, for the same reason the leaderboard has one. The store now
@@ -657,6 +869,25 @@ static void DrawRunsTab(void)
                 else
                     ImGui::TextDisabled("-");
 
+                // Put this one demo where the game's own replay viewer looks.
+                // The viewer lists ten, so being able to choose which ten is
+                // the whole point -- see wr_intogame.h.
+                ImGui::TableSetColumnIndex(9);
+                // Only the manifest is consulted here, never the disk: this
+                // runs per visible row per frame, and a GetFileAttributes
+                // each would be forty file-system round trips a frame --
+                // translated ones, under Proton. Send handles the
+                // already-present case itself and says so.
+                if (mapId <= 0)
+                    ImGui::TextDisabled("-");
+                else if (WrIntoGameMine(mapId, r->srcSha1))
+                {
+                    if (ImGui::SmallButton("take out"))
+                        WrIntoGameRemoveOne(mapId, r->srcSha1);
+                }
+                else if (ImGui::SmallButton("send"))
+                    WrIntoGameSend(r->map, mapId, r->srcSha1);
+
                 ImGui::PopID();
             }
         }
@@ -667,6 +898,52 @@ static void DrawRunsTab(void)
         ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
                            "%d enabled but only %d drawn -- raise the limit in Display.",
                            WrRunEnabledCount(), g_render.maxRunsDrawn);
+}
+
+// The count of what we have put in the game's replay folder, and the one button
+// that takes it back out. Shared by the Runs and Board tabs, which both have a
+// per-row "send".
+static void DrawIntoGameLine(void)
+{
+    // Re-checked here rather than trusted: a game cache clear takes our copies
+    // with everything else, and a number that still counted them would be wrong
+    // about the only thing this feature is about.
+    WrIntoGameRefresh();
+    int n = WrIntoGameCount();
+
+    ImGui::Text("In the game's replay viewer:");
+    ImGui::SameLine();
+    if (n == 0)
+        ImGui::TextDisabled("none of ours");
+    else
+        ImGui::TextColored(ImVec4(0.6f, 0.9f, 1.0f, 1.0f),
+                           "%d of ours", n);
+    ImGui::SameLine();
+    HelpMarker(
+        "Momentum's demo viewer lists ten local demos, and it finds them by "
+        "scanning its own replay folder -- there is no index beside them. So "
+        "the cap is not a wall: put the run you want in, take the others out, "
+        "and it is the one you can watch.\n\n"
+        "\"Send\" copies that demo's .mtv into the game's folder. It is a copy, "
+        "so your line stays whatever happens to it.\n\n"
+        "REMOVING ONLY EVER TOUCHES OURS. Every file sent is written into "
+        "wrlines_data\\into_game.txt first, and nothing outside that list can be "
+        "deleted from here. The demos the game downloaded by itself -- 4268 of "
+        "them on the machine this was built on -- are not in that list and are "
+        "not reachable.\n\n"
+        "Nothing here makes the game play anything. No console command, no "
+        "cvar: it copies a file and the game's own menu does the rest.");
+    if (n > 0)
+    {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Remove ours"))
+            WrIntoGameRemoveAll();
+    }
+    if (WrIntoGameStatus()[0])
+    {
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", WrIntoGameStatus());
+    }
 }
 
 // One row of checkboxes choosing what a label says. The `on` flag stays separate
@@ -751,17 +1028,6 @@ static float ListHeightAbove(bool showingOutput)
     if (!showingOutput)
         return 0.0f;            // ImGui reads 0 as "take what is left"
     return FillHeight(WR_OUTPUT_HEIGHT + SeparatorHeight(), 140.0f);
-}
-
-static bool StrIContains(const char *hay, const char *needle)
-{
-    if (!needle || !*needle)
-        return true;
-    size_t n = strlen(needle);
-    for (const char *p = hay; *p; p++)
-        if (_strnicmp(p, needle, n) == 0)
-            return true;
-    return false;
 }
 
 // Every map Momentum knows about, what we hold for it, and a way to get more.
@@ -1080,6 +1346,47 @@ static void DrawMapsTab(void)
     }
 }
 
+// Set the energy colour range to what the enabled runs actually reach.
+//
+// Scanned on demand rather than kept on each run, for the reason wr_path.cpp
+// gives for not caching per-point energy at all: E = z + |v|^2/2g moves with the
+// gravity setting, so a stored range would go quietly stale the moment that
+// slider moved and the colours would stop matching their own key.
+//
+// Strided. A thousand points per run is far more than enough to find the ends of
+// a range that is then rounded to the nearest fifty anyway, and it keeps a press
+// of this button off the frame budget even with a full store enabled.
+static void FitEnergyRange(void)
+{
+    float lo = 1e30f, hi = -1e30f;
+    for (int i = 0; i < WrRunCount(); i++)
+    {
+        const WrRun *r = WrRunAt(i);
+        if (!r || !r->enabled || r->pointCount < 2)
+            continue;
+        int from = r->startIndex;
+        int step = (r->pointCount - from) / 1000;
+        if (step < 1)
+            step = 1;
+        for (int k = from; k < r->pointCount; k += step)
+        {
+            float e = WrEnergyOf(r->points[k].pos, r->points[k].vel);
+            if (!WrSaneFloat(e))
+                continue;
+            if (e < lo) lo = e;
+            if (e > hi) hi = e;
+        }
+    }
+    if (lo > hi)
+        return;             // nothing enabled; leave the range alone
+
+    // A little margin, so the fastest point on the fastest line is not sitting
+    // exactly on the end of the ramp where it stops varying.
+    float pad = (hi - lo) * 0.05f + 25.0f;
+    g_render.energyMin = floorf((lo - pad) / 50.0f) * 50.0f;
+    g_render.energyMax = ceilf((hi + pad) / 50.0f) * 50.0f;
+}
+
 static void DrawDisplayTab(void)
 {
     ImGui::SeparatorText("Line");
@@ -1091,6 +1398,23 @@ static void DrawDisplayTab(void)
                        0.0f, 1.0f, "%.2f of draw distance");
     ImGui::SliderFloat("Screen decimation", &g_render.pixelTolerance,
                        0.0f, 8.0f, "%.1f px");
+    ImGui::Checkbox("Start each line where the run starts", &g_render.hidePreRoll);
+    ImGui::SameLine();
+    HelpMarker(
+        "A demo starts recording before the run does. Measured over 500 demo "
+        "headers here, the recording is a median of 2.06 seconds longer than the "
+        "run -- the player walking into the start zone, and on the extracted "
+        "line about three quarters of a second of it survives.\n\n"
+        "That approach is what makes a replay look like it begins in an odd "
+        "place, and it was also the graph's zero: the energy origin and both "
+        "axes were taken from a point where the run had not started. Turning "
+        "this on trims it from the lines; the graph is fixed either way.\n\n"
+        "Not every run can be trimmed. The start is recovered from the run's "
+        "own duration, cross-checked against the split times the game recorded, "
+        "and on this machine that works for 61% of the files on disk. The rest "
+        "draw in full, exactly as they always did -- the Runs tab marks which "
+        "is which. Re-extracting fixes the remainder, because the extractor can "
+        "match the start velocity the demo stores.");
     ImGui::SliderInt("Points per run", &g_render.pointBudget, 100, 6000);
     ImGui::TextDisabled("Caps per-frame work. Distance culling does the job on a big");
     ImGui::TextDisabled("open map, but a compact stage fits entirely inside the draw");
@@ -1157,14 +1481,130 @@ static void DrawDisplayTab(void)
         ImGui::Checkbox("Show the rank key on screen", &g_render.rankLegend);
     }
 
-    ImGui::Checkbox("Colour by speed", &g_render.colourBySpeed);
-    if (g_render.colourBySpeed)
+    // Radio, not three checkboxes. Only one quantity can be mapped onto a line's
+    // colour, and the previous pair of booleans had an unwritten precedence:
+    // ticking "colour by speed" while efficiency was on did nothing at all.
+    ImGui::Text("Colour along each line by");
+    ImGui::SameLine();
+    HelpMarker(
+        "One at a time, because a line has one colour and these are three "
+        "different measurements of it. Rank colour above is separate and stacks "
+        "with these: it decides what each run's BASE colour is, and efficiency "
+        "shades away from that base.\n\n"
+        "SPEED is the obvious one and the least informative on a surf map, "
+        "where speed is mostly a function of where you are on the ramp.\n\n"
+        "ENERGY is height plus speed squared over 2g -- what the run actually "
+        "had to spend, whether it was holding it as altitude or as pace. It is "
+        "an absolute figure, so the same colour is the same energy on every "
+        "line and two runs can be read against each other directly. That is why "
+        "there is a fit button: the range has to match the map before the "
+        "middle of it means anything.\n\n"
+        "EFFICIENCY is how much of the energy air strafing could physically "
+        "have added was actually added. It needs the per-point data the "
+        "extractor writes, so it works on demo lines and not on your own.");
+    const char *kLine[WR_LINE_MODE_COUNT] = {
+        "nothing -- one colour per run", "speed", "energy", "strafing efficiency"
+    };
+    if (g_render.lineColour < 0 || g_render.lineColour >= WR_LINE_MODE_COUNT)
+        g_render.lineColour = WR_LINE_FLAT;
+    ImGui::Combo("##linecolour", &g_render.lineColour, kLine, WR_LINE_MODE_COUNT);
+
+    if (g_render.lineColour == WR_LINE_SPEED)
     {
         ImGui::SliderFloat("Slow", &g_render.speedMin, 0.0f, 3000.0f, "%.0f u/s");
         ImGui::SliderFloat("Fast", &g_render.speedMax, 100.0f, 6000.0f, "%.0f u/s");
         if (g_render.speedMax < g_render.speedMin + 50.0f)
             g_render.speedMax = g_render.speedMin + 50.0f;
+        ImGui::Checkbox("Show the key on screen##spd", &g_render.lineKey);
         ImGui::TextDisabled("blue slow -> cyan -> green -> yellow -> red fast");
+    }
+    else if (g_render.lineColour == WR_LINE_ENERGY)
+    {
+        ImGui::SliderFloat("Low", &g_render.energyMin, -8000.0f, 16000.0f, "%.0f");
+        ImGui::SliderFloat("High", &g_render.energyMax, -8000.0f, 32000.0f, "%.0f");
+        if (g_render.energyMax < g_render.energyMin + 50.0f)
+            g_render.energyMax = g_render.energyMin + 50.0f;
+        if (ImGui::Button("Fit to the runs on screen"))
+            FitEnergyRange();
+        ImGui::SameLine();
+        HelpMarker(
+            "Energy is an absolute height in world units, so its useful range "
+            "depends entirely on where the map sits in the world -- a map built "
+            "at z = -8000 and one built at z = +12000 share no part of the "
+            "scale. This walks the enabled runs and sets the ends to what they "
+            "actually reach, with a little margin.\n\n"
+            "Not done automatically, and not cached: the figure moves with the "
+            "gravity setting, so a range fitted once and kept would quietly "
+            "stop matching the lines it was fitted to.");
+        ImGui::Checkbox("Show the key on screen##nrg", &g_render.lineKey);
+        ImGui::TextDisabled("blue low -> cyan -> green -> yellow -> red high");
+    }
+
+    ImGui::SeparatorText("Aim at a line");
+    ImGui::Checkbox("Say whose line I am looking at", &g_render.pickEnabled);
+    ImGui::SameLine();
+    HelpMarker(
+        "Point the crosshair at a line and it thickens, gets a ring at the "
+        "point you are aiming at, and a plate saying whose it is and what it "
+        "was carrying there.\n\n"
+        "It uses the crosshair, not the mouse, because there is no mouse while "
+        "you are playing -- ImGui's pointer is parked the moment this panel "
+        "closes.\n\n"
+        "TWO THINGS IT CANNOT DO. Lines are drawn through walls, so a line "
+        "behind the ramp you are standing on is just as pickable as one in "
+        "front of it. And two runs that sit within a few pixels of each other "
+        "for the whole visible stretch cannot be told apart by aiming -- when "
+        "that happens the plate says how many others were equally close, so a "
+        "coin toss is visible instead of being presented as an answer.\n\n"
+        "The cost is about 0.3 ms a frame with 256 lines drawn, against the "
+        "8 ms drawing them already costs. Diagnostics shows the real figure.");
+    if (g_render.pickEnabled)
+    {
+        ImGui::SliderFloat("Aim tolerance", &g_render.pickRadiusPx, 8.0f, 160.0f,
+                           "%.0f px");
+        ImGui::SliderFloat("Prefer near lines", &g_render.pickDepthBias, 0.0f, 1.0f,
+                           "%.2f");
+        ImGui::SameLine();
+        HelpMarker(
+            "How much a distant line is penalised against a near one at the "
+            "same distance from the crosshair. At zero, two lines crossing on "
+            "screen swap the pick on sub-pixel noise -- which is exactly the "
+            "situation where you wanted an answer.");
+        ImGui::SliderFloat("Thicker by", &g_render.pickThickBoost, 1.0f, 4.0f,
+                           "%.2fx");
+        ImGui::SliderFloat("Keep showing for", &g_render.pickHoldSeconds,
+                           0.0f, 2.0f, "%.2f s");
+        ImGui::Checkbox("Ring the point", &g_render.pickRing);
+
+        // Written out rather than passed to LabelPicker: that helper pairs the
+        // bits with an on/off checkbox, and here the only thing that could
+        // switch off is the whole feature, which already has one above.
+        ImGui::TextUnformatted("Plate shows");
+        static const struct { unsigned int bit; const char *name; } kPick[4] = {
+            { WR_LABEL_SPEED,  "speed" },
+            { WR_LABEL_ENERGY, "energy" },
+            { WR_LABEL_TIME,   "time" },
+            { WR_LABEL_DELTA,  "vs you" },
+        };
+        for (int b = 0; b < 4; b++)
+        {
+            bool on = (g_render.pickLabel & kPick[b].bit) != 0;
+            ImGui::SameLine();
+            ImGui::PushID(b + 700);
+            if (ImGui::Checkbox(kPick[b].name, &on))
+                g_render.pickLabel = on ? (g_render.pickLabel | kPick[b].bit)
+                                        : (g_render.pickLabel & ~kPick[b].bit);
+            ImGui::PopID();
+        }
+
+        int pi = 0, tied = 0;
+        float px = 0.0f;
+        const WrRun *picked = WrPickedRun(&pi, &px, &tied);
+        if (picked)
+            ImGui::TextDisabled("now: %s, %.0f px off the crosshair",
+                                picked->player[0] ? picked->player : "(unknown)", px);
+        else
+            ImGui::TextDisabled("now: nothing aimed at");
     }
 
     ImGui::SeparatorText("Who is who");
@@ -1246,8 +1686,7 @@ static void DrawDisplayTab(void)
                "red or green 14% of the time at 2000 u/s and 36% at 3200.");
 
     ImGui::SeparatorText("Strafing efficiency");
-    ImGui::Checkbox("Colour lines by strafing efficiency",
-                    &g_render.colourByEfficiency);
+    ImGui::TextDisabled("Turned on in \"Colour along each line by\", above.");
     ImGui::SameLine();
     HelpMarker(
         "GREEN means energy is being added. RED means energy is being "
@@ -1284,12 +1723,25 @@ static void DrawDisplayTab(void)
         "beside demo lines that are exact, would be worse than drawing "
         "nothing.");
 
-    if (g_render.colourByEfficiency)
+    if (g_render.lineColour == WR_LINE_EFFICIENCY)
     {
-        if (g_render.colourBySpeed)
-            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
-                               "Efficiency wins, so colour by speed is ignored.");
-        ImGui::Checkbox("Show the key on screen", &g_render.effLegend);
+        ImGui::SliderInt("Measured over", &g_wrEffWindow, 1, 32,
+                         "%d points either side");
+        // Deactivation, not the drag: a rebuild is a full pass over every point
+        // of every loaded run, and doing that on each frame of a slider drag is
+        // a freeze rather than a preview.
+        if (ImGui::IsItemDeactivatedAfterEdit())
+            WrPathRefreshEfficiency();
+        ImGui::SameLine();
+        HelpMarker(
+            "The window the figure is differenced over, in points either side. "
+            "Four is about an eighth of a second at 66 tick.\n\n"
+            "Narrow follows a ramp entry closely and carries the noise of a "
+            "short difference; wide is steadier but smears the moment a line "
+            "lost its energy over the points around it. Rebuilt when you let go "
+            "of the slider, because it is a pass over every point of every "
+            "loaded run.");
+        ImGui::Checkbox("Show the key on screen", &g_render.lineKey);
         ImGui::SameLine();
         ImGui::Checkbox("Blue/orange instead", &g_render.effColourblind);
         ImGui::SliderFloat("Full colour at", &g_render.effSaturation,
@@ -1573,6 +2025,19 @@ static void DrawGraphsTab(void)
     // 33-element stack array below. Typing 900 here wrote 900 entries into it.
     ImGui::SliderInt("Curves at once", &g_gMaxSeries, 1, G_MAX_SERIES, "%d",
                      ImGuiSliderFlags_AlwaysClamp);
+    ImGui::SetNextItemWidth(160.0f);
+    ImGui::SliderInt("Detail", &g_wrProfileBuckets, 16, WR_PROFILE_BUCKETS,
+                     "%d points", ImGuiSliderFlags_AlwaysClamp);
+    ImGui::SameLine();
+    HelpMarker(
+        "How many samples each curve is drawn from. This is the graph's own "
+        "averaging window and it scales with the run: 480 points across a "
+        "sixty-second run is an eighth of a second each.\n\n"
+        "Fewer is a smoother, blunter curve. That is the right trade when the "
+        "question is where a run lost its energy rather than what happened on "
+        "one particular ramp.\n\n"
+        "Changing it rebuilds the curves, a few per frame, so the plot settles "
+        "over the next moment rather than instantly.");
 
     // --- gather -------------------------------------------------------------
     GSeries series[G_MAX_SERIES + 1];
@@ -1609,7 +2074,11 @@ static void DrawGraphsTab(void)
         }
         series[nSeries].p = p;
         series[nSeries].run = r;
-        series[nSeries].colour = r->colour;
+        // WrRunColour, not r->colour. Reading the stored colour directly meant
+        // that with rank colouring on, a run's curve here and its line in the
+        // world were different colours -- which is the exact confusion
+        // WrRunColour exists to prevent, and this was the last site bypassing it.
+        series[nSeries].colour = WrRunColour(r);
         series[nSeries].name = r->player;
         nSeries++;
     }
@@ -2422,13 +2891,15 @@ static void DrawBoardTab(void)
     int *order = g_bOrder;
     int shown = g_bShown;
 
+    DrawIntoGameLine();
+
     bool showOut = WrExtractRunning() || WrExtractLineCount() > 0;
     float tableH = ListHeightAbove(showOut);
 
     ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                             ImGuiTableFlags_ScrollY | ImGuiTableFlags_Sortable |
                             ImGuiTableFlags_SortMulti;
-    if (ImGui::BeginTable("##board", 6, flags, ImVec2(0.0f, tableH)))
+    if (ImGui::BeginTable("##board", 7, flags, ImVec2(0.0f, tableH)))
     {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed |
@@ -2444,6 +2915,8 @@ static void DrawBoardTab(void)
                                 82.0f, BCOL_DATE);
         ImGui::TableSetupColumn("have", ImGuiTableColumnFlags_WidthFixed,
                                 44.0f, BCOL_HAVE);
+        ImGui::TableSetupColumn("watch", ImGuiTableColumnFlags_WidthFixed |
+                                         ImGuiTableColumnFlags_NoSort, 66.0f);
         ImGui::TableHeadersRow();
 
         ImGuiTableSortSpecs *specs = ImGui::TableGetSortSpecs();
@@ -2511,6 +2984,21 @@ static void DrawBoardTab(void)
                     ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "yes");
                 else
                     ImGui::TextDisabled("no");
+
+                // Only offered for runs already on disk. Downloading from here
+                // would need the fetcher, which is a whole different button and
+                // already sitting above this table.
+                ImGui::TableNextColumn();
+                int bMapId = WrBoardMapId();
+                if (!r->have || bMapId <= 0)
+                    ImGui::TextDisabled("-");
+                else if (WrIntoGameMine(bMapId, r->hash))
+                {
+                    if (ImGui::SmallButton("take out"))
+                        WrIntoGameRemoveOne(bMapId, r->hash);
+                }
+                else if (ImGui::SmallButton("send"))
+                    WrIntoGameSend(WrBoardMap(), bMapId, r->hash);
 
                 ImGui::PopID();
             }
@@ -2694,6 +3182,9 @@ static void DrawEnergyTab(void)
     if (src == WR_ANCHOR_RUN_START)
         ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f),
                            "the start of the run you are chasing");
+    else if (src == WR_ANCHOR_START_ZONE)
+        ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f),
+                           "the start zone, fitted to every run on this leg");
     else if (src == WR_ANCHOR_MANUAL)
         ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "set by hand");
     else
@@ -2723,6 +3214,142 @@ static void DrawEnergyTab(void)
         WrEnergyReset();
     ImGui::SameLine();
     ImGui::Checkbox("Follow the run's start", &g_energy.anchorToRunStart);
+
+    // --- the start zone -----------------------------------------------------
+    ImGui::SeparatorText("Start zone");
+    ImGui::Checkbox("Notice when I leave the start", &g_start.enabled);
+    ImGui::SameLine();
+    HelpMarker(
+        "THIS IS NOT READING THE MAPPER'S ZONE. WrLines has no entity access, "
+        "no netvars, and no sight of the game's timer -- it knows a camera and "
+        "some files. It cannot see a trigger fire and it is not going to.\n\n"
+        "What it does instead: every loaded run knows where its own run began, "
+        "so a map with two hundred runs carries two hundred independent "
+        "observations of where the start is. The circle drawn in the world is "
+        "fitted to those, and the bright line across it is where their clocks "
+        "actually started.\n\n"
+        "The circle only decides when you count as standing in the start. The "
+        "moment that fires is crossing the LINE outward, because the recorded "
+        "points sit on the way out of the zone rather than in the middle of it "
+        "-- firing on leaving the circle would start the clock late by the "
+        "radius divided by your speed, which is half a second at 500 u/s.\n\n"
+        "It arms only when you are inside, on the ground and slow, so looping "
+        "back over the line at speed mid-run cannot re-fire it.");
+    if (g_start.enabled)
+    {
+        ImGui::Checkbox("Re-anchor", &g_start.autoAnchor);
+        ImGui::SameLine();
+        ImGui::Checkbox("Zero the clock", &g_start.autoZeroClock);
+        ImGui::SameLine();
+        ImGui::Checkbox("Draw it", &g_start.showZone);
+
+        ImGui::Text("state: ");
+        ImGui::SameLine();
+        WrStartState st = WrStartStateNow();
+        ImVec4 col = (st == WR_START_ARMED)  ? ImVec4(0.5f, 1.0f, 0.5f, 1.0f)
+                   : (st == WR_START_INSIDE) ? ImVec4(1.0f, 0.85f, 0.3f, 1.0f)
+                                             : ImVec4(0.6f, 0.6f, 0.6f, 1.0f);
+        ImGui::TextColored(col, "%s", WrStartStateName());
+        if (WrStartWhyNot()[0])
+        {
+            ImGui::SameLine();
+            ImGui::TextDisabled("-- %s", WrStartWhyNot());
+        }
+        if (WrStartSince() >= 0.0f)
+            ImGui::TextDisabled("last crossing %.1f s ago", WrStartSince());
+
+        ImGui::SliderFloat("Circle size", &g_start.radiusScale, 0.4f, 3.0f, "%.2fx");
+        ImGui::SliderFloat("Leaving at least", &g_start.leaveSpeed, 0.0f, 600.0f,
+                           "%.0f u/s");
+        ImGui::SliderFloat("Standing under", &g_start.stillSpeed, 20.0f, 600.0f,
+                           "%.0f u/s");
+
+        if (WrStartZoneCount() == 0)
+        {
+            ImGui::TextDisabled("No runs loaded, so there is nothing to say where");
+            ImGui::TextDisabled("the start is. Nothing will fire, and nothing that");
+            ImGui::TextDisabled("worked before this existed has changed.");
+        }
+        else if (ImGui::BeginTable("##zones", 6,
+                                   ImGuiTableFlags_Borders |
+                                   ImGuiTableFlags_RowBg |
+                                   ImGuiTableFlags_SizingFixedFit))
+        {
+            ImGui::TableSetupColumn("leg");
+            ImGui::TableSetupColumn("from");
+            ImGui::TableSetupColumn("circle");
+            ImGui::TableSetupColumn("line good to");
+            ImGui::TableSetupColumn("away");
+            ImGui::TableSetupColumn("");
+            ImGui::TableHeadersRow();
+
+            const WrStartZone *here = WrStartZoneHere();
+            for (int i = 0; i < WrStartZoneCount(); i++)
+            {
+                const WrStartZone *z = WrStartZoneAt(i);
+                if (!z)
+                    continue;
+                ImGui::TableNextRow();
+                ImGui::PushID(i);
+
+                ImGui::TableSetColumnIndex(0);
+                if (z == here)
+                    ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "%s",
+                                       WrTrackNameOf(z->trackType, z->trackNum));
+                else
+                    ImGui::TextUnformatted(
+                        WrTrackNameOf(z->trackType, z->trackNum));
+
+                ImGui::TableSetColumnIndex(1);
+                if (z->approx)
+                    ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
+                                       "%d runs, none placed", z->members);
+                else
+                    ImGui::Text("%d of %d runs", z->trusted, z->members);
+
+                ImGui::TableSetColumnIndex(2);
+                if (z->radiusCapped)
+                    ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
+                                       "%.0f capped", WrStartZoneRadius(z));
+                else
+                    ImGui::Text("%.0f u", WrStartZoneRadius(z));
+
+                ImGui::TableSetColumnIndex(3);
+                // The honest error bar on the trigger, in both the unit it was
+                // measured in and the one that matters.
+                ImGui::Text("+-%.0f u", z->alongSpread);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(
+                        "How far apart the recorded starts sit along the "
+                        "crossing direction. At 1600 u/s that is about %.0f ms "
+                        "of uncertainty in when the clock zeroes.",
+                        z->alongSpread / 1600.0f * 1000.0f);
+
+                ImGui::TableSetColumnIndex(4);
+                {
+                    Vec3 cam;
+                    if (WrCameraOrigin(&cam))
+                    {
+                        float dx = cam.x - z->centre.x, dy = cam.y - z->centre.y;
+                        ImGui::Text("%.0f u", sqrtf(dx * dx + dy * dy));
+                    }
+                    else
+                        ImGui::TextDisabled("-");
+                }
+
+                ImGui::TableSetColumnIndex(5);
+                if (ImGui::SmallButton("anchor here"))
+                    WrEnergyAnchorToStartZone(z->centre);
+
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+        ImGui::TextDisabled("There is no matching finish detector, on purpose: a");
+        ImGui::TextDisabled("finish is a line crossed once at speed rather than a");
+        ImGui::TextDisabled("place you wait in, so the same trick would be far");
+        ImGui::TextDisabled("less reliable while looking just as confident.");
+    }
 
     // --- the clock ----------------------------------------------------------
     ImGui::SeparatorText("Time");
@@ -2959,6 +3586,54 @@ static void DrawEnergyTab(void)
                                 full, 1.0f / tick);
     }
     ImGui::SeparatorText("Steadiness");
+
+    // Three presets in front of the sliders, because the reading passes through
+    // four filters and setting them one at a time means understanding all four.
+    // The lag figure is the honest one: half the difference window plus the
+    // output time constant.
+    float lag = g_energy.velWindowSeconds * 0.5f + g_energy.smoothSeconds;
+    ImGui::Text("Response");
+    ImGui::SameLine();
+    HelpMarker(
+        "The readout is filtered four times over before you see it: the velocity "
+        "is differenced over a window, that velocity is smoothed, the speed is "
+        "smoothed again, and the energy figure is smoothed once more and then "
+        "rounded. Only one of those was adjustable, which is why it could still "
+        "feel slow with the smoothing slider already at its lowest.\n\n"
+        "SNAPPY costs noise, and not in a small way: the velocity comes from a "
+        "finite difference of camera positions, so halving the window doubles "
+        "the noise in it. It is the right choice for judging a ramp exit and the "
+        "wrong one for reading a number while standing still.\n\n"
+        "BALANCED is what every version before this one used, exactly.");
+    if (ImGui::Button("Snappy"))
+    {
+        g_energy.velWindowSeconds = 0.020f;
+        g_energy.velTau = 0.030f;
+        g_energy.speedTau = 0.050f;
+        g_energy.smoothSeconds = 0.12f;
+        g_energy.quantiseStep = 5.0f;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Balanced"))
+    {
+        g_energy.velWindowSeconds = 0.040f;
+        g_energy.velTau = 0.060f;
+        g_energy.speedTau = 0.100f;
+        g_energy.smoothSeconds = 0.30f;
+        g_energy.quantiseStep = 5.0f;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Smooth"))
+    {
+        g_energy.velWindowSeconds = 0.080f;
+        g_energy.velTau = 0.120f;
+        g_energy.speedTau = 0.200f;
+        g_energy.smoothSeconds = 0.50f;
+        g_energy.quantiseStep = 10.0f;
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("about %.0f ms behind", lag * 1000.0f);
+
     ImGui::SliderFloat("Smoothing", &g_energy.smoothSeconds, 0.05f, 1.0f, "%.2f s");
     ImGui::SameLine();
     HelpMarker("How long the headline figure takes to settle. The signal itself "
@@ -2966,11 +3641,40 @@ static void DrawEnergyTab(void)
                "physical ceiling on what air strafing can add -- so a third of a "
                "second of filtering costs at most a dozen units of lag and "
                "removes almost all of the jitter.");
+    ImGui::SliderFloat("Velocity window", &g_energy.velWindowSeconds,
+                       0.010f, 0.200f, "%.3f s");
+    ImGui::SameLine();
+    HelpMarker(
+        "The window the velocity is differenced over, and the first thing in the "
+        "chain -- everything downstream inherits its lag and its noise.\n\n"
+        "It contributes about half its own length to the delay, so 40 ms costs "
+        "20 ms. Below about 20 ms a two-unit view bob starts reading as real "
+        "movement: over a single frame at 200 fps the same bob would come out as "
+        "400 u/s.");
+    ImGui::SliderFloat("Velocity smoothing", &g_energy.velTau, 0.005f, 0.400f,
+                       "%.3f s");
+    ImGui::SliderFloat("Speed smoothing", &g_energy.speedTau, 0.005f, 0.500f,
+                       "%.3f s");
     ImGui::SliderFloat("Arrow window", &g_energy.trendSeconds, 0.3f, 2.0f, "%.2f s");
+    ImGui::SliderFloat("Arrow dead band", &g_energy.arrowBand, 0.0f, 60.0f, "%.0f");
+    ImGui::SameLine();
+    HelpMarker("How far the trend has to move before the arrow commits to a "
+               "direction at all. Under this it shows nothing, which is the "
+               "truthful answer when the change is smaller than the noise.");
+    ImGui::SliderFloat("Power window", &g_energy.powerSeconds, 0.05f, 1.5f, "%.2f s");
+    ImGui::SameLine();
+    HelpMarker("The window dE/dt is measured over, which is what the live "
+               "energy-per-second figure reads. A derivative of a noisy signal "
+               "is noise, so this one wants to be longer than it feels like it "
+               "should.");
     ImGui::SliderFloat("Round to", &g_energy.quantiseStep, 0.0f, 25.0f, "%.0f");
     ImGui::SameLine();
     HelpMarker("Rounds the displayed figure, with hysteresis, so the last digit "
-               "stops churning. Zero shows the raw value.");
+               "stops churning. Zero shows the raw value.\n\n"
+               "Worth checking if the number feels sticky rather than slow: this "
+               "makes it wait until the value has moved three quarters of a step "
+               "before it redraws, which is a different complaint from lag and "
+               "has a different fix.");
     ImGui::SeparatorText("Where the comparison is reading");
     ImGui::Checkbox("Ring the point being compared", &g_energy.showComparePoint);
     ImGui::SameLine();
@@ -3311,8 +4015,23 @@ static void DrawDiagnosticsTab(void)
     ImGui::Text("backbuffer  %d x %d", bw, bh);
     ImGui::Text("d3d11.dll   %s", WrD3D11Path());
     ImGui::Text("DXVK        %s", WrIsDxvk() ? "yes" : "no");
+    if (WrIsWine())
+        ImGui::TextColored(ImVec4(0.6f, 0.9f, 1.0f, 1.0f),
+                           "platform    Wine/Proton -- the supported way to run "
+                           "this on Linux");
+    else
+        ImGui::Text("platform    Windows");
     ImGui::Text("emit        %d segments from %d points in %.2f ms", segs, pts, ms);
     ImGui::Text("batches     %d AddPolyline calls", batches);
+    {
+        // The pick's real cost, because it was estimated rather than measured
+        // when it was written and an estimate that never gets checked is a
+        // guess with a number on it.
+        int pc = 0, pp = 0;
+        float pms = 0.0f;
+        WrPickStats(&pc, &pp, &pms);
+        ImGui::Text("aim         %d chunks, %d points, %.3f ms", pc, pp, pms);
+    }
     ImGui::Text("frame       %.1f fps", ImGui::GetIO().Framerate);
 
     // --- where the frame actually goes --------------------------------------

@@ -122,6 +122,32 @@ struct WrEnergySettings
     float trendSeconds;     // window the arrow judges over
     float quantiseStep;     // round the displayed figure to this
 
+    // The rest of the filter chain, which used to be four #defines.
+    //
+    // Reported as "the numbers feel slow", and the smoothing slider above was
+    // not the whole story: the reading is filtered four times over before it is
+    // shown, and only one of those stages was reachable. The full chain is
+    //
+    //     velWindowSeconds   position differenced over a window -> velocity
+    //     velTau             that velocity, smoothed  (vector and turn rates)
+    //     speedTau           the speedometer
+    //     smoothSeconds      the energy figure itself
+    //     quantiseStep       and then rounded, with 0.75-step hysteresis
+    //
+    // and the end-to-end lag is about velWindowSeconds/2 + smoothSeconds. The
+    // defaults are the values those #defines held, so nothing moves until a
+    // slider does.
+    //
+    // Shortening velWindowSeconds is not free: it is a finite difference, so
+    // halving the window doubles the noise in the result. 40 ms was chosen
+    // because a two-unit view bob reads as 50 u/s over it rather than the
+    // 400 u/s a single frame at 200 fps would give.
+    float velWindowSeconds;
+    float velTau;
+    float speedTau;
+    float powerSeconds;     // window dE/dt is measured over
+    float arrowBand;        // trend inside +-this shows no arrow at all
+
     // Anchor the readout to the start of the run being compared against, so its
     // clock and yours start in the same place. Off means only manual anchors.
     bool anchorToRunStart;
@@ -201,6 +227,7 @@ enum WrAnchorSource
 {
     WR_ANCHOR_NONE = 0,
     WR_ANCHOR_RUN_START,
+    WR_ANCHOR_START_ZONE,   // fitted from every run on the leg, not just one
     WR_ANCHOR_MANUAL
 };
 
@@ -225,6 +252,10 @@ void WrEnergyRearm(void);
 // Anchor to a world position that is a PLAYER ORIGIN (a run's first point), not
 // a camera. eyeHeight is added so it is comparable with our own eye height.
 void WrEnergyAnchorToFeet(const Vec3 &feet);
+
+// The same, from the start zone fitted to every run on the leg. See wr_start.h
+// for why that is a better point than any single run's first sample.
+void WrEnergyAnchorToStartZone(const Vec3 &centre);
 
 WrAnchorSource WrEnergyAnchorSource(void);
 bool WrEnergyAnchorPos(Vec3 *out);   // false when there is no anchor

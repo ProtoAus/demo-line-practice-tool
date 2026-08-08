@@ -26,6 +26,8 @@
 #include "wr_extract.h"
 #include "wr_timer.h"
 #include "wr_savelocs.h"
+#include "wr_start.h"
+#include "wr_intogame.h"
 
 #include "imgui.h"
 
@@ -58,6 +60,9 @@ void WrIdleTick(void)
         WrLiveClear();
         WrEnergyReset();
         WrTimerReset();
+        WrStartReset();
+        WrRenderPickReset();
+        WrIntoGameRefresh();
         WrExtractOnMapChanged(map);
     }
 
@@ -181,6 +186,7 @@ static DWORD WINAPI InitThread(LPVOID)
     WrLogInit();
     WrRenderDefaults();
     WrEnergyDefaults();
+    WrStartDefaults();
     WrLimitDefaults();
 
     if (!WrProbeInit())

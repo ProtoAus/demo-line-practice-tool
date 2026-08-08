@@ -19,7 +19,7 @@
 #include <windows.h>
 #include <stdint.h>
 
-#define WRLINES_VERSION "0.3.0"
+#define WRLINES_VERSION "0.4.0"
 
 // How far from the origin a real world coordinate can be.
 //
@@ -104,8 +104,13 @@ bool WrSaneVec(const Vec3 &v);
 // ---------------------------------------------------------------------------
 
 // Absolute path to "<directory containing wrlines.dll>\wrlines_data\<rel>".
-// Creates the directory tree on demand. Nothing is ever written into the game
-// install; this is the only place WrLines writes at all.
+// Creates the directory tree on demand.
+//
+// This is where WrLines writes. The one exception is deliberate and opt-in: a
+// demo copied into the game's own replay folder so the game can play it, either
+// by the --into-game flag or by the per-run send button. See wr_intogame.h --
+// that path is recorded before it is written and is the only thing that can be
+// removed again.
 const char *WrDataPath(const char *rel);
 
 // Directory the DLL itself was loaded from.
@@ -114,6 +119,20 @@ const char *WrModuleDir(void);
 // The game install root, derived from the running executable
 // (<root>\bin\win64\momentum.exe -> <root>). Empty if it cannot be determined.
 const char *WrGameDir(void);
+
+// Are we running under Wine (which is what Proton is)?
+//
+// There is no native Linux build of the game -- the install ships bin\win64 and
+// no .so at all -- so Linux users run the Windows game under Proton, and this
+// Windows DLL is what loads into it. That works, and it is the supported path.
+// It is worth KNOWING though, because it changes what several other diagnostics
+// mean: which d3d11.dll is loaded, whether a Python is reachable, and whether a
+// path the game printed is a Windows path or a Z: mapping of a Linux one.
+//
+// Detected the standard way, by asking ntdll for an export only Wine has. No
+// call is made through it and nothing is loaded; this is a GetProcAddress and a
+// null test.
+bool WrIsWine(void);
 
 extern HMODULE g_wrSelf;
 

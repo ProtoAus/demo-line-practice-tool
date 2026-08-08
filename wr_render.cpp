@@ -24,6 +24,7 @@
 #include "wr_path.h"
 #include "wr_steam.h"
 #include "wr_energy.h"
+#include "wr_start.h"
 #include "wr_imgui.h"
 #include "wr_stress.h"
 #include "wr_hook.h"
@@ -93,9 +94,22 @@ void WrRenderDefaults(void)
     // that press from being a freeze; it is not what makes it cheap.
     g_render.maxRunsDrawn = 256;
     g_render.pointBudget = 1500;
-    g_render.colourBySpeed = false;
+    g_render.lineColour = WR_LINE_FLAT;
     g_render.speedMin = 250.0f;
     g_render.speedMax = 3500.0f;
+
+    // Energy is a HEIGHT in world units -- z + |v|^2/2g -- so it is an absolute
+    // map coordinate, not a per-run quantity. That is deliberate: the same
+    // colour then means the same energy on every line, which is the only way
+    // two runs can be compared by eye. It also means the default range is a
+    // guess until it is fitted to the map, which is what the button is for.
+    g_render.energyMin = 0.0f;
+    g_render.energyMax = 4000.0f;
+
+    // On. The pre-roll is not part of the run, and showing it is what makes a
+    // line appear to start somewhere the player was not yet racing.
+    g_render.hidePreRoll = true;
+
     g_render.drawMarkers = true;
     g_render.markerRadius = 6.0f;
     g_render.drawLive = true;
@@ -124,7 +138,6 @@ void WrRenderDefaults(void)
     // every checkpoint is unreadable long before it is slow.
     g_render.maxLabelsPerFrame = 40;
     g_render.drawVelocity = true;
-    g_render.colourByEfficiency = false;
     // Symmetric. Measured p60 of in-band eta is +0.589, and once the loss side
     // stopped being discarded it carries more mass than the gain side, not less.
     g_render.effSaturation = 0.60f;
@@ -132,7 +145,18 @@ void WrRenderDefaults(void)
     g_render.effNeutralMix = 0.70f;
     g_render.effNoDataAlpha = 0.35f;
     g_render.effColourblind = false;
-    g_render.effLegend = true;
+    g_render.lineKey = true;
+
+    g_render.pickEnabled = true;
+    // 48 px on a 1080p screen is about 2.5 degrees of arc at a 90 degree fov --
+    // a bit wider than a crosshair, which is what you want when the thing being
+    // aimed at is a two-pixel line that may be moving across the view.
+    g_render.pickRadiusPx = 48.0f;
+    g_render.pickDepthBias = 0.35f;
+    g_render.pickThickBoost = 1.8f;
+    g_render.pickHoldSeconds = 0.25f;
+    g_render.pickLabel = WR_LABEL_SPEED | WR_LABEL_ENERGY | WR_LABEL_TIME;
+    g_render.pickRing = true;
 
     g_render.rankColour = WR_RANK_OFF;
     // 25% off the record is fully red. Measured on the 66 surf_demise runs here
@@ -444,13 +468,43 @@ static unsigned int SpeedColour(float speed)
 static unsigned int EfficiencyColour(float eta, unsigned int runColour);
 static unsigned int MixColour(unsigned int c, float r, float g, float b, float t);
 
-static void EmitPath(ImDrawList *dl, const WrPoint *pts, int count,
-                     const int *breaks, int breakCount,
-                     unsigned int baseColour, float velScale,
-                     const signed char *eff)
+// A descriptor rather than eleven positional arguments, three of which are
+// floats that mean entirely different things. The body below keeps its old local
+// names, so this is an interface change and not a rewrite.
+struct WrPathDraw
 {
+    const WrPoint *pts;
+    int count;
+    int first;                  // where the RUN starts; 0 for the live trail
+    const int *breaks;
+    int breakCount;
+    const signed char *eff;
+    unsigned int baseColour;
+    float velScale;
+    float thickness;
+    float lift;                 // 0 normally; mixes toward white for the pick
+};
+
+static void EmitPath(ImDrawList *dl, const WrPathDraw &d)
+{
+    const WrPoint *pts = d.pts;
+    const int count = d.count;
+    const int *breaks = d.breaks;
+    const int breakCount = d.breakCount;
+    const signed char *eff = d.eff;
+    const float velScale = d.velScale;
+    const float thickness = d.thickness;
+
+    unsigned int baseColour = d.baseColour;
+    if (d.lift > 0.0f)
+        baseColour = MixColour(baseColour, 1.0f, 1.0f, 1.0f, d.lift);
+
     if (count < 2)
         return;
+
+    int first = d.first;
+    if (first < 0 || first > count - 2)
+        first = 0;
 
     const float maxDist = g_render.maxDrawDistance;
     const float maxDistSqr = maxDist * maxDist;
@@ -470,8 +524,9 @@ static void EmitPath(ImDrawList *dl, const WrPoint *pts, int count,
     // to be projected to find out they are close together. Skipping in index
     // space bounds the work before any of it happens.
     int step = 1;
-    if (g_render.pointBudget > 16 && count > g_render.pointBudget)
-        step = (count + g_render.pointBudget - 1) / g_render.pointBudget;
+    int span = count - first;
+    if (g_render.pointBudget > 16 && span > g_render.pointBudget)
+        step = (span + g_render.pointBudget - 1) / g_render.pointBudget;
 
     int lastBucket = -1;
     unsigned int lastColour = 0;
@@ -491,7 +546,7 @@ static void EmitPath(ImDrawList *dl, const WrPoint *pts, int count,
     // breaks[] is sorted, and i only increases, so a cursor walks it in step.
     int bi = 0;
 
-    for (int i = 0; i + step < count; i += step)
+    for (int i = first; i + step < count; i += step)
     {
         Vec3 a = pts[i].pos;
         Vec3 b = pts[i + step].pos;
@@ -504,7 +559,7 @@ static void EmitPath(ImDrawList *dl, const WrPoint *pts, int count,
             // This chord spans a teleport somewhere inside it.
             if (have)
             {
-                FlushBatch(dl, lastColour, g_render.thickness);
+                FlushBatch(dl, lastColour, thickness);
                 have = false;
             }
             continue;
@@ -516,7 +571,7 @@ static void EmitPath(ImDrawList *dl, const WrPoint *pts, int count,
         {
             if (have)
             {
-                FlushBatch(dl, lastColour, g_render.thickness);
+                FlushBatch(dl, lastColour, thickness);
                 have = false;
             }
             continue;
@@ -532,7 +587,7 @@ static void EmitPath(ImDrawList *dl, const WrPoint *pts, int count,
         {
             if (have)
             {
-                FlushBatch(dl, lastColour, g_render.thickness);
+                FlushBatch(dl, lastColour, thickness);
                 have = false;
             }
             continue;
@@ -547,7 +602,7 @@ static void EmitPath(ImDrawList *dl, const WrPoint *pts, int count,
         // ordinary on switchbacks and 180 turns.
         if (have && clippedStart)
         {
-            FlushBatch(dl, lastColour, g_render.thickness);
+            FlushBatch(dl, lastColour, thickness);
             have = false;
         }
 
@@ -557,7 +612,7 @@ static void EmitPath(ImDrawList *dl, const WrPoint *pts, int count,
         {
             if (have)
             {
-                FlushBatch(dl, lastColour, g_render.thickness);
+                FlushBatch(dl, lastColour, thickness);
                 have = false;
             }
             continue;
@@ -573,7 +628,7 @@ static void EmitPath(ImDrawList *dl, const WrPoint *pts, int count,
             {
                 if (have)
                 {
-                    FlushBatch(dl, lastColour, g_render.thickness);
+                    FlushBatch(dl, lastColour, thickness);
                     have = false;
                 }
                 continue;
@@ -602,7 +657,7 @@ static void EmitPath(ImDrawList *dl, const WrPoint *pts, int count,
 
         unsigned int colour;
         int bucket;
-        if (g_render.colourByEfficiency && eff)
+        if (g_render.lineColour == WR_LINE_EFFICIENCY && eff)
         {
             signed char e = eff[i];
             if (e == WR_ETA_NO_DATA)
@@ -623,11 +678,32 @@ static void EmitPath(ImDrawList *dl, const WrPoint *pts, int count,
                 bucket = fBucket * EFF_CLASSES + cBucket;
             }
         }
-        else if (g_render.colourBySpeed && velScale > 0.0f)
+        else if (g_render.lineColour == WR_LINE_SPEED && velScale > 0.0f)
         {
             float speed = WrLength(pts[i].vel) * velScale;
             float t = WrClampF((speed - g_render.speedMin) /
                                (g_render.speedMax - g_render.speedMin + 1e-3f),
+                               0.0f, 1.0f);
+            int cBucket = (int)(t * (COLOUR_BUCKETS - 1) + 0.5f);
+            colour = WithAlpha(SpeedColour(g_render.speedMin +
+                        (g_render.speedMax - g_render.speedMin) *
+                        ((float)cBucket / (COLOUR_BUCKETS - 1))), a01);
+            bucket = fBucket * COLOUR_BUCKETS + cBucket;
+        }
+        else if (g_render.lineColour == WR_LINE_ENERGY && velScale > 0.0f)
+        {
+            // z + |v|^2/2g, and cheaper than the speed branch above because it
+            // needs no sqrt. Absolute, not relative to the run's own start:
+            // a colour has to mean the same thing on every line or two lines
+            // cannot be read against each other, which is the whole point.
+            //
+            // Quantised through the same bucket key as speed, so the number of
+            // AddPolyline calls is unchanged. Reusing SpeedColour's ramp is
+            // deliberate too -- a second ramp for a second quantity would be
+            // one more thing to learn for no gain.
+            float e = WrEnergyOf(pts[i].pos, pts[i].vel);
+            float t = WrClampF((e - g_render.energyMin) /
+                               (g_render.energyMax - g_render.energyMin + 1e-3f),
                                0.0f, 1.0f);
             int cBucket = (int)(t * (COLOUR_BUCKETS - 1) + 0.5f);
             colour = WithAlpha(SpeedColour(g_render.speedMin +
@@ -643,7 +719,7 @@ static void EmitPath(ImDrawList *dl, const WrPoint *pts, int count,
 
         if (have && bucket != lastBucket)
         {
-            FlushBatch(dl, lastColour, g_render.thickness);
+            FlushBatch(dl, lastColour, thickness);
             have = false;
         }
 
@@ -674,14 +750,14 @@ static void EmitPath(ImDrawList *dl, const WrPoint *pts, int count,
         if (g_batchCount >= MAX_BATCH - 2)
         {
             ImVec2 carry = g_batch[g_batchCount - 1];
-            FlushBatch(dl, colour, g_render.thickness);
+            FlushBatch(dl, colour, thickness);
             g_batch[g_batchCount++] = carry;    // keep the line continuous
             have = true;
         }
     }
 
     if (have)
-        FlushBatch(dl, lastColour, g_render.thickness);
+        FlushBatch(dl, lastColour, thickness);
 }
 
 // ---------------------------------------------------------------------------
@@ -873,7 +949,7 @@ static void EmitTurns(ImDrawList *dl, const WrRun *run, bool tops)
         // 0.36x to 10.32x on the worst map measured. See CheckTimes.
         char label[128];
         BuildLabel(label, sizeof(label), what, p,
-                   p->t * run->timeScale, run->timingTrusted);
+                   WrRunTimeAt(run, idx), run->timingTrusted);
         if (!label[0])
             continue;
 
@@ -1599,6 +1675,103 @@ static unsigned int EfficiencyColour(float eta, unsigned int runColour)
     return MixColour(neutral, lr, lg, lb, u);
 }
 
+// The fitted start zone, drawn so the guesswork is visible rather than magic.
+//
+// Three things, and the third is the point: a ring for the arming region, an
+// arrow for the direction the runs left in, and the TRIGGER LINE with a band
+// either side of it that is the measured p90 spread of where those runs' clocks
+// actually started. The band is the uncertainty, drawn to scale, in the world.
+// Anything that infers a place from data ought to show its error bars.
+static void EmitStartZone(ImDrawList *dl)
+{
+    if (!g_start.enabled || !g_start.showZone)
+        return;
+
+    const WrStartZone *z = WrStartZoneHere();
+    if (!z)
+    {
+        float d = 0.0f;
+        z = WrStartZoneNearest(&d);
+        // Only when it is close enough to be worth looking at. A ring drawn
+        // across the map is a distraction, not information.
+        if (!z || d > g_render.maxDrawDistance)
+            return;
+    }
+
+    bool armed = (WrStartStateNow() == WR_START_ARMED);
+    unsigned int ring = armed ? 0xFF66FF66u : 0xFFAAAAAAu;
+    unsigned int band = 0x40FFFFFFu;
+    float zBase = z->zLo + 128.0f;      // back to the members' own floor
+    float zr = WrStartZoneRadius(z);    // fitted, with the size setting on
+
+    // The ring, as a world-space polygon so it lies flat on the floor and
+    // shrinks with distance like everything else here.
+    const int kSegs = 48;
+    ImVec2 pts[kSegs];
+    int n = 0;
+    bool broken = false;
+    for (int i = 0; i < kSegs; i++)
+    {
+        float a = (float)i / (float)kSegs * 6.28318531f;
+        Vec3 p = WrVec(z->centre.x + cosf(a) * zr,
+                       z->centre.y + sinf(a) * zr, zBase);
+        if (!Project(p, &pts[n]))
+        {
+            broken = true;      // wraps behind the camera; draw what is left
+            if (n >= 2)
+                dl->AddPolyline(pts, n, ring, 0, g_render.thickness);
+            n = 0;
+            continue;
+        }
+        n++;
+    }
+    if (n >= 2)
+        dl->AddPolyline(pts, n, ring, broken ? 0 : ImDrawFlags_Closed,
+                        g_render.thickness);
+
+    if (WrLength(z->outDir) < 0.5f)
+        return;                 // no usable heading: no line and no arrow
+
+    // The trigger line: across the ring, through the centre, perpendicular to
+    // the way out.
+    Vec3 side = WrVec(-z->outDir.y, z->outDir.x, 0.0f);
+    Vec3 c = WrVec(z->centre.x, z->centre.y, zBase);
+
+    for (int k = -1; k <= 1; k++)
+    {
+        float off = (float)k * z->alongSpread;
+        Vec3 a = WrAdd(WrAdd(c, WrScale(side, -zr)),
+                       WrScale(z->outDir, off));
+        Vec3 b = WrAdd(WrAdd(c, WrScale(side, zr)),
+                       WrScale(z->outDir, off));
+        ImVec2 pa, pb;
+        if (!ClipToNear(&a, &b) || !Project(a, &pa) || !Project(b, &pb))
+            continue;
+        dl->AddLine(pa, pb, k == 0 ? ring : band,
+                    g_render.thickness * (k == 0 ? 1.6f : 0.8f));
+    }
+
+    // And the way out, from the centre.
+    {
+        Vec3 a = c;
+        Vec3 b = WrAdd(c, WrScale(z->outDir, zr * 0.9f));
+        ImVec2 pa, pb;
+        if (ClipToNear(&a, &b) && Project(a, &pa) && Project(b, &pb))
+        {
+            dl->AddLine(pa, pb, ring, g_render.thickness);
+            for (int s = -1; s <= 1; s += 2)
+            {
+                Vec3 h0 = b;
+                Vec3 h1 = WrAdd(b, WrAdd(WrScale(z->outDir, -48.0f),
+                                         WrScale(side, 28.0f * (float)s)));
+                ImVec2 q0, q1;
+                if (ClipToNear(&h0, &h1) && Project(h0, &q0) && Project(h1, &q1))
+                    dl->AddLine(q0, q1, ring, g_render.thickness);
+            }
+        }
+    }
+}
+
 static void EmitVelocityVector(ImDrawList *dl)
 {
     if (!g_render.drawVelocity)
@@ -1684,9 +1857,11 @@ static void EmitVelocityVector(ImDrawList *dl)
 // to the same box.
 static void EmitEfficiencyLegend(ImDrawList *dl)
 {
-    bool effOn = g_render.colourByEfficiency && g_render.effLegend;
+    bool effOn = g_render.lineColour == WR_LINE_EFFICIENCY && g_render.lineKey;
+    bool spdOn = g_render.lineColour == WR_LINE_SPEED && g_render.lineKey;
+    bool nrgOn = g_render.lineColour == WR_LINE_ENERGY && g_render.lineKey;
     bool rankOn = g_render.rankColour != WR_RANK_OFF && g_render.rankLegend;
-    if (!effOn && !rankOn)
+    if (!effOn && !spdOn && !nrgOn && !rankOn)
         return;
 
     float size = 0.0f;
@@ -1696,9 +1871,12 @@ static void EmitEfficiencyLegend(ImDrawList *dl)
     float sw = size * 1.6f;         // swatch width
 
     struct Row { unsigned int colour; bool dim; const char *text; };
-    Row rows[10];
-    const char *foots[6];
+    Row rows[12];
+    const char *foots[8];
     int n = 0, nf = 0;
+
+    // Held across the call because the rows point at them rather than copying.
+    static char sLo[48], sMid[48], sHi[48];
 
     if (rankOn)
     {
@@ -1716,6 +1894,42 @@ static void EmitEfficiencyLegend(ImDrawList *dl)
         // The thing that would otherwise look like a bug on a staged map.
         foots[nf++] = "placed within each leg -- a bonus cannot out-place a "
                       "main run";
+    }
+
+    // Speed and energy share SpeedColour's ramp, so both keys are built the same
+    // way: the swatches are taken from the ramp function itself at the ends and
+    // the middle, which is what stops the key from drifting away from the lines
+    // it describes.
+    if (spdOn || nrgOn)
+    {
+        float lo = nrgOn ? g_render.energyMin : g_render.speedMin;
+        float hi = nrgOn ? g_render.energyMax : g_render.speedMax;
+        const char *unit = nrgOn ? "units of height" : "u/s";
+        _snprintf_s(sLo, sizeof(sLo), _TRUNCATE, "%.0f %s and below", lo, unit);
+        _snprintf_s(sMid, sizeof(sMid), _TRUNCATE, "%.0f", (lo + hi) * 0.5f);
+        _snprintf_s(sHi, sizeof(sHi), _TRUNCATE, "%.0f and above", hi);
+
+        rows[n].colour = SpeedColour(lo);                 rows[n].dim = false;
+        rows[n++].text = sLo;
+        rows[n].colour = SpeedColour((lo + hi) * 0.5f);   rows[n].dim = false;
+        rows[n++].text = sMid;
+        rows[n].colour = SpeedColour(hi);                 rows[n].dim = false;
+        rows[n++].text = sHi;
+
+        if (nrgOn)
+        {
+            // The one thing that is not obvious about the energy mode, and the
+            // reason it is worth having at all: it is an absolute height, so the
+            // same colour on two different lines is the same energy.
+            foots[nf++] = "energy = height + speed^2 / 2g, in world units";
+            foots[nf++] = "absolute, so the same colour means the same energy on "
+                          "every line";
+        }
+        else
+        {
+            foots[nf++] = "the range is yours to set -- fit it to the map and "
+                          "the middle becomes readable";
+        }
     }
 
     if (effOn)
@@ -1899,6 +2113,549 @@ static void EmitEnergyOverlay(ImDrawList *dl)
 // Frame entry point
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Aiming at a line
+// ---------------------------------------------------------------------------
+//
+// The problem is cost, not geometry. 256 drawn runs measures 8.1 ms against a
+// 16.7 ms frame at 60 Hz, and EmitPath does at most pointBudget = 1500 chord
+// iterations per run -- so about 21 ns each, which is one cache miss plus some
+// arithmetic. Anything that touches points at a comparable rate costs a
+// comparable share of 8 ms.
+//
+// That rules out the two obvious designs. Folding the test into EmitPath, where
+// the screen coordinates are already in hand, would make pick accuracy a
+// function of the point-budget slider -- the exact failure recorded at the top
+// of EmitPath, where teleports re-derived from strided chords appeared and
+// vanished as that slider moved. And a flat "sample N points per run" is either
+// too coarse to identify a line on a 38 751-point run or too expensive.
+//
+// So: reject in bulk against precomputed bounds, project only what survives, and
+// walk points at full resolution only on the winner. The same shape TagAnchor,
+// MeasureNearest and WrUpdateNearest all already use.
+//
+// Two hard caps, because a bound that depends on the geometry being reasonable
+// is not a bound. Six chunks per run and 8192 projections per frame: pathological
+// geometry degrades the pick, it does not blow the frame.
+#define WR_PICK_CHUNKS_PER_RUN 6
+#define WR_PICK_MAX_PROJECTIONS 8192
+#define WR_PICK_HYSTERESIS 0.20f
+#define WR_PICK_FLOOR_PX 4.0f
+#define WR_PICK_TIE_PX 6.0f
+#define WR_PICK_REFINE 16
+
+// One pick at a time, so this is a singleton rather than state on WrRun. On the
+// run, a line that stopped being drawn -- or stopped being enabled -- would keep
+// claiming the crosshair.
+static struct
+{
+    int slot;               // store index, or -1
+    int index;              // which point of it
+    Vec3 pos;               // smoothed, for the ring
+    float scorePx;
+    float holdFor;
+    int tied;
+    bool dim;               // held over from a frame that had no answer
+} g_pick = { -1, 0, { 0.0f, 0.0f, 0.0f }, 0.0f, 0.0f, 0, false };
+
+// The best score seen for each of the nearest few RUNS, so the tie count is a
+// count of lines and not of samples.
+//
+// Counting every sample within the tie window was the obvious version and it is
+// wrong in a way that shows: one line running alongside another contributes a
+// hundred samples, and the plate then claims a hundred other lines were just as
+// close. The number is there to admit a coin toss, so it has to be countable.
+#define WR_PICK_CAND 8
+static struct { int slot; float score; } g_cand[WR_PICK_CAND];
+static int g_candCount = 0;
+
+static void CandNote(int slot, float score)
+{
+    for (int i = 0; i < g_candCount; i++)
+        if (g_cand[i].slot == slot)
+        {
+            if (score < g_cand[i].score)
+                g_cand[i].score = score;
+            return;
+        }
+    if (g_candCount < WR_PICK_CAND)
+    {
+        g_cand[g_candCount].slot = slot;
+        g_cand[g_candCount].score = score;
+        g_candCount++;
+        return;
+    }
+    // Full: replace the worst, but only if this is better than it. The array is
+    // eight long and only ever read for a count, so an exact top-eight is more
+    // than the answer needs.
+    int worst = 0;
+    for (int i = 1; i < g_candCount; i++)
+        if (g_cand[i].score > g_cand[worst].score)
+            worst = i;
+    if (score < g_cand[worst].score)
+    {
+        g_cand[worst].slot = slot;
+        g_cand[worst].score = score;
+    }
+}
+
+static int g_pickChunks = 0, g_pickPoints = 0;
+static float g_pickMs = 0.0f;
+
+// Screen offset from the CROSSHAIR, not a screen position. ProjectKnownW adds
+// half the screen size and this would immediately subtract it again, so the
+// crosshair is simply made the origin.
+static bool PickProject(const Vec3 &p, float *w, ImVec2 *off)
+{
+    float ww = ClipW(p);
+    if (ww < NEAR_W)
+        return false;
+    ImVec2 s;
+    if (!ProjectKnownW(p, ww, &s))
+        return false;
+    *w = ww;
+    off->x = s.x - g_sw * 0.5f;
+    off->y = s.y - g_sh * 0.5f;
+    return true;
+}
+
+// Squared distance from the origin to a segment, plus where along it that was.
+// Squared and unrooted: the winner takes the one sqrt at the end.
+static float SegDistSqr(const ImVec2 &a, const ImVec2 &b, float *tOut)
+{
+    float dx = b.x - a.x, dy = b.y - a.y;
+    float l2 = dx * dx + dy * dy;
+    float t = 0.0f;
+    if (l2 > 1e-6f)
+    {
+        t = -(a.x * dx + a.y * dy) / l2;
+        t = WrClampF(t, 0.0f, 1.0f);
+    }
+    float px = a.x + dx * t, py = a.y + dy * t;
+    if (tOut)
+        *tOut = t;
+    return px * px + py * py;
+}
+
+// Sphere against the aim cone. No divide, no sqrt.
+static inline bool SphereNearRay(const Vec3 &c, float r, const Vec3 &fwd,
+                                 float range, float tanHalf)
+{
+    Vec3 d = WrSub(c, g_cam);
+    float along = WrDot(d, fwd);
+    if (along < -r || along > range + r)
+        return false;
+    float perp2 = WrDot(d, d) - along * along;
+    float lim = r + (along > 0.0f ? along * tanHalf : 0.0f);
+    return perp2 <= lim * lim;
+}
+
+static void UpdatePick(void)
+{
+    LARGE_INTEGER pt0, pt1;
+    QueryPerformanceCounter(&pt0);
+    g_pickChunks = 0;
+    g_pickPoints = 0;
+
+    // Frame time for the hold. WrRenderWorld only runs on frames that draw, so
+    // this is the interval between VISIBLE frames -- which is the right clock
+    // for something whose whole job is to stay on screen a moment longer.
+    static LARGE_INTEGER last = { 0 };
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    float dt = 0.0f;
+    if (last.QuadPart)
+        dt = WrClampF((float)((double)(now.QuadPart - last.QuadPart) / (double)Qpf()),
+                      0.0f, 0.1f);
+    last = now;
+
+    Vec3 fwd;
+    if (!g_render.pickEnabled || !WrCameraForward(&fwd))
+    {
+        g_pick.slot = -1;
+        return;
+    }
+
+    float range = g_render.maxDrawDistance;
+    // The cone the pick radius subtends, in world terms. |row0| of the matrix is
+    // the horizontal focal length, so a radius in pixels becomes a slope here.
+    float focal = WrLength(WrVec(g_m->m[0][0], g_m->m[0][1], g_m->m[0][2]));
+    float tanHalf = (focal > 1e-6f && g_sw > 1.0f)
+                  ? (g_render.pickRadiusPx * 2.0f / g_sw) / focal
+                  : 0.15f;
+    tanHalf += 0.02f;           // a little slack: the cone is a reject, not a test
+
+    int bestSlot = -1, bestIndex = 0;
+    float bestScore = 0.0f;
+    g_candCount = 0;
+    int projections = 0;
+    int drawn = 0;
+
+    for (int i = 0; i < WrRunCount() && drawn < g_render.maxRunsDrawn; i++)
+    {
+        WrRun *run = WrRunAt(i);
+        // The identical gate the draw loop uses. A run that is not drawn must
+        // not be pickable, or the readout names a line that is not on screen.
+        if (!run || !run->enabled || run->pointCount < 2)
+            continue;
+        drawn++;
+
+        if (run->boundRadius <= 0.0f || !run->chunks)
+            continue;
+        if (!SphereNearRay(run->boundCentre, run->boundRadius, fwd, range, tanHalf))
+            continue;
+
+        // Which chunks survive, nearest first, capped.
+        int cand[WR_PICK_CHUNKS_PER_RUN];
+        float candAlong[WR_PICK_CHUNKS_PER_RUN];
+        int nCand = 0;
+        int first = g_render.hidePreRoll ? run->startIndex : 0;
+        int firstChunk = first / WR_PICK_CHUNK;
+
+        for (int k = firstChunk; k < run->chunkCount; k++)
+        {
+            g_pickChunks++;
+            const WrChunk &ch = run->chunks[k];
+            if (!SphereNearRay(ch.c, ch.r, fwd, range, tanHalf))
+                continue;
+            float along = WrDot(WrSub(ch.c, g_cam), fwd);
+            if (nCand < WR_PICK_CHUNKS_PER_RUN)
+            {
+                cand[nCand] = k;
+                candAlong[nCand] = along;
+                nCand++;
+            }
+            else
+            {
+                // Replace the furthest. Keeping the nearest is what makes the
+                // cap a sensible truncation rather than an arbitrary one.
+                int worst = 0;
+                for (int a = 1; a < nCand; a++)
+                    if (candAlong[a] > candAlong[worst])
+                        worst = a;
+                if (along < candAlong[worst])
+                {
+                    cand[worst] = k;
+                    candAlong[worst] = along;
+                }
+            }
+        }
+
+        for (int c = 0; c < nCand && projections < WR_PICK_MAX_PROJECTIONS; c++)
+        {
+            int a = cand[c] * WR_PICK_CHUNK;
+            int b = a + WR_PICK_CHUNK;
+            if (b > run->pointCount)
+                b = run->pointCount;
+            if (a < first)
+                a = first;
+            int step = WR_PICK_CHUNK / 4;
+            if (step < 1)
+                step = 1;
+
+            ImVec2 prev;
+            float prevW = 0.0f;
+            bool havePrev = false;
+            for (int p = a; p < b && projections < WR_PICK_MAX_PROJECTIONS; p += step)
+            {
+                ImVec2 off;
+                float w;
+                projections++;
+                g_pickPoints++;
+                if (!PickProject(run->points[p].pos, &w, &off) || w > range)
+                {
+                    havePrev = false;       // straddles the near plane: see below
+                    continue;
+                }
+                if (havePrev)
+                {
+                    // Chords straddling the near plane are rejected rather than
+                    // clipped: one endpoint behind the camera projects mirrored
+                    // and yields a bogus tiny distance -- the trap EmitPath
+                    // documents. A pick at the near plane means nothing anyway.
+                    float t = 0.0f;
+                    float d2 = SegDistSqr(prev, off, &t);
+                    float lim = g_render.pickRadiusPx;
+                    if (d2 <= lim * lim)
+                    {
+                        float wAt = prevW + (w - prevW) * t;
+                        // A far line must be meaningfully closer on screen to
+                        // take the pick from a near one. Without this, two lines
+                        // crossing on screen trade it on sub-pixel noise, which
+                        // is precisely the situation the feature exists for.
+                        float score = sqrtf(d2) +
+                                      g_render.pickDepthBias * lim *
+                                      (wAt / (range > 1.0f ? range : 1.0f));
+                        CandNote(i, score);
+                        if (bestSlot < 0 || score < bestScore)
+                        {
+                            bestScore = score;
+                            bestSlot = i;
+                            bestIndex = p;
+                        }
+                    }
+                }
+                prev = off;
+                prevW = w;
+                havePrev = true;
+            }
+        }
+    }
+
+    // Incumbent hysteresis, the same shape TagAnchor uses: last frame's answer
+    // keeps the pick unless it is beaten by a real margin. Without it a line
+    // crossing another swaps the readout every frame.
+    if (bestSlot >= 0 && g_pick.slot >= 0 && g_pick.slot != bestSlot &&
+        !g_pick.dim)
+    {
+        const WrRun *prev = WrRunAt(g_pick.slot);
+        // pointCount is not enough on its own: FinishLoad qsorts the store, so
+        // slot N can become a different, shorter run between frames and the
+        // remembered index then points past its end. The refine loop below
+        // would run zero iterations and leave bestIndex there.
+        if (prev && prev->enabled && prev->pointCount >= 2 &&
+            g_pick.index >= 0 && g_pick.index < prev->pointCount &&
+            g_pick.scorePx <= bestScore * (1.0f + WR_PICK_HYSTERESIS) +
+                              WR_PICK_FLOOR_PX)
+        {
+            bestSlot = g_pick.slot;
+            bestIndex = g_pick.index;
+            bestScore = g_pick.scorePx;
+        }
+    }
+
+    if (bestSlot >= 0)
+    {
+        WrRun *run = WrRunAt(bestSlot);
+
+        // Full resolution, winner only. The coarse pass steps a quarter of a
+        // chunk, so the index can be out by eight points; this is 33 more
+        // distance tests and fixes it.
+        // Clamped before use, not just bounded: bestIndex reaches here either
+        // from this frame's scan or from last frame's remembered pick, and only
+        // one of those two is guaranteed to still be inside this run.
+        bestIndex = WrClampI(bestIndex, 0, run->pointCount - 1);
+        int lo = bestIndex - WR_PICK_REFINE, hi = bestIndex + WR_PICK_REFINE;
+        if (lo < 0) lo = 0;
+        if (hi > run->pointCount) hi = run->pointCount;
+        float bestD = -1.0f;
+        for (int p = lo; p < hi; p++)
+        {
+            ImVec2 off;
+            float w;
+            g_pickPoints++;
+            if (!PickProject(run->points[p].pos, &w, &off))
+                continue;
+            float d = off.x * off.x + off.y * off.y;
+            if (bestD < 0.0f || d < bestD)
+            {
+                bestD = d;
+                bestIndex = p;
+            }
+        }
+
+        Vec3 want = run->points[bestIndex].pos;
+        if (g_pick.slot != bestSlot || WrDistSqr(want, g_pick.pos) >
+            TAG_SNAP_UNITS * TAG_SNAP_UNITS)
+            g_pick.pos = want;
+        else
+            g_pick.pos = WrAdd(g_pick.pos,
+                               WrScale(WrSub(want, g_pick.pos), TAG_SMOOTH));
+
+        g_pick.slot = bestSlot;
+        g_pick.index = bestIndex;
+        g_pick.scorePx = bestScore;
+
+        // Distinct runs that came within a few pixels of the winner. Counted
+        // here rather than while scanning, because the same run contributes
+        // many samples and only one of them is that run.
+        int tied = 0;
+        for (int c = 0; c < g_candCount; c++)
+            if (g_cand[c].slot != bestSlot &&
+                g_cand[c].score < bestScore + WR_PICK_TIE_PX)
+                tied++;
+        g_pick.tied = tied;
+        g_pick.holdFor = g_render.pickHoldSeconds;
+        g_pick.dim = false;
+    }
+    else if (g_pick.slot >= 0)
+    {
+        // Held, DIMMED, for a moment. Dimming rather than blanking for the same
+        // reason the energy readout dims when it is held: a display that
+        // silently stops is indistinguishable from one that is stuck.
+        g_pick.holdFor -= dt;
+        g_pick.dim = true;
+        const WrRun *run = WrRunAt(g_pick.slot);
+        if (g_pick.holdFor <= 0.0f || !run || !run->enabled ||
+            run->pointCount < 2 || g_pick.index >= run->pointCount)
+            g_pick.slot = -1;
+    }
+
+    QueryPerformanceCounter(&pt1);
+    g_pickMs = (float)((double)(pt1.QuadPart - pt0.QuadPart) * 1000.0 / (double)Qpf());
+}
+
+const WrRun *WrPickedRun(int *pointIndex, float *screenPx, int *tied)
+{
+    if (g_pick.slot < 0)
+        return NULL;
+    const WrRun *run = WrRunAt(g_pick.slot);
+    if (!run || !run->enabled || g_pick.index >= run->pointCount)
+        return NULL;
+    if (pointIndex) *pointIndex = g_pick.index;
+    if (screenPx) *screenPx = g_pick.scorePx;
+    if (tied) *tied = g_pick.tied;
+    return run;
+}
+
+void WrRenderPickReset(void)
+{
+    g_pick.slot = -1;
+    g_pick.tied = 0;
+    g_pick.holdFor = 0.0f;
+    g_pick.dim = false;
+    g_candCount = 0;
+}
+
+void WrPickStats(int *chunksTested, int *pointsTested, float *millis)
+{
+    if (chunksTested) *chunksTested = g_pickChunks;
+    if (pointsTested) *pointsTested = g_pickPoints;
+    if (millis) *millis = g_pickMs;
+}
+
+// The ring at the picked point, and the plate that says whose line it is.
+static void EmitPickPlate(ImDrawList *dl)
+{
+    int idx = 0, tied = 0;
+    float px = 0.0f;
+    const WrRun *run = WrPickedRun(&idx, &px, &tied);
+    if (!run)
+        return;
+
+    float fade = g_pick.dim ? 0.6f : 1.0f;
+    unsigned int col = WithAlpha(WrRunColour(run), fade);
+
+    ImVec2 at;
+    bool onScreen = Project(g_pick.pos, &at);
+
+    if (g_render.pickRing && onScreen)
+    {
+        // The same recipe EmitComparePoint uses, at a bigger radius so the two
+        // read as different things when both land on one run.
+        dl->AddCircle(at, 11.0f, WithAlpha(0xFF000000u, fade), 0, 3.0f);
+        dl->AddCircle(at, 10.0f, col, 0, 2.0f);
+        dl->AddCircleFilled(at, 2.5f, col);
+    }
+
+    // Eight, and every append below is bounded against it. The worst case is a
+    // name, four rows from BuildLabel (its mask has four bits), the track and
+    // the tie note -- seven. A five-element array was one label bit away from
+    // being written past.
+    char lines[8][96];
+    unsigned int cols[8];
+    const int kMaxLines = 8;
+    int n = 0;
+
+    const char *who = WrSteamPersona(run->steamId);
+    if (!who || !*who)
+        who = run->player[0] ? run->player : "(unknown)";
+    _snprintf_s(lines[n], sizeof(lines[0]), _TRUNCATE, "%s", who);
+    cols[n++] = WithAlpha(0xFFFFFFFFu, fade);
+
+    // BuildLabel is the same formatter the numbers on the line use, which is why
+    // it exists. It separates its parts with newlines, so they become rows here.
+    char body[128];
+    BuildLabel(body, sizeof(body), g_render.pickLabel, &run->points[idx],
+               WrRunTimeAt(run, idx), run->timingTrusted);
+    for (char *p = body; *p && n < kMaxLines - 2; )
+    {
+        char *nl = strchr(p, '\n');
+        if (nl)
+            *nl = '\0';
+        if (*p)
+        {
+            _snprintf_s(lines[n], sizeof(lines[0]), _TRUNCATE, "%s", p);
+            cols[n++] = WithAlpha(0xFFDDDDDDu, fade);
+        }
+        if (!nl)
+            break;
+        p = nl + 1;
+    }
+
+    if (n < kMaxLines)
+    {
+        if (run->rank > 0)
+            _snprintf_s(lines[n], sizeof(lines[0]), _TRUNCATE, "%s  %d / %d",
+                        WrTrackName(run), run->rank, run->rankOutOf);
+        else
+            _snprintf_s(lines[n], sizeof(lines[0]), _TRUNCATE, "%s",
+                        WrTrackName(run));
+        cols[n++] = col;
+    }
+
+    if (tied > 0 && n < kMaxLines)
+    {
+        // Said out loud, because the choice between overlapping lines was
+        // effectively a coin toss and a confident name would be a lie.
+        _snprintf_s(lines[n], sizeof(lines[0]), _TRUNCATE,
+                    "%d other line%s just as close", tied, tied == 1 ? "" : "s");
+        cols[n++] = WithAlpha(0xFF80B0FFu, fade);
+    }
+
+    float size = 0.0f;
+    ImFont *font = WrFontFor(14.0f * g_render.tagScale, &size);
+    float lh = size * 1.3f;
+    float pad = 6.0f * g_render.tagScale;
+    float w = 0.0f;
+    for (int i = 0; i < n; i++)
+    {
+        ImVec2 m = font->CalcTextSizeA(size, FLT_MAX, 0.0f, lines[i]);
+        if (m.x > w) w = m.x;
+    }
+    float h = lh * (float)n;
+
+    // Anchored to the picked point when it is on screen, and to the crosshair
+    // when it is not -- which happens while the hold is running out after you
+    // have looked away.
+    float ax = onScreen ? at.x : g_sw * 0.5f;
+    float ay = onScreen ? at.y : g_sh * 0.5f;
+
+    // Never on top of the crosshair. Pushed away from screen centre, so the
+    // thing you are aiming at stays visible.
+    float dx = ax - g_sw * 0.5f, dy = ay - g_sh * 0.5f;
+    float len = sqrtf(dx * dx + dy * dy);
+    if (len < 1.0f) { dx = 0.0f; dy = 1.0f; len = 1.0f; }
+    float ox = dx / len * 26.0f, oy = dy / len * 26.0f;
+
+    float x = ax + ox;
+    float y = ay + oy - h * 0.5f;
+    if (x + w + pad * 2.0f > g_sw) x = g_sw - w - pad * 2.0f;
+    if (x < 0.0f) x = 0.0f;
+    if (y + h + pad * 2.0f > g_sh) y = g_sh - h - pad * 2.0f;
+    if (y < 0.0f) y = 0.0f;
+
+    // Drawn last of everything in the frame, so it is never under a name tag or
+    // a ramp number. It does NOT reserve a TagRect: that would have to happen
+    // before the run loop, and the plate's size is not known until the run has
+    // been picked. Being opaque and on top is the cheaper answer to the same
+    // problem -- the labels underneath are still readable either side of it.
+    ImVec2 p0(x, y), p1(x + w + pad * 2.0f, y + h + pad * 2.0f);
+    dl->AddRectFilled(p0, p1, WithAlpha(0xC0000000u, fade), 5.0f);
+    dl->AddRect(p0, p1, col, 5.0f, 0, 1.5f);
+    if (onScreen)
+        dl->AddLine(at, ImVec2(x + (ox < 0.0f ? w + pad * 2.0f : 0.0f),
+                               y + h * 0.5f + pad), col, 1.5f);
+
+    for (int i = 0; i < n; i++)
+    {
+        ImVec2 tp(x + pad, y + pad + lh * (float)i);
+        dl->AddText(font, size, ImVec2(tp.x + 1.0f, tp.y + 1.0f),
+                    WithAlpha(0xC0000000u, fade), lines[i]);
+        dl->AddText(font, size, tp, cols[i], lines[i]);
+    }
+}
+
 void WrRenderWorld(void)
 {
     g_statSegments = 0;
@@ -1919,14 +2676,18 @@ void WrRenderWorld(void)
     // a staged map a run belongs to.
     WrUpdateNearest(g_cam);
 
-    // Anchor to the reference run's first point, once, so that its clock and
-    // ours start at the same place -- see wr_timer.h. Only ever taken when
+    // Anchor to where the reference run's RUN starts, once, so that its clock
+    // and ours start at the same place -- see wr_timer.h. Only ever taken when
     // nothing has anchored yet, so a manual anchor is never overwritten.
+    //
+    // points[startIndex], not points[0]. The first recorded point is roughly
+    // three quarters of a second of walking into the start zone earlier, so
+    // anchoring there put our zero somewhere the run had not begun.
     if (g_energy.anchorToRunStart && WrEnergyAnchorSource() == WR_ANCHOR_NONE)
     {
         const WrRun *ref = WrEnergyReferenceRun();
         if (ref && ref->pointCount >= 2)
-            WrEnergyAnchorToFeet(ref->points[0].pos);
+            WrEnergyAnchorToFeet(ref->points[ref->startIndex].pos);
     }
 
     int bw = 0, bh = 0;
@@ -1943,14 +2704,42 @@ void WrRenderWorld(void)
 
     ImDrawList *dl = ImGui::GetBackgroundDrawList();
 
+    // Before the draw loop: the pick decides which run is drawn last, and the
+    // panel reads the answer in the same frame.
+    UpdatePick();
+    int pickSlot = -1;
+    {
+        int pi = 0;
+        if (WrPickedRun(&pi, NULL, NULL))
+            pickSlot = g_pick.slot;
+    }
+
     int drawn = 0;
     for (int i = 0; i < WrRunCount() && drawn < g_render.maxRunsDrawn; i++)
     {
         WrRun *run = WrRunAt(i);
         if (!run || !run->enabled || run->pointCount < 2)
             continue;
-        EmitPath(dl, run->points, run->pointCount, run->breaks, run->breakCount,
-                 WrRunColour(run), 1.0f, run->eff);
+        if (i == pickSlot)
+        {
+            // Drawn after the loop instead, so the highlighted line sits on top
+            // of the ones crossing it. Still counted, so turning the pick on
+            // cannot change how many runs get drawn.
+            drawn++;
+            continue;
+        }
+        WrPathDraw d;
+        d.pts = run->points;
+        d.count = run->pointCount;
+        d.first = g_render.hidePreRoll ? run->startIndex : 0;
+        d.breaks = run->breaks;
+        d.breakCount = run->breakCount;
+        d.eff = run->eff;
+        d.baseColour = WrRunColour(run);
+        d.velScale = 1.0f;
+        d.thickness = g_render.thickness;
+        d.lift = 0.0f;
+        EmitPath(dl, d);
         EmitTurns(dl, run, false);
         EmitTurns(dl, run, true);
         EmitMarkers(dl, run);
@@ -1959,11 +2748,41 @@ void WrRenderWorld(void)
         drawn++;
     }
 
+    // The picked run, last and on top. No second pass over its points: the same
+    // EmitPath, with a thickness and a lift, so the highlight costs nothing that
+    // drawing it normally would not have cost anyway.
+    if (pickSlot >= 0)
+    {
+        WrRun *run = WrRunAt(pickSlot);
+        if (run && run->enabled && run->pointCount >= 2)
+        {
+            WrPathDraw d;
+            d.pts = run->points;
+            d.count = run->pointCount;
+            d.first = g_render.hidePreRoll ? run->startIndex : 0;
+            d.breaks = run->breaks;
+            d.breakCount = run->breakCount;
+            d.eff = run->eff;
+            d.baseColour = WrRunColour(run);
+            d.velScale = 1.0f;
+            d.thickness = g_render.thickness * g_render.pickThickBoost;
+            d.lift = 0.35f;
+            EmitPath(dl, d);
+            EmitTurns(dl, run, false);
+            EmitTurns(dl, run, true);
+            EmitMarkers(dl, run);
+            // No name tag for this one: the plate already carries the name, and
+            // suppressing it frees a rectangle for something else.
+        }
+    }
+
     EmitEnergyOverlay(dl);
     EmitEfficiencyLegend(dl);
+    EmitStartZone(dl);
     EmitComparePoint(dl);
     EmitVelocityVector(dl);
     EmitEnergyHud(dl);
+    EmitPickPlate(dl);      // last, so it is never drawn under anything
 
     if (g_render.drawLive)
     {
@@ -1976,7 +2795,20 @@ void WrRenderWorld(void)
         // WrLiveRecord started being handed one, so colour-by-speed works on
         // your own line as well as on everybody else's.
         if (n >= 2)
-            EmitPath(dl, live, n, NULL, 0, g_render.liveColour, 1.0f, NULL);
+        {
+            WrPathDraw d;
+            d.pts = live;
+            d.count = n;
+            d.first = 0;            // your own line has no pre-roll to hide
+            d.breaks = NULL;
+            d.breakCount = 0;
+            d.eff = NULL;
+            d.baseColour = g_render.liveColour;
+            d.velScale = 1.0f;
+            d.thickness = g_render.thickness;
+            d.lift = 0.0f;
+            EmitPath(dl, d);
+        }
     }
 
     QueryPerformanceCounter(&t1);

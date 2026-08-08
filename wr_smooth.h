@@ -237,8 +237,21 @@ static inline void WrTrendPush(WrTrendWindow *w, float value, float dt)
         w->count++;
 }
 
-static inline float WrTrendOver(const WrTrendWindow *w, float window)
+// The change over `window` seconds, AND how long a span that actually covered.
+//
+// The second output exists because the ring holds 256 samples and no more. At
+// 60 fps that is 4.2 seconds and any window fits; at 300 fps it is 0.85, and a
+// request for more than that quietly returns the change over 0.85 seconds
+// instead. That is harmless for the arrow, which only wants a sign -- and wrong
+// for anything that divides by the window to get a RATE, which then reads low
+// by exactly the ratio it was short by. WrEnergyPower does divide.
+//
+// `actual` may be NULL; WrTrendOver is the same call without it.
+static inline float WrTrendOverSpan(const WrTrendWindow *w, float window,
+                                    float *actual)
 {
+    if (actual)
+        *actual = 0.0f;
     if (w->count < 2)
         return 0.0f;
     int newest = (w->head - 1 + WR_TREND_RING) % WR_TREND_RING;
@@ -252,7 +265,14 @@ static inline float WrTrendOver(const WrTrendWindow *w, float window)
         if (tNew - w->t[idx] >= window)
             break;
     }
+    if (actual)
+        *actual = tNew - w->t[pick];
     return w->v[newest] - w->v[pick];
+}
+
+static inline float WrTrendOver(const WrTrendWindow *w, float window)
+{
+    return WrTrendOverSpan(w, window, 0);
 }
 
 // ---------------------------------------------------------------------------

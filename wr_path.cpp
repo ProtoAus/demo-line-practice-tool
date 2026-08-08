@@ -29,6 +29,11 @@ static bool g_liveOn = true;
 // camera, which is where the default run selection is actually made.
 static bool g_autoEnablePending = false;
 
+// See WrRunStoreGeneration in the header. Bumped on a map change and again
+// when the last file of a load is in, which are the two moments the store
+// stops meaning what it meant.
+static unsigned int g_generation = 1;
+
 // What counts as "on the leg I am standing in" for that default. Matches the
 // panel's own default radius: enough to cover one stage of a surf map without
 // reaching into the next one.
@@ -95,6 +100,8 @@ static void FreeRuns(void)
             free(g_runs[i].peaks);
         if (g_runs[i].eff)
             free(g_runs[i].eff);
+        if (g_runs[i].chunks)
+            free(g_runs[i].chunks);
         WrProfileFree(&g_runs[i]);
     }
     memset(g_runs, 0, sizeof(g_runs));
@@ -260,7 +267,71 @@ static void FindPeaks(WrRun *run)
     }
 }
 
+// Bounding spheres, for aiming at a line. See WrChunk in the header for why the
+// path is bounded in blocks rather than walked.
+//
+// Centre-of-AABB rather than a true minimal sphere: a real Welzl solve on 38 751
+// points would be a lot of code to shave a few per cent off a radius that is
+// only ever used to say "not this one". Over-large is the safe direction --
+// it costs a chunk that gets rejected at the next stage, never a missed line.
+static void BuildBounds(WrRun *run)
+{
+    run->chunks = NULL;
+    run->chunkCount = 0;
+    run->boundRadius = 0.0f;
+    if (run->pointCount < 2)
+        return;
+
+    Vec3 lo = run->points[0].pos, hi = lo;
+    for (int i = 1; i < run->pointCount; i++)
+    {
+        const Vec3 &p = run->points[i].pos;
+        if (p.x < lo.x) lo.x = p.x;  if (p.x > hi.x) hi.x = p.x;
+        if (p.y < lo.y) lo.y = p.y;  if (p.y > hi.y) hi.y = p.y;
+        if (p.z < lo.z) lo.z = p.z;  if (p.z > hi.z) hi.z = p.z;
+    }
+    run->boundCentre = WrScale(WrAdd(lo, hi), 0.5f);
+    float r = 0.0f;
+    for (int i = 0; i < run->pointCount; i++)
+    {
+        float d = WrDistSqr(run->points[i].pos, run->boundCentre);
+        if (d > r) r = d;
+    }
+    run->boundRadius = sqrtf(r);
+
+    int n = (run->pointCount + WR_PICK_CHUNK - 1) / WR_PICK_CHUNK;
+    run->chunks = (WrChunk *)malloc(sizeof(WrChunk) * (size_t)n);
+    if (!run->chunks)
+        return;                 // the whole-run sphere still works without them
+    run->chunkCount = n;
+
+    for (int k = 0; k < n; k++)
+    {
+        int a = k * WR_PICK_CHUNK;
+        int b = a + WR_PICK_CHUNK;
+        if (b > run->pointCount)
+            b = run->pointCount;
+        Vec3 clo = run->points[a].pos, chi = clo;
+        for (int i = a + 1; i < b; i++)
+        {
+            const Vec3 &p = run->points[i].pos;
+            if (p.x < clo.x) clo.x = p.x;  if (p.x > chi.x) chi.x = p.x;
+            if (p.y < clo.y) clo.y = p.y;  if (p.y > chi.y) chi.y = p.y;
+            if (p.z < clo.z) clo.z = p.z;  if (p.z > chi.z) chi.z = p.z;
+        }
+        run->chunks[k].c = WrScale(WrAdd(clo, chi), 0.5f);
+        float cr = 0.0f;
+        for (int i = a; i < b; i++)
+        {
+            float d = WrDistSqr(run->points[i].pos, run->chunks[k].c);
+            if (d > cr) cr = d;
+        }
+        run->chunks[k].r = sqrtf(cr);
+    }
+}
+
 // Defined below, next to the rest of the per-run analysis.
+static void FindStart(WrRun *run, int stored, bool storedUsable);
 static void CheckTimes(WrRun *run);
 static void FindEfficiency(WrRun *run);
 
@@ -343,6 +414,18 @@ static bool LoadOne(const char *path, WrRun *run)
     run->trackType = buf[0xF9];
     run->trackNum = buf[0xFA];
     strcpy_s(run->file, sizeof(run->file), path);
+
+    // The extractor's own answer for where the run starts, when it has one.
+    //
+    // 0xE8 and 0xEC held minSampleDist and minSampleAngleDeg, both written as
+    // 0.0 since the format existed and never read by anything. Checked across
+    // all 1735 .wrpath files on this machine: bytes 0xE8..0xF3 are zero in every
+    // single one. So reading them as two integers costs no version bump and no
+    // reader branch -- an old file reads 0, and 0 already means "unknown", which
+    // is what an old file genuinely is.
+    unsigned int storedStart = 0, storedStartFlags = 0;
+    memcpy(&storedStart, buf + 0xE8, 4);
+    memcpy(&storedStartFlags, buf + 0xEC, 4);
 
     run->points = (WrPoint *)malloc(sizeof(WrPoint) * nPts);
     if (!run->points)
@@ -434,9 +517,16 @@ static bool LoadOne(const char *path, WrRun *run)
         }
     }
 
+    // Points that failed WrSaneVec were dropped above, which shifts every index
+    // after the first bad one. The extractor's stored start is a file index, so
+    // it only means anything when nothing was dropped.
+    FindStart(run, (int)storedStart, kept == (int)nPts && storedStartFlags != 0);
+
+    BuildBounds(run);
     FindDips(run);
     FindPeaks(run);
-    CheckTimes(run);        // after breaks: a break makes the clock untrustworthy
+    CheckTimes(run);        // after breaks and FindStart: a break makes the clock
+                            // untrustworthy, and the pre-roll used to dilute it
     FindEfficiency(run);    // after breaks: never differences across a teleport
 
     // No energy array. It would only ever be read one element at a time -- the
@@ -509,22 +599,27 @@ static void ComputeRanks(void)
     }
 }
 
-const char *WrTrackName(const WrRun *run)
+const char *WrTrackNameOf(int trackType, int trackNum)
 {
     static char buf[32];
-    if (!run)
-        return "?";
-    switch (run->trackType)
+    switch (trackType)
     {
     case 0:  return "main";
-    case 1:  _snprintf_s(buf, sizeof(buf), _TRUNCATE, "stage %d", run->trackNum);
+    case 1:  _snprintf_s(buf, sizeof(buf), _TRUNCATE, "stage %d", trackNum);
              return buf;
-    case 2:  _snprintf_s(buf, sizeof(buf), _TRUNCATE, "bonus %d", run->trackNum);
+    case 2:  _snprintf_s(buf, sizeof(buf), _TRUNCATE, "bonus %d", trackNum);
              return buf;
     default: _snprintf_s(buf, sizeof(buf), _TRUNCATE, "t%d/%d",
-                         run->trackType, run->trackNum);
+                         trackType, trackNum);
              return buf;
     }
+}
+
+const char *WrTrackName(const WrRun *run)
+{
+    if (!run)
+        return "?";
+    return WrTrackNameOf(run->trackType, run->trackNum);
 }
 
 // The stored per-point time is not a clock, and it has to be made into one.
@@ -543,6 +638,116 @@ const char *WrTrackName(const WrRun *run)
 // rather than quietly used.
 #define TIME_SCALE_TRUST 0.10f      // how far from 1.0 is still believable
 
+// How much pre-roll is believable, in seconds.
+//
+// Measured over the 1735 .wrpath files on this machine. Extrapolating back from
+// the first split marker -- whose timeReached the GAME measured -- puts the
+// pre-roll at 0.19 s to 1.11 s across the deciles, 1.74 s at worst, and never
+// below zero on any of the 660 files that carry markers.
+//
+// The range is doing more work than it looks. The back-solve below is only
+// valid while the extracted point stream is COMPLETE, and on a fragmented
+// extraction it does not go slightly wrong, it goes to -1089 seconds. So this
+// is a completeness test wearing a plausibility test's clothes, and it is why
+// the 39% of files with incomplete streams fall back to "unknown" rather than
+// being handed a confident wrong number.
+#define START_PREROLL_MIN (-0.15f)
+#define START_PREROLL_MAX 5.0f
+
+// How far the two independent estimates may disagree and still confirm one
+// another. The back-solve agrees with the marker figure to within 0.05 s on
+// 99.4% of the files that have both, and to within 0.15 s on all of them.
+#define START_AGREE 0.15f
+
+// Find the first point of the RUN, as opposed to the first point of the
+// recording. See the comment on startIndex in wr_path.h for why they differ.
+//
+// Three routes, in decreasing order of authority:
+//
+//   the extractor's       matched against the JSON's effectiveStartVelocity,
+//   stored index          a full-precision fingerprint. Does not care whether
+//                         the stream is complete, so it is the only one that
+//                         works on a fragmented extraction.
+//
+//   the markers           extrapolated back from the first split, whose time
+//                         the game measured. A measurement, not an inference.
+//
+//   the back-solve        (pointCount-1) - runTime/tick. The extracted stream
+//                         ends AT the finish -- implied post-roll is a median
+//                         0.00 s over every file here that can be checked --
+//                         so every surplus tick is at the front.
+//
+// Agreement between the last two is what earns "trusted". Neither available
+// leaves startIndex at 0, which is what every run did before this existed.
+static void FindStart(WrRun *run, int stored, bool storedUsable)
+{
+    run->startIndex = 0;
+    run->startTrusted = false;
+    if (run->pointCount < 2)
+        return;
+
+    float dt = run->tickInterval;
+    if (!(dt > 1e-6f) || !(run->runTime > 0.0))
+    {
+        run->startPos = run->points[0].pos;
+        return;
+    }
+
+    // >= 0, not > 0: storedUsable already carries the extractor's "I found it"
+    // bit, so an index of genuinely zero -- a demo with no pre-roll at all -- is
+    // an answer and not a missing one.
+    if (storedUsable && stored >= 0 && stored < run->pointCount)
+    {
+        run->startIndex = stored;
+        run->startTrusted = true;
+        run->startPos = run->points[run->startIndex].pos;
+        return;
+    }
+
+    float back = (float)(run->pointCount - 1) * dt - (float)run->runTime;
+    int backIdx = (int)(back / dt + 0.5f);
+    bool backOk = back >= START_PREROLL_MIN && back <= START_PREROLL_MAX;
+    if (backIdx < 0)
+        backIdx = 0;                    // a fraction of a tick negative, rounded
+    if (backIdx >= run->pointCount)
+        backOk = false;
+
+    int markIdx = -1;
+    if ((run->flags & WRPATH_FLAG_MARKERS_OK) && run->markerCount > 0 &&
+        run->markers[0].timeReached > 0.0)
+    {
+        markIdx = (int)run->markers[0].pointIndex
+                - (int)(run->markers[0].timeReached / (double)dt + 0.5);
+        float mark = (float)markIdx * dt;
+        if (mark < START_PREROLL_MIN || mark > START_PREROLL_MAX ||
+            markIdx >= run->pointCount)
+            markIdx = -1;
+        else if (markIdx < 0)
+            markIdx = 0;
+    }
+
+    if (markIdx >= 0 && backOk)
+    {
+        float gap = (float)(markIdx - backIdx) * dt;
+        if (gap < 0.0f)
+            gap = -gap;
+        run->startIndex = markIdx;      // measured beats inferred on a tie
+        run->startTrusted = (gap <= START_AGREE);
+    }
+    else if (markIdx >= 0)
+    {
+        run->startIndex = markIdx;
+        run->startTrusted = true;
+    }
+    else if (backOk)
+    {
+        run->startIndex = backIdx;
+        run->startTrusted = true;
+    }
+
+    run->startPos = run->points[run->startIndex].pos;
+}
+
 // Decide whether this run's stored times can be used as a clock. A TEST, not a
 // correction -- see the comment on timeScale in wr_path.h. Rescaling would
 // stretch a clock whose rate is already right.
@@ -553,11 +758,18 @@ static void CheckTimes(WrRun *run)
     if (run->pointCount < 2 || run->runTime <= 0.0f)
         return;
 
-    float last = run->points[run->pointCount - 1].t;
-    if (!(last > 1e-3f))
+    // Over the run, not over the recording. This used to divide runTime by the
+    // last point's time with the pre-roll still in it, which conflates two
+    // different faults: ticks the extractor missed, and ticks that were never
+    // part of the run. A 60 s run with 0.72 s of pre-roll scored 0.988 for a
+    // stream with nothing wrong with it. Measuring from startIndex removes the
+    // pre-roll term entirely, so what is left is genuinely the missing ticks.
+    float first = run->points[run->startIndex].t;
+    float span = run->points[run->pointCount - 1].t - first;
+    if (!(span > 1e-3f))
         return;
 
-    run->timeScale = (float)run->runTime / last;
+    run->timeScale = (float)run->runTime / span;
     float off = run->timeScale - 1.0f;
     if (off < 0.0f) off = -off;
 
@@ -573,31 +785,42 @@ static void CheckTimes(WrRun *run)
 // for why this is not a turn-rate metric.
 #define EFF_WINDOW 4                // points either side; ~120 ms at 66 tick
 
+// The window actually used, so it can be widened without an edit and a rebuild.
+//
+// Same trade as every other window in the tool: narrow follows a ramp entry and
+// carries the noise of a short difference, wide is steadier and smears the
+// moment a line lost its energy across the points either side of it. Four points
+// either side is about an eighth of a second at 66 tick.
+int g_wrEffWindow = EFF_WINDOW;
+
 static void FindEfficiency(WrRun *run)
 {
+    int win = WrClampI(g_wrEffWindow, 1, 64);
+    free(run->eff);
     run->eff = NULL;
-    if (run->pointCount < EFF_WINDOW * 2 + 1)
+    run->effWindow = win;
+    if (run->pointCount < win * 2 + 1)
         return;
     run->eff = (signed char *)malloc((size_t)run->pointCount);
     if (!run->eff)
         return;
 
-    // NO DATA, not neutral. This was calloc'd, so the EFF_WINDOW points at each
+    // NO DATA, not neutral. This was calloc'd, so the window's points at each
     // end and every window spanning a teleport read as "eta 0" -- the same value
     // as free flight. A gap in the measurement and a player coasting are not the
     // same thing and must not draw the same.
     memset(run->eff, WR_ETA_NO_DATA, (size_t)run->pointCount);
 
     float ceiling = WrAirPowerCeiling(g_energy.gravity, run->tickInterval);
-    float dt = run->tickInterval * (float)(EFF_WINDOW * 2);
+    float dt = run->tickInterval * (float)(win * 2);
     if (!(dt > 1e-5f))
         return;
 
     // A centred difference, so the figure belongs to the point it is drawn at
     // rather than trailing it by half a window.
-    for (int i = EFF_WINDOW; i + EFF_WINDOW < run->pointCount; i++)
+    for (int i = win; i + win < run->pointCount; i++)
     {
-        int a = i - EFF_WINDOW, b = i + EFF_WINDOW;
+        int a = i - win, b = i + win;
 
         // Never across a teleport: the join skips an unknown duration, and the
         // height either side of it is unrelated.
@@ -742,6 +965,28 @@ void WrUpdateNearest(const Vec3 &cam)
     }
 }
 
+// Rebuild every run's efficiency array. Runs already at the wanted window are
+// skipped, so calling this every frame would be free -- but it is not called
+// every frame, because on a full store a real rebuild is a pass over millions of
+// points and that belongs on a slider release rather than inside Present.
+float WrRunTimeAt(const WrRun *run, int index)
+{
+    if (!run || index < 0 || index >= run->pointCount)
+        return 0.0f;
+    int from = run->startIndex;
+    if (from < 0 || from >= run->pointCount)
+        from = 0;
+    return (run->points[index].t - run->points[from].t) * run->timeScale;
+}
+
+void WrPathRefreshEfficiency(void)
+{
+    int want = WrClampI(g_wrEffWindow, 1, 64);
+    for (int i = 0; i < g_runCount; i++)
+        if (g_runs[i].effWindow != want)
+            FindEfficiency(&g_runs[i]);
+}
+
 void WrEnableBestNearby(int count, float radius)
 {
     // Runs are already sorted fastest-first, so the first `count` within range
@@ -801,6 +1046,7 @@ static void FinishLoad(void)
         g_runs[i].enabled = (i == 0);       // provisional; see WrUpdateNearest
     }
     ComputeRanks();     // after the sort, and after the last run is in
+    g_generation++;     // the store is now what it is going to be
     g_autoEnablePending = true;
 
     WrLogf("loaded %d run%s for \"%s\"%s", g_runCount, g_runCount == 1 ? "" : "s",
@@ -849,6 +1095,7 @@ bool WrPathLoading(int *done, int *total)
 void WrPathLoadMap(const char *map)
 {
     FreeRuns();
+    g_generation++;         // whatever was derived from the old store is void
     free(g_pending);
     g_pending = NULL;
     g_pendingCount = g_pendingNext = g_pendingFailed = 0;
@@ -909,6 +1156,7 @@ void WrPathLoadMap(const char *map)
 }
 
 int WrRunCount(void) { return g_runCount; }
+unsigned int WrRunStoreGeneration(void) { return g_generation; }
 WrRun *WrRunAt(int i) { return (i >= 0 && i < g_runCount) ? &g_runs[i] : NULL; }
 
 // Fill the store directly, for tests\test_rank.exe.
@@ -929,6 +1177,17 @@ void WrPathTestLoad(const WrRun *runs, int count)
     memcpy(g_runs, runs, sizeof(WrRun) * (size_t)count);
     g_runCount = count;
     ComputeRanks();     // the loader's job, done here because there is no loader
+    g_generation++;     // so anything derived from the store rebuilds
+}
+
+// Run the real start recovery over one run, for tests\test_start.exe.
+//
+// The same reasoning as WrPathTestLoad: FindStart is where the pre-roll
+// arithmetic lives, and a harness that reimplemented that arithmetic would agree
+// with itself rather than with the shipped code.
+void WrPathTestFindStart(WrRun *run, int stored, bool storedUsable)
+{
+    FindStart(run, stored, storedUsable);
 }
 const char *WrPathLoadedMap(void) { return g_loadedMap; }
 

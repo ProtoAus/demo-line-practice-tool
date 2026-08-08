@@ -4,10 +4,12 @@
 #include "wr_energy.h"
 #include "wr_path.h"
 #include "wr_savelocs.h"
+#include "wr_start.h"
 #include "wr_log.h"
 
 #include <math.h>
 #include <string.h>
+#include <stdio.h>
 
 // How far you have to leave the anchor before the clock starts. Small enough
 // that it starts the moment you actually move, large enough that standing on the
@@ -108,6 +110,33 @@ void WrTimerTick(const Vec3 &cam, float dt)
         g_elapsed = 0.0f;
     }
 
+    // The start-zone machine, fed the flags rather than allowed to take them.
+    //
+    // Both of the take functions above are consume-once and this is their one
+    // consumer; a second reader would clear a flag out from under the first,
+    // which is the same defect as having had two teleport detectors. See the
+    // note at the top of this file.
+    WrStartTick(cam, dt, teleported);
+
+    const WrStartZone *crossed = NULL;
+    if (WrStartTakeCrossed(&crossed) && crossed)
+    {
+        // Placed AFTER the save-loc block on purpose: loading a save-loc is a
+        // more specific statement about where you are in a run than crossing
+        // the start line, and if both happen in one frame the save-loc is the
+        // one that was actually asked for.
+        if (g_start.autoAnchor && WrEnergyAnchorSource() != WR_ANCHOR_MANUAL)
+            WrEnergyAnchorToStartZone(crossed->centre);
+        if (g_start.autoZeroClock)
+        {
+            char why[64];
+            _snprintf_s(why, sizeof(why), _TRUNCATE, "left the %s start",
+                        WrTrackNameOf(crossed->trackType, crossed->trackNum));
+            WrTimerSet(0.0f, why);
+        }
+        return;
+    }
+
     if (!haveAnchor)
     {
         // No anchor is no longer the same as no clock. It used to zero and stop
@@ -168,7 +197,12 @@ bool WrTimerDelta(const WrRun *ref, float *ours, float *theirs, float *delta)
     if (ref->nearestIndex < 0 || ref->nearestIndex >= ref->pointCount)
         return false;
 
-    float t = ref->points[ref->nearestIndex].t;
+    // Their clock from THEIR run's start, because ours is zeroed at that same
+    // place -- the anchor is points[startIndex]. Reading the raw stored `t` was
+    // measuring from the first recorded sample instead, which put a constant
+    // offset of the whole pre-roll into every delta: a median of 0.72 s, and
+    // 1.74 s at worst. WrRunTimeAt is the one place that arithmetic lives.
+    float t = WrRunTimeAt(ref, ref->nearestIndex);
     if (ours) *ours = g_elapsed;
     if (theirs) *theirs = t;
     if (delta) *delta = g_elapsed - t;

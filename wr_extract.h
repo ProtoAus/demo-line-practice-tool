@@ -32,7 +32,7 @@
 // Must match EXTRACTOR_REVISION in wrpath_extract.py. A recorded failure from a
 // different revision is ignored here, which reports the demo as unprocessed --
 // the safe direction, since the worst case is offering to redo work.
-#define WR_EXTRACTOR_REVISION 2
+#define WR_EXTRACTOR_REVISION 3
 
 // Start counting demos for this map, on a background thread. Cheap to call.
 void WrExtractOnMapChanged(const char *map);

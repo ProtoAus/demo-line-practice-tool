@@ -33,6 +33,15 @@ WrEnergySettings g_energy;
 // The arrow has to hold a new state this long before it is allowed on screen.
 #define ARROW_HOLD 0.20f
 
+// And the trend has to leave this band before there is a state to hold. Twelve
+// units of height is under a tenth of a jump, so anything inside it is noise
+// rather than a direction.
+#define ARROW_BAND 12.0f
+
+// Over how long dE/dt is measured. Long enough that a single ramp tick does not
+// dominate, short enough to still be about what you are doing now.
+#define POWER_WINDOW 0.30f
+
 // Ground detection, kept for the "last jump" line only. It no longer drives the
 // reference height -- that was the bug; see the header.
 #define GROUND_VZ 30.0f
@@ -172,6 +181,14 @@ void WrEnergyDefaults(void)
     g_energy.smoothSeconds = 0.30f;
     g_energy.trendSeconds = 0.75f;
     g_energy.quantiseStep = 5.0f;
+
+    // Exactly the values the #defines above held, so turning these into settings
+    // changes nothing until one is moved.
+    g_energy.velWindowSeconds = VEL_WINDOW_SECONDS;
+    g_energy.velTau = VEL_TAU;
+    g_energy.speedTau = SPEED_TAU;
+    g_energy.powerSeconds = POWER_WINDOW;
+    g_energy.arrowBand = ARROW_BAND;
     g_energy.anchorToRunStart = true;
     g_energy.hudMode = WR_HUD_NET;
     g_energy.airAccelerate = WR_AIR_ACCEL_DEFAULT;
@@ -245,6 +262,20 @@ void WrEnergyReset(void)
     g_vel = WrVec(0.0f, 0.0f, 0.0f);
 }
 
+// Everything a re-anchor has to forget.
+//
+// The peak and the start reference were being cleared; the gain/loss swing
+// accumulator was not, so re-anchoring mid-session left "gained" and "lost"
+// spanning two attempts and quietly growing for ever. The restart path at the
+// bottom of WrEnergySample has always done this properly -- these two had
+// simply drifted out of step with it.
+static void ForgetForNewAttempt(void)
+{
+    g_peak = 0.0f;
+    WrSwingReset(&g_swing, WR_SWING_HYSTERESIS);
+    g_spliced = false;
+}
+
 void WrEnergyRearm(void)
 {
     if (!g_valid)
@@ -255,8 +286,31 @@ void WrEnergyRearm(void)
     g_refSource = WR_ANCHOR_MANUAL;
     g_start = g_now;
     g_haveStart = true;
-    g_peak = 0.0f;
+    ForgetForNewAttempt();
     WrLogf("energy: anchored here, z %.0f", g_refZ);
+}
+
+// The same as anchoring to a run's start, but sourced from the fitted start zone
+// rather than from whichever run happens to be nearest this frame.
+//
+// A separate entry point rather than a parameter on WrEnergyAnchorToFeet,
+// because that function has other callers including the test harness, and
+// because the difference is worth being able to see in the panel: one of these
+// is a guess derived from one run, the other from every run on the leg.
+void WrEnergyAnchorToStartZone(const Vec3 &centre)
+{
+    g_refZ = centre.z + g_energy.eyeHeight;
+    g_refPos = centre;
+    g_haveRef = true;
+    g_refSource = WR_ANCHOR_START_ZONE;
+    if (g_valid)
+    {
+        g_start = g_now;
+        g_haveStart = true;
+    }
+    ForgetForNewAttempt();
+    WrLogf("energy: anchored to the fitted start zone (%.0f %.0f %.0f)",
+           centre.x, centre.y, centre.z);
 }
 
 void WrEnergyAnchorToFeet(const Vec3 &feet)
@@ -267,7 +321,7 @@ void WrEnergyAnchorToFeet(const Vec3 &feet)
     g_refPos = feet;
     g_haveRef = true;
     g_refSource = WR_ANCHOR_RUN_START;
-    g_peak = 0.0f;
+    ForgetForNewAttempt();
     if (g_valid)
     {
         g_start = g_now;
@@ -464,7 +518,8 @@ void WrEnergySample(const Vec3 &pos, float dt)
 
     float rx = 0.0f, ry = 0.0f, rz = 0.0f;
     float mx = 0.0f, my = 0.0f, mz = 0.0f;
-    if (!WrVelEstimate(&g_win, VEL_WINDOW_SECONDS, &rx, &ry, &rz, &mx, &my, &mz))
+    if (!WrVelEstimate(&g_win, g_energy.velWindowSeconds,
+                       &rx, &ry, &rz, &mx, &my, &mz))
         return;
 
     Vec3 raw = WrVec(rx, ry, rz);
@@ -481,12 +536,12 @@ void WrEnergySample(const Vec3 &pos, float dt)
         return;
     }
 
-    g_vel.x = WrEmaStep(&g_velX, raw.x, dt, VEL_TAU);
-    g_vel.y = WrEmaStep(&g_velY, raw.y, dt, VEL_TAU);
-    g_vel.z = WrEmaStep(&g_velZ, raw.z, dt, VEL_TAU);
+    g_vel.x = WrEmaStep(&g_velX, raw.x, dt, g_energy.velTau);
+    g_vel.y = WrEmaStep(&g_velY, raw.y, dt, g_energy.velTau);
+    g_vel.z = WrEmaStep(&g_velZ, raw.z, dt, g_energy.velTau);
 
     float instSpeed = WrLength(g_vel);
-    g_speed = WrEmaStep(&g_speedEma, instSpeed, dt, SPEED_TAU);
+    g_speed = WrEmaStep(&g_speedEma, instSpeed, dt, g_energy.speedTau);
 
     g_valid = true;
     g_haveReading = true;
@@ -701,11 +756,22 @@ bool WrEnergySampleAt(Vec3 *feet, Vec3 *vel)
 }
 
 // dE/dt, for the efficiency figure. Taken over a window rather than per frame,
-// because a derivative of a noisy signal is noise.
-#define POWER_WINDOW 0.30f
+// because a derivative of a noisy signal is noise. POWER_WINDOW is the default
+// the setting starts at, and the fallback if it is ever driven to zero.
 float WrEnergyPower(void)
 {
-    return WrTrendOver(&g_trend, POWER_WINDOW) / POWER_WINDOW;
+    float w = g_energy.powerSeconds > 1e-3f ? g_energy.powerSeconds : POWER_WINDOW;
+
+    // Divided by the span the ring COULD give, not by the one that was asked
+    // for. The trend ring is 256 samples: at 300 fps it spans 0.85 s, so a
+    // longer window comes back as the change over 0.85 s -- and dividing that
+    // by 1.5 would report a rate 43% low, silently, and only at high frame
+    // rates. The two agree whenever the window fits, which is nearly always.
+    float span = 0.0f;
+    float d = WrTrendOverSpan(&g_trend, w, &span);
+    if (span < 1e-3f)
+        return 0.0f;
+    return d / span;
 }
 
 float WrEnergyViewTurnRate(void) { return g_viewTurn; }
@@ -796,5 +862,5 @@ void WrEnergyTickArrow(float dt)
 {
     if (!g_valid)
         return;
-    WrArrowStep(&g_arrow, WrEnergyTrend(), 12.0f, dt, ARROW_HOLD);
+    WrArrowStep(&g_arrow, WrEnergyTrend(), g_energy.arrowBand, dt, ARROW_HOLD);
 }

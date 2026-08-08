@@ -72,7 +72,21 @@ struct WrProfile
     float gravity;      // what it was built with; a change rebuilds it
     bool timeUsable;    // false when the run's recovered clock failed its test
     int builtFrom;      // point count at build time; the live series grows
+    int builtStart;     // startIndex at build time; the store can reload
+    int builtBuckets;   // g_wrProfileBuckets at build time
 };
+
+// How many buckets a curve is actually drawn with, up to WR_PROFILE_BUCKETS.
+//
+// A bucket is a slice of the run by index, so this is the graph's averaging
+// window and it scales with the run: 480 buckets on a 60-second run is an eighth
+// of a second each. Fewer buckets is a smoother, blunter curve -- which is the
+// right trade when the question is "where did this run lose energy" rather than
+// "what happened on this ramp".
+//
+// The array is still allocated at the compile-time maximum; only the used count
+// moves, so changing it costs a rebuild and no reallocation.
+extern int g_wrProfileBuckets;
 
 // The profile for a loaded run, building it if needed. NULL while it has not
 // been built yet -- the caller is expected to ask again next frame rather than
