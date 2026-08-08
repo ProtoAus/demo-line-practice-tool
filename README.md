@@ -110,7 +110,9 @@ Press **INSERT** in game. Tick runs in the Runs tab. **ESC** closes the panel.
   magic. Details under **The start zone**.
 - **Search and filter the run list**, by player, by their current Steam name, or by track. One
   button per leg turns all of *bonus 4* on at once, and **All**/**None** work on whatever the
-  filter left rather than on the whole store.
+  filter left rather than on the whole store. The map list and the leaderboard each have a
+  **This map** button that jumps to whichever map you are standing in — on the map list it
+  toggles, and it reaches maps you hold nothing for, which the unfiltered list hides.
 - **Send one demo to the game's replay viewer.** Momentum lists ten, and it finds them by
   scanning its own folder, so choosing which ten is the whole workaround. Removal only ever
   touches files this put there — see **Watching what you download**.

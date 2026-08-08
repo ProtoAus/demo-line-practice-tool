@@ -1127,6 +1127,41 @@ static void DrawMapsTab(void)
     ImGui::SetNextItemWidth(200.0f);
     ImGui::InputTextWithHint("##filter", "filter by name", g_mapFilter,
                              sizeof(g_mapFilter));
+
+    // Two thousand rows, and the one you are standing in is somewhere among
+    // them. Typing its name is the thing you already know, which is the sign it
+    // should be a button.
+    //
+    // Truncated into a buffer the same size as the filter rather than copied
+    // blind: g_levelName holds 128 characters and this box holds 64, so a long
+    // map name has to be cut somewhere, and cutting it HERE keeps the compare
+    // below honest -- the lit state then means "the box holds what the button
+    // would write", which is what makes pressing it again the way out.
+    char wantFilter[64] = "";
+    const char *standingIn = WrLevelName();
+    if (standingIn && *standingIn)
+        strncpy_s(wantFilter, sizeof(wantFilter), standingIn, _TRUNCATE);
+    bool filteredHere = wantFilter[0] &&
+                        _stricmp(g_mapFilter, wantFilter) == 0;
+
+    ImGui::SameLine();
+    if (!wantFilter[0])
+        ImGui::BeginDisabled();
+    if (filteredHere)
+        ImGui::PushStyleColor(ImGuiCol_Button,
+                              ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+    if (ImGui::Button("This map"))
+    {
+        if (filteredHere)
+            g_mapFilter[0] = '\0';
+        else
+            strcpy_s(g_mapFilter, sizeof(g_mapFilter), wantFilter);
+    }
+    if (filteredHere)
+        ImGui::PopStyleColor();
+    if (!wantFilter[0])
+        ImGui::EndDisabled();
+
     ImGui::SameLine();
     ImGui::TextDisabled("%d maps", WrMapsCount());
     ImGui::SameLine();
@@ -1134,7 +1169,12 @@ static void DrawMapsTab(void)
                "them, so the ones you hold nothing for are hidden until you "
                "type a name. That is why a map you are looking for can appear "
                "with a 0 beside it: the 0 is what is on your disk, not what "
-               "exists.");
+               "exists.\n\n"
+               "\"This map\" fills the box with the map you are standing in, "
+               "and pressing it again empties it. It works even on a map you "
+               "hold nothing for -- an empty filter hides the zeroes, so the "
+               "row you want is one of the ones being hidden, and typing its "
+               "name is exactly what brings it back.");
 
     // --- fetching -----------------------------------------------------------
     ImGui::SeparatorText("Download demos");
@@ -1210,7 +1250,7 @@ static void DrawMapsTab(void)
     bool showOut = WrExtractRunning() || WrExtractLineCount() > 0;
     float tableH = ListHeightAbove(showOut);
 
-    const char *here = WrLevelName();
+    const char *here = standingIn;      // the green row, same map as the button
     if (ImGui::BeginTable("##maps", 5,
                           ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders |
                           ImGuiTableFlags_ScrollY | ImGuiTableFlags_Sortable,
@@ -2584,8 +2624,10 @@ static void DrawBoardTab(void)
     if (!g_bMap[0])
     {
         const char *here = WrLevelName();
+        // Truncating, not asserting: g_levelName is 128 and this box is 72, and
+        // strcpy_s answers an overlong name by killing the process.
         if (here && *here)
-            strcpy_s(g_bMap, sizeof(g_bMap), here);
+            strncpy_s(g_bMap, sizeof(g_bMap), here, _TRUNCATE);
     }
 
     ImGui::TextWrapped(
@@ -2597,6 +2639,30 @@ static void DrawBoardTab(void)
     ImGui::SetNextItemWidth(200.0f);
     if (ImGui::InputText("Map", g_bMap, sizeof(g_bMap)))
         g_bLoaded = false;
+
+    // The default above only fires while the box is EMPTY, so one look at
+    // somebody else's board and the way back is retyping your own map name.
+    //
+    // Always drawn, disabled when it would do nothing, rather than appearing
+    // only when it applies: this row continues into the mode and track combos,
+    // and a button that comes and goes would slide them sideways under the
+    // cursor every time you changed map.
+    const char *standingIn = WrLevelName();
+    bool canGoBack = standingIn && *standingIn &&
+                     _stricmp(g_bMap, standingIn) != 0;
+    ImGui::SameLine();
+    if (!canGoBack)
+        ImGui::BeginDisabled();
+    if (ImGui::Button("This map"))
+    {
+        strncpy_s(g_bMap, sizeof(g_bMap), standingIn, _TRUNCATE);
+        g_bLoaded = false;
+    }
+    if (!canGoBack)
+        ImGui::EndDisabled();
+    if (canGoBack && ImGui::IsItemHovered())
+        ImGui::SetTooltip("Back to %s, where you are standing.", standingIn);
+
     ImGui::SameLine();
     ImGui::SetNextItemWidth(130.0f);
     const char *modeNames[WR_GAMEMODE_COUNT];
