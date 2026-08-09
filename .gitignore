@@ -39,9 +39,10 @@ minhook/
 __pycache__/
 *.pyc
 
-# Dear ImGui's own settings file. Inert here -- wr_imgui.cpp sets
-# io.IniFilename = NULL, so nothing reads or writes it -- but a stray copy turns
-# up in the working tree and is not ours to ship.
+# Dear ImGui's own settings file. Ours lives in wrlines_data\ -- wr_imgui.cpp
+# points io.IniFilename there so the panel remembers where you put it -- but a
+# stray copy still turns up in the working tree, and it is per-machine state
+# rather than anything to ship.
 imgui.ini
 
 # Editors / IDE

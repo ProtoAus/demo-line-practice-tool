@@ -99,6 +99,10 @@ build.bat
 Needs MSVC Build Tools and the Windows SDK. Close the game first — the DLL never unloads.
 `tests\build.bat` builds and runs the test harnesses.
 
+The C++ is in [src/](src/), the harnesses in [tests/](tests/), and everything that talks to the
+network is in [wrpath_extract.py](wrpath_extract.py). Both `.bat` files run from the repo root and
+put their output there.
+
 ## How it works
 
 There is no entity access here and no game API: it finds the camera by scanning memory for the

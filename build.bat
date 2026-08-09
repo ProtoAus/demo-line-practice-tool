@@ -57,18 +57,27 @@ set "IM=imgui"
 set "IMSRC=%IM%\imgui.cpp %IM%\imgui_draw.cpp %IM%\imgui_tables.cpp %IM%\imgui_widgets.cpp"
 set "IMSRC=%IMSRC% %IM%\backends\imgui_impl_dx11.cpp %IM%\backends\imgui_impl_win32.cpp"
 
-set "SRC=dllmain.cpp wr_log.cpp wr_pe.cpp wr_probe.cpp wr_engine.cpp wr_scan.cpp"
-set "SRC=%SRC% wr_hook.cpp wr_imgui.cpp wr_render.cpp wr_path.cpp wr_ui.cpp"
-set "SRC=%SRC% wr_steam.cpp wr_energy.cpp wr_limit.cpp wr_extract.cpp"
-set "SRC=%SRC% wr_timer.cpp wr_savelocs.cpp wr_maps.cpp wr_profile.cpp wr_board.cpp"
-set "SRC=%SRC% wr_intogame.cpp wr_start.cpp wr_settings.cpp"
+rem Our own code lives in src\. The build still runs from the repo root, so the
+rem .obj files, the DLL and wrpath_extract.py all stay where they were.
+set "S=src"
+set "SRC=%S%\dllmain.cpp %S%\wr_log.cpp %S%\wr_pe.cpp %S%\wr_probe.cpp"
+set "SRC=%SRC% %S%\wr_engine.cpp %S%\wr_scan.cpp %S%\wr_hook.cpp %S%\wr_imgui.cpp"
+set "SRC=%SRC% %S%\wr_render.cpp %S%\wr_path.cpp %S%\wr_ui.cpp %S%\wr_steam.cpp"
+set "SRC=%SRC% %S%\wr_energy.cpp %S%\wr_limit.cpp %S%\wr_extract.cpp"
+set "SRC=%SRC% %S%\wr_timer.cpp %S%\wr_savelocs.cpp %S%\wr_maps.cpp"
+set "SRC=%SRC% %S%\wr_profile.cpp %S%\wr_board.cpp %S%\wr_intogame.cpp"
+set "SRC=%SRC% %S%\wr_start.cpp %S%\wr_settings.cpp"
 
+rem IMGUI_USER_CONFIG is resolved by the preprocessor relative to the file that
+rem does the #include -- imgui\imgui.h -- and NOT relative to the working
+rem directory or to /I. So this path is "up out of imgui\, then into src\", and
+rem it has to move whenever wr_imconfig.h does.
 set "DEFS=/DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS"
-set "DEFS=%DEFS% /DIMGUI_USER_CONFIG=\"../wr_imconfig.h\""
+set "DEFS=%DEFS% /DIMGUI_USER_CONFIG=\"../src/wr_imconfig.h\""
 
 echo.
 echo === wrlines.dll (x64) ===
-cl /nologo /c /O2 /MT /EHsc /Zi /W3 %DEFS% /I. /I"%MH%\include" /I"%IM%" ^
+cl /nologo /c /O2 /MT /EHsc /Zi /W3 %DEFS% /I%S% /I"%MH%\include" /I"%IM%" ^
    %SRC% %IMSRC%
 if errorlevel 1 ( echo. & echo [!] compile FAILED & exit /b 1 )
 
@@ -83,7 +92,7 @@ del *.obj >nul 2>&1
 
 echo.
 echo === wrinject.exe (x64) ===
-cl /nologo /O2 /MT /W3 %DEFS% injector.cpp /Fe:wrinject.exe /link /SUBSYSTEM:CONSOLE
+cl /nologo /O2 /MT /W3 %DEFS% %S%\injector.cpp /Fe:wrinject.exe /link /SUBSYSTEM:CONSOLE
 if errorlevel 1 ( echo. & echo [!] injector build FAILED & exit /b 1 )
 
 del *.obj >nul 2>&1
