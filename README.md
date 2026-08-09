@@ -3,6 +3,8 @@
 Draws other players' runs as **lines in the world**, in the Momentum Mod map you are playing.
 See the route, see where they carried speed and where you don't.
 
+![Six views: aiming at a line on surf_hades2, watching a replay on surf_colin_blaster_69000, the Graphs tab, the Runs list on surf_utopia, the Board tab downloading from surf_tropic's leaderboard, and the Maps tab](screenshots/tour.jpg)
+
 ![Runs drawn on surf_fiellu bonus 4, coloured green where strafing is adding energy and red where it is being lost](screenshots/lines.jpg)
 
 ---
@@ -42,8 +44,6 @@ acts on it too.
 ---
 
 ## What you get
-
-![Six views: aiming at a line on surf_hades2, watching a replay on surf_colin_blaster_69000, the Graphs tab, the Runs list on surf_utopia, the Board tab downloading from surf_tropic's leaderboard, and the Maps tab](screenshots/tour.jpg)
 
 **Colour the lines by whatever you are chasing** — strafing efficiency, raw speed, energy, or where
 each run placed. Numbers at every top and bottom say what a line carried *through* a ramp and what
