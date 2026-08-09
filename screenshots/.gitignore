@@ -1,0 +1,9 @@
+# Only the three shots the README uses are tracked, as JPEGs resized to 1600px --
+# the originals are 1920px PNGs at about 3 MB each, and git keeps every version of
+# a binary for ever. Drop new captures in here freely; they stay local until you
+# add one on purpose.
+*
+!.gitignore
+!lines.jpg
+!energy.jpg
+!graphs.jpg
