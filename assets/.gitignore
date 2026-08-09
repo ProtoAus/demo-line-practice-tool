@@ -1,0 +1,3 @@
+# Scratch from make_art.py: the supersampled layers, the glow passes and the
+# per-size proofs. Every one of them is regenerated on the next run.
+_build/

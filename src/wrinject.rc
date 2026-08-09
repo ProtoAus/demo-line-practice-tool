@@ -1,0 +1,49 @@
+// Resources for wrinject.exe: the icon, and a version block.
+//
+// The version block is not decoration. An unsigned executable that injects
+// into a game is exactly the shape of thing people are right to be suspicious
+// of, and a blank Properties -> Details tab is one of the few things a person
+// can actually check before running it. Filling it in costs nothing and lets
+// the file say what it is, who wrote it and which release it came from.
+//
+// The icon path is relative to this file. rc.exe resolves it that way, which
+// is why it works even though build.bat runs from the repository root.
+
+#include <windows.h>
+
+#define WR_VER_STR "0.4.4"
+#define WR_VER_NUM 0, 4, 4, 0
+
+1 ICON "..\\assets\\wrlines.ico"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     WR_VER_NUM
+PRODUCTVERSION  WR_VER_NUM
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "Alexis Lazootin"
+            VALUE "FileDescription",  "Demo Line Practice Tool -- loader"
+            VALUE "FileVersion",      WR_VER_STR
+            VALUE "InternalName",     "wrinject"
+            VALUE "LegalCopyright",   "MIT licensed. See LICENSE."
+            VALUE "OriginalFilename", "wrinject.exe"
+            VALUE "ProductName",      "Demo Line Practice Tool"
+            VALUE "ProductVersion",   WR_VER_STR
+            VALUE "Comments",
+                  "Loads wrlines.dll into Momentum Mod. "
+                  "https://github.com/ProtoAus/demo-line-practice-tool"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

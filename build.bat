@@ -92,8 +92,22 @@ del *.obj >nul 2>&1
 
 echo.
 echo === wrinject.exe (x64) ===
-cl /nologo /O2 /MT /W3 %DEFS% %S%\injector.cpp /Fe:wrinject.exe /link /SUBSYSTEM:CONSOLE
+rem The icon and version block. assets\wrlines.ico is committed, so a normal
+rem build needs no Python and no ImageMagick -- assets\make_art.py only has to
+rem be run when the artwork itself changes.
+if exist assets\wrlines.ico (
+    rc /nologo /fo wrinject.res %S%\wrinject.rc
+    if errorlevel 1 ( echo. & echo [!] resource compile FAILED & exit /b 1 )
+    set "RES=wrinject.res"
+) else (
+    echo [i] assets\wrlines.ico missing -- building without an icon.
+    set "RES="
+)
+
+cl /nologo /O2 /MT /W3 %DEFS% %S%\injector.cpp %RES% /Fe:wrinject.exe ^
+   /link /SUBSYSTEM:CONSOLE
 if errorlevel 1 ( echo. & echo [!] injector build FAILED & exit /b 1 )
+del wrinject.res >nul 2>&1
 
 del *.obj >nul 2>&1
 
