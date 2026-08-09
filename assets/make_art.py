@@ -7,7 +7,8 @@ clean edges where a stroke is one pixel wide.
 
     py -3 assets/make_art.py social  -> assets/social.png        1280x640 card
     py -3 assets/make_art.py icon    -> assets/wrlines.ico       16..256
-    py -3 assets/make_art.py swoop   -> assets/wrlines_swoop.ico the first icon
+    py -3 assets/make_art.py swoop   -> assets/wrlines_swoop.ico  design 1
+    py -3 assets/make_art.py ramp    -> assets/wrlines_ramp.ico   design 2
     py -3 assets/make_art.py variants-> assets/_build/variants.png candidates
     py -3 assets/make_art.py all       social + icon
 
@@ -18,20 +19,22 @@ it. Its green and red are the literal constants out of EfficiencyColour in
 wr_render.cpp, so the picture cannot advertise colours the program does not
 draw.
 
-THE ICON is not that picture scaled down, and cannot be: what makes the card
-work is the run arriving out of the distance, and most of that stroke is one
-pixel wide, which at 64 px is one pixel and at 16 px is nothing. It is a
-triangular prism -- the shape of a ramp -- with a run boarding it from above,
-swooping along the face, and leaving off the FAR END at a shallow angle, up and
-to the right, which in this view is straight away from the camera. It never
-reaches the floor and it does not hop off the bottom: that is not what the
-movement does, and an icon that showed it would be teaching the wrong thing.
-Drawn flat and deliberately overstated.
+THE ICON is a BRACHISTOCHRONE: the curve of fastest descent, which is neither
+the straight line nor the steepest one. It is a cycloid, and it is the right
+mark for a tool whose entire subject is that the quick way round is not the
+obvious way round. The straight chord it beats is drawn behind it, dimly,
+because without that the curve is just a swoosh.
 
-`variants` renders the candidate parameter sets side by side at 256 px and at
-32 px. Adjusting one number per turn is a slow way to discover that a whole
-direction is wrong. wrlines_swoop.ico is the first design, kept buildable so it
-is not a binary nobody can regenerate.
+It is coloured by SPEED, with SpeedColour from wr_render.cpp -- the same ramp
+the panel paints run lines with. On a brachistochrone the body starts at rest
+and accelerates the whole way, v = sqrt(2gy), so blue at the top through green
+and yellow to red at the bottom is what the tool would actually draw if you
+handed it this curve. The colour is taken from that speed, not from arc length:
+most of it is gained in the first, steepest part.
+
+Two earlier designs are kept buildable, so neither is a binary nobody can
+regenerate -- `swoop` (a run coming past the camera) and `ramp` (a triangular
+prism with a run crossing it).
 
 Needs ImageMagick 7 ("magick" on PATH). Nothing else -- no PIL, no numpy.
 """
@@ -814,6 +817,121 @@ def variants():
     print(out)
 
 
+# --- the brachistochrone -----------------------------------------------------
+# The curve of fastest descent: the path a body under gravity gets down in the
+# least time, which is not the straight line and is not the steepest one. It is
+# a cycloid, x = r(t - sin t), y = r(1 - cos t), and it is the right mark for a
+# tool whose whole subject is that the quick way round is not the obvious one.
+#
+# It is coloured by SPEED, using SpeedColour from wr_render.cpp -- the same ramp
+# the panel paints run lines with when you colour by speed. That is not a
+# decorative choice: on a brachistochrone the body starts at rest and
+# accelerates the whole way, v = sqrt(2gy), so blue at the top through to red at
+# the bottom is what the tool would actually draw if you handed it this curve.
+BRACH = dict(
+    theta_max=0.85 * math.pi,   # 1.17:1, so it nearly fills a square tile, and
+                                # still finishes at 13 degrees rather than flat
+    pad=0.105,
+    w0=0.026, w1=0.055,         # thin where it is slow, heavier as it picks up
+    chord=True,                 # the straight line it beats
+    chord_w=0.017,
+    chord_col="#4A5570",
+)
+
+
+def speed_colour(t):
+    """SpeedColour from wr_render.cpp, exactly: blue, cyan, green, yellow, red."""
+    t = clamp(t, 0.0, 1.0)
+    if t < 0.25:
+        return (0.0, t / 0.25, 1.0)
+    if t < 0.50:
+        return (0.0, 1.0, 1.0 - (t - 0.25) / 0.25)
+    if t < 0.75:
+        return ((t - 0.50) / 0.25, 1.0, 0.0)
+    return (1.0, 1.0 - (t - 0.75) / 0.25, 0.0)
+
+
+def brach_mvg(size, ss, p=None, n=440):
+    p = p or BRACH
+    th_max = p["theta_max"]
+    raw = []
+    for i in range(n + 1):
+        th = th_max * i / n
+        raw.append((th - math.sin(th), 1.0 - math.cos(th)))
+
+    xs = [q[0] for q in raw]
+    ys = [q[1] for q in raw]
+    bw, bh = max(xs) - min(xs), max(ys) - min(ys)
+    pad = p["pad"]
+    avail = 1.0 - 2.0 * pad
+    k = avail / max(bw, bh)
+    ox = pad + (avail - bw * k) * 0.5 - min(xs) * k
+    oy = pad + (avail - bh * k) * 0.5 - min(ys) * k
+    S = size * ss
+    fit = [((q[0] * k + ox) * S, (q[1] * k + oy) * S) for q in raw]
+
+    out = []
+    if p["chord"]:
+        # The straight line from start to finish -- the obvious route, and the
+        # slower one. It is what makes the curve mean something rather than just
+        # being a swoosh, and it is the tool's whole thesis in one stroke.
+        out += ["fill none", "stroke %s" % p["chord_col"], "stroke-linecap round",
+                "stroke-width %.2f" % (p["chord_w"] * S),
+                "line %.2f,%.2f %.2f,%.2f" % (fit[0][0], fit[0][1],
+                                              fit[-1][0], fit[-1][1])]
+
+    ymax = max(ys) or 1.0
+    out += ["stroke-linecap round", "fill none"]
+    for i in range(1, len(fit)):
+        # v = sqrt(2gy), so the speed fraction is sqrt(y/ymax). Colouring by
+        # arc length instead would put the hand-overs in the wrong places: the
+        # thing gains most of its speed in the first, steepest part.
+        t = math.sqrt(0.5 * (ys[i] + ys[i - 1]) / ymax)
+        w = (p["w0"] + (p["w1"] - p["w0"]) * t) * S
+        out.append("stroke %s" % hexof(speed_colour(t)))
+        out.append("stroke-width %.2f" % w)
+        out.append("line %.2f,%.2f %.2f,%.2f" %
+                   (fit[i - 1][0], fit[i - 1][1], fit[i][0], fit[i][1]))
+    return out
+
+
+BRACH_SMALL = dict(w0=0.052, w1=0.082, chord_w=0.026, pad=0.085)
+
+
+def icon_brach(ico="wrlines.ico", preview="icon_preview.png"):
+    size, ss = 256, 4
+    heavy = dict(BRACH)
+    heavy.update(BRACH_SMALL)
+
+    thin = compose_icon(brach_mvg(size, ss), None, None, size=size, ss=ss,
+                        master_name="b_thin.png")
+    fat = compose_icon(brach_mvg(size, ss, heavy), None, None, size=size, ss=ss,
+                       master_name="b_heavy.png")
+
+    layers = []
+    for n_ in LARGE_SIZES:
+        t = os.path.join(TMP, "bi_%d.png" % n_)
+        run("magick", thin, "-filter", "Lanczos", "-resize", "%dx%d" % (n_, n_), t)
+        layers.append(t)
+    for n_ in SMALL_SIZES:
+        t = os.path.join(TMP, "bi_%d.png" % n_)
+        run("magick", fat, "-filter", "Lanczos", "-resize", "%dx%d" % (n_, n_), t)
+        layers.append(t)
+    run("magick", *layers, os.path.join(HERE, ico))
+
+    tiles = []
+    for n_ in (64, 48, 32, 16):
+        src = thin if n_ in LARGE_SIZES else fat
+        t = os.path.join(TMP, "bp%d.png" % n_)
+        run("magick", src, "-filter", "Lanczos", "-resize", "%dx%d" % (n_, n_), t)
+        big = os.path.join(TMP, "bb%d.png" % n_)
+        run("magick", t, "-filter", "point", "-resize", "192x192", big)
+        tiles.append(big)
+    run("magick", "montage", *tiles, "-tile", "4x1", "-geometry", "+8+8",
+        "-background", "#1C1C1C", os.path.join(HERE, preview))
+    print("%s  +  %s" % (ico, preview))
+
+
 def icon_swoop():
     """The first design, kept buildable so the file it produced is not a binary
     nobody can regenerate."""
@@ -828,7 +946,9 @@ if __name__ == "__main__":
     if what in ("social", "all"):
         social()
     if what in ("icon", "all"):
-        icon_ramp()
+        icon_brach()
+    if what == "ramp":
+        icon_ramp(ico="wrlines_ramp.ico", preview="icon_preview_ramp.png")
     if what == "swoop":
         icon_swoop()
     if what == "variants":

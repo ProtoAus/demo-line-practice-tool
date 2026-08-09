@@ -1,3 +1,12 @@
 # Scratch from make_art.py: the supersampled layers, the glow passes and the
 # per-size proofs. Every one of them is regenerated on the next run.
 _build/
+
+# Stray captures dropped in here while working. The tracked artwork is listed
+# by name below, so a screenshot left in this folder cannot be committed by a
+# careless `git add -A`.
+*.png
+!social.png
+!icon_preview.png
+!icon_preview_swoop.png
+!icon_preview_ramp.png
