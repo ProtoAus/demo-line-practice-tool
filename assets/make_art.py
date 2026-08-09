@@ -1,20 +1,31 @@
 #!/usr/bin/env python3
-"""Draw the project's artwork: one run line, seen from the floor of a surf ramp.
+"""Draw the project's artwork.
 
-There is no clip art here and no external asset. The line is a 3-D curve lying
-on a 3-D ramp plane, both run through the same pinhole projection, and it is
-coloured with the tool's own efficiency ramp -- the literal green and red from
-EfficiencyColour in wr_render.cpp -- so the picture cannot end up advertising
-colours the program does not draw. The line thins with distance because it is
-actually further away, not because a gradient was painted on it.
+There is no clip art here and no external asset. Everything is emitted as
+ImageMagick MVG and rendered supersampled, then scaled down, which is what gives
+clean edges where a stroke is one pixel wide.
 
-Everything is emitted as ImageMagick MVG and rendered supersampled, then scaled
-down. That is what gives clean edges where the line is one pixel wide in the
-distance and sixty wide as it passes the camera.
+    py -3 assets/make_art.py social  -> assets/social.png        1280x640 card
+    py -3 assets/make_art.py icon    -> assets/wrlines.ico       16..256
+    py -3 assets/make_art.py swoop   -> assets/wrlines_swoop.ico the first icon
+    py -3 assets/make_art.py all       social + icon
 
-    py -3 assets/make_art.py social     -> assets/social.png   (1280x640)
-    py -3 assets/make_art.py icon       -> assets/wrlines.ico  (16..256)
-    py -3 assets/make_art.py all
+THE CARD is one run seen from the floor of a surf ramp: a 3-D curve lying on a
+3-D ramp plane, both through the same pinhole projection. The line thins with
+distance because it is further away, not because a gradient was painted along
+it. Its green and red are the literal constants out of EfficiencyColour in
+wr_render.cpp, so the picture cannot advertise colours the program does not
+draw.
+
+THE ICON is not that picture scaled down, and cannot be: what makes the card
+work is the run arriving out of the distance, and most of that stroke is one
+pixel wide, which at 64 px is one pixel and at 16 px is nothing. It is a
+triangular prism -- the shape of a ramp -- with a run boarding it from above,
+crossing the face diagonally, and leaving over the lower SIDE edge into the
+air. Not off the end, and never down to the floor: that is not what the
+movement does, and an icon that showed it would be teaching the wrong thing.
+Drawn flat and deliberately overstated. wrlines_swoop.ico is the earlier
+design, kept buildable so it is not a binary nobody can regenerate.
 
 Needs ImageMagick 7 ("magick" on PATH). Nothing else -- no PIL, no numpy.
 """
@@ -370,8 +381,173 @@ def mark_mvg(size, ss, pad, wmin, wmax, steps=260):
     return out
 
 
-def icon():
-    size, ss = 256, 4
+# --- the ramp icon -----------------------------------------------------------
+# A triangular prism -- which is the shape of a surf ramp -- with a run boarding
+# it from above, riding it down, and launching off the end.
+#
+# The colour key here is the ICON'S OWN and not one of the tool's ramps: blue
+# for the fast approach, red down the face, green off the launch. Worth saying
+# out loud, because the tool's SpeedColour puts blue at the SLOW end. What is
+# borrowed is the three literal colours, so the icon at least uses paint the
+# program owns: the blue is EfficiencyColour's colourblind-mode gaining blue,
+# and the red and green are its ordinary losing and gaining pair.
+FAST = (0.20, 0.55, 1.00)
+
+# Everything below is a fraction of the icon's side, so the design is resolved
+# once and holds at every size.
+#
+# The prism is given as a cross-section plus a length, which is what a prism
+# actually is, and it is LONG. That is not decoration: a run does not slide to
+# the bottom of a ramp and hop off the end -- it never reaches the floor at all.
+# It crosses the face diagonally, travelling mostly along the ramp while the
+# slope carries it down, and leaves over the lower SIDE edge into the air. A
+# short wedge cannot show that, because there is no length to travel along.
+# A LONG prism, laid out flat rather than in perspective, because at 16 px a
+# vanishing point buys nothing and costs the near end cap all of its size.
+#
+# The length matters. A run does not slide to the bottom of a ramp and hop off
+# the end -- it never reaches the floor at all. It crosses the face diagonally,
+# travelling along the ramp while the slope trades height for speed, and leaves
+# over the lower SIDE edge into the air. There has to be a length to travel
+# along for any of that to be visible, and the first two attempts at this were
+# a stubby wedge with nowhere to go.
+PRISM_R = (0.100, 0.260)             # ridge, near end
+PRISM_K = (0.100, 0.720)             # foot of the back wall, near end
+PRISM_T = (0.420, 0.720)             # toe -- the lower side edge, near end
+PRISM_L = (0.520, -0.060)            # along the ramp, away to the right
+
+
+def _off(p, d, k=1.0):
+    return (p[0] + d[0] * k, p[1] + d[1] * k)
+
+
+def _face(a, b):
+    """A point on the sloped face. a runs 0..1 along the ramp, b runs 0 at the
+    ridge to 1 at the toe."""
+    R, T, L = PRISM_R, PRISM_T, PRISM_L
+    return (R[0] + L[0] * a + (T[0] - R[0]) * b,
+            R[1] + L[1] * a + (T[1] - R[1]) * b)
+
+
+def prism_mvg(size, ss):
+    """The sliding face, the near end cap that shows the triangular section,
+    and one outline so the whole thing holds together as a solid."""
+    R, K, T, L = PRISM_R, PRISM_K, PRISM_T, PRISM_L
+    R2, T2 = _off(R, L), _off(T, L)
+
+    def poly(pts, fill):
+        s = " ".join("%.2f,%.2f" % (p[0] * size * ss, p[1] * size * ss) for p in pts)
+        return ["fill %s" % fill, "stroke none", "polygon %s" % s]
+
+    # The face first, then the end cap much darker on top. The two fills
+    # together are the whole silhouette, so the prism is one solid object -- but
+    # only if the tones are far enough apart to say which is in front. At two
+    # shades of the same grey it read as two overlapping rectangles.
+    out = []
+    out += poly([R, T, T2, R2], "#3B4860")       # the face the run rides
+    out += poly([R, K, T], "#1C2430")            # near end cap, in shadow
+
+    # One outline round the outside, so the shape holds together at the sizes
+    # where the fills are three pixels of nearly the same colour.
+    edge = " ".join("%.2f,%.2f" % (p[0] * size * ss, p[1] * size * ss)
+                    for p in (R2, R, K, T, T2))
+    out += ["fill none", "stroke #5E6E8D", "stroke-linejoin round",
+            "stroke-width %.2f" % (0.014 * size * ss), "polygon %s" % edge]
+    return out
+
+
+def catmull(ctrl, per=48):
+    """Catmull-Rom through the control points, ends duplicated. Used so the
+    corner where the ramp becomes the launch is a rounded arc rather than a
+    kink -- a hard corner survives downsampling as a smudge."""
+    P = [ctrl[0]] + list(ctrl) + [ctrl[-1]]
+    out = []
+    for i in range(len(P) - 3):
+        p0, p1, p2, p3 = P[i], P[i + 1], P[i + 2], P[i + 3]
+        for j in range(per):
+            t = j / per
+            t2, t3 = t * t, t * t * t
+            out.append(tuple(
+                0.5 * ((2 * p1[k]) + (-p0[k] + p2[k]) * t
+                       + (2 * p0[k] - 5 * p1[k] + 4 * p2[k] - p3[k]) * t2
+                       + (-p0[k] + 3 * p1[k] - 3 * p2[k] + p3[k]) * t3)
+                for k in range(2)))
+    out.append(tuple(ctrl[-1]))
+    return out
+
+
+def ramp_colour(u):
+    """Blue in, red down the face, green off the launch.
+
+    Blue is held flat for the whole approach instead of starting to blend from
+    the first pixel. Blending from u = 0 meant the approach was already a third
+    of the way to red by the time it entered the tile, and it read as purple --
+    a fourth colour nobody asked for, in the one band that is supposed to say
+    "fast".
+
+    The flip to green is quick for the same kind of reason: a slow blend spends
+    the pixels that ought to be carrying green on a muddy olive."""
+    if u < 0.30:                       # the drop in: touchdown is at u = 0.307
+        return FAST
+    if u < 0.66:
+        return mix(FAST, LOSS, (u - 0.30) / 0.36)
+    if u < 0.79:                       # the flip straddles the departure, 0.737
+        return mix(LOSS, GAIN, (u - 0.66) / 0.13)
+    return GAIN
+
+
+def ramp_line_mvg(size, ss, wmin=0.052, wmax=0.088):
+    """The run: in from above across the ridge, diagonally along the face, off
+    the lower side edge and away.
+
+    It crosses the face rather than running down it. A surfer holds height by
+    travelling along the ramp and lets the slope trade it for speed, so the
+    track is a long diagonal that reaches the lower edge near the far end --
+    and it leaves over that SIDE edge, into the air, without ever reaching the
+    floor. Sliding to the toe and hopping off the end is not what the movement
+    does.
+
+    The approach is set perpendicular to the ridge rather than merely steep, so
+    the two lines read as crossing rather than as one bent line. Both ends run
+    off the tile: a stroke that stops inside the frame reads as a finished
+    shape, and this is meant to read as something passing through.
+
+    The stroke is thin and tapers slightly, widening as it comes towards you.
+    A line as fat as the surface it rides stops being a line on a ramp and
+    becomes a stripe, which is what the first version of this was."""
+    L = PRISM_L
+    ln = math.hypot(L[0], L[1])
+    perp = (-L[1] / ln, L[0] / ln)     # across the ridge and onto the face
+
+    touch = _face(0.12, 0.20)          # just over the ridge, near end
+    leave = _face(0.55, 1.00)          # out over the lower side edge, mid-ramp
+
+    ctrl = [
+        (touch[0] - perp[0] * 0.42, touch[1] - perp[1] * 0.42),   # off the top
+        touch,
+        _face(0.28, 0.48),             # across the face, along and down at once
+        _face(0.44, 0.78),
+        leave,
+        (0.845, 0.730),                # airborne, levelling off
+        (1.060, 0.735),                # away, off the tile
+    ]
+    pts = catmull(ctrl, per=54)
+    frac = arc_fractions(pts)
+
+    out = ["stroke-linecap round", "fill none"]
+    for i in range(1, len(pts)):
+        u = 0.5 * (frac[i] + frac[i - 1])
+        w = (wmin + (wmax - wmin) * u) * size * ss
+        out.append("stroke %s" % hexof(ramp_colour(u)))
+        out.append("stroke-width %.2f" % w)
+        out.append("line %.2f,%.2f %.2f,%.2f" %
+                   (pts[i - 1][0] * size * ss, pts[i - 1][1] * size * ss,
+                    pts[i][0] * size * ss, pts[i][1] * size * ss))
+    return out
+
+
+def compose_icon(mark, ico_name, preview_name, under=None, size=256, ss=4,
+                 glow=3):
     S = size * ss
     r = int(S * 0.17)
 
@@ -380,29 +556,36 @@ def icon():
         "-fill", "#0A0E15", "-stroke", "#1B2130", "-strokewidth", str(2 * ss),
         "-draw", "roundrectangle %d,%d %d,%d %d,%d" % (ss, ss, S - ss, S - ss, r, r),
         plate)
+    if under:
+        # Clipped to the plate, so the wedge can run off the edges without
+        # spilling out of the rounded corners.
+        body = os.path.join(TMP, "body.png")
+        run("magick", "-size", "%dx%d" % (S, S), "xc:none",
+            "-draw", "@" + write_mvg("under.mvg", under), body)
+        run("magick", body, plate, "-alpha", "set",
+            "-compose", "dst-in", "-composite", body)
+        run("magick", plate, body, "-compose", "over", "-composite", plate)
 
     core = os.path.join(TMP, "mark.png")
-    run("magick", "-size", "%dx%d" % (S, S), "xc:none", "-draw",
-        "@" + write_mvg("mark.mvg",
-                        mark_mvg(size, ss, pad=22.0, wmin=27.0, wmax=48.0)), core)
+    run("magick", "-size", "%dx%d" % (S, S), "xc:none",
+        "-draw", "@" + write_mvg("mark.mvg", mark), core)
 
     # One tight glow only. A wide bloom is invisible at 32 px and turns the
     # whole tile into a smudge at 16.
-    glow = os.path.join(TMP, "mark_glow.png")
-    run("magick", core, "-channel", "RGBA", "-blur", "0x%d" % (3 * ss), "+channel",
-        "-evaluate", "multiply", "0.85", glow)
+    gl = os.path.join(TMP, "mark_glow.png")
+    run("magick", core, "-channel", "RGBA", "-blur", "0x%d" % (glow * ss),
+        "+channel", "-evaluate", "multiply", "0.85", gl)
 
-    master = os.path.join(TMP, "icon256.png")
+    master = os.path.join(TMP, "icon_master.png")
     run("magick", plate,
-        glow, "-compose", "screen", "-composite",
+        gl, "-compose", "screen", "-composite",
         core, "-compose", "over", "-composite",
         "-filter", "Lanczos", "-resize", "%dx%d" % (size, size),
-        plate, "-compose", "dst-in", "-composite",      # keep the rounded corners
+        plate, "-compose", "dst-in", "-composite",     # keep the rounded corners
         master)
 
-    ico = os.path.join(HERE, "wrlines.ico")
-    run("magick", master, "-define",
-        "icon:auto-resize=256,128,96,64,48,32,24,16", ico)
+    run("magick", master, "-define", "icon:auto-resize=256,128,96,64,48,32,24,16",
+        os.path.join(HERE, ico_name))
 
     # Proof at the sizes that actually matter, laid out side by side and blown
     # back up, because "does this survive 16 px" is not a question to answer by
@@ -415,8 +598,22 @@ def icon():
         run("magick", t, "-filter", "point", "-resize", "192x192", big)
         tiles.append(big)
     run("magick", "montage", *tiles, "-tile", "4x1", "-geometry", "+8+8",
-        "-background", "#1C1C1C", os.path.join(HERE, "icon_preview.png"))
-    print("wrlines.ico  +  icon_preview.png")
+        "-background", "#1C1C1C", os.path.join(HERE, preview_name))
+    print("%s  +  %s" % (ico_name, preview_name))
+
+
+def icon_ramp():
+    size, ss = 256, 4
+    compose_icon(ramp_line_mvg(size, ss), "wrlines.ico", "icon_preview.png",
+                 under=prism_mvg(size, ss), size=size, ss=ss)
+
+
+def icon_swoop():
+    """The first design, kept buildable so the file it produced is not a binary
+    nobody can regenerate."""
+    size, ss = 256, 4
+    compose_icon(mark_mvg(size, ss, pad=22.0, wmin=27.0, wmax=48.0),
+                 "wrlines_swoop.ico", "icon_preview_swoop.png", size=size, ss=ss)
 
 
 if __name__ == "__main__":
@@ -425,4 +622,6 @@ if __name__ == "__main__":
     if what in ("social", "all"):
         social()
     if what in ("icon", "all"):
-        icon()
+        icon_ramp()
+    if what == "swoop":
+        icon_swoop()
