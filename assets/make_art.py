@@ -428,9 +428,10 @@ RAMP = dict(
     # the toe through the middle and recovers towards the ridge before the end
     # -- that is the swoop, and it is why the run can leave off the FAR END
     # rather than dribbling over the near side edge.
-    path=((0.10, 0.14), (0.36, 0.55), (0.66, 0.78), (0.88, 0.66), (1.00, 0.46)),
+    path=((0.10, 0.14), (0.34, 0.55), (0.62, 0.82), (0.82, 0.78), (1.00, 0.66)),
     approach=0.40,                # length of the drop-in, across the ridge
-    tail=(0.335, -0.060),         # the airborne exit: shallow, up and to the right
+    launch=0.60,                  # how far the airborne arc runs
+    launch_dir=(0.90, -0.44),     # where it ends up heading: up and to the right
     w0=0.038, w1=0.016,           # thick near the camera, thin as it recedes
 )
 
@@ -489,22 +490,47 @@ def prism_mvg(size, ss, p=None):
     return out
 
 
-def catmull(ctrl, per=48):
-    """Catmull-Rom through the control points, ends duplicated. Used so the
-    corner where the ramp becomes the launch is a rounded arc rather than a
-    kink -- a hard corner survives downsampling as a smudge."""
-    P = [ctrl[0]] + list(ctrl) + [ctrl[-1]]
+def catmull(ctrl, per=48, alpha=0.5):
+    """Centripetal Catmull-Rom.
+
+    Uniform Catmull-Rom (alpha = 0) overshoots and can cusp wherever the
+    control points are unevenly spaced, which is exactly this path: short steps
+    across the face, then a long one into the air. Centripetal spacing is the
+    variant with the proof that it never self-intersects or forms a cusp, so
+    the curve through the same points comes out clean.
+
+    The phantom end points are EXTRAPOLATED rather than duplicated. Duplicating
+    them gives a zero-length segment, and the knot spacing then divides by
+    zero -- and, before that, flattens the tangent at both ends into a visible
+    straight stub."""
+    if len(ctrl) < 2:
+        return list(ctrl)
+    first = (2 * ctrl[0][0] - ctrl[1][0], 2 * ctrl[0][1] - ctrl[1][1])
+    last = (2 * ctrl[-1][0] - ctrl[-2][0], 2 * ctrl[-1][1] - ctrl[-2][1])
+    P = [first] + list(ctrl) + [last]
+
+    def knot(t, a, b):
+        d = math.hypot(b[0] - a[0], b[1] - a[1])
+        return t + (d ** alpha if d > 1e-9 else 1e-6)
+
     out = []
     for i in range(len(P) - 3):
         p0, p1, p2, p3 = P[i], P[i + 1], P[i + 2], P[i + 3]
-        for j in range(per):
-            t = j / per
-            t2, t3 = t * t, t * t * t
-            out.append(tuple(
-                0.5 * ((2 * p1[k]) + (-p0[k] + p2[k]) * t
-                       + (2 * p0[k] - 5 * p1[k] + 4 * p2[k] - p3[k]) * t2
-                       + (-p0[k] + 3 * p1[k] - 3 * p2[k] + p3[k]) * t3)
-                for k in range(2)))
+        t0 = 0.0
+        t1 = knot(t0, p0, p1)
+        t2 = knot(t1, p1, p2)
+        t3 = knot(t2, p2, p3)
+        for k in range(per):
+            t = t1 + (t2 - t1) * k / per
+            def blend(u, v, ta, tb):
+                w = (tb - t) / (tb - ta)
+                return (w * u[0] + (1 - w) * v[0], w * u[1] + (1 - w) * v[1])
+            a1 = blend(p0, p1, t0, t1)
+            a2 = blend(p1, p2, t1, t2)
+            a3 = blend(p2, p3, t2, t3)
+            b1 = blend(a1, a2, t0, t2)
+            b2 = blend(a2, a3, t1, t3)
+            out.append(blend(b1, b2, t1, t2))
     out.append(tuple(ctrl[-1]))
     return out
 
@@ -555,12 +581,38 @@ def ramp_path(p):
 
     track = [_face(p, a, b) for a, b in p["path"]]
     touch, leave = track[0], track[-1]
-    tail = p["tail"]
+
+    # The launch is built from the direction the run is ALREADY travelling at
+    # the end of the face, then bent towards the exit heading. Handing it a
+    # fixed vector instead put a corner at the departure -- by the far end the
+    # track is running almost straight up the screen, so any mostly-sideways
+    # tail read as a hard right turn rather than as a launch.
+    dx, dy = leave[0] - track[-2][0], leave[1] - track[-2][1]
+    dl = math.hypot(dx, dy) or 1.0
+    d = (dx / dl, dy / dl)
+    e = p["launch_dir"]
+    el = math.hypot(*e) or 1.0
+    e = (e[0] / el, e[1] / el)
+    mid = (d[0] + e[0], d[1] + e[1])
+    ml = math.hypot(*mid) or 1.0
+    mid = (mid[0] / ml, mid[1] / ml)
+    ln = p["launch"]
+
+    # Bend towards the exit heading from the FIRST span rather than running on
+    # along d and turning late. By the far end the track is climbing at about
+    # sixty degrees -- the ramp has converged, so a step along it barely moves
+    # sideways -- and a launch that holds that heading shoots straight out of
+    # the top of the tile, mirroring the blue approach into a symmetrical U.
+    near_e = (d[0] * 0.30 + e[0], d[1] * 0.30 + e[1])
+    nl = math.hypot(*near_e) or 1.0
+    near_e = (near_e[0] / nl, near_e[1] / nl)
+
+    a1 = (leave[0] + mid[0] * ln * 0.28, leave[1] + mid[1] * ln * 0.28)
+    a2 = (a1[0] + near_e[0] * ln * 0.34, a1[1] + near_e[1] * ln * 0.34)
+    a3 = (a2[0] + e[0] * ln * 0.38, a2[1] + e[1] * ln * 0.38)
 
     ctrl = ([(touch[0] - perp[0] * p["approach"], touch[1] - perp[1] * p["approach"])]
-            + track
-            + [(leave[0] + tail[0] * 0.42, leave[1] + tail[1] * 0.42),
-               (leave[0] + tail[0], leave[1] + tail[1])])
+            + track + [a1, a2, a3])
     return ctrl, touch, leave
 
 
@@ -612,51 +664,54 @@ def ramp_line_mvg(size, ss, p=None):
 
 
 def compose_icon(mark, ico_name, preview_name, under=None, size=256, ss=4,
-                 glow=3, master_name="icon_master.png"):
-    """Draws one tile. With ico_name/preview_name as None it just returns the
-    master, which is how the two-weight icon set is built."""
-    S = size * ss
-    r = int(S * 0.17)
+                 glow=0, master_name="icon_master.png"):
+    """Draws one tile on TRANSPARENCY -- no plate behind it.
 
-    plate = os.path.join(TMP, "plate.png")
-    run("magick", "-size", "%dx%d" % (S, S), "xc:none",
-        "-fill", "#0A0E15", "-stroke", "#1B2130", "-strokewidth", str(2 * ss),
-        "-draw", "roundrectangle %d,%d %d,%d %d,%d" % (ss, ss, S - ss, S - ss, r, r),
-        plate)
+    The dark rounded square was doing two jobs and only one of them honestly.
+    It gave the glow something to sit on, and it hid the fact that the artwork
+    had never been checked against a light background. Without it the icon is
+    just the object, which is what an icon should be, and it now has to hold up
+    on white as well as on dark. The glow goes with it: a coloured bloom over
+    transparency is a smear on whatever the icon is dropped onto.
+
+    With ico_name/preview_name as None it just returns the master, which is how
+    the two-weight icon set is built."""
+    S = size * ss
+    canvas = os.path.join(TMP, "icanvas.png")
+    # PNG32: is not decoration. A fully transparent xc:none saves as GrayAlpha,
+    # and reading it back as the base of the composite converts every layer
+    # after it to greyscale -- the artwork comes out correct in the MVG and
+    # monochrome in the file.
+    run("magick", "-size", "%dx%d" % (S, S), "xc:none", "PNG32:" + canvas)
+
+    layers = ["magick", canvas]
     if under:
-        # Clipped to the plate, so the wedge can run off the edges without
-        # spilling out of the rounded corners.
         body = os.path.join(TMP, "body.png")
         run("magick", "-size", "%dx%d" % (S, S), "xc:none",
-            "-draw", "@" + write_mvg("under.mvg", under), body)
-        run("magick", body, plate, "-alpha", "set",
-            "-compose", "dst-in", "-composite", body)
-        run("magick", plate, body, "-compose", "over", "-composite", plate)
+            "-draw", "@" + write_mvg("under.mvg", under), "PNG32:" + body)
+        layers += [body, "-compose", "over", "-composite"]
 
     core = os.path.join(TMP, "mark.png")
     run("magick", "-size", "%dx%d" % (S, S), "xc:none",
-        "-draw", "@" + write_mvg("mark.mvg", mark), core)
+        "-draw", "@" + write_mvg("mark.mvg", mark), "PNG32:" + core)
 
-    # One tight glow only. A wide bloom is invisible at 32 px and turns the
-    # whole tile into a smudge at 16.
-    gl = os.path.join(TMP, "mark_glow.png")
-    run("magick", core, "-channel", "RGBA", "-blur", "0x%d" % (glow * ss),
-        "+channel", "-evaluate", "multiply", "0.85", gl)
+    if glow:
+        gl = os.path.join(TMP, "mark_glow.png")
+        run("magick", core, "-channel", "RGBA", "-blur", "0x%d" % (glow * ss),
+            "+channel", "-evaluate", "multiply", "0.85", gl)
+        layers += [gl, "-compose", "over", "-composite"]
 
     master = os.path.join(TMP, master_name)
-    run("magick", plate,
-        gl, "-compose", "screen", "-composite",
-        core, "-compose", "over", "-composite",
-        "-filter", "Lanczos", "-resize", "%dx%d" % (size, size),
-        plate, "-compose", "dst-in", "-composite",     # keep the rounded corners
-        master)
+    layers += [core, "-compose", "over", "-composite",
+               "-filter", "Lanczos", "-resize", "%dx%d" % (size, size),
+               "PNG32:" + master]
+    run(*layers)
 
     if ico_name is None:
         return master
 
     run("magick", master, "-define", "icon:auto-resize=256,128,96,64,48,32,24,16",
         os.path.join(HERE, ico_name))
-
     tiles = []
     for n in (64, 48, 32, 16):
         t = os.path.join(TMP, "p%d.png" % n)
@@ -725,13 +780,13 @@ def icon_ramp(p=None, ico="wrlines.ico", preview="icon_preview.png"):
 # looking at them at 32 px settles in one pass what serial guessing does not.
 VARIANTS = {
     "A-base":  dict(),
-    "B-shal":  dict(tail=(0.330, -0.062)),          # an even shallower exit
+    "B-shal":  dict(launch_dir=(0.90, -0.44)),      # a flatter launch
     "C-deep":  dict(path=((0.10, 0.16), (0.34, 0.68), (0.64, 0.94),
                           (0.88, 0.84), (1.00, 0.64))),
     "D-high":  dict(path=((0.10, 0.14), (0.36, 0.55), (0.66, 0.78),
                           (0.88, 0.66), (1.00, 0.46))),
-    "E-conv":  dict(conv=0.36, tail=(0.300, -0.080)),   # more foreshortening
-    "F-thin":  dict(w0=0.038, w1=0.016, tail=(0.310, -0.075)),
+    "E-conv":  dict(conv=0.36),                     # more foreshortening
+    "F-thin":  dict(w0=0.032, w1=0.014),
 }
 
 
