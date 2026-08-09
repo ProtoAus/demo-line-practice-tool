@@ -8,6 +8,7 @@ clean edges where a stroke is one pixel wide.
     py -3 assets/make_art.py social  -> assets/social.png        1280x640 card
     py -3 assets/make_art.py icon    -> assets/wrlines.ico       16..256
     py -3 assets/make_art.py swoop   -> assets/wrlines_swoop.ico the first icon
+    py -3 assets/make_art.py variants-> assets/_build/variants.png candidates
     py -3 assets/make_art.py all       social + icon
 
 THE CARD is one run seen from the floor of a surf ramp: a 3-D curve lying on a
@@ -21,11 +22,16 @@ THE ICON is not that picture scaled down, and cannot be: what makes the card
 work is the run arriving out of the distance, and most of that stroke is one
 pixel wide, which at 64 px is one pixel and at 16 px is nothing. It is a
 triangular prism -- the shape of a ramp -- with a run boarding it from above,
-crossing the face diagonally, and leaving over the lower SIDE edge into the
-air. Not off the end, and never down to the floor: that is not what the
+swooping along the face, and leaving off the FAR END at a shallow angle, up and
+to the right, which in this view is straight away from the camera. It never
+reaches the floor and it does not hop off the bottom: that is not what the
 movement does, and an icon that showed it would be teaching the wrong thing.
-Drawn flat and deliberately overstated. wrlines_swoop.ico is the earlier
-design, kept buildable so it is not a binary nobody can regenerate.
+Drawn flat and deliberately overstated.
+
+`variants` renders the candidate parameter sets side by side at 256 px and at
+32 px. Adjusting one number per turn is a slow way to discover that a whole
+direction is wrong. wrlines_swoop.ico is the first design, kept buildable so it
+is not a binary nobody can regenerate.
 
 Needs ImageMagick 7 ("magick" on PATH). Nothing else -- no PIL, no numpy.
 """
@@ -411,32 +417,59 @@ FAST = (0.20, 0.55, 1.00)
 # over the lower SIDE edge into the air. There has to be a length to travel
 # along for any of that to be visible, and the first two attempts at this were
 # a stubby wedge with nowhere to go.
-PRISM_R = (0.100, 0.260)             # ridge, near end
-PRISM_K = (0.100, 0.720)             # foot of the back wall, near end
-PRISM_T = (0.420, 0.720)             # toe -- the lower side edge, near end
-PRISM_L = (0.520, -0.060)            # along the ramp, away to the right
+RAMP = dict(
+    R=(0.090, 0.290),        # ridge, near end
+    K=(0.090, 0.815),        # foot of the back wall, near end
+    T=(0.455, 0.815),        # toe -- the lower side edge, near end
+    L=(0.520, -0.175),       # along the ramp, away from the camera
+    conv=0.46,               # how much the section shrinks at the far end
+
+    # The track across the face, as (along, down-slope) pairs. It dips towards
+    # the toe through the middle and recovers towards the ridge before the end
+    # -- that is the swoop, and it is why the run can leave off the FAR END
+    # rather than dribbling over the near side edge.
+    path=((0.10, 0.14), (0.36, 0.55), (0.66, 0.78), (0.88, 0.66), (1.00, 0.46)),
+    approach=0.40,                # length of the drop-in, across the ridge
+    tail=(0.335, -0.060),         # the airborne exit: shallow, up and to the right
+    w0=0.038, w1=0.016,           # thick near the camera, thin as it recedes
+)
 
 
-def _off(p, d, k=1.0):
-    return (p[0] + d[0] * k, p[1] + d[1] * k)
+def _lerp(a, b, t):
+    return (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
 
 
-def _face(a, b):
-    """A point on the sloped face. a runs 0..1 along the ramp, b runs 0 at the
-    ridge to 1 at the toe."""
-    R, T, L = PRISM_R, PRISM_T, PRISM_L
-    return (R[0] + L[0] * a + (T[0] - R[0]) * b,
-            R[1] + L[1] * a + (T[1] - R[1]) * b)
+def _sections(p):
+    """Near and far cross-sections. The far one is the near one shrunk about
+    the ridge and pushed along L, so the ramp's edges CONVERGE.
+
+    Two earlier attempts kept the section the same size at both ends. That is a
+    box, and it read as a tilted slab no matter how it was shaded -- and worse,
+    with parallel edges there is no such thing as "further away" for the run to
+    depart into."""
+    R, K, T, L, c = p["R"], p["K"], p["T"], p["L"], p["conv"]
+    R2 = (R[0] + L[0], R[1] + L[1])
+    K2 = (R2[0] + (K[0] - R[0]) * c, R2[1] + (K[1] - R[1]) * c)
+    T2 = (R2[0] + (T[0] - R[0]) * c, R2[1] + (T[1] - R[1]) * c)
+    return R, K, T, R2, K2, T2
 
 
-def prism_mvg(size, ss):
+def _face(p, a, b):
+    """A point on the sloped face. a runs 0 at the near end to 1 at the far end,
+    b runs 0 at the ridge to 1 at the toe. Bilinear over the quad, so a path in
+    (a, b) foreshortens with the surface it is drawn on."""
+    R, _, T, R2, _, T2 = _sections(p)
+    return _lerp(_lerp(R, R2, a), _lerp(T, T2, a), b)
+
+
+def prism_mvg(size, ss, p=None):
     """The sliding face, the near end cap that shows the triangular section,
     and one outline so the whole thing holds together as a solid."""
-    R, K, T, L = PRISM_R, PRISM_K, PRISM_T, PRISM_L
-    R2, T2 = _off(R, L), _off(T, L)
+    p = p or RAMP
+    R, K, T, R2, K2, T2 = _sections(p)
 
     def poly(pts, fill):
-        s = " ".join("%.2f,%.2f" % (p[0] * size * ss, p[1] * size * ss) for p in pts)
+        s = " ".join("%.2f,%.2f" % (q[0] * size * ss, q[1] * size * ss) for q in pts)
         return ["fill %s" % fill, "stroke none", "polygon %s" % s]
 
     # The face first, then the end cap much darker on top. The two fills
@@ -449,10 +482,10 @@ def prism_mvg(size, ss):
 
     # One outline round the outside, so the shape holds together at the sizes
     # where the fills are three pixels of nearly the same colour.
-    edge = " ".join("%.2f,%.2f" % (p[0] * size * ss, p[1] * size * ss)
-                    for p in (R2, R, K, T, T2))
+    edge = " ".join("%.2f,%.2f" % (q[0] * size * ss, q[1] * size * ss)
+                    for q in (R2, R, K, T, T2))
     out += ["fill none", "stroke #5E6E8D", "stroke-linejoin round",
-            "stroke-width %.2f" % (0.014 * size * ss), "polygon %s" % edge]
+            "stroke-width %.2f" % (0.013 * size * ss), "polygon %s" % edge]
     return out
 
 
@@ -476,69 +509,101 @@ def catmull(ctrl, per=48):
     return out
 
 
-def ramp_colour(u):
-    """Blue in, red down the face, green off the launch.
+def ramp_colour(u, touch_u, leave_u):
+    """Blue in, red across the face, green off the side.
 
-    Blue is held flat for the whole approach instead of starting to blend from
-    the first pixel. Blending from u = 0 meant the approach was already a third
-    of the way to red by the time it entered the tile, and it read as purple --
-    a fourth colour nobody asked for, in the one band that is supposed to say
-    "fast".
+    The two hand-over points are passed in, measured off the drawn path, rather
+    than being constants tuned by eye. Blue holds until the run is actually on
+    the ramp and the flip to green straddles the moment it leaves it, so the
+    colours mark the two events in the picture instead of landing wherever the
+    arithmetic happened to put them.
 
-    The flip to green is quick for the same kind of reason: a slow blend spends
-    the pixels that ought to be carrying green on a muddy olive."""
-    if u < 0.30:                       # the drop in: touchdown is at u = 0.307
+    BOTH hand-overs are short, and each of the three colours is held flat in
+    between. Blending blue slowly into red across the whole face put a wide
+    magenta band down the middle of the swoop -- a fourth colour nobody asked
+    for, occupying more of the line than the blue did. The same slow-blend
+    mistake between red and green produces olive. Three flat bands and two quick
+    flips is the only arrangement that survives 32 px, where a blended pixel is
+    just a wrong-coloured pixel."""
+    b0, b1 = touch_u + 0.03, touch_u + 0.15   # blue  -> red, just after touchdown
+    g0, g1 = leave_u - 0.07, leave_u + 0.05   # red   -> green, straddling the exit
+    if u < b0:
         return FAST
-    if u < 0.66:
-        return mix(FAST, LOSS, (u - 0.30) / 0.36)
-    if u < 0.79:                       # the flip straddles the departure, 0.737
-        return mix(LOSS, GAIN, (u - 0.66) / 0.13)
+    if u < b1:
+        return mix(FAST, LOSS, (u - b0) / max(b1 - b0, 1e-6))
+    if u < g0:
+        return LOSS
+    if u < g1:
+        return mix(LOSS, GAIN, (u - g0) / max(g1 - g0, 1e-6))
     return GAIN
 
 
-def ramp_line_mvg(size, ss, wmin=0.052, wmax=0.088):
-    """The run: in from above across the ridge, diagonally along the face, off
-    the lower side edge and away.
+def ramp_path(p):
+    """The control points, and where along the finished path the run touches
+    down and leaves. Split out from the drawing so the colour hand-overs can be
+    measured off the real geometry instead of guessed.
 
-    It crosses the face rather than running down it. A surfer holds height by
-    travelling along the ramp and lets the slope trade it for speed, so the
-    track is a long diagonal that reaches the lower edge near the far end --
-    and it leaves over that SIDE edge, into the air, without ever reaching the
-    floor. Sliding to the toe and hopping off the end is not what the movement
-    does.
+    The run leaves off the FAR END of the prism, not over the near side edge,
+    and the exit is shallow -- it carries on roughly the way it was already
+    going, up and to the right, which in this view is straight away from the
+    camera. A sharp turn at the departure draws a run that bounces off the ramp
+    rather than one that flies off the end of it still carrying its speed."""
+    R, _, _, R2, _, _ = _sections(p)
+    ridge = (R2[0] - R[0], R2[1] - R[1])
+    rl = math.hypot(*ridge)
+    perp = (-ridge[1] / rl, ridge[0] / rl)      # across the ridge, onto the face
+
+    track = [_face(p, a, b) for a, b in p["path"]]
+    touch, leave = track[0], track[-1]
+    tail = p["tail"]
+
+    ctrl = ([(touch[0] - perp[0] * p["approach"], touch[1] - perp[1] * p["approach"])]
+            + track
+            + [(leave[0] + tail[0] * 0.42, leave[1] + tail[1] * 0.42),
+               (leave[0] + tail[0], leave[1] + tail[1])])
+    return ctrl, touch, leave
+
+
+def ramp_line_mvg(size, ss, p=None):
+    """The run: in from above across the ridge, swooping along the face, and off
+    the lower side edge into the distance.
+
+    It travels ALONG the ramp rather than down it. A surfer holds height by
+    running the length of the ramp and letting the slope trade it for speed, so
+    the track is a long swoop that only reaches the lower edge near the far end
+    -- and it leaves over that SIDE edge, into the air, without ever reaching
+    the floor.
+
+    Because it departs going away from the camera, the stroke gets THINNER as
+    it goes, not thicker. An earlier version tapered the other way, which drew
+    a run that leaves the ramp by flying at you.
 
     The approach is set perpendicular to the ridge rather than merely steep, so
     the two lines read as crossing rather than as one bent line. Both ends run
     off the tile: a stroke that stops inside the frame reads as a finished
-    shape, and this is meant to read as something passing through.
-
-    The stroke is thin and tapers slightly, widening as it comes towards you.
-    A line as fat as the surface it rides stops being a line on a ramp and
-    becomes a stripe, which is what the first version of this was."""
-    L = PRISM_L
-    ln = math.hypot(L[0], L[1])
-    perp = (-L[1] / ln, L[0] / ln)     # across the ridge and onto the face
-
-    touch = _face(0.12, 0.20)          # just over the ridge, near end
-    leave = _face(0.55, 1.00)          # out over the lower side edge, mid-ramp
-
-    ctrl = [
-        (touch[0] - perp[0] * 0.42, touch[1] - perp[1] * 0.42),   # off the top
-        touch,
-        _face(0.28, 0.48),             # across the face, along and down at once
-        _face(0.44, 0.78),
-        leave,
-        (0.845, 0.730),                # airborne, levelling off
-        (1.060, 0.735),                # away, off the tile
-    ]
+    shape, and this is meant to read as something passing through."""
+    p = p or RAMP
+    ctrl, touch, leave = ramp_path(p)
     pts = catmull(ctrl, per=54)
     frac = arc_fractions(pts)
+
+    # Where the two events actually fall along the drawn path.
+    def frac_at(target):
+        best, bi = 1e9, 0
+        for i, q in enumerate(pts):
+            d = math.hypot(q[0] - target[0], q[1] - target[1])
+            if d < best:
+                best, bi = d, i
+        return frac[bi]
+
+    touch_u, leave_u = frac_at(touch), frac_at(leave)
+    w0, w1 = p["w0"], p["w1"]
 
     out = ["stroke-linecap round", "fill none"]
     for i in range(1, len(pts)):
         u = 0.5 * (frac[i] + frac[i - 1])
-        w = (wmin + (wmax - wmin) * u) * size * ss
-        out.append("stroke %s" % hexof(ramp_colour(u)))
+        w = (w0 + (w1 - w0) * u) * size * ss
+        out.append("stroke %s" % hexof(ramp_colour(u, touch_u, leave_u)))
         out.append("stroke-width %.2f" % w)
         out.append("line %.2f,%.2f %.2f,%.2f" %
                    (pts[i - 1][0] * size * ss, pts[i - 1][1] * size * ss,
@@ -547,7 +612,9 @@ def ramp_line_mvg(size, ss, wmin=0.052, wmax=0.088):
 
 
 def compose_icon(mark, ico_name, preview_name, under=None, size=256, ss=4,
-                 glow=3):
+                 glow=3, master_name="icon_master.png"):
+    """Draws one tile. With ico_name/preview_name as None it just returns the
+    master, which is how the two-weight icon set is built."""
     S = size * ss
     r = int(S * 0.17)
 
@@ -576,7 +643,7 @@ def compose_icon(mark, ico_name, preview_name, under=None, size=256, ss=4,
     run("magick", core, "-channel", "RGBA", "-blur", "0x%d" % (glow * ss),
         "+channel", "-evaluate", "multiply", "0.85", gl)
 
-    master = os.path.join(TMP, "icon_master.png")
+    master = os.path.join(TMP, master_name)
     run("magick", plate,
         gl, "-compose", "screen", "-composite",
         core, "-compose", "over", "-composite",
@@ -584,12 +651,12 @@ def compose_icon(mark, ico_name, preview_name, under=None, size=256, ss=4,
         plate, "-compose", "dst-in", "-composite",     # keep the rounded corners
         master)
 
+    if ico_name is None:
+        return master
+
     run("magick", master, "-define", "icon:auto-resize=256,128,96,64,48,32,24,16",
         os.path.join(HERE, ico_name))
 
-    # Proof at the sizes that actually matter, laid out side by side and blown
-    # back up, because "does this survive 16 px" is not a question to answer by
-    # looking at a 256 px render of it.
     tiles = []
     for n in (64, 48, 32, 16):
         t = os.path.join(TMP, "p%d.png" % n)
@@ -600,12 +667,96 @@ def compose_icon(mark, ico_name, preview_name, under=None, size=256, ss=4,
     run("magick", "montage", *tiles, "-tile", "4x1", "-geometry", "+8+8",
         "-background", "#1C1C1C", os.path.join(HERE, preview_name))
     print("%s  +  %s" % (ico_name, preview_name))
+    return master
 
 
-def icon_ramp():
+# A stroke thin enough to look right at 256 px is under one pixel wide at 16.
+# That is not a reason to thicken the big one -- it is the reason .ico holds
+# several images instead of one. The large entries are drawn at the weight the
+# design wants; the small ones are redrawn heavier so the run is still a line
+# rather than a smear, which is what icon sets have always done.
+SMALL_SIZES = (48, 32, 24, 16)
+LARGE_SIZES = (256, 128, 96, 64)
+SMALL_BOOST = dict(w0=0.070, w1=0.045)
+
+
+def icon_ramp(p=None, ico="wrlines.ico", preview="icon_preview.png"):
     size, ss = 256, 4
-    compose_icon(ramp_line_mvg(size, ss), "wrlines.ico", "icon_preview.png",
-                 under=prism_mvg(size, ss), size=size, ss=ss)
+    p = dict(p or RAMP)
+    heavy = dict(p)
+    heavy.update(SMALL_BOOST)
+
+    thin_master = compose_icon(ramp_line_mvg(size, ss, p), None, None,
+                               under=prism_mvg(size, ss, p), size=size, ss=ss,
+                               master_name="m_thin.png")
+    heavy_master = compose_icon(ramp_line_mvg(size, ss, heavy), None, None,
+                                under=prism_mvg(size, ss, heavy), size=size, ss=ss,
+                                master_name="m_heavy.png")
+
+    layers = []
+    for n in LARGE_SIZES:
+        t = os.path.join(TMP, "ico_%d.png" % n)
+        run("magick", thin_master, "-filter", "Lanczos", "-resize", "%dx%d" % (n, n), t)
+        layers.append(t)
+    for n in SMALL_SIZES:
+        t = os.path.join(TMP, "ico_%d.png" % n)
+        run("magick", heavy_master, "-filter", "Lanczos", "-resize", "%dx%d" % (n, n), t)
+        layers.append(t)
+    run("magick", *layers, os.path.join(HERE, ico))
+
+    # Proof at the sizes that actually matter, blown back up, because "does this
+    # survive 16 px" is not a question to answer by looking at a 256 px render.
+    tiles = []
+    for n in (64, 48, 32, 16):
+        src = thin_master if n in LARGE_SIZES else heavy_master
+        t = os.path.join(TMP, "p%d.png" % n)
+        run("magick", src, "-filter", "Lanczos", "-resize", "%dx%d" % (n, n), t)
+        big = os.path.join(TMP, "b%d.png" % n)
+        run("magick", t, "-filter", "point", "-resize", "192x192", big)
+        tiles.append(big)
+    run("magick", "montage", *tiles, "-tile", "4x1", "-geometry", "+8+8",
+        "-background", "#1C1C1C", os.path.join(HERE, preview))
+    print("%s  +  %s" % (ico, preview))
+
+
+# Candidate parameter sets. Seven turns of adjusting one number at a time is
+# how the earlier versions were arrived at, and it is a slow way to find out
+# that a whole direction is wrong. Rendering the alternatives together and
+# looking at them at 32 px settles in one pass what serial guessing does not.
+VARIANTS = {
+    "A-base":  dict(),
+    "B-shal":  dict(tail=(0.330, -0.062)),          # an even shallower exit
+    "C-deep":  dict(path=((0.10, 0.16), (0.34, 0.68), (0.64, 0.94),
+                          (0.88, 0.84), (1.00, 0.64))),
+    "D-high":  dict(path=((0.10, 0.14), (0.36, 0.55), (0.66, 0.78),
+                          (0.88, 0.66), (1.00, 0.46))),
+    "E-conv":  dict(conv=0.36, tail=(0.300, -0.080)),   # more foreshortening
+    "F-thin":  dict(w0=0.038, w1=0.016, tail=(0.310, -0.075)),
+}
+
+
+def variants():
+    tiles = []
+    for name, over in VARIANTS.items():
+        p = dict(RAMP)
+        p.update(over)
+        icon_ramp(p, "_build/v_%s.ico" % name, "_build/vp_%s.png" % name)
+        master = os.path.join(TMP, master_name)
+        big = os.path.join(TMP, "v256_%s.png" % name)
+        run("magick", master, big)
+        small = os.path.join(TMP, "v32_%s.png" % name)
+        run("magick", master, "-filter", "Lanczos", "-resize", "32x32",
+            "-filter", "point", "-resize", "256x256", small)
+        col = os.path.join(TMP, "vcol_%s.png" % name)
+        run("magick", big, small, "-append",
+            "-background", "#101010", "-fill", "#E6E6E6", "-font", "Consolas",
+            "-pointsize", "26", "label:%s" % name, "-gravity", "center",
+            "-append", col)
+        tiles.append(col)
+    out = os.path.join(TMP, "variants.png")
+    run("magick", "montage", *tiles, "-tile", "%dx1" % len(tiles),
+        "-geometry", "+10+10", "-background", "#101010", out)
+    print(out)
 
 
 def icon_swoop():
@@ -625,3 +776,5 @@ if __name__ == "__main__":
         icon_ramp()
     if what == "swoop":
         icon_swoop()
+    if what == "variants":
+        variants()
