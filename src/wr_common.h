@@ -19,7 +19,7 @@
 #include <windows.h>
 #include <stdint.h>
 
-#define WRLINES_VERSION "0.4.4"
+#include "wr_version.h"
 
 // How far from the origin a real world coordinate can be.
 //

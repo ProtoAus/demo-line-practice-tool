@@ -10,15 +10,13 @@
 // is why it works even though build.bat runs from the repository root.
 
 #include <windows.h>
-
-#define WR_VER_STR "0.4.4"
-#define WR_VER_NUM 0, 4, 4, 0
+#include "wr_version.h"
 
 1 ICON "..\\assets\\wrlines.ico"
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION     WR_VER_NUM
-PRODUCTVERSION  WR_VER_NUM
+FILEVERSION     WRLINES_VERSION_NUM
+PRODUCTVERSION  WRLINES_VERSION_NUM
 FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
 FILEFLAGS       0
 FILEOS          VOS_NT_WINDOWS32
@@ -31,12 +29,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "Alexis Lazootin"
             VALUE "FileDescription",  "Demo Line Practice Tool -- loader"
-            VALUE "FileVersion",      WR_VER_STR
+            VALUE "FileVersion",      WRLINES_VERSION
             VALUE "InternalName",     "wrinject"
             VALUE "LegalCopyright",   "MIT licensed. See LICENSE."
             VALUE "OriginalFilename", "wrinject.exe"
             VALUE "ProductName",      "Demo Line Practice Tool"
-            VALUE "ProductVersion",   WR_VER_STR
+            VALUE "ProductVersion",   WRLINES_VERSION
             VALUE "Comments",
                   "Loads wrlines.dll into Momentum Mod. "
                   "https://github.com/ProtoAus/demo-line-practice-tool"
