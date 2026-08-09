@@ -43,14 +43,12 @@ acts on it too.
 
 ## What you get
 
-![The same lines coloured by absolute energy, with a plate naming the line under the crosshair](screenshots/energy.jpg)
+![Six views: aiming at a line on surf_hades2, watching a replay on surf_colin_blaster_69000, the Graphs tab, the Runs list on surf_utopia, the Board tab downloading from surf_tropic's leaderboard, and the Maps tab](screenshots/tour.jpg)
 
 **Colour the lines by whatever you are chasing** — strafing efficiency, raw speed, energy, or where
 each run placed. Numbers at every top and bottom say what a line carried *through* a ramp and what
 it bought with it. Aim at a line (`Home`) and it tells you whose it is and how you compare at that
 exact point.
-
-![The Graphs tab, showing twelve runs' energy across the whole map, with the start zone drawn in the world](screenshots/graphs.jpg)
 
 **Energy across a whole run, plotted.** A line that sags gently was leaking everywhere; a line with
 one cliff in it lost the lot at one ramp — and only one of those is worth practising the same way.

@@ -1,0 +1,58 @@
+How tour.jpg is built
+=====================
+
+Six snipping-tool captures of the game window, 3 across and 2 down, each with a
+caption strip under it. Kept here so the sheet can be rebuilt when the panel
+changes rather than reassembled by hand.
+
+The captures are of the whole window, so every one of them carries 38 px of
+title bar on top and 1 px of frame on the other three sides. That comes off
+with a single crop, and it is the same crop for all six because the window was
+not resized between them:
+
+    -crop 1280x960+1+38
+
+If you recapture at a different window size, check the frame before assuming
+those numbers still hold -- one pixel out and every tile has a teal hairline
+down its edge.
+
+Needs ImageMagick 7 (the "magick" command). Run it from this folder in a POSIX
+shell; on Windows that is Git Bash.
+
+    BG="#0D1117"      # GitHub's dark canvas, so the sheet reads as one object
+    EDGE="#30363D"    # a hairline, so a bright tile still has an edge
+    TEXT="#C9D1D9"
+
+    cell () {         # cell <capture> <caption> <output>
+      magick "$1" -crop 1280x960+1+38 +repage -resize 780x585 \
+          -bordercolor "$EDGE" -border 1 tile.png
+      magick -size 782x40 xc:"$BG" -font Consolas -pointsize 19 -fill "$TEXT" \
+          -gravity west -annotate +15+0 "$2" cap.png
+      magick tile.png cap.png -append "$3"
+    }
+
+    cell 8.PNG  "Aim at a line and it says whose it is  --  surf_hades2 bonus 4"   a.png
+    cell 13.PNG "Watching a replay, every line drawn  --  surf_colin_blaster_69000" b.png
+    cell 9.PNG  "Graphs: energy across a whole run, every line at once"            c.png
+    cell 10.PNG "Runs: tick what gets drawn  --  273 cached on surf_utopia"        d.png
+    cell 11.PNG "Board: the map's real leaderboard, fetch what you want"           e.png
+    cell 12.PNG "Maps: 2050 of them, and which ones you already hold"              f.png
+
+    magick montage a.png b.png c.png d.png e.png f.png \
+        -tile 3x2 -geometry +8+8 -background "$BG" grid.png
+
+    magick grid.png -bordercolor "$BG" -border 12 \
+        -strip -quality 88 -sampling-factor 4:4:4 -interlace Plane tour.jpg
+
+    rm -f tile.png cap.png a.png b.png c.png d.png e.png f.png grid.png
+
+Two things there are deliberate. 4:4:4 sampling keeps the thin coloured lines
+from bleeding into each other -- JPEG's default halves the chroma resolution,
+which is exactly the wrong thing to do to a picture that is mostly one-pixel
+lines of saturated colour. And the top row is what you look at in the world
+while the bottom row is the lists that feed it, so the sheet reads left to
+right and top to bottom as an order of operations.
+
+The result is about 2400x1300 and 800 KB. GitHub scales it down to the width of
+the README column and the full size is one click away, which is why the small
+text in the tiles is worth keeping legible.

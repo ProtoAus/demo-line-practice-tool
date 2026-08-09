@@ -1,9 +1,10 @@
-# Only the three shots the README uses are tracked, as JPEGs resized to 1600px --
-# the originals are 1920px PNGs at about 3 MB each, and git keeps every version of
-# a binary for ever. Drop new captures in here freely; they stay local until you
-# add one on purpose.
+# Only the shots the README uses are tracked, as JPEGs -- the originals are PNGs at
+# 1-3 MB each and git keeps every version of a binary for ever. Drop new captures in
+# here freely; they stay local until you add one on purpose.
+#
+# tour.jpg is built from 8-13.PNG by the recipe in tour.txt.
 *
 !.gitignore
+!tour.txt
 !lines.jpg
-!energy.jpg
-!graphs.jpg
+!tour.jpg
