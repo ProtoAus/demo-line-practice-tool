@@ -31,7 +31,17 @@
 # repository at all.
 wrlines_data/
 
+# A demo, anywhere, for the same reason: it is a recording of somebody's run
+# with their name and SteamID64 in the header. The harnesses write two of these
+# under tests\ and delete them again, and a crashed run must not leave one
+# behind where `git add .` would find it.
+*.mtv
+
 # Third-party trees, cloned by hand -- see README, "Build".
+#
+# third_party\ is deliberately NOT here: those are committed, because they are a
+# few frozen files that decide what a .wrpath contains rather than fifty that
+# draw a panel. third_party\VERSION.txt argues it properly.
 imgui/
 minhook/
 

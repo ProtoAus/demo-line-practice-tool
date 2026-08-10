@@ -147,12 +147,18 @@ void WrIdleTick(void)
     // tag asked for one, which only happens while drawing.
     WrSteamTick();
 
-    // The extractor writes .wrpath files from another process, so once it has
-    // finished the store on this side is out of date.
+    // The extractor writes .wrpath files, so once it has finished the store on
+    // this side is out of date.
+    //
+    // Only for an extraction, and only for a fetch that brought new demos in.
+    // The slot is shared by four jobs and this reloads every .wrpath for the map
+    // -- 273 of them on surf_utopia -- which is a visible hitch to pay for
+    // having looked at a leaderboard.
     if (WrExtractTakeFinished())
     {
+        WrJobKind kind = WrExtractLastKind();
         const char *m = WrPathLoadedMap();
-        if (m && *m)
+        if ((kind == WR_JOB_EXTRACT || kind == WR_JOB_FETCH) && m && *m)
         {
             char keep[72];
             strcpy_s(keep, sizeof(keep), m);

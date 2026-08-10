@@ -1,0 +1,56 @@
+// Resources for wrlines.dll: a version block, and nothing else.
+//
+// wrinject.rc says why the executable has one. The DLL had none at all, which
+// is worse in one specific way: the README tells people to inspect this file
+// before they trust it, and until now the Properties -> Details tab it told
+// them to look at was blank. A file that will not say who wrote it is a poor
+// answer to "is this a virus".
+//
+// No icon, unlike wrinject.rc. assets\wrlines.ico is 154 KB against a 1.1 MB
+// DLL -- a 13% size increase to give Explorer a thumbnail for a file nobody
+// ever double-clicks. The loader is the one people look at.
+//
+// No manifest either. A DLL manifest is a side-by-side / isolated-COM
+// mechanism and putting one here would only give the loader a new way to fail.
+//
+// A .res cannot add exports. The export directory is populated by
+// __declspec(dllexport), a .def file or /EXPORT: and by nothing else, so
+// build.bat's "exports should be EMPTY" check -- the thing that keeps our
+// ImGui from ever binding to the copy inside the game's devui.dll -- is
+// unaffected by this file. build.bat now also checks that the resource IS
+// present, so a silently dropped .res is caught the same way round.
+
+#include <windows.h>
+#include "wr_version.h"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     WRLINES_VERSION_NUM
+PRODUCTVERSION  WRLINES_VERSION_NUM
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_DLL
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "Alexis Lazootin"
+            VALUE "FileDescription",  "Demo Line Practice Tool -- overlay"
+            VALUE "FileVersion",      WRLINES_VERSION
+            VALUE "InternalName",     "wrlines"
+            VALUE "LegalCopyright",   "MIT licensed. See LICENSE."
+            VALUE "OriginalFilename", "wrlines.dll"
+            VALUE "ProductName",      "Demo Line Practice Tool"
+            VALUE "ProductVersion",   WRLINES_VERSION
+            VALUE "Comments",
+                  "Draws other players' run paths as lines in Momentum Mod. "
+                  "https://github.com/ProtoAus/demo-line-practice-tool"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

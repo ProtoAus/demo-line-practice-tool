@@ -1,6 +1,7 @@
 // wr_maps.cpp  --  see wr_maps.h.
 
 #include "wr_maps.h"
+#include "wr_msml.h"
 #include "wr_log.h"
 
 #include <stdio.h>
@@ -73,6 +74,117 @@ static void CountForMap(WrMapInfo *m)
     _snprintf_s(rel, sizeof(rel), _TRUNCATE, "paths\\%s", m->name);
     m->extracted = CountFiles(WrDataPath(rel), ".wrpath");
 }
+
+// ---------------------------------------------------------------------------
+// Writing the index
+// ---------------------------------------------------------------------------
+
+static int __cdecl ByName(const void *a, const void *b)
+{
+    // strcmp, not _stricmp. The reference sorts Python strings, which compares
+    // by code point, and UTF-8 byte order is code point order -- so this is the
+    // same ordering for any name, not just the ASCII ones we actually see.
+    return strcmp(((const WrMsmlMap *)a)->name, ((const WrMsmlMap *)b)->name);
+}
+
+int WrMapsWriteIndex(const char *gameDir, WrMapsEmitFn emit)
+{
+    char msg[256];
+
+    WrMsmlMap *cat = (WrMsmlMap *)malloc(sizeof(WrMsmlMap) * MAX_MAPS);
+    if (!cat)
+        return -1;
+
+    int skipped = 0;
+    int n = WrMsmlRead(gameDir, cat, MAX_MAPS, &skipped);
+    if (n <= 0)
+    {
+        free(cat);
+        if (emit)
+        {
+            char dir[MAX_PATH];
+            WrMsmlCacheDir(gameDir, dir, sizeof(dir));
+            _snprintf_s(msg, sizeof(msg), _TRUNCATE,
+                        "[!] no map cache found under %s", dir);
+            emit(msg);
+            emit("    Momentum writes it when it fetches the map list; open the");
+            emit("    map selector in game once and it will appear.");
+        }
+        return -1;
+    }
+
+    qsort(cat, (size_t)n, sizeof(WrMsmlMap), ByName);
+
+    const char *path = WrDataPath("maps.txt");
+    char tmp[MAX_PATH];
+    _snprintf_s(tmp, sizeof(tmp), _TRUNCATE, "%s.tmp", path);
+
+    // Text mode, so \n becomes \r\n. The reference writes with Python's default
+    // text mode and the reader above opens "r", so a binary write here would
+    // leave every last field carrying a stray \r -- and the parity check would
+    // fail on 2050 lines at once, which is at least a loud way to find out.
+    //
+    // Atomic, which the reference is NOT for this one file: it writes maps.txt
+    // in place, so an interrupted rebuild leaves a half index that reads as a
+    // short one. A deliberate divergence, and it cannot affect parity because
+    // the bytes that land are identical either way.
+    FILE *f = NULL;
+    if (fopen_s(&f, tmp, "w") != 0 || !f)
+    {
+        free(cat);
+        WrLogf("[!] maps: could not write %s", tmp);
+        if (emit)
+            emit("could not write the index");
+        return -1;
+    }
+
+    fprintf(f, "# WrLines map index, from the game's own _cache. No network.\n");
+    fprintf(f, "# id\tname\ttier\tapproved\tmodes\n");
+    for (int i = 0; i < n; i++)
+    {
+        const WrMsmlMap *m = &cat[i];
+
+        // The modes, ascending, comma separated. A set in the reference; a
+        // bitmask here, and walking a bitmask low to high IS sorted order.
+        char modes[96];
+        int used = 0;
+        modes[0] = '\0';
+        for (int b = 0; b < 32; b++)
+        {
+            if (!(m->modes & (1u << b)))
+                continue;
+            used += _snprintf_s(modes + used, sizeof(modes) - used, _TRUNCATE,
+                                "%s%d", used ? "," : "", b);
+            if (used >= (int)sizeof(modes) - 4)
+                break;
+        }
+        fprintf(f, "%d\t%s\t%d\t%d\t%s\n", m->id, m->name, m->tier,
+                m->approved ? 1 : 0, modes);
+    }
+    bool wrote = (fclose(f) == 0);
+    free(cat);
+
+    if (!wrote || !MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING))
+    {
+        WrLogf("[!] maps: could not replace %s", path);
+        DeleteFileA(tmp);
+        if (emit)
+            emit("could not replace the index");
+        return -1;
+    }
+
+    if (emit)
+    {
+        _snprintf_s(msg, sizeof(msg), _TRUNCATE, "indexed %d maps -> %s", n, path);
+        emit(msg);
+    }
+    WrLogf("maps: indexed %d maps (%d cache files unreadable)", n, skipped);
+    return n;
+}
+
+// ---------------------------------------------------------------------------
+// Reading it back
+// ---------------------------------------------------------------------------
 
 static DWORD WINAPI ReadThread(LPVOID)
 {

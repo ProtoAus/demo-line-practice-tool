@@ -93,6 +93,29 @@ DEFAULT_GAME = _default_game()
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_OUT = os.path.join(SCRIPT_DIR, "wrlines_data", "paths")
 
+
+# The wall clock, unless it has been pinned.
+#
+# Every stamp this program writes into a file goes through here: the .wrpath
+# header's 0xF4, and the board cache's "fetched" line. Both are metadata that
+# nothing reads back for a decision, and both are the ONLY reason two runs of
+# this program over the same demos do not produce identical bytes.
+#
+# Pinning it makes the output reproducible, which is worth having on its own --
+# you can re-extract a map and diff it against what you had. It is also what
+# makes the C++ port checkable at all: with WRLINES_FAKE_NOW set on both sides,
+# "did the port produce the same file" is fc /b and nothing else. Without it
+# every comparison needs a tool that knows to skip four bytes and recompute a
+# CRC, which is one more thing that can be wrong.
+def _now():
+    v = os.environ.get("WRLINES_FAKE_NOW")
+    if v:
+        try:
+            return int(v)
+        except ValueError:
+            pass
+    return int(time.time())
+
 # Bumped whenever anything that decides whether a demo can be extracted changes.
 #
 # Failures are recorded per map (see FAILURES_FILE) so that re-running a map
@@ -472,6 +495,11 @@ def check_deadline(where):
                        "limit, or a larger value" % (_deadline[1], where))
 
 
+# Non-empty while a --dump-* run is in flight. extract_path checks it before
+# hanging on to intermediates that nothing else wants. See cmd_dump.
+_DUMP = {}
+
+
 def longest_smooth_chain(cands, keys, banned, gap_max):
     """Longest physically-smooth chain of candidates, by dynamic programming.
 
@@ -604,6 +632,12 @@ def origin_stream_score(f32, cands, chain, dt, frame_bits):
 
     best, bestoff = 0.0, -1
     for off in range(0, int(frame_bits * 1.2)):
+        # The only unbounded loop in here without a deadline check. Nothing has
+        # been seen to sit in it for long, but "offsets x steps x rounds" has no
+        # ceiling that comes from the data, and the C++ port runs this inside the
+        # game where a wedged worker cannot be killed from outside. Checking per
+        # offset costs one clock read per few hundred float reads.
+        check_deadline("the derivative sweep")
         hit = 0
         for b, vz in steps:
             w = f32(b + off)
@@ -731,6 +765,8 @@ def extract_path(body, h):
     cands = scan_candidates(body, start_byte=0x300)
     keys = sorted(cands)
     info["candidates"] = len(cands)
+    if _DUMP:
+        info["_cands"] = cands
     if len(keys) < MIN_CHAIN:
         raise MtvError("only %d coordinate-triple candidates; this body does not "
                        "look like a player delta stream" % len(keys))
@@ -826,6 +862,11 @@ def extract_path(body, h):
     pts = [p for seg in seg_pts for p in seg]
     info["segments"] = len(segments)
     info["first_segment"] = len(chosen)
+    # Only when asked for. A 30000-point chain is a quarter of a megabyte of bit
+    # positions that nothing in the ordinary path would ever read.
+    if _DUMP:
+        info["_chain"] = list(chosen)
+        info["_segments"] = [list(s) for s in segments]
 
     # Per segment, so a teleport step never counts as movement.
     peak = max(_peak_horizontal_speed(s, dt) for s in seg_pts)
@@ -1109,7 +1150,7 @@ def write_wrpath(out_path, h, points, markers, src_sha1, flags,
     struct.pack_into("<I", head, 0xE8, start_index if start_ok else 0)
     struct.pack_into("<I", head, 0xEC, START_FLAG_FOUND if start_ok else 0)
     struct.pack_into("<f", head, 0xF0, 0.0)     # eyeHeightOffset: true origin
-    struct.pack_into("<I", head, 0xF4, int(time.time()))
+    struct.pack_into("<I", head, 0xF4, _now())
     struct.pack_into("<B", head, 0xF8, h.get("gamemode", 0))
     struct.pack_into("<B", head, 0xF9, h.get("track_type", 0))
     struct.pack_into("<B", head, 0xFA, h.get("track_num", 0))
@@ -1219,26 +1260,13 @@ def cmd_list(args):
     return 0
 
 
-def process_one(path, args):
-    name = os.path.basename(path)
-    sha1 = os.path.splitext(name)[0]
-    set_deadline(getattr(args, "timeout", 0))
-    try:
-        data = open(path, "rb").read()
-        h = parse_mtv_header(data, path)
-    except (MtvError, OSError) as e:
-        return ("error", name, str(e), None)
-
-    if h["codec"] == "zstd" and _zstd is None:
-        return ("skip", name, "zstd body (pip install zstandard)", h)
-
-    try:
-        body = decompress_body(data, h)
-        pts, info = extract_path(body, h)
-    except (MtvError, OSError, lzma.LZMAError) as e:
-        return ("error", name, str(e), h)
-
-    markers, mok = anchor_markers(pts, h, info.get("segments", 1))
+# The last few decisions about a run, and the flags they produce.
+#
+# Split out of process_one so --dump-info reports exactly what a real extraction
+# would record rather than an approximation of it. Two implementations of
+# "is this run flagged" would be one implementation and one thing that agrees
+# with itself.
+def finish_info(info, h, pts, markers, mok):
     flags = FLAG_HAS_VELOCITY | FLAG_FROM_EXTRACTOR
     if mok:
         flags |= FLAG_MARKERS_OK
@@ -1260,11 +1288,36 @@ def process_one(path, args):
     info["start_index"] = start_index
     info["start_ok"] = start_ok
     info["preroll"] = start_index * h["tick_interval"] if start_ok else -1.0
+    return flags
+
+
+def process_one(path, args):
+    name = os.path.basename(path)
+    sha1 = os.path.splitext(name)[0]
+    set_deadline(getattr(args, "timeout", 0))
+    try:
+        data = open(path, "rb").read()
+        h = parse_mtv_header(data, path)
+    except (MtvError, OSError) as e:
+        return ("error", name, str(e), None)
+
+    if h["codec"] == "zstd" and _zstd is None:
+        return ("skip", name, "zstd body (pip install zstandard)", h)
+
+    try:
+        body = decompress_body(data, h)
+        pts, info = extract_path(body, h)
+    except (MtvError, OSError, lzma.LZMAError) as e:
+        return ("error", name, str(e), h)
+
+    markers, mok = anchor_markers(pts, h, info.get("segments", 1))
+    flags = finish_info(info, h, pts, markers, mok)
 
     if not args.verify:
         out = os.path.join(args.out, h["map"], sha1 + ".wrpath")
         info["bytes"] = write_wrpath(out, h, pts, markers if mok else [], sha1,
-                                     flags, start_index, start_ok)
+                                     flags, info["start_index"],
+                                     info["start_ok"])
     return ("ok", name, "", (h, info))
 
 
@@ -1432,6 +1485,172 @@ def wrpath_revision(path):
         return struct.unpack_from("<I", head, 0xFC)[0]
     except OSError:
         return -1
+
+
+# ---------------------------------------------------------------------------
+# Dumps: each layer of the extraction, on its own, in a file you can diff
+# ---------------------------------------------------------------------------
+#
+# These exist for the C++ port and for nothing else, and they are worth the
+# hundred lines because of what the alternative looks like.
+#
+# The pipeline is: container -> LZMA -> a scan for float triples -> a dynamic
+# program over them -> a scoring pass -> reassembly -> a file. Six layers, and
+# the only externally visible output is the last one. Port all six and compare
+# the .wrpath, and a mismatch tells you a byte differs somewhere in half a
+# million floats. Every layer below has an EXACT oracle available, and none of
+# them is reachable without a flag that prints it.
+#
+#   --dump-body    the decompressed run body. Byte-identical or not; no floats
+#                  are involved yet, so this isolates the whole container and
+#                  LZMA question with no ambiguity at all. Run it first.
+#   --dump-cands   the candidate scan. Pins the bit<->(phase,q,word) mapping and
+#                  the end bound, which is the subtlest thing in the file.
+#   --dump-chain   the chosen chain and the harvested segments, as bit
+#                  positions. Pins the DP and the origin oracle.
+#   --dump-info    everything the run decided, as a TSV row per demo. Diffable
+#                  across implementations, and it is also how the numbers that
+#                  size the C++ side's memory budget get measured across a real
+#                  library rather than guessed.
+#
+# Floats are %.17g in the chain and info dumps, not %.9g. A 32-bit float
+# round-trips exactly through %.9g, but these are DOUBLES -- the DP and the
+# scoring run in double throughout -- and a divergence in a compensated
+# summation shows up in the tenth digit, which is precisely what %.9g hides.
+
+_DUMP_INFO_KEYS = [
+    "candidates", "ticks", "rounds", "confident", "identified_by",
+    "deriv_rate", "deriv_offset", "segments", "first_segment",
+    "ref_max_horiz", "chain_max_horiz", "match_error",
+    "samples", "coverage", "path_length",
+    "markers", "markers_ok", "start_index", "start_ok", "preroll",
+    "flagged", "why_flagged",
+]
+
+
+def _dump_val(v):
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if isinstance(v, float):
+        return "%.17g" % v
+    if v is None:
+        return "-"
+    return str(v)
+
+
+def _dump_targets(args):
+    """The same selection cmd_extract makes, without the skip rules."""
+    if args.file:
+        return [args.file]
+    out = []
+    for _tree, path in iter_demos(args.game):
+        if args.map and (peek_map(path) or "").lower() != args.map.lower():
+            continue
+        out.append(path)
+    out.sort()
+    if args.limit:
+        out = out[:args.limit]
+    return out
+
+
+def cmd_dump(args):
+    which = ("body" if args.dump_body else "cands" if args.dump_cands
+             else "chain" if args.dump_chain else "info")
+    dest = (args.dump_body or args.dump_cands or args.dump_chain
+            or args.dump_info)
+    _DUMP[which] = True
+
+    targets = _dump_targets(args)
+    if not targets:
+        print("[!] nothing selected -- pass --file PATH, or --map NAME, or --all")
+        return 1
+    if which != "info" and len(targets) != 1:
+        print("[!] --dump-%s takes exactly one demo; %d selected. Use --file."
+              % (which, len(targets)))
+        return 1
+
+    d = os.path.dirname(os.path.abspath(dest))
+    if d:
+        os.makedirs(d, exist_ok=True)
+
+    if which == "info":
+        rows = 0
+        with open(dest, "w", encoding="utf-8", newline="\n") as f:
+            f.write("demo\tfile_bytes\tbody_bytes\tstatus\t%s\n"
+                    % "\t".join(_DUMP_INFO_KEYS))
+            for path in targets:
+                name = os.path.basename(path)
+                try:
+                    data = open(path, "rb").read()
+                    h = parse_mtv_header(data, path)
+                    if h["codec"] == "zstd" and _zstd is None:
+                        raise MtvError("skip: zstd body")
+                    body = decompress_body(data, h)
+                    _pts, info = extract_path(body, h)
+                    mk, mok = anchor_markers(_pts, h, info.get("segments", 1))
+                    finish_info(info, h, _pts, mk, mok)
+                    f.write("%s\t%d\t%d\tok\t%s\n"
+                            % (name, len(data), len(body),
+                               "\t".join(_dump_val(info.get(k))
+                                         for k in _DUMP_INFO_KEYS)))
+                except (MtvError, OSError, lzma.LZMAError) as e:
+                    f.write("%s\t%d\t0\t%s\t%s\n"
+                            % (name, os.path.getsize(path) if
+                               os.path.exists(path) else -1,
+                               str(e).replace("\t", " ").replace("\n", " "),
+                               "\t".join("-" for _ in _DUMP_INFO_KEYS)))
+                rows += 1
+                if rows % 100 == 0:
+                    print("[%d/%d]" % (rows, len(targets)))
+                    sys.stdout.flush()
+        print("%d demos -> %s" % (rows, dest))
+        return 0
+
+    path = targets[0]
+    data = open(path, "rb").read()
+    h = parse_mtv_header(data, path)
+    if h["codec"] == "zstd" and _zstd is None:
+        print("[!] zstd body and no zstandard installed")
+        return 1
+    body = decompress_body(data, h)
+
+    if which == "body":
+        with open(dest, "wb") as f:
+            f.write(body)
+        print("%d bytes -> %s" % (len(body), dest))
+        return 0
+
+    if which == "cands":
+        cands = scan_candidates(body, start_byte=0x300)
+        with open(dest, "w", encoding="utf-8", newline="\n") as f:
+            f.write("# bit\tx\ty\tz\n")
+            f.write("# count\t%d\n" % len(cands))
+            for b in sorted(cands):
+                x, y, z = cands[b]
+                f.write("%d\t%.9g\t%.9g\t%.9g\n" % (b, x, y, z))
+        print("%d candidates -> %s" % (len(cands), dest))
+        return 0
+
+    # chain
+    _pts, info = extract_path(body, h)
+    chain = info.get("_chain") or []
+    segs = info.get("_segments") or []
+    with open(dest, "w", encoding="utf-8", newline="\n") as f:
+        f.write("# identified_by\t%s\n" % _dump_val(info.get("identified_by")))
+        f.write("# rounds\t%s\n" % _dump_val(info.get("rounds")))
+        f.write("# deriv_rate\t%s\n" % _dump_val(info.get("deriv_rate")))
+        f.write("# deriv_offset\t%s\n" % _dump_val(info.get("deriv_offset")))
+        f.write("# chain\t%d\n" % len(chain))
+        for b in chain:
+            f.write("c\t%d\n" % b)
+        f.write("# segments\t%d\n" % len(segs))
+        for i, s in enumerate(segs):
+            f.write("s\t%d\t%d\t%d\t%d\n"
+                    % (i, len(s), s[0] if s else -1, s[-1] if s else -1))
+            for b in s:
+                f.write("b\t%d\t%d\n" % (i, b))
+    print("chain %d, %d segments -> %s" % (len(chain), len(segs), dest))
+    return 0
 
 
 def cmd_extract(args):
@@ -1735,11 +1954,80 @@ GAMEMODES = {
 }
 
 
+# Where a recorded conversation is kept, and which way it flows. Set from
+# --api-record / --api-replay; empty for every ordinary run.
+#
+# A leaderboard is not a fixture. It changes under you: ranks move as runs land,
+# and a board fetched twice an hour apart produces two different .tsv files that
+# are both correct. That makes "did the port write the same file" unanswerable
+# against a live server, and it makes the board and fetch paths untestable in CI
+# at all, since a build machine should not be calling somebody's API.
+#
+# So: record once, replay for ever. The index is url -> file, in the order the
+# requests happened, because a URL here is short ASCII and matching the exact
+# string is both sufficient and easy to eyeball. A replay that is asked for a URL
+# it does not hold is an error rather than a fetch -- silently going to the
+# network during a comparison would make the comparison a lie.
+_API_TAPE = {"dir": None, "mode": None, "index": [], "n": 0}
+
+
+def _pace():
+    """The pause between requests. Not owed to a file on disk."""
+    if _API_TAPE["mode"] != "replay":
+        time.sleep(FETCH_DELAY)
+
+
+def _tape_index_path():
+    return os.path.join(_API_TAPE["dir"], "index.txt")
+
+
+def _tape_load():
+    _API_TAPE["index"] = []
+    try:
+        with open(_tape_index_path(), "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("#") or "\t" not in line:
+                    continue
+                url, name = line.rstrip("\n").split("\t", 1)
+                _API_TAPE["index"].append((url, name))
+    except OSError:
+        pass
+
+
+def api_tape_open(directory, mode):
+    _API_TAPE["dir"] = directory
+    _API_TAPE["mode"] = mode
+    if mode == "record":
+        os.makedirs(directory, exist_ok=True)
+        with open(_tape_index_path(), "w", encoding="utf-8", newline="\n") as f:
+            f.write("# WrLines: recorded API responses, in request order.\n")
+    else:
+        _tape_load()
+
+
 def _api_get(url):
+    mode = _API_TAPE["mode"]
+
+    if mode == "replay":
+        for u, name in _API_TAPE["index"]:
+            if u == url:
+                with open(os.path.join(_API_TAPE["dir"], name), "rb") as f:
+                    return f.read()
+        raise MtvError("not in the recording: %s" % url)
+
     import urllib.request
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=30) as r:
-        return r.read()
+        blob = r.read()
+
+    if mode == "record":
+        _API_TAPE["n"] += 1
+        name = "%04d.bin" % _API_TAPE["n"]
+        with open(os.path.join(_API_TAPE["dir"], name), "wb") as f:
+            f.write(blob)
+        with open(_tape_index_path(), "a", encoding="utf-8", newline="\n") as f:
+            f.write("%s\t%s\n" % (url, name))
+    return blob
 
 
 def _epoch(iso):
@@ -1876,7 +2164,7 @@ def _fetch_window(map_id, args, first, count):
         if total is not None and first - 1 + got >= total:
             break
         if got < count:
-            time.sleep(FETCH_DELAY)
+            _pace()
     return out, total, reqs
 
 
@@ -1907,7 +2195,7 @@ def _fetch_spread(map_id, args, n):
         rank = 1 + int(round((total - 1) * (float(i) / (n - 1))))
         if rank > total:
             rank = total
-        time.sleep(FETCH_DELAY)
+        _pace()
         page, _ = _leaderboard(map_id, args.gamemode, args.track_type,
                                args.track_num, 1, rank - 1)
         reqs += 1
@@ -1981,7 +2269,7 @@ def _fetch_friends(map_id, args, ids):
             if rec:
                 rows.append(rec)
         if i + FRIEND_BATCH < len(ids):
-            time.sleep(FETCH_DELAY)
+            _pace()
     return rows, reqs
 
 
@@ -2045,7 +2333,7 @@ def cmd_board(args):
                 first = 1
             print("the board holds %d runs; taking ranks %d-%d"
                   % (total, first, total))
-            time.sleep(FETCH_DELAY)
+            _pace()
             rows, t2, r2 = _fetch_window(map_id, args, first, count)
             reqs = 1 + r2
             total = t2 if isinstance(t2, int) else total
@@ -2084,7 +2372,7 @@ def cmd_board(args):
     meta["track"] = [args.track_type, args.track_num]
     if isinstance(total, int) and total > 0:
         meta["total"] = [total]
-    meta["fetched"] = [int(time.time())]
+    meta["fetched"] = [_now()]
 
     write_board(path, meta, held)
     print("%d request%s, %d rows returned, %d new; %d of %s now cached"
@@ -2197,7 +2485,7 @@ def _download(dest, rows, have, into_game=None):
             except OSError as e:
                 print("      (could not place it in the game folder: %s)" % e)
         got += 1
-        time.sleep(FETCH_DELAY)
+        _pace()
 
     print("fetched %d demo%s into %s" % (got, "" if got == 1 else "s", dest))
     print("run the extractor on this map to turn them into lines")
@@ -2282,7 +2570,7 @@ def cmd_fetch(args):
             first = max(1, total - count + 1)
             print("the leaderboard holds %d runs; taking ranks %d-%d"
                   % (total, first, total))
-            time.sleep(FETCH_DELAY)
+            _pace()
         else:
             first = args.from_rank if args.from_rank > 0 else 1
             print("map %s (id %d), track %d/%d, ranks %d-%d"
@@ -2431,11 +2719,42 @@ def main(argv):
                     help="with --fetch, which stage or bonus")
     ap.add_argument("--dry-run", action="store_true",
                     help="with --fetch, list what would be downloaded and stop")
+
+    # Everything below exists so the C++ port can be checked against this file.
+    # None of it is reached by the DLL; see cmd_dump and _api_get.
+    ap.add_argument("--dump-body", metavar="PATH",
+                    help="write one demo's decompressed body and stop. The "
+                         "container and LZMA, isolated, with a byte oracle")
+    ap.add_argument("--dump-cands", metavar="PATH",
+                    help="write one demo's coordinate-triple candidates as "
+                         "bit/x/y/z. The scan, isolated")
+    ap.add_argument("--dump-chain", metavar="PATH",
+                    help="write one demo's chosen chain and harvested segments "
+                         "as bit positions. The DP and the origin oracle")
+    ap.add_argument("--dump-info", metavar="PATH",
+                    help="write what each run decided, one TSV row per demo. "
+                         "Takes --file, --map or --all")
+    ap.add_argument("--api-record", metavar="DIR",
+                    help="save every leaderboard response under DIR as this runs")
+    ap.add_argument("--api-replay", metavar="DIR",
+                    help="answer every leaderboard request from DIR and never "
+                         "touch the network. A URL not in the recording is an "
+                         "error, not a fetch")
     args = ap.parse_args(argv)
+
+    if args.api_record and args.api_replay:
+        print("[!] pick one of --api-record and --api-replay")
+        return 1
+    if args.api_record:
+        api_tape_open(args.api_record, "record")
+    elif args.api_replay:
+        api_tape_open(args.api_replay, "replay")
 
     if not os.path.isdir(args.game):
         print("[!] game directory not found: %s" % args.game)
         return 1
+    if args.dump_body or args.dump_cands or args.dump_chain or args.dump_info:
+        return cmd_dump(args)
     if args.index_maps:
         return cmd_index_maps(args)
     if args.board:

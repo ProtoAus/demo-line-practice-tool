@@ -132,20 +132,314 @@ static bool HashHas(const HashSet *s, const char *hash)
     return bsearch(key, s->h, s->n, 48, CompareHash) != NULL;
 }
 
-// --- parsing ----------------------------------------------------------------
+// --- the cache file: one reader, one writer ---------------------------------
 
-static const char *NextField(const char *p, char *out, size_t cap)
+void WrBoardCachePath(char *out, int cap, const char *map, int gamemode,
+                      int trackType, int trackNum)
 {
-    size_t n = 0;
-    while (*p && *p != '\t' && *p != '\n' && *p != '\r')
-    {
-        if (n + 1 < cap)
-            out[n++] = *p;
-        p++;
-    }
-    out[n] = '\0';
-    return (*p == '\t') ? p + 1 : p;
+    char rel[192];
+    _snprintf_s(rel, sizeof(rel), _TRUNCATE, "boards\\%s_g%d_t%d%d.tsv",
+                map ? map : "", gamemode, trackType, trackNum);
+    strncpy_s(out, (size_t)cap, WrDataPath(rel), _TRUNCATE);
 }
+
+static bool IsAsciiSpace(char c)
+{
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f';
+}
+
+// Python's int(s): optional surrounding whitespace, an optional sign, and then
+// nothing but digits. Deliberately stricter than atoi, which reads "5abc" as 5
+// where the reference raises ValueError and drops the row -- and a row silently
+// kept on one side and dropped on the other is precisely the kind of difference
+// this file exists to not have.
+static bool ParseInt(const char *s, long long *out)
+{
+    while (IsAsciiSpace(*s)) s++;
+    const char *start = s;
+    if (*s == '+' || *s == '-') s++;
+    if (*s < '0' || *s > '9')
+        return false;
+    char *end = NULL;
+    long long v = _strtoi64(start, &end, 10);
+    if (!end) return false;
+    while (IsAsciiSpace(*end)) end++;
+    if (*end != '\0')
+        return false;
+    *out = v;
+    return true;
+}
+
+// Python's float(s), near enough. strtod also accepts C99 hex floats, which
+// float() does not; nothing writes one and a hand-typed "0x10" in a time column
+// is not a case worth thirty lines.
+static bool ParseReal(const char *s, double *out)
+{
+    while (IsAsciiSpace(*s)) s++;
+    if (!*s) return false;
+    char *end = NULL;
+    double v = strtod(s, &end);
+    if (!end || end == s) return false;
+    while (IsAsciiSpace(*end)) end++;
+    if (*end != '\0')
+        return false;
+    *out = v;
+    return true;
+}
+
+static void LowerAscii(char *s)
+{
+    for (; *s; s++)
+        if (*s >= 'A' && *s <= 'Z')
+            *s = (char)(*s - 'A' + 'a');
+}
+
+// The reference keys its dict on hash.lower(). A replay hash is hex, so ASCII
+// folding is the whole of str.lower() here -- and _stricmp is avoided anyway,
+// because it consults the C locale and a hash comparison should not depend on
+// what locale the game happened to start in.
+static bool SameHash(const char *a, const char *b)
+{
+    for (; *a && *b; a++, b++)
+    {
+        char x = (*a >= 'A' && *a <= 'Z') ? (char)(*a - 'A' + 'a') : *a;
+        char y = (*b >= 'A' && *b <= 'Z') ? (char)(*b - 'A' + 'a') : *b;
+        if (x != y)
+            return false;
+    }
+    return *a == *b;
+}
+
+int WrBoardCacheFindRow(const WrBoardCache *c, const char *hash)
+{
+    for (int i = 0; i < c->count; i++)
+        if (SameHash(c->rows[i].hash, hash))
+            return i;
+    return -1;
+}
+
+bool WrBoardCacheMerge(WrBoardCache *c, const WrBoardCacheRow *r)
+{
+    int at = WrBoardCacheFindRow(c, r->hash);
+    if (at >= 0)
+    {
+        // Replaced where it already sits. A dict assignment to an existing key
+        // does not move it, and the write order depends on that.
+        c->rows[at] = *r;
+        return false;
+    }
+
+    if (c->count >= c->cap)
+    {
+        int cap = c->cap ? c->cap * 2 : 256;
+        WrBoardCacheRow *grown =
+            (WrBoardCacheRow *)realloc(c->rows, sizeof(*grown) * (size_t)cap);
+        if (!grown)
+            return false;       // dropped, and the caller's count will show it
+        c->rows = grown;
+        c->cap = cap;
+    }
+    c->rows[c->count++] = *r;
+    return true;
+}
+
+void WrBoardCacheFree(WrBoardCache *c)
+{
+    free(c->rows);
+    memset(c, 0, sizeof(*c));
+}
+
+// Strip ASCII whitespace from both ends, in place.
+static char *Strip(char *s)
+{
+    while (IsAsciiSpace(*s)) s++;
+    size_t n = strlen(s);
+    while (n > 0 && IsAsciiSpace(s[n - 1])) n--;
+    s[n] = '\0';
+    return s;
+}
+
+bool WrBoardReadCache(const char *path, WrBoardCache *c, int maxRows)
+{
+    memset(c, 0, sizeof(*c));
+
+    FILE *f = NULL;
+    if (fopen_s(&f, path, "r") != 0 || !f)
+        return false;
+
+    // Long enough for the longest line the writer can produce -- a 191-byte
+    // alias and a 319-byte URL and the rest -- with room to spare. A line over
+    // this is split by fgets, and the tail would parse as a row with too few
+    // fields and be dropped, which is what the reference does with a line it
+    // cannot make seven fields out of.
+    char line[1024];
+    while (fgets(line, sizeof(line), f))
+    {
+        // The reference rstrips "\n" then "\r". Opened in text mode here, so
+        // the \r is already gone on a CRLF file and this catches a stray one.
+        size_t n = strlen(line);
+        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r'))
+            line[--n] = '\0';
+        if (n == 0)
+            continue;
+
+        if (line[0] == '#')
+        {
+            // "# key<TAB>value", where value keeps any further tabs -- that is
+            // parts[1:] joined back with tabs, which is what write_board does.
+            char *body = Strip(line + 1);
+            char *tab = strchr(body, '\t');
+            if (!tab)
+                continue;
+            *tab = '\0';
+            const char *key = body, *val = tab + 1;
+
+            if      (!strcmp(key, "map"))      strcpy_s(c->map, sizeof(c->map), val);
+            else if (!strcmp(key, "mapid"))    strcpy_s(c->mapId, sizeof(c->mapId), val);
+            else if (!strcmp(key, "gamemode")) strcpy_s(c->gamemode, sizeof(c->gamemode), val);
+            else if (!strcmp(key, "track"))    strcpy_s(c->track, sizeof(c->track), val);
+            else if (!strcmp(key, "total"))    strcpy_s(c->total, sizeof(c->total), val);
+            else if (!strcmp(key, "fetched"))  strcpy_s(c->fetched, sizeof(c->fetched), val);
+            // Anything else -- including the "# rank time steamid..." column
+            // line -- is read into the reference's meta dict and then never
+            // written back, because write_board only emits the six keys above.
+            // Dropping it here is the same outcome by a shorter route.
+            continue;
+        }
+
+        if (maxRows > 0 && c->count >= maxRows)
+        {
+            c->truncated = true;
+            break;
+        }
+
+        // Exactly seven fields. An eighth and beyond are dropped, as
+        // line.split("\t")[6] drops them.
+        char *field[7];
+        int nf = 0;
+        char *p = line;
+        for (;;)
+        {
+            field[nf++] = p;
+            if (nf == 7)
+                break;
+            char *tab = strchr(p, '\t');
+            if (!tab)
+                break;
+            *tab = '\0';
+            p = tab + 1;
+        }
+        if (nf < 7)
+            continue;
+        {
+            char *tab = strchr(field[6], '\t');
+            if (tab)
+                *tab = '\0';
+        }
+
+        long long rank = 0, epoch = 0;
+        double time = 0.0;
+        if (!ParseInt(field[0], &rank) || !ParseReal(field[1], &time) ||
+            !ParseInt(field[5], &epoch))
+            continue;           // the reference's except ValueError: continue
+
+        WrBoardCacheRow r;
+        memset(&r, 0, sizeof(r));
+        r.rank = (int)rank;
+        r.time = time;
+        strncpy_s(r.steamId, sizeof(r.steamId), field[2], _TRUNCATE);
+        strncpy_s(r.alias, sizeof(r.alias), field[3], _TRUNCATE);
+        strncpy_s(r.hash, sizeof(r.hash), field[4], _TRUNCATE);
+        r.epoch = epoch;
+        strncpy_s(r.url, sizeof(r.url), field[6], _TRUNCATE);
+        WrBoardCacheMerge(c, &r);
+    }
+    fclose(f);
+    return true;
+}
+
+// Stable by rank, breaking ties by the order the rows were first seen. See the
+// long comment in wr_board.h -- this three-line struct is the whole of it.
+struct SortKey { int rank; int at; };
+
+static int ByRankThenSeen(const void *a, const void *b)
+{
+    const SortKey *x = (const SortKey *)a, *y = (const SortKey *)b;
+    if (x->rank != y->rank)
+        return x->rank < y->rank ? -1 : 1;
+    return x->at < y->at ? -1 : (x->at > y->at ? 1 : 0);
+}
+
+bool WrBoardWriteCache(const char *path, const WrBoardCache *c)
+{
+    SortKey *order = NULL;
+    if (c->count > 0)
+    {
+        order = (SortKey *)malloc(sizeof(SortKey) * (size_t)c->count);
+        if (!order)
+        {
+            WrLogf("[!] board: out of memory sorting %d rows", c->count);
+            return false;
+        }
+        for (int i = 0; i < c->count; i++)
+        {
+            order[i].rank = c->rows[i].rank;
+            order[i].at = i;
+        }
+        qsort(order, (size_t)c->count, sizeof(SortKey), ByRankThenSeen);
+    }
+
+    char tmp[MAX_PATH];
+    _snprintf_s(tmp, sizeof(tmp), _TRUNCATE, "%s.tmp", path);
+
+    // Text mode, so every \n becomes \r\n. The reference writes with Python's
+    // default newline translation and the readers on both sides open in text
+    // mode, so this is not a preference -- a binary write here would put a
+    // carriage return on the end of every url field.
+    FILE *f = NULL;
+    if (fopen_s(&f, tmp, "w") != 0 || !f)
+    {
+        free(order);
+        WrLogf("[!] board: could not write %s", tmp);
+        return false;
+    }
+
+    fprintf(f, "# WrLines leaderboard cache -- the windows you asked for, not "
+               "the whole board.\n");
+    // Fixed key order, and only the keys that are set. This is the reference's
+    // ("map", "mapid", "gamemode", "track", "total", "fetched") tuple, which is
+    // why it is a written-out list and not a loop over whatever we happen to
+    // hold.
+    if (c->map[0])      fprintf(f, "# map\t%s\n", c->map);
+    if (c->mapId[0])    fprintf(f, "# mapid\t%s\n", c->mapId);
+    if (c->gamemode[0]) fprintf(f, "# gamemode\t%s\n", c->gamemode);
+    if (c->track[0])    fprintf(f, "# track\t%s\n", c->track);
+    if (c->total[0])    fprintf(f, "# total\t%s\n", c->total);
+    if (c->fetched[0])  fprintf(f, "# fetched\t%s\n", c->fetched);
+    fprintf(f, "# rank\ttime\tsteamid\talias\thash\tepoch\turl\n");
+
+    for (int i = 0; i < c->count; i++)
+    {
+        const WrBoardCacheRow *r = &c->rows[order ? order[i].at : i];
+        fprintf(f, "%d\t%.6f\t%s\t%s\t%s\t%lld\t%s\n",
+                r->rank, r->time, r->steamId, r->alias, r->hash,
+                r->epoch, r->url);
+    }
+
+    bool wrote = (fclose(f) == 0);
+    free(order);
+
+    // Atomic, which the reference is too -- write_board is tmp + os.replace.
+    if (!wrote || !MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING))
+    {
+        WrLogf("[!] board: could not replace %s", path);
+        DeleteFileA(tmp);
+        return false;
+    }
+    return true;
+}
+
+// --- what the table reads ---------------------------------------------------
 
 int WrBoardParseFile(const char *path, WrBoardRow *out, int maxRows,
                      int *total, long long *fetched, int *mapId)
@@ -154,75 +448,45 @@ int WrBoardParseFile(const char *path, WrBoardRow *out, int maxRows,
     if (fetched) *fetched = 0;
     if (mapId)   *mapId = 0;
 
-    FILE *f = NULL;
-    if (fopen_s(&f, path, "r") != 0 || !f)
+    WrBoardCache c;
+    if (!WrBoardReadCache(path, &c, maxRows))
         return -1;
 
+    if (total)   *total = atoi(c.total);
+    if (fetched) *fetched = _atoi64(c.fetched);
+    if (mapId)   *mapId = atoi(c.mapId);
+
     int n = 0;
-    char line[512];
-    while (fgets(line, sizeof(line), f))
+    for (int i = 0; i < c.count && n < maxRows; i++)
     {
-        if (line[0] == '\n' || line[0] == '\r')
+        const WrBoardCacheRow *s = &c.rows[i];
+
+        // A row without a rank or a hash is not a row. The writer produces
+        // neither as empty, so this only fires on a hand-edited file -- which
+        // is exactly when quietly keeping half a record is worst. It is a
+        // DISPLAY rule and not a format rule, which is why it is here and not
+        // in the reader: the fetcher must round-trip such a row unchanged
+        // rather than silently delete it from somebody's cache.
+        if (s->rank <= 0 || !s->hash[0])
             continue;
 
-        // "# key<TAB>value" carries what the cache knows about itself. The
-        // column-name header line has no second field it can be confused with,
-        // so both are handled by the same parse.
-        if (line[0] == '#')
-        {
-            char key[32], val[64];
-            const char *p = line + 1;
-            while (*p == ' ')
-                p++;
-            p = NextField(p, key, sizeof(key));
-            NextField(p, val, sizeof(val));
-            if (total && _stricmp(key, "total") == 0)
-                *total = atoi(val);
-            else if (fetched && _stricmp(key, "fetched") == 0)
-                *fetched = _atoi64(val);
-            else if (mapId && _stricmp(key, "mapid") == 0)
-                *mapId = atoi(val);
-            continue;
-        }
-
-        if (n >= maxRows)
-            break;
-
-        char buf[128];
-        const char *p = line;
         WrBoardRow r;
         memset(&r, 0, sizeof(r));
-
-        p = NextField(p, buf, sizeof(buf));  r.rank = atoi(buf);
-        p = NextField(p, buf, sizeof(buf));  r.time = (float)atof(buf);
-        p = NextField(p, buf, sizeof(buf));  r.steamId = _strtoui64(buf, NULL, 10);
-        p = NextField(p, r.alias, sizeof(r.alias));
-        p = NextField(p, r.hash, sizeof(r.hash));
-        p = NextField(p, buf, sizeof(buf));  r.dateEpoch = _atoi64(buf);
-        NextField(p, r.url, sizeof(r.url));
-
-        // A row without a rank or a hash is not a row. Python writes neither
-        // as empty, so this only fires on a truncated or hand-edited file --
-        // which is exactly when quietly keeping half a record is worst.
-        if (r.rank <= 0 || !r.hash[0])
-            continue;
-
+        r.rank = s->rank;
+        r.time = (float)s->time;
+        r.steamId = _strtoui64(s->steamId, NULL, 10);
+        strncpy_s(r.alias, sizeof(r.alias), s->alias, _TRUNCATE);
+        strncpy_s(r.hash, sizeof(r.hash), s->hash, _TRUNCATE);
+        r.dateEpoch = s->epoch;
+        strncpy_s(r.url, sizeof(r.url), s->url, _TRUNCATE);
         out[n++] = r;
     }
-    fclose(f);
+
+    WrBoardCacheFree(&c);
     return n;
 }
 
 // --- the reader thread ------------------------------------------------------
-
-static void BoardPath(char *out, size_t cap, const char *map, int mode,
-                      int type, int num)
-{
-    char rel[160];
-    _snprintf_s(rel, sizeof(rel), _TRUNCATE, "boards\\%s_g%d_t%d%d.tsv",
-                map, mode, type, num);
-    strncpy_s(out, cap, WrDataPath(rel), _TRUNCATE);
-}
 
 static DWORD WINAPI ReadThread(LPVOID)
 {
@@ -253,7 +517,7 @@ static DWORD WINAPI ReadThread(LPVOID)
     else
     {
         char path[MAX_PATH];
-        BoardPath(path, sizeof(path), map, mode, type, num);
+        WrBoardCachePath(path, sizeof(path), map, mode, type, num);
 
         WrBoardRow *rows = (WrBoardRow *)malloc(sizeof(WrBoardRow) * WR_BOARD_MAX);
         int n = rows ? WrBoardParseFile(path, rows, WR_BOARD_MAX, &back->total,

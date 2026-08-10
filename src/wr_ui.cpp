@@ -792,7 +792,11 @@ static void DrawRunsTab(void)
                        "_failed.txt next to that map's paths, so the same "
                        "minutes are not spent reaching the same answer every "
                        "time. Improving the extractor clears the record "
-                       "automatically.");
+                       "automatically.\n\n"
+                       "A few can be ruled out without trying: a demo whose "
+                       "header does not make sense -- a tick interval that is "
+                       "not one, a player ID that is not one -- has had its "
+                       "layout moved and is counted here straight away.");
         }
 
         if (running)
@@ -876,7 +880,7 @@ static void DrawRunsTab(void)
             ImGui::EndChild();
         }
         if (!WrExtractRunning() && !haveCounts)
-            ImGui::TextDisabled("%s", WrExtractInterpreter());
+            ImGui::TextDisabled("%s", WrExtractStatus());
     }
 
     if (WrRunCount() == 0)
@@ -1522,15 +1526,19 @@ static void DrawMapsTab(void)
     ImGui::TextDisabled("%s", WrMapsStatus());
 
     if (ImGui::Button("Rebuild the index"))
-        WrExtractRunArgs("--index-maps", false);
+    {
+        WrExtractRequest req = {WR_JOB_INDEX_MAPS};
+        WrExtractSubmit(&req);
+    }
     ImGui::SameLine();
     if (ImGui::Button("Recount what is on disk"))
         WrMapsRefresh();
     ImGui::SameLine();
     HelpMarker("The index comes from momentum\\_cache, which the game writes "
                "when it fetches the map list. Rebuilding reads that file and "
-               "nothing else -- no network. If a map is missing, open the map "
-               "selector in game once so the game refreshes its own copy.");
+               "nothing else -- no network, and no Python: this one is done "
+               "inside the DLL. If a map is missing, open the map selector in "
+               "game once so the game refreshes its own copy.");
 
     ImGui::SetNextItemWidth(200.0f);
     ImGui::InputTextWithHint("##filter", "filter by name", g_mapFilter,
@@ -1744,12 +1752,13 @@ static void DrawMapsTab(void)
                 BoardShow(m->name, g_fetchTrackType, g_fetchTrackNum);
             if (g_fetchEnabled && !WrExtractRunning())
             {
-                char args[256];
-                _snprintf_s(args, sizeof(args), _TRUNCATE,
-                            "--fetch --map \"%s\" --map-id %d --top %d "
-                            "--track-type %d --track-num %d%s",
-                            m->name, m->id, g_fetchTop, g_fetchTrackType,
-                            g_fetchTrackNum, g_intoGame ? " --into-game" : "");
+                WrExtractRequest req = {WR_JOB_FETCH};
+                strncpy_s(req.map, sizeof(req.map), m->name, _TRUNCATE);
+                req.mapId = m->id;
+                req.top = g_fetchTop;
+                req.trackType = g_fetchTrackType;
+                req.trackNum = g_fetchTrackNum;
+                req.intoGame = g_intoGame;
 
                 // Browse first, download second. One request, nothing written,
                 // and it prints the leaderboard's own total -- which is the
@@ -1757,13 +1766,13 @@ static void DrawMapsTab(void)
                 ImGui::SameLine();
                 if (ImGui::SmallButton("browse"))
                 {
-                    char dry[300];
-                    _snprintf_s(dry, sizeof(dry), _TRUNCATE, "%s --dry-run", args);
-                    WrExtractRunArgs(dry, false);
+                    req.dryRun = true;
+                    WrExtractSubmit(&req);
+                    req.dryRun = false;
                 }
                 ImGui::SameLine();
                 if (ImGui::SmallButton("download"))
-                    WrExtractRunArgs(args, false);
+                    WrExtractSubmit(&req);
             }
             else if (isHere && m->extracted < m->demos)
             {
@@ -1785,7 +1794,11 @@ static void DrawMapsTab(void)
                               ImGuiChildFlags_Borders,
                               ImGuiWindowFlags_HorizontalScrollbar))
         {
-            for (int i = 0; i < WrExtractLineCount(); i++)
+            // Hoisted, as the Runs pane does it. As the loop condition this
+            // took the extractor's lock once per line per frame and could see
+            // the ring shift underneath it half way down.
+            int nLines = WrExtractLineCount();
+            for (int i = 0; i < nLines; i++)
                 ImGui::TextUnformatted(WrExtractLine(i));
             if (WrExtractRunning())
                 ImGui::SetScrollHereY(1.0f);
@@ -3155,40 +3168,39 @@ static int BuildRankArg(char *out, size_t cap, int *picked)
     return n;
 }
 
-// Write the selection to a file and hand the fetcher its path.
+// The ticked places, as an array of ranks.
 //
-// The 64-pick cap existed only because the whole selection travelled as one
-// --ranks argument on a 2048-byte command line, and "tick all" makes that cap
-// absurd rather than merely arbitrary. A file has no such limit, so the cap is
-// gone rather than raised to another number somebody will hit.
-static bool WritePickFile(char *out, size_t cap)
+// This used to write a file, because the whole selection travelled as one
+// --ranks argument on a 2048-byte command line and "tick all" made a cap absurd
+// rather than merely arbitrary. The request carries the array now; whether it
+// still has to become a file is the fetcher's problem, not this tab's.
+//
+// Returns how many were ticked. Fills at most `cap` of them, and there is no
+// caller that passes a cap smaller than the board.
+static int CollectPicks(int *out, int cap)
 {
-    char rel[192];
-    _snprintf_s(rel, sizeof(rel), _TRUNCATE, "boards\\%s_g%d_t%d%d.pick",
-                g_bMap, g_bMode, g_bTrackType, g_bTrackNum);
-    strncpy_s(out, cap, WrDataPath(rel), _TRUNCATE);
-
-    FILE *f = NULL;
-    if (fopen_s(&f, out, "w") != 0 || !f)
-        return false;
-    fprintf(f, "# WrLines: the places ticked in the Board tab, for --ranks-file.\n");
     int n = 0;
-    for (int i = 0; i < WrBoardCount(); i++)
+    for (int i = 0; i < WrBoardCount() && n < cap; i++)
     {
         if (!g_bSelect[i])
             continue;
         const WrBoardRow *r = WrBoardAt(i);
         if (!r)
             continue;
-        fprintf(f, "%d\n", r->rank);
-        n++;
+        out[n++] = r->rank;
     }
-    fclose(f);
-    return n > 0;
+    return n;
 }
 
-// Hand the fetcher the friends we can see. Only this side can: it is inside the
-// game, so it has a live ISteamFriends, and the script does not.
+// Write down the friends we can see. Only this side can: it is inside the game,
+// so it has a live ISteamFriends.
+//
+// It goes through a FILE even though wr_api.cpp -- the only thing that reads it
+// -- now runs in this same process and could have been handed the array. That
+// is deliberate and it is not the leftover it looks like. The panel documents
+// this file to the user, and it is the thing you would want to be able to open
+// and read before pressing a button that sends a hundred SteamID64s anywhere.
+// An in-memory hand-off would be one less artefact and one less way to check.
 static int WriteFriendsFile(void)
 {
     WrSteamRefreshFriends();
@@ -3198,8 +3210,8 @@ static int WriteFriendsFile(void)
     if (fopen_s(&f, WrDataPath("friends.txt"), "w") != 0 || !f)
         return -1;
     fprintf(f, "# WrLines: SteamID64s from your Steam friends list.\n");
-    fprintf(f, "# Written here so wrpath_extract.py can ask the leaderboard "
-               "about them.\n");
+    fprintf(f, "# Written here, where you can read it, so the leaderboard "
+               "lookup has something to ask about.\n");
     for (int i = 0; i < n; i++)
         fprintf(f, "%llu\n", WrSteamFriendAt(i));
     fclose(f);
@@ -3216,13 +3228,21 @@ static void BoardShow(const char *map, int trackType, int trackNum)
     g_bWantFocus = true;
 }
 
-static void BoardRun(const char *verb)
+// The five fetch buttons on this tab differ only in which window of the board
+// they ask for. They used to differ by formatting five different command-line
+// fragments, which is the same thing said less clearly.
+static void BoardRun(WrBoardFetchMode mode, int fromRank, int count, int spread)
 {
-    char args[512];
-    _snprintf_s(args, sizeof(args), _TRUNCATE,
-                "%s --map \"%s\" --gamemode %d --track-type %d --track-num %d",
-                verb, g_bMap, g_bMode, g_bTrackType, g_bTrackNum);
-    WrExtractRunArgs(args, false);
+    WrExtractRequest req = {WR_JOB_BOARD};
+    strncpy_s(req.map, sizeof(req.map), g_bMap, _TRUNCATE);
+    req.gamemode = g_bMode;
+    req.trackType = g_bTrackType;
+    req.trackNum = g_bTrackNum;
+    req.boardMode = mode;
+    req.fromRank = fromRank;
+    req.count = count;
+    req.spread = spread;
+    WrExtractSubmit(&req);
 }
 
 static void DrawBoardTab(void)
@@ -3306,13 +3326,22 @@ static void DrawBoardTab(void)
     }
 
     // A fetch that has just finished has rewritten the cache, so re-read it.
-    // Watched here rather than in dllmain because the extract slot is shared
-    // and only this tab knows the last command was a board one.
-    static bool wasRunning = false;
-    bool running = WrExtractRunning();
-    if (wasRunning && !running)
-        g_bLoaded = false;
-    wasRunning = running;
+    // Watched here rather than in dllmain because the extract slot is shared.
+    //
+    // On the generation counter rather than on WrExtractRunning() going false,
+    // which had two holes: a job that started and ended between two frames was
+    // never seen at all, and an EXTRACTION finishing threw away this tab's cache
+    // for no reason. A counter cannot miss an edge and the kind says whose it
+    // was -- BOARD writes the .tsv, FETCH marks rows as held.
+    static unsigned int lastGen = 0;
+    unsigned int gen = WrExtractRunGeneration();
+    if (gen != lastGen)
+    {
+        lastGen = gen;
+        WrJobKind kind = WrExtractLastKind();
+        if (kind == WR_JOB_BOARD || kind == WR_JOB_FETCH)
+            g_bLoaded = false;
+    }
 
     if (!g_bLoaded && g_bMap[0] && !WrBoardBusy())
     {
@@ -3345,7 +3374,9 @@ static void DrawBoardTab(void)
                "both places so neither tab is a dead end.\n\n"
                "Nothing here reaches the network until it is on, and then only "
                "when a button is pressed. One request at a time, with a pause "
-               "between them: this is free community infrastructure.");
+               "between them: this is free community infrastructure.\n\n"
+               "The buttons below are done inside the DLL and need no Python. "
+               "Downloading the demos themselves still runs the script.");
     if (g_fetchEnabled)
     {
         bool busy = WrExtractRunning();
@@ -3366,30 +3397,15 @@ static void DrawBoardTab(void)
         char lbl[64];
         _snprintf_s(lbl, sizeof(lbl), _TRUNCATE, "Fastest %d##fast", g_bCount);
         if (ImGui::Button(lbl))
-        {
-            char v[128];
-            _snprintf_s(v, sizeof(v), _TRUNCATE,
-                        "--board --from-rank 1 --count %d", g_bCount);
-            BoardRun(v);
-        }
+            BoardRun(WR_BOARD_WINDOW, 1, g_bCount, 0);
         ImGui::SameLine();
         _snprintf_s(lbl, sizeof(lbl), _TRUNCATE, "Slowest %d##slow", g_bCount);
         if (ImGui::Button(lbl))
-        {
-            char v[128];
-            _snprintf_s(v, sizeof(v), _TRUNCATE,
-                        "--board --slowest --count %d", g_bCount);
-            BoardRun(v);
-        }
+            BoardRun(WR_BOARD_SLOWEST, 0, g_bCount, 0);
         ImGui::SameLine();
         _snprintf_s(lbl, sizeof(lbl), _TRUNCATE, "From %d##from", g_bFromRank);
         if (ImGui::Button(lbl))
-        {
-            char v[128];
-            _snprintf_s(v, sizeof(v), _TRUNCATE,
-                        "--board --from-rank %d --count %d", g_bFromRank, g_bCount);
-            BoardRun(v);
-        }
+            BoardRun(WR_BOARD_WINDOW, g_bFromRank, g_bCount, 0);
         ImGui::SameLine();
         ImGui::TextDisabled("%d request%s", reqs, reqs == 1 ? "" : "s");
 
@@ -3400,11 +3416,7 @@ static void DrawBoardTab(void)
         ImGui::SameLine();
         _snprintf_s(lbl, sizeof(lbl), _TRUNCATE, "Spread %d##spread", g_bSpread);
         if (ImGui::Button(lbl))
-        {
-            char v[128];
-            _snprintf_s(v, sizeof(v), _TRUNCATE, "--board --spread %d", g_bSpread);
-            BoardRun(v);
-        }
+            BoardRun(WR_BOARD_SPREAD, 0, 0, g_bSpread);
         ImGui::SameLine();
         ImGui::TextDisabled("%d requests", g_bSpread);
         ImGui::SameLine();
@@ -3424,7 +3436,7 @@ static void DrawBoardTab(void)
         {
             int n = WriteFriendsFile();
             if (n > 0)
-                BoardRun("--board --friends");
+                BoardRun(WR_BOARD_FRIENDS, 0, 0, 0);
             else
                 WrLogf("[!] board: no friends to look up (%d)", n);
         }
@@ -3437,7 +3449,9 @@ static void DrawBoardTab(void)
             "without an account, which is why the site does not offer you this. "
             "Asking for specific SteamID64s is not gated at all. Your friends "
             "are enumerated here, inside the game, because only this side has a "
-            "live Steam connection -- the fetch script does not and cannot.\n\n"
+            "live Steam connection -- and the list is written to "
+            "wrlines_data\\friends.txt where you can read it before pressing "
+            "this.\n\n"
             "One request per hundred friends. Friends with no run on the map "
             "cost nothing; they simply come back absent.");
 
@@ -3497,18 +3511,23 @@ static void DrawBoardTab(void)
         _snprintf_s(lbl, sizeof(lbl), _TRUNCATE, "Download %d ticked##dl", picked);
         if (ImGui::Button(lbl))
         {
-            // Through a file, not the command line. A selection has no natural
-            // bound and a command line has a 2048-byte one.
-            char pick[MAX_PATH];
-            if (WritePickFile(pick, sizeof(pick)))
+            // The whole selection, however big. It used to have to become a file
+            // on the way out because it travelled on a command line; the request
+            // carries the array itself now.
+            int *ranks = (int *)malloc(sizeof(int) * (size_t)picked);
+            if (ranks)
             {
-                char args[1024];
-                _snprintf_s(args, sizeof(args), _TRUNCATE,
-                            "--fetch --map \"%s\" --gamemode %d --track-type %d "
-                            "--track-num %d --ranks-file \"%s\"%s",
-                            g_bMap, g_bMode, g_bTrackType, g_bTrackNum, pick,
-                            g_intoGame ? " --into-game" : "");
-                WrExtractRunArgs(args, false);
+                WrExtractRequest req = {WR_JOB_FETCH};
+                strncpy_s(req.map, sizeof(req.map), g_bMap, _TRUNCATE);
+                req.gamemode = g_bMode;
+                req.trackType = g_bTrackType;
+                req.trackNum = g_bTrackNum;
+                req.intoGame = g_intoGame;
+                req.ranks = ranks;
+                req.rankCount = CollectPicks(ranks, picked);
+                if (req.rankCount > 0)
+                    WrExtractSubmit(&req);
+                free(ranks);
             }
         }
         if (busy)
@@ -3717,7 +3736,8 @@ static void DrawBoardTab(void)
                               ImGuiChildFlags_Borders,
                               ImGuiWindowFlags_HorizontalScrollbar))
         {
-            for (int i = 0; i < WrExtractLineCount(); i++)
+            int nLines = WrExtractLineCount();     // hoisted; see ##fetchout
+            for (int i = 0; i < nLines; i++)
                 ImGui::TextUnformatted(WrExtractLine(i));
             if (WrExtractRunning())
                 ImGui::SetScrollHereY(1.0f);

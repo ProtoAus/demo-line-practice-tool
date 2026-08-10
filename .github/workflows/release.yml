@@ -1,0 +1,165 @@
+# Builds and publishes a release from a tag.
+#
+# Why this exists at all: every release up to v0.4.5 was built on one laptop and
+# uploaded by hand. That is a trust hole in a project whose whole pitch is that
+# you can check what it does, and it is the first thing anyone reasonable asks
+# when their antivirus flags an unsigned injector. A public runner, a public
+# log, a pinned commit and an attestation turn "trust me" into something you can
+# verify with one command.
+#
+# It does NOT make Defender or SmartScreen happier by itself. Nothing here is a
+# code-signing certificate. What it produces is the evidence that makes a
+# false-positive report to Microsoft succeed, and it removes the developer's
+# machine from the story.
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write        # create the release and upload assets
+  id-token: write        # sign the provenance attestation
+  attestations: write    # write it to the attestations store
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # imgui and MinHook are cloned at build time rather than vendored, so they
+      # have to be pinned here or the release is not reproducible, which is
+      # exactly the thing the attestation is supposed to rule out. imgui was
+      # already pinned; MinHook was not, and build.bat and the README have been
+      # corrected to match.
+      - name: Fetch imgui and MinHook
+        shell: cmd
+        run: |
+          git clone --depth 1 --branch v1.91.9b https://github.com/ocornut/imgui imgui
+          git clone --depth 1 --branch v1.3.3   https://github.com/TsudaKageyu/MinHook minhook
+
+      # Everything that went into the binary, in one file. The two clones need
+      # their commit recorded because they are not in our history; miniz and the
+      # LZMA decoder are committed under third_party\, so the wrlines sha above
+      # already pins them exactly -- they are named anyway, because "what is in
+      # this DLL" should have one complete answer and not one that stops at the
+      # things that happen to be fetched.
+      - name: Record what went in
+        shell: pwsh
+        run: |
+          @(
+            "wrlines  ${{ github.ref_name }}  ${{ github.sha }}"
+            "imgui    v1.91.9b  $(git -C imgui   rev-parse HEAD)  (cloned)"
+            "minhook  v1.3.3    $(git -C minhook rev-parse HEAD)  (cloned)"
+            "miniz    3.1.2     third_party\miniz  (committed; see third_party\VERSION.txt)"
+            "lzma sdk 23.01     third_party\lzma   (committed; see third_party\VERSION.txt)"
+            "built by ${{ github.workflow }} run ${{ github.run_id }} on $(hostname)"
+          ) | Set-Content PROVENANCE.txt -Encoding ascii
+          Get-Content PROVENANCE.txt
+
+      # build.bat finds the toolchain with vswhere, which is what lets it work
+      # here: the runner has VS 2022 Enterprise, not the BuildTools layout the
+      # script used to hardcode.
+      - name: Build
+        shell: cmd
+        run: build.bat
+
+      - name: Test harnesses
+        shell: cmd
+        run: tests\build.bat
+
+      # The checks build.bat prints are only useful if something reads them.
+      # An empty export table is what keeps our ImGui from binding to the copy
+      # inside the game's devui.dll, and the import list is a claim the README
+      # makes to users in writing. Both are load-bearing, so fail the release
+      # rather than ship a binary that quietly broke one of them.
+      - name: Assert the shape of wrlines.dll
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
+                  -latest -products * `
+                  -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+                  -property installationPath
+          $vc = "$vs\VC\Auxiliary\Build\vcvarsall.bat"
+
+          $exports = cmd /c "call `"$vc`" x64 >nul && dumpbin /nologo /exports wrlines.dll"
+          if ($exports -match 'ordinal hint') { throw "wrlines.dll exports something. It must export nothing." }
+
+          $headers = cmd /c "call `"$vc`" x64 >nul && dumpbin /nologo /headers wrlines.dll"
+          if ($headers -notmatch 'Resource Directory') { throw "wrlines.dll has no version resource. See src\wrlines.rc." }
+
+          # WINHTTP.dll arrived at v0.6.0 with the leaderboard fetcher, and this
+          # list, README.md, HOW TO USE.txt, src\wr_board.h, src\wr_http.h and
+          # docs\how-it-works.md all changed in that one commit. They make the
+          # same claim about the same list; keep them in step.
+          $expected = @('USER32.dll','SHELL32.dll','WINHTTP.dll','KERNEL32.dll','IMM32.dll','D3DCOMPILER_47.dll')
+          $deps = (cmd /c "call `"$vc`" x64 >nul && dumpbin /nologo /dependents wrlines.dll") |
+                  Select-String -Pattern '^\s+(\S+\.dll)$' | ForEach-Object { $_.Matches[0].Groups[1].Value }
+          $diff = Compare-Object $expected $deps
+          if ($diff) {
+            $diff | Format-Table -AutoSize | Out-String | Write-Host
+            throw "wrlines.dll's imports changed. The README makes a claim about this list; update both together."
+          }
+          Write-Host "exports empty, resource present, imports unchanged."
+
+          foreach ($f in 'wrlines.dll','wrinject.exe') {
+            $bytes = [IO.File]::ReadAllBytes($f)
+            $text  = [Text.Encoding]::ASCII.GetString($bytes)
+            if ($text -match 'C:\\Users\\') { throw "$f has a build-machine path baked into it. Check /PDBALTPATH." }
+          }
+
+      - name: Stage the release
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}" -replace '^v',''
+          New-Item -ItemType Directory dist | Out-Null
+
+          # wrpath_extract.py drops out of this list when the extractor port
+          # lands. Everything else stays.
+          Compress-Archive -DestinationPath "dist/demo-line-practice-tool-v$v.zip" -Path `
+            wrinject.exe, wrlines.dll, wrpath_extract.py, 'HOW TO USE.txt', LICENSE
+
+          # Symbols are a separate asset. wrlines.pdb alone is 8 MB against a
+          # 1.5 MB payload and would be most of what people downloaded.
+          Compress-Archive -DestinationPath "dist/demo-line-practice-tool-v$v-symbols.zip" -Path `
+            wrlines.pdb, wrinject.pdb, PROVENANCE.txt
+
+          Get-FileHash dist/*.zip, wrinject.exe, wrlines.dll -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } |
+            Set-Content dist/SHA256SUMS.txt -Encoding ascii
+          Get-Content dist/SHA256SUMS.txt
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'dist/*.zip'
+
+      # The gh CLI rather than a third-party release action: one less thing in
+      # the supply chain of a project that argues about supply chains.
+      - name: Publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $assets = Get-ChildItem dist | ForEach-Object FullName
+          gh release create "${{ github.ref_name }}" @assets --generate-notes --verify-tag
+
+      - name: What is left to do by hand
+        shell: pwsh
+        run: |
+          @'
+          Still manual, and both matter more than anything above:
+
+            1. Upload the zip and both binaries to VirusTotal, and put the link
+               in the README's "Why your antivirus may flag this" section.
+            2. Submit both binaries to https://www.microsoft.com/en-us/wdsi/filesubmission
+               as "Software developer" -> "Incorrectly detected as malware".
+               Paste the SHA256s and this run's attestation. Defender keys on
+               the file hash, so this has to be redone for every release, and it
+               is the only step that actually changes a Defender verdict.
+
+          Do both BEFORE announcing the release.
+          '@ | Write-Host

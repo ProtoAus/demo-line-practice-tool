@@ -19,7 +19,7 @@ Two halves:
 
 | | |
 | --- | --- |
-| `wrpath_extract.py` | offline. Reads the `.mtv` demos the game already downloaded and writes small `.wrpath` files. |
+| `wrpath_extract.py` | offline. Reads the `.mtv` demos the game already downloaded and writes small `.wrpath` files, and downloads new ones. Being folded into the DLL a piece at a time — the map index and the leaderboard have gone already. |
 | `wrlines.dll` | in-game. Reads `.wrpath`, draws the lines, and gives you a panel on **INSERT**. |
 
 The DLL never parses `.mtv`. It only ever reads a simple, versioned, CRC-checked array of
@@ -29,8 +29,10 @@ points.
 > their working name, `wrlines`. Nothing depends on that — it is just what the files were
 > called while it was being written.
 
-**Requires:** Windows x64, Momentum Mod Playtest (Strata Source), D3D11 or DXVK, Python 3.8+
-for the extractor. There is no 32-bit path anywhere in the game, so both binaries are x64.
+**Requires:** Windows x64, Momentum Mod Playtest (Strata Source), D3D11 or DXVK, and Python 3.8+
+for the parts still in the script — extraction and downloading. The Maps tab and the Board tab's
+leaderboard fetch need no interpreter. There is no 32-bit path anywhere in the game, so both
+binaries are x64.
 **Linux works, through Proton** — see [Linux](#linux) below for why that is the answer rather
 than a native build.
 
@@ -384,11 +386,17 @@ bundled ImGui ever binding to the copy inside the game's `devui.dll`).
 
 ### Third-party dependencies
 
-Neither is committed to this repository. Clone them into the source folder before building:
+Four, split into two groups by a rule worth stating: **anything on the path that decides what a
+run path contains is committed; anything that draws a panel is cloned.** A decompressor that is
+subtly the wrong version does not fail loudly — it produces a different byte somewhere in a run
+and the line in the world bends. Git is the pin for those.
+
+Cloned into the source folder before building, and pinned by tag because the release workflow
+records the commit:
 
 ```
 git clone --depth 1 --branch v1.91.9b https://github.com/ocornut/imgui imgui
-git clone --depth 1 https://github.com/TsudaKageyu/MinHook minhook
+git clone --depth 1 --branch v1.3.3   https://github.com/TsudaKageyu/MinHook minhook
 ```
 
 - **Dear ImGui** (MIT) — left exactly as cloned; only `imgui{,_draw,_tables,_widgets}.cpp`
@@ -396,6 +404,23 @@ git clone --depth 1 https://github.com/TsudaKageyu/MinHook minhook
   in with `/DIMGUI_USER_CONFIG`, so the vendored tree is never edited.
 - **MinHook** (BSD-2-Clause) — built with `hde64.c` rather than `hde32.c`, since the target
   is 64-bit.
+
+Committed under [third_party/](../third_party/), unmodified, with
+[VERSION.txt](../third_party/VERSION.txt) recording the upstream tag, the release archive's
+SHA-256, the SHA-256 of every file taken, and what each build option switches off:
+
+- **miniz** 3.1.2 (MIT) — inflate only, for the map catalogue. The `.zip` reader is compiled
+  out with `MINIZ_NO_ARCHIVE_APIS`; it is the part of miniz with a CVE history and nothing
+  here opens an archive.
+- **LZMA SDK** 23.01 (public domain) — five files of the ~400 in the archive, which is the
+  exact set `DOC/lzma.txt` names as an ANSI-C decoder. Decoder only: this build cannot
+  compress anything, in either format, which is why the test fixtures are committed as
+  pre-compressed bytes.
+
+Neither adds an import — both are static C — so `dumpbin /dependents wrlines.dll` was unchanged
+by their arrival. The thing that did change it was `winhttp.lib` at v0.6.0, which is the OS and
+not a dependency to vendor; see *Your data* in the README and
+[src/wr_http.h](../src/wr_http.h). The release workflow asserts the exact list either way.
 
 ### Python
 
@@ -415,10 +440,19 @@ The Runs tab counts the demos you have downloaded for the map you are standing i
 are already extracted, and how many are new — then offers a button to run the extractor
 without leaving the game. Output streams into the panel and the lines appear when it finishes.
 
-The count is exact rather than a guess, and cheap: a demo's map name lives at offset `0x10` of
-the `MMTV` header, and the extractor names its output after the source file's basename, so
-"is this demo for this map, and has it been done" is one 80-byte read plus one file-exists
+The count is exact rather than a guess, and cheap: everything a demo says about itself lives in
+its first 512 bytes, and the extractor names its output after the source file's basename, so
+"is this demo for this map, and has it been done" is one 512-byte read plus one file-exists
 check. Measured on a 4095-demo library across 475 maps, that reads every file correctly.
+
+It used to read one field — the map name at offset `0x10` — because reading the rest meant
+having a parser, and the parser was in Python. Now that [src/wr_mtv.cpp](../src/wr_mtv.cpp)
+exists it reads the whole fixed header and applies the same three sanity gates the reference
+does: a non-empty map name, a tick interval in `[0.001, 0.1]`, and a SteamID64 whose high word
+is `0x01100001`. A demo that fails one of those has had its layout moved under it and can never
+be extracted, so it is now counted as *already known bad* rather than as work waiting to be
+done. Nothing in a 6,249-demo library fails any of them, which is the point: the counter should
+be telling the truth on the day one does.
 
 It runs **only when you press the button** — starting a python process off a map change would
 launch a program behind your back and then compete with the game for CPU while you play. The
@@ -576,6 +610,23 @@ A `.mtv` is Momentum's own container (`MMTV`): a packed binary header, a JSON ru
 blob, then the run body compressed with Valve-LZMA (or zstd on the very largest files).
 The body is a Source entity-delta netstream — there is no public spec, and the send-table
 metadata needed to decode it properly lives in the closed-source game DLL.
+
+Two details worth knowing about that container, because both cost a day. The JSON blob is
+**not** at a constant offset — `0xC6` in one container version and `0xC7` in the next, with
+nothing saying which — so it is found by scanning for a `{` whose preceding `u32` is a
+plausible length and whose byte at that length is a codec magic. And that scan has to try
+*every* `{` in the window rather than the first: the padding around the player name is
+arbitrary bytes, and taking the first on faith is what produced `implausible JSON length
+1076353433` on two demos. Valve-LZMA is its own thing too — seventeen bytes of header, then a
+raw LZMA1 stream with no end marker, so the decoder has to be told how much to produce.
+
+All of that now exists twice: in `wrpath_extract.py`, and in
+[src/wr_mtv.cpp](../src/wr_mtv.cpp) over a committed copy of the LZMA SDK's decoder. It is
+allowed to exist twice because the two are checked against each other:
+[tests/parity.ps1](../tests/parity.ps1) runs both over every demo on this machine and compares
+the decompressed bodies byte for byte. That comparison is a *perfect* oracle — no floats are
+involved yet, so a difference is a difference rather than something to argue about — which is
+why it is the checkpoint the rest of the port is built on top of.
 
 We don't decode it properly. `m_vecOrigin` is networked as three raw IEEE-754 float32, so
 the extractor scans the decompressed body for every bit position holding a plausible
@@ -1028,9 +1079,17 @@ There was no good way to see what existed. `surf_demise` has **9,104 runs on its
 this machine had 52 of them, and nothing told you about the other nine thousand.
 
 **Browsing costs nothing.** The game already keeps the whole catalogue on disk, in
-`momentum\_cache`: an `MSML` header, then raw zlib from offset 12, decompressing to JSON with
-every map's id, name and leaderboard tiers — **2049 maps**. The Maps tab lists all of it with
-what you hold for each, and asks nothing of anybody's server to do so.
+`momentum\_cache`: an `MSML` header, two `u32`s giving the decompressed size and the map count,
+then a raw zlib stream from offset 12 decompressing to JSON with every map's id, name and
+leaderboard tiers — **2,135 maps** at the time of writing. The Maps tab lists all of it with what
+you hold for each, and asks nothing of anybody's server to do so.
+
+Reading it used to be Python's job, because it needs inflate and a JSON parser and the DLL had
+neither. It is [src/wr_msml.cpp](../src/wr_msml.cpp) now: `tinfl_decompress_mem_to_heap` from a
+committed copy of miniz, and a three-hundred-line cursor-style JSON reader in
+[src/wr_json.cpp](../src/wr_json.cpp) that walks the twelve megabytes once and allocates nothing.
+Neither adds an import — they are static C — so the Maps tab works with no interpreter installed
+and the DLL's dependency list is unchanged.
 
 **Fetching is opt-in.** Momentum's backend is open source and `GET /maps/:id/leaderboard` carries
 `@BypassJwtAuth`, so it needs no account and no token. Each entry hands back an absolute
@@ -1051,10 +1110,29 @@ direction, which makes this manners rather than permission:
   holds. The extractor gained a second search root rather than the downloader gaining write
   access to `momtv\`.
 
-None of it lives in the DLL. It links no HTTP client and no zlib, and `dumpbin /dependents` is
-checked on every build precisely so "it reads memory and two files" is verifiable rather than
-asserted — the import list is still five system DLLs. The work is flags on `wrpath_extract.py`,
-which the DLL already knew how to launch and stream.
+**Reading a leaderboard lives in the DLL now, and downloading still does not.** That split is
+where v0.6.0 left it: `--board` is [src/wr_api.cpp](../src/wr_api.cpp) and `--fetch` is still a
+flag on `wrpath_extract.py`, which the DLL already knew how to launch and stream.
+
+The cost of the first half is the one claim this project has had to give up. Until v0.5.1 the DLL
+linked no HTTP client at all and `dumpbin /dependents` proved it in one line — five system DLLs,
+none of them a network stack, "it reads memory and two files" verifiable rather than asserted.
+`WINHTTP.dll` is the sixth name now. There is no version of this port that keeps that sentence,
+and the release workflow's import assert changed in the same commit as this paragraph, the README
+and `HOW TO USE.txt`, so none of them can quietly go stale.
+
+What replaced it is narrower but still checkable in a couple of minutes, and
+[src/wr_http.h](../src/wr_http.h) is written to be the first file a suspicious reader opens:
+
+- `WinHttp` — the prefix every function in that API carries — appears in [src/](../src/) in
+  exactly two files, `wr_http.cpp` and its header. 120 lines, one function, GET and nothing else.
+  No POST, no cookies, no credentials, no scheme it did not start with.
+- Every URL is built in one place from one constant host, plus the absolute `downloadURL` the
+  server's own reply contained.
+- It sends no identifier of any kind. The User-Agent names the tool and this repo and that is
+  all. The one request that carries SteamID64s carries your *friends'*, because you pressed a
+  button that says so.
+- Nothing runs on a timer, at startup, or on a map change.
 
 One consequence worth stating: downloaded demos carry other players' names and SteamID64s, the
 same as the ones the game downloads. That is why `wrlines_data\` is gitignored.
@@ -1088,6 +1166,25 @@ between them visible. You browse as much of the board as you actually looked at.
 
 Rows are deduped on the **replay hash, not the rank**. Ranks move as runs land, so the same run
 cached a week apart would otherwise sit in the file twice under two different numbers.
+
+**Since v0.6.0 the DLL fetches this itself** — [src/wr_api.cpp](../src/wr_api.cpp) over
+[src/wr_http.cpp](../src/wr_http.cpp) — so **Fastest 50** works with no Python installed. Two
+things in that port are worth knowing because neither is obvious and both are one line wide:
+
+- **The rank sort has to be stable over insertion order.** The reference writes
+  `sorted(rows.values(), key=rank)` on a dict keyed by replay hash; Python dicts iterate in
+  insertion order and `sorted` is stable, so two rows at the same rank come out in the order they
+  were first seen — file order, then API order — and a re-fetched row keeps its original position
+  while taking its new value. `qsort` is not stable. The port keeps an insertion-ordered array and
+  breaks a rank tie by index, which is a one-line difference in a two-hundred-row file and an
+  afternoon to find without a test for it.
+- **A leaderboard is not a fixture**, so it cannot be an oracle either: fetch it twice an hour
+  apart and you get two different files that are both correct. `--api-record` saves a real
+  conversation once and `--api-replay` answers both implementations from it, which is what makes
+  "did the port write the same bytes" a question with an answer. `tests\parity.ps1 -Verb board`
+  runs a five-step accumulating sequence three ways — the reference live, the reference off the
+  recording, then the port — and the middle pass exists to prove the recording itself is faithful
+  before anything is concluded from it.
 
 **Spread** samples N places evenly across the whole board, one request each — the cheap way to see
 the shape of a 17,000-run leaderboard. Twenty requests gives you a fast one, a mid one and a slow

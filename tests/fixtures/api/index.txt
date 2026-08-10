@@ -1,0 +1,10 @@
+# WrLines: recorded API responses, in request order.
+https://api.momentum-mod.org/v1/maps/700/leaderboard?gamemode=1&trackType=0&trackNum=1&take=6&skip=0	0001.bin
+https://api.momentum-mod.org/v1/maps/700/leaderboard?gamemode=1&trackType=0&trackNum=1&take=100&skip=100	0002.bin
+https://api.momentum-mod.org/v1/maps/700/leaderboard?gamemode=1&trackType=0&trackNum=1&take=100&skip=103	0003.bin
+https://api.momentum-mod.org/v1/maps/701/leaderboard?gamemode=1&trackType=0&trackNum=1&take=1&skip=0	0004.bin
+https://api.momentum-mod.org/v1/maps/701/leaderboard?gamemode=1&trackType=0&trackNum=1&take=1&skip=4	0005.bin
+https://api.momentum-mod.org/v1/maps/701/leaderboard?gamemode=1&trackType=0&trackNum=1&take=1&skip=9	0006.bin
+https://api.momentum-mod.org/v1/maps/702/leaderboard?gamemode=1&trackType=0&trackNum=1&take=100&steamIDs=76561198000000001,76561198000000009	0007.bin
+https://api.momentum-mod.org/v1/maps/703/leaderboard?gamemode=1&trackType=0&trackNum=1&take=1&skip=0	0008.bin
+https://api.momentum-mod.org/v1/maps/703/leaderboard?gamemode=1&trackType=0&trackNum=1&take=50&skip=0	0009.bin

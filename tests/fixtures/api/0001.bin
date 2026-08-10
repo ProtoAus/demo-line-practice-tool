@@ -1,0 +1,8 @@
+{"totalCount":9108,"data":[
+{"rank":1,"time":37.123456,"replayHash":"AAAA0001","downloadURL":"https://cdn.example/AAAA0001.mtv","createdAt":"2026-03-16T09:40:41.194Z","user":{"steamID":"76561198000000001","alias":"nova"}},
+{"rank":2,"time":38.5,"replayHash":"aaaa0002","downloadURL":"https://cdn.example/aaaa0002.mtv","createdAt":"2024-02-29T00:00:00.000Z","user":{"steamID":"76561198000000002","alias":"two\ttabs\there"}},
+{"rank":3,"time":39.000001,"replayHash":"AAAA0003","downloadURL":"","createdAt":"not a date","user":{"steamID":"76561198000000003","alias":"\u00a0 padded \u3000"}},
+{"rank":4,"time":40,"replayHash":"AAAA0004","downloadURL":"https://cdn.example/AAAA0004.mtv","createdAt":"2026-03-16T09:40:41.194Z","user":null},
+{"rank":5,"time":41,"downloadURL":"x","user":{"steamID":"5","alias":"no replayHash, so dropped"}},
+{"rank":6,"time":42,"replayHash":"AAAA0006","createdAt":"2026-01-01T00:00:00Z","user":{"steamID":"76561198000000006","alias":"\u0001\u0002"}}
+]}

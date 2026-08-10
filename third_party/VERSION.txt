@@ -1,0 +1,106 @@
+Third-party source, vendored and committed
+==========================================
+
+WHY THESE ARE COMMITTED WHEN imgui AND minhook ARE NOT
+
+imgui\ and minhook\ are cloned at build time (see build.bat and the README's
+build section). They are fifty-odd files each, actively developed, and they draw
+the panel and patch a vtable -- if either is the wrong version the failure is
+loud and immediate.
+
+These are different in every one of those respects. They are two or three files,
+they are effectively frozen, and they sit on the path where a .wrpath's contents
+are decided. A decompressor that is subtly the wrong version does not fail
+loudly; it produces a slightly different byte somewhere in a run and the line in
+the world bends the wrong way. Committing them makes git the pin, and makes
+"what exactly is in this build" a question with one answer.
+
+Nothing here is modified. Every file is byte-for-byte what upstream published,
+which is the point -- a reviewer can diff against the release and be done. If
+one of them ever HAS to be patched, the patch goes in a .diff beside it and gets
+named here, rather than being edited in place where nobody would find it.
+
+The build compiles them on their own cl line, as C, with the options below. It
+never includes them from a header of ours: only the .cpp that needs one includes
+it, so the surface stays where you can see it.
+
+
+miniz 3.1.2
+-----------
+what     zlib inflate. Momentum's map catalogue (momentum\_cache\*.dat) is a
+         12-byte header and then a raw zlib stream, and reading it is what lets
+         the Maps tab list every map without asking anybody's server.
+upstream https://github.com/richgel999/miniz
+release  https://github.com/richgel999/miniz/releases/tag/3.1.2
+archive  miniz-3.1.2.zip
+         sha256 f0446d863f9c19926ad9483c523fdc42e42b8d4a6a431d27e09d49c79a140d9a
+         101958 bytes
+licence  MIT. See miniz\LICENSE.
+vendored 2026-08-10
+files    miniz.c, miniz.h, LICENSE. The examples\, readme and ChangeLog from the
+         release archive are not here.
+used     tinfl_decompress_mem_to_heap() with TINFL_FLAG_PARSE_ZLIB_HEADER, and
+         mz_free(). That is the whole of it -- see src\wr_msml.cpp.
+
+compiled out, and why each one:
+  MINIZ_NO_ARCHIVE_APIS           the .zip reader. We never open an archive, and
+                                  it is the part of miniz with a CVE history.
+                                  (This also switches off the archive WRITING
+                                  apis on its own, so passing that one as well
+                                  is a redefinition warning rather than belt and
+                                  braces.)
+  MINIZ_NO_DEFLATE_APIS           we only ever decompress. Note this is why the
+                                  test fixtures carry pre-compressed bytes: this
+                                  build genuinely cannot make a zlib stream.
+  MINIZ_NO_STDIO                  no file handling; we hand it a buffer.
+  MINIZ_NO_TIME                   only the archive code wants a clock.
+  MINIZ_NO_ZLIB_COMPATIBLE_NAMES  keeps bare compress/uncompress/crc32 out of
+                                  the link. wrlines.dll exports nothing and the
+                                  build asserts that; this is the same instinct
+                                  applied to the symbols going in.
+
+
+LZMA SDK 23.01
+--------------
+what     the LZMA1 decoder. A Momentum demo's run body is a raw LZMA1 stream
+         behind a seventeen-byte Valve header, and it is the only thing between
+         a .mtv on disk and any of the numbers this program draws.
+upstream https://www.7-zip.org/sdk.html
+release  https://www.7-zip.org/a/lzma2301.7z  (dated 2023-06-20)
+archive  lzma2301.7z
+         sha256 317dd834d6bbfd95433488b832e823cd3d4d420101436422c03af88507dd1370
+         1322733 bytes
+licence  public domain. See lzma\LICENSE, under the heading LICENSE -- that file
+         is DOC\lzma-sdk.txt from the archive, unmodified, renamed so that a
+         reader looking for the licence finds it where they expect to.
+vendored 2026-08-10
+files    LzmaDec.c, LzmaDec.h, 7zTypes.h, Precomp.h, Compiler.h. That is not a
+         judgement call: DOC\lzma.txt names exactly those five as what an
+         ANSI-C decoder needs, and the archive's other four hundred files are
+         the encoder, LZMA2, XZ, 7z, C++, C# and Java.
+         sha256, in the same order:
+           0b938edae2aec133d144e2ff3493ac2b82850b3bbf8a79d1e925409124d39933
+           3a3b0ece1ba58601a8265a421a91b9720b39ee92ce898fadecb22f052bc3011f
+           1cd69ecb9e6cf97949aca3faa53ecd7590149efade07c6f816e9bb48515b2329
+           87a4dcb75ec1a24b7d77ec82d90499f276d14c401a1fa3841f9d9986c285efe8
+           a7ab2e9b059c6830280fc63c8a8f5254b48b847a0701f73bea409f954134852e
+used     LzmaDecode(), the one-call interface, and nothing else. See
+         src\wr_mtv.cpp.
+
+         Worth knowing, because it decided how much of this file there needed
+         to be: LzmaDecode() decompresses straight into the destination buffer
+         and the allocator it is handed is used only for the probability model
+         -- a few hundred kilobytes, fixed. The dictionary size in the stream's
+         own property bytes therefore allocates nothing, so a demo claiming a
+         four-gigabyte dictionary is not a thing that has to be clamped. It is
+         only a bound on match distances, which the decoder already checks
+         against how much output exists.
+
+compiled out
+         nothing, and that is the answer rather than an omission. The usual
+         flag to reach for is _7ZIP_ST, "no threading layer" -- but in 23.01
+         the block that acts on it is commented out in 7zTypes.h, and none of
+         the other four files mentions it. Passing it would have looked like
+         due diligence and done nothing at all, which is worse than not
+         passing it. These five files include only <errno.h>, <stddef.h>,
+         <stdint.h> and <string.h>, and pull in no Windows header.

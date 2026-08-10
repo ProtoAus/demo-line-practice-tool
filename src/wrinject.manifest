@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Application manifest for wrinject.exe, embedded by build.bat with
+  /MANIFEST:EMBED /MANIFESTINPUT: /MANIFESTUAC:NO.
+
+  (The comments here use single dashes. The house style is a double dash, but
+  XML forbids that sequence inside a comment and mt.exe rejects the file with
+  an unhelpful "unable to parse the requested XML data".)
+
+  Before this file there was no manifest at all, not an empty one. The loader
+  falls back to as-invoker anyway, so nothing about how the program runs changes
+  here. What changes is that the file now says so. A binary with no
+  requestedExecutionLevel is a small negative signal to the static malware
+  classifiers, and the honest answer to "does this want administrator" is worth
+  writing down rather than leaving to a default: it does not. The one place the
+  program mentions Administrator is an error message on the path where
+  OpenProcess has already failed.
+
+  /MANIFESTUAC:NO on the link line is load-bearing. Without it the linker
+  generates its own trustInfo block and mt.exe is then asked to merge two
+  conflicting requestedExecutionLevel elements. One manifest, one file, no
+  merge, and you can read the whole thing here.
+
+  The version attribute below is the third place the version lives. rc.exe
+  preprocesses and can share wr_version.h; mt.exe preprocesses nothing, so this
+  one is by hand. Bump it with wr_version.h. Nothing reads it, because an
+  assemblyIdentity only matters for side-by-side and this is not part of one,
+  but a wrong number is still a wrong number.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+
+  <assemblyIdentity type="win32"
+                    name="ProtoAus.WrLines.Injector"
+                    version="0.6.0.0"
+                    processorArchitecture="amd64"/>
+
+  <description>Loads wrlines.dll into Momentum Mod.</description>
+
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+
+  <!-- Declaring these stops Windows applying its compatibility shims for
+       "written before this OS existed". Momentum is x64-only and modern, so in
+       practice only the last entry matters, but the list is cheap and the
+       convention is to declare from Vista forward. -->
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <supportedOS Id="{e2011457-1546-43c5-a5fe-008deee3d3f0}"/><!-- Vista  -->
+      <supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}"/><!-- 7      -->
+      <supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}"/><!-- 8      -->
+      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/><!-- 8.1    -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/><!-- 10, 11 -->
+    </application>
+  </compatibility>
+
+  <!-- The injector builds its DLL path in MAX_PATH buffers, so this is not a
+       fix on its own. It is here so that a deep install directory fails in the
+       program's own error message rather than somewhere inside the loader. -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+    </windowsSettings>
+  </application>
+
+</assembly>

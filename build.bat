@@ -14,13 +14,31 @@ rem GetModuleHandle + GetProcAddress on whichever d3d11.dll the game already
 rem loaded. That is what makes this work identically under native D3D11 and
 rem under DXVK. dxguid.lib is just a static GUID blob with no DLL behind it.
 
-setlocal
+setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
-set "VCVARS=C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvarsall.bat"
+rem Finding the toolchain: an explicit override first, then vswhere, then the
+rem two hardcoded BuildTools paths that used to be all there was.
+rem
+rem vswhere is installed by every VS 2017+ setup and lives at a fixed path, so
+rem it finds Community, Professional and Enterprise as well as BuildTools. That
+rem matters beyond convenience: the GitHub Actions runner has VS 2022
+rem ENTERPRISE, so without this the release workflow cannot call this script at
+rem all. The hardcoded paths stay as a fallback so a machine that built
+rem yesterday still builds today.
+if defined WRLINES_VCVARS set "VCVARS=%WRLINES_VCVARS%"
+if not defined VCVARS (
+    set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+    if exist "!VSWHERE!" for /f "usebackq tokens=*" %%i in (
+        `"!VSWHERE!" -latest -products * ^
+           -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 ^
+           -property installationPath`
+    ) do set "VCVARS=%%i\VC\Auxiliary\Build\vcvarsall.bat"
+)
+if not defined VCVARS set "VCVARS=C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvarsall.bat"
 if not exist "%VCVARS%" set "VCVARS=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat"
 if not exist "%VCVARS%" (
-    echo [!] Could not find vcvarsall.bat. Edit VCVARS at the top of this script.
+    echo [!] Could not find vcvarsall.bat. Set WRLINES_VCVARS to its full path.
     exit /b 1
 )
 
@@ -45,13 +63,27 @@ if not exist imgui\imgui.cpp (
 )
 if not exist minhook\src\hook.c (
     echo [!] minhook\ is missing. Fetch it with:
-    echo     git clone --depth 1 https://github.com/TsudaKageyu/MinHook minhook
+    echo     git clone --depth 1 --branch v1.3.3 https://github.com/TsudaKageyu/MinHook minhook
     exit /b 1
 )
 
 rem hde64.c, not hde32.c: the target is 64-bit.
 set "MH=minhook"
 set "MHSRC=%MH%\src\buffer.c %MH%\src\hook.c %MH%\src\trampoline.c %MH%\src\hde\hde64.c"
+
+rem Committed rather than cloned, unlike imgui and minhook. third_party\
+rem VERSION.txt argues that properly and records the upstream tag, the archive's
+rem sha256 and what each option below switches off.
+set "TP=third_party"
+set "TPSRC=%TP%\miniz\miniz.c %TP%\lzma\LzmaDec.c"
+set "TPINC=/I%TP%\miniz /I%TP%\lzma"
+rem NO_ARCHIVE_WRITING_APIS is not here: miniz.h defines it itself the moment
+rem NO_ARCHIVE_APIS is set, and setting both is a C4005 redefinition warning.
+rem LzmaDec.c wants no options at all -- VERSION.txt says why the obvious
+rem _7ZIP_ST is not among them.
+set "TPDEFS=/DMINIZ_NO_ARCHIVE_APIS /DMINIZ_NO_DEFLATE_APIS"
+set "TPDEFS=%TPDEFS% /DMINIZ_NO_STDIO /DMINIZ_NO_TIME"
+set "TPDEFS=%TPDEFS% /DMINIZ_NO_ZLIB_COMPATIBLE_NAMES"
 
 set "IM=imgui"
 set "IMSRC=%IM%\imgui.cpp %IM%\imgui_draw.cpp %IM%\imgui_tables.cpp %IM%\imgui_widgets.cpp"
@@ -67,6 +99,8 @@ set "SRC=%SRC% %S%\wr_energy.cpp %S%\wr_limit.cpp %S%\wr_extract.cpp"
 set "SRC=%SRC% %S%\wr_timer.cpp %S%\wr_savelocs.cpp %S%\wr_maps.cpp"
 set "SRC=%SRC% %S%\wr_profile.cpp %S%\wr_board.cpp %S%\wr_intogame.cpp"
 set "SRC=%SRC% %S%\wr_start.cpp %S%\wr_settings.cpp"
+set "SRC=%SRC% %S%\wr_json.cpp %S%\wr_msml.cpp %S%\wr_mtv.cpp"
+set "SRC=%SRC% %S%\wr_http.cpp %S%\wr_api.cpp"
 
 rem IMGUI_USER_CONFIG is resolved by the preprocessor relative to the file that
 rem does the #include -- imgui\imgui.h -- and NOT relative to the working
@@ -75,19 +109,56 @@ rem it has to move whenever wr_imconfig.h does.
 set "DEFS=/DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS"
 set "DEFS=%DEFS% /DIMGUI_USER_CONFIG=\"../src/wr_imconfig.h\""
 
+rem /fp:precise is MSVC's default and /O2 does not change it, so this flag adds
+rem nothing today. It is written down as a lock. /fp:fast would let the compiler
+rem reassociate and contract floating point, which would break the exactness the
+rem energy arithmetic is asserted on in wr_budget.h, and -- once the extractor
+rem is C++ rather than Python -- would break bit-for-bit agreement with the
+rem reference implementation, which is the only way that port can be checked.
+rem Do not replace this with /fp:fast, and do not add /arch:AVX2.
+set "FP=/fp:precise"
+
 echo.
 echo === wrlines.dll (x64) ===
-cl /nologo /c /O2 /MT /EHsc /Zi /W3 %DEFS% /I%S% /I"%MH%\include" /I"%IM%" ^
-   %SRC% %IMSRC%
+cl /nologo /c /O2 /MT /EHsc /Zi /W3 %FP% %DEFS% /I%S% /I"%MH%\include" /I"%IM%" ^
+   %TPINC% %SRC% %IMSRC%
 if errorlevel 1 ( echo. & echo [!] compile FAILED & exit /b 1 )
 
-cl /nologo /c /O2 /MT /W3 /I"%MH%\include" %MHSRC%
+rem The C dependencies, on their own line: they are C, they do not want /EHsc,
+rem and they are not ours to warn about at our level.
+cl /nologo /c /O2 /MT /W3 %FP% /I"%MH%\include" %MHSRC%
 if errorlevel 1 ( echo. & echo [!] minhook compile FAILED & exit /b 1 )
 
-link /nologo /DLL /DEBUG /OPT:REF /OPT:ICF /OUT:wrlines.dll *.obj ^
-     user32.lib gdi32.lib shell32.lib dxguid.lib
+cl /nologo /c /O2 /MT /W3 %FP% %TPDEFS% %TPINC% %TPSRC%
+if errorlevel 1 ( echo. & echo [!] third-party compile FAILED & exit /b 1 )
+
+rem The version block. See src\wrlines.rc for why the DLL has one and why it
+rem has no icon.
+rc /nologo /fo wrlines.res %S%\wrlines.rc
+if errorlevel 1 ( echo. & echo [!] wrlines resource compile FAILED & exit /b 1 )
+
+rem wrlines.res is named explicitly: the line globs *.obj and a .res is not one.
+rem
+rem No /guard:cf here, deliberately, and see the injector below for where it
+rem does go. We call MinHook's trampolines -- g_origPresent and friends -- and
+rem those live in VirtualAlloc'd PAGE_EXECUTE_READWRITE memory that nobody has
+rem registered with SetProcessValidCallTargets. In a process where CFG is
+rem enforced, a guarded indirect call to one is an instant __fastfail with no
+rem callstack. It would not fire on most machines today, which is exactly the
+rem problem: it would fire on a machine with Exploit Protection -> CFG -> on by
+rem default, or the day Strata ships a CFG build of the game. Not worth it for a
+rem flag no antivirus engine scores.
+rem winhttp.lib is the sixth import, and it arrived at v0.6.0 with the
+rem leaderboard fetcher. It is called from src\wr_http.cpp and from nowhere
+rem else -- the README, HOW TO USE.txt, src\wr_board.h, docs\how-it-works.md
+rem and the $expected list in .github\workflows\release.yml all name the same
+rem list, and the CI assert fails the build if this line and that one disagree.
+link /nologo /DLL /DEBUG /OPT:REF /OPT:ICF /PDBALTPATH:%%_PDB%% ^
+     /OUT:wrlines.dll *.obj wrlines.res ^
+     user32.lib gdi32.lib shell32.lib dxguid.lib winhttp.lib
 if errorlevel 1 ( echo. & echo [!] link FAILED & exit /b 1 )
 
+del wrlines.res >nul 2>&1
 del *.obj >nul 2>&1
 
 echo.
@@ -104,8 +175,25 @@ if exist assets\wrlines.ico (
     set "RES="
 )
 
-cl /nologo /O2 /MT /W3 %DEFS% %S%\injector.cpp %RES% /Fe:wrinject.exe ^
-   /link /SUBSYSTEM:CONSOLE
+rem This is the file antivirus and SmartScreen actually judge -- nobody
+rem double-clicks a DLL -- so it gets everything the DLL cannot have:
+rem
+rem   /guard:cf      on compile AND link; the link flag is what emits the load
+rem                  config table. Safe here where it is not on the DLL: the
+rem                  injector makes no indirect calls into memory it allocated.
+rem   /Zi /DEBUG     an optimised, statically linked, symbol-free binary is
+rem                  about as opaque as a sample can look. A debug directory
+rem                  costs nothing and its absence is a packer tell.
+rem   /OPT:REF /OPT:ICF   /DEBUG turns both OFF by default, so re-state them or
+rem                  the injector quietly grows.
+rem   /PDBALTPATH    stops C:\Users\<name>\... being baked into the binary.
+rem   the manifest   see src\wrinject.manifest. /MANIFESTUAC:NO is required or
+rem                  the linker adds a second, conflicting trustInfo block.
+cl /nologo /O2 /MT /W3 /guard:cf /Zi %FP% %DEFS% ^
+   %S%\injector.cpp %RES% /Fe:wrinject.exe ^
+   /link /SUBSYSTEM:CONSOLE /guard:cf /DEBUG /OPT:REF /OPT:ICF ^
+         /PDBALTPATH:%%_PDB%% /MANIFEST:EMBED ^
+         /MANIFESTINPUT:%S%\wrinject.manifest /MANIFESTUAC:NO
 if errorlevel 1 ( echo. & echo [!] injector build FAILED & exit /b 1 )
 del wrinject.res >nul 2>&1
 
@@ -114,11 +202,15 @@ del *.obj >nul 2>&1
 echo.
 echo === done ===
 echo   wrlines.dll   + wrlines.pdb
-echo   wrinject.exe
+echo   wrinject.exe  + wrinject.pdb
 echo.
 echo Sanity checks:
 dumpbin /nologo /headers wrlines.dll | findstr /C:"machine"
 echo Exports (should be EMPTY -- that is what keeps our ImGui from ever binding
 echo to the copy inside the game's devui.dll):
 dumpbin /nologo /exports wrlines.dll | findstr /C:"ordinal hint"
+echo Version resource (should be NON-empty -- see src\wrlines.rc):
+dumpbin /nologo /headers wrlines.dll | findstr /C:"Resource Directory"
+echo Imports (the README makes a claim about this list -- keep them in step):
+dumpbin /nologo /dependents wrlines.dll | findstr /R /C:"\.dll$"
 endlocal

@@ -12,14 +12,22 @@ GETTING STARTED
   1. Start Momentum Mod and load into a map.
   2. Run wrinject.exe.
   3. Press INSERT in game.
-  4. Runs tab -> "Extract new demos". Wait. The lines appear when it finishes.
+  4. Board tab -> tick "Allow downloading" -> press "Fastest 50" -> tick the
+     rows you want -> "Download". That is the map's real board, and it is where
+     the demos come from. Nothing reaches the network until that box is ticked.
+  5. Runs tab -> "Extract new demos". Wait. The lines appear when it finishes.
 
-That reads the .mtv demos the game has already downloaded. If you want more
-lines than the game happens to have, use the Board tab: it lists the map's
-real board, top to bottom, and you tick the runs you want and fetch them.
+Step 5 also picks up whatever .mtv demos the game had already downloaded by
+itself, so it is worth pressing even if you skip step 4. When there is nothing
+new to do it reads "Re-run extractor" instead -- same button.
 
-Extraction needs Python (py.exe or python.exe on PATH). The panel says which one
-it found, or that it found neither. Everything else is self-contained.
+Downloading and extracting still need Python (py.exe, python.exe or
+python3.exe on PATH): the "Download" half of step 4 and the whole of step 5 run
+through wrpath_extract.py, which is in this folder. The panel says which
+interpreter it found, or that it found none. This is being folded into the DLL
+a piece at a time and the requirement will go away -- the Maps tab and the
+leaderboard itself no longer need it, so "Fastest 50" works with no Python
+installed at all.
 
 
 KEYS
@@ -118,13 +126,54 @@ A NOTE ON FAIR PLAY
   run counting, do not have this loaded while you set it.
 
 
+IF YOUR ANTIVIRUS FLAGS THIS
+
+  It might, and it is not being stupid. wrinject.exe loads the DLL into the
+  game with OpenProcess / VirtualAllocEx / WriteProcessMemory /
+  CreateRemoteThread, which is also how a lot of malware loads itself, and
+  there is no code-signing certificate on either file. That is also why
+  SmartScreen says "Windows protected your PC" the first time: it is a
+  statement about reputation, not about the file.
+
+  What it does not do: no registry access at all, no persistence, no packing or
+  obfuscation, no anti-debug, no hidden API names, no driver, no elevation.
+
+  Every release publishes SHA256SUMS.txt and both binaries are built by a
+  public GitHub Actions runner with a provenance attestation you can verify.
+  Check the hash before you run it.
+
+  If Defender quarantines it, reporting the false positive is the only thing
+  that actually fixes it, and it fixes it for everyone:
+
+      https://www.microsoft.com/en-us/wdsi/filesubmission
+
+  Pick "Software developer" -> "Incorrectly detected as malware". The README
+  has the longer version of all of this.
+
+
 A NOTE ON YOUR DATA
 
   Nothing leaves your machine unless you press a button that says it will. There
-  is no telemetry, no analytics, and no phone-home of any kind: the DLL links no
-  HTTP client at all, which you can check yourself -- dumpbin /dependents on
-  wrlines.dll lists five Windows system DLLs and nothing else. Every request to
-  Momentum's servers is made by wrpath_extract.py, which you can read.
+  is no telemetry, no analytics, and no phone-home of any kind.
+
+  Up to v0.5.1 the DLL linked no HTTP client at all and dumpbin proved it in one
+  line. From v0.6.0 it does: leaderboards are fetched by the DLL itself rather
+  than by the script, so WINHTTP.dll is now the sixth name in
+  dumpbin /dependents wrlines.dll. What you can still check quickly:
+
+    - It is called from ONE file, src\wr_http.cpp, which is about a hundred and
+      twenty lines and does GET and nothing else. Search the source for
+      "WinHttp" and that file and its header are the only two that have it.
+    - The only addresses it is ever given are api.momentum-mod.org and the
+      download link that Momentum's own reply contained.
+    - It sends no identifier. No machine id, no account, no counter. The one
+      request that names SteamIDs names your friends', because you pressed a
+      button that says it will look them up.
+    - It never runs on a timer, at startup, or on a map change. Only from a
+      button.
+
+  Everything else that reaches the network is still wrpath_extract.py, which you
+  can read.
 
 
 Source, full documentation and issues:

@@ -10,3 +10,23 @@
 *.dll binary
 *.exe binary
 *.pdb binary
+
+# Vendored third-party sources: exactly the bytes that came out of the upstream
+# release archive, and NOT normalised.
+#
+# This is load-bearing rather than fussy. third_party\VERSION.txt records a
+# SHA-256 for every file taken, so that a reviewer can hash their own copy and
+# see it is unmodified. `* text=auto` above would store them LF-normalised and
+# hand each cloner whatever their platform prefers -- and the two libraries do
+# not even agree with each other about what came out of the archive: the LZMA
+# SDK ships CRLF and miniz ships LF. Either way at least one platform's clone
+# would hash differently from the record, which makes the record worse than
+# useless: it would read as evidence of tampering on a clean checkout.
+#
+# -text rather than binary, so `git diff` against a future upstream bump is
+# still readable.
+third_party/** -text
+
+# A recorded API conversation is bytes off somebody's server, not text of ours.
+# See tests\api_tape.h.
+tests/fixtures/api/** -text

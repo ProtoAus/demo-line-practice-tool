@@ -134,6 +134,17 @@ const char *WrGameDir(void);
 // null test.
 bool WrIsWine(void);
 
+// ---------------------------------------------------------------------------
+// The clock
+// ---------------------------------------------------------------------------
+
+// Unix seconds, unless WRLINES_FAKE_NOW pins them. The reference's _now().
+//
+// Every timestamp written into a file goes through this one function so that
+// setting one environment variable makes the whole program's output
+// reproducible. See the comment on the definition in wr_log.cpp.
+long long WrNowEpoch(void);
+
 extern HMODULE g_wrSelf;
 
 #endif // WR_COMMON_H

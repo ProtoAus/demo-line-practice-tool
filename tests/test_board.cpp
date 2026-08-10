@@ -155,6 +155,213 @@ int main(void)
     }
 
     // -----------------------------------------------------------------------
+    printf("\nthe rank sort is stable over the order rows arrived in\n");
+    {
+        // Forty rows, all at the same rank, merged in a known order. This is
+        // the trap the writer exists to avoid: the reference sorts a dict's
+        // values, dicts iterate in insertion order, and sorted() is stable --
+        // so ties come out in arrival order there. qsort is not stable and
+        // would leave them in whatever order the partitioning happened to
+        // produce, which is a difference of one line in a two-hundred-row file
+        // and an afternoon to find.
+        //
+        // Forty rather than three because MSVC's qsort falls back to an
+        // insertion sort below a threshold, and an insertion sort is stable by
+        // accident. A three-row case would pass with a broken comparator.
+        WrBoardCache c;
+        memset(&c, 0, sizeof(c));
+        for (int i = 0; i < 40; i++)
+        {
+            WrBoardCacheRow r;
+            memset(&r, 0, sizeof(r));
+            r.rank = 7;
+            r.time = 1.0 + i;
+            _snprintf_s(r.hash, sizeof(r.hash), _TRUNCATE, "h%02d", i);
+            strcpy_s(r.steamId, sizeof(r.steamId), "1");
+            strcpy_s(r.alias, sizeof(r.alias), "x");
+            WrBoardCacheMerge(&c, &r);
+        }
+        strcpy_s(c.map, sizeof(c.map), "m");
+        Check(WrBoardWriteCache(kPath, &c), "forty tied rows are written");
+        WrBoardCacheFree(&c);
+
+        WrBoardCache back;
+        WrBoardReadCache(kPath, &back, 0);
+        bool ordered = (back.count == 40);
+        for (int i = 0; i < back.count && ordered; i++)
+        {
+            char want[16];
+            _snprintf_s(want, sizeof(want), _TRUNCATE, "h%02d", i);
+            if (strcmp(back.rows[i].hash, want) != 0)
+                ordered = false;
+        }
+        Check(ordered, "and come back in the order they went in");
+        WrBoardCacheFree(&back);
+    }
+
+    // -----------------------------------------------------------------------
+    printf("\na re-fetched row keeps its place and takes the new value\n");
+    {
+        WrBoardCache c;
+        memset(&c, 0, sizeof(c));
+        const char *hashes[3] = {"AAAA", "BBBB", "CCCC"};
+        for (int i = 0; i < 3; i++)
+        {
+            WrBoardCacheRow r;
+            memset(&r, 0, sizeof(r));
+            r.rank = i + 1;
+            r.time = 10.0 + i;
+            strcpy_s(r.hash, sizeof(r.hash), hashes[i]);
+            strcpy_s(r.steamId, sizeof(r.steamId), "1");
+            strcpy_s(r.alias, sizeof(r.alias), "x");
+            WrBoardCacheMerge(&c, &r);
+        }
+
+        // The same run again, at a new rank, and spelled in a different case --
+        // the reference keys its dict on hash.lower(), so this is the same row.
+        WrBoardCacheRow again;
+        memset(&again, 0, sizeof(again));
+        again.rank = 3;
+        again.time = 99.0;
+        strcpy_s(again.hash, sizeof(again.hash), "bbbb");
+        strcpy_s(again.steamId, sizeof(again.steamId), "1");
+        strcpy_s(again.alias, sizeof(again.alias), "x");
+        Check(!WrBoardCacheMerge(&c, &again), "a hash in a different case is not new");
+        Check(c.count == 3, "so nothing was appended");
+        Check(c.rows[1].time > 98.9 && strcmp(c.rows[1].hash, "bbbb") == 0,
+              "and the row where it already sat took the new value whole");
+
+        WrBoardWriteCache(kPath, &c);
+        WrBoardCacheFree(&c);
+
+        WrBoardCache back;
+        WrBoardReadCache(kPath, &back, 0);
+        Check(back.count == 3 &&
+              strcmp(back.rows[0].hash, "AAAA") == 0 &&
+              strcmp(back.rows[1].hash, "bbbb") == 0 &&
+              strcmp(back.rows[2].hash, "CCCC") == 0,
+              "the tie at rank 3 breaks the way insertion order says it should");
+        WrBoardCacheFree(&back);
+    }
+
+    // -----------------------------------------------------------------------
+    printf("\nthe header lines are a fixed order, and only what is set\n");
+    {
+        WrBoardCache c;
+        memset(&c, 0, sizeof(c));
+        strcpy_s(c.map, sizeof(c.map), "surf_demise");
+        strcpy_s(c.mapId, sizeof(c.mapId), "265");
+        strcpy_s(c.gamemode, sizeof(c.gamemode), "1");
+        strcpy_s(c.track, sizeof(c.track), "0\t1");
+        strcpy_s(c.total, sizeof(c.total), "9108");
+        strcpy_s(c.fetched, sizeof(c.fetched), "1700000000");
+        WrBoardWriteCache(kPath, &c);
+        WrBoardCacheFree(&c);
+
+        FILE *f = NULL;
+        fopen_s(&f, kPath, "rb");
+        char blob[1024] = {0};
+        size_t got = f ? fread(blob, 1, sizeof(blob) - 1, f) : 0;
+        if (f) fclose(f);
+        blob[got] = '\0';
+
+        Check(strcmp(blob,
+            "# WrLines leaderboard cache -- the windows you asked for, not the whole board.\r\n"
+            "# map\tsurf_demise\r\n"
+            "# mapid\t265\r\n"
+            "# gamemode\t1\r\n"
+            "# track\t0\t1\r\n"
+            "# total\t9108\r\n"
+            "# fetched\t1700000000\r\n"
+            "# rank\ttime\tsteamid\talias\thash\tepoch\turl\r\n") == 0,
+            "the six keys in the reference's order, then the column line");
+
+        // CRLF, and that is not a preference: the reference writes with
+        // Python's default newline translation, and both readers open the file
+        // in text mode. A binary write would put a stray \r on every url field.
+        Check(strstr(blob, "\r\n") != NULL, "the lines end CRLF");
+
+        // Absent is not the same as zero. A friends lookup learns nothing about
+        // the board's size, so it must leave whatever was there rather than
+        // writing a "# total 0" that reads as an empty leaderboard.
+        WrBoardCache noTotal;
+        memset(&noTotal, 0, sizeof(noTotal));
+        strcpy_s(noTotal.map, sizeof(noTotal.map), "m");
+        WrBoardWriteCache(kPath, &noTotal);
+        WrBoardCacheFree(&noTotal);
+
+        fopen_s(&f, kPath, "rb");
+        memset(blob, 0, sizeof(blob));
+        got = f ? fread(blob, 1, sizeof(blob) - 1, f) : 0;
+        if (f) fclose(f);
+        Check(strstr(blob, "# total") == NULL,
+              "a key that is not set gets no line at all");
+        Check(strstr(blob, "# map\tm\r\n") != NULL, "and the ones that are, do");
+    }
+
+    // -----------------------------------------------------------------------
+    printf("\nthe time is a double all the way to the file\n");
+    {
+        WrBoardCache c;
+        memset(&c, 0, sizeof(c));
+        strcpy_s(c.map, sizeof(c.map), "m");
+
+        WrBoardCacheRow r;
+        memset(&r, 0, sizeof(r));
+        r.rank = 1;
+        // A float holds about seven significant digits, so this value as a
+        // float prints "4567.891113" and as a double "4567.891234". The row
+        // type the FETCHER uses is a double for exactly this reason -- the
+        // table's WrBoardRow.time is a float, which is fine for a column and
+        // wrong for a byte-for-byte comparison.
+        r.time = 4567.891234;
+        strcpy_s(r.hash, sizeof(r.hash), "h");
+        strcpy_s(r.steamId, sizeof(r.steamId), "1");
+        strcpy_s(r.alias, sizeof(r.alias), "x");
+        WrBoardCacheMerge(&c, &r);
+
+        r.rank = 2;
+        r.time = 1.0 / 3.0;
+        strcpy_s(r.hash, sizeof(r.hash), "h2");
+        WrBoardCacheMerge(&c, &r);
+
+        WrBoardWriteCache(kPath, &c);
+        WrBoardCacheFree(&c);
+
+        FILE *f = NULL;
+        fopen_s(&f, kPath, "rb");
+        char blob[512] = {0};
+        size_t got = f ? fread(blob, 1, sizeof(blob) - 1, f) : 0;
+        if (f) fclose(f);
+        blob[got] = '\0';
+
+        Check(strstr(blob, "1\t4567.891234\t") != NULL,
+              "%.6f of a double keeps the sixth place");
+        Check(strstr(blob, "4567.891113") == NULL,
+              "which a float would have lost");
+        Check(strstr(blob, "2\t0.333333\t") != NULL, "and rounds the last one");
+    }
+
+    // -----------------------------------------------------------------------
+    printf("\nrows the display would not show still round-trip\n");
+    {
+        // WrBoardParseFile drops a row with no rank or no hash, because a table
+        // cannot show one. The FETCHER must not: it reads, merges and writes
+        // the same file, and dropping a row it did not understand would delete
+        // it from somebody's cache without saying so.
+        Write("# rank\ttime\tsteamid\talias\thash\tepoch\turl\n"
+              "0\t1.000000\t1\tzerorank\tZZZZ\t0\t\n"
+              "5\t2.000000\t1\tfine\tAAAA\t0\t\n");
+
+        WrBoardCache c;
+        WrBoardReadCache(kPath, &c, 0);
+        Check(c.count == 2, "the reader keeps both");
+        int shown = WrBoardParseFile(kPath, rows, 64, NULL, NULL, NULL);
+        Check(shown == 1, "and the table shows one");
+        WrBoardCacheFree(&c);
+    }
+
+    // -----------------------------------------------------------------------
     printf("\ngamemode names come from Momentum's own enum\n");
     {
         Check(strcmp(WrGamemodeName(1), "surf") == 0, "1 is surf");

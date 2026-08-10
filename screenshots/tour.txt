@@ -33,10 +33,10 @@ shell; on Windows that is Git Bash.
 
     cell 8.PNG  "Aim at a line and it says whose it is  --  surf_hades2 bonus 4"   a.png
     cell 13.PNG "Watching a replay, every line drawn  --  surf_colin_blaster_69000" b.png
-    cell 9.PNG  "Graphs: energy across a whole run, every line at once"            c.png
+    cell 9.PNG  "Graphs: energy across a run, every line  --  surf_hades2 bonus 4" c.png
     cell 10.PNG "Runs: tick what gets drawn  --  273 cached on surf_utopia"        d.png
-    cell 11.PNG "Board: the map's real leaderboard, fetch what you want"           e.png
-    cell 12.PNG "Maps: 2050 of them, and which ones you already hold"              f.png
+    cell 11.PNG "Board: the real leaderboard, fetch what you want  --  surf_tropic" e.png
+    cell 12.PNG "Maps: 2050 of them, and which ones you hold  --  surf_zoomathon"  f.png
 
     magick montage a.png b.png c.png d.png e.png f.png \
         -tile 3x2 -geometry +8+8 -background "$BG" grid.png
@@ -46,12 +46,19 @@ shell; on Windows that is Git Bash.
 
     rm -f tile.png cap.png a.png b.png c.png d.png e.png f.png grid.png
 
-Two things there are deliberate. 4:4:4 sampling keeps the thin coloured lines
+Three things there are deliberate. 4:4:4 sampling keeps the thin coloured lines
 from bleeding into each other -- JPEG's default halves the chroma resolution,
 which is exactly the wrong thing to do to a picture that is mostly one-pixel
 lines of saturated colour. And the top row is what you look at in the world
 while the bottom row is the lists that feed it, so the sheet reads left to
 right and top to bottom as an order of operations.
+
+And every caption names its map. Somebody asked which map each tile was, which
+is a fair question to have to ask twice and not at all after that. The map goes
+last, after a "  --  ", and the body text gets trimmed to make room: the strip
+is 782 px of Consolas at pointsize 19 with a 15 px inset, so about 71 characters
+fit and 66 is the bound to write to. Past that the last word walks off the right
+edge and nothing warns you -- check the rebuilt sheet, do not trust the count.
 
 The result is about 2400x1300 and 800 KB. GitHub scales it down to the width of
 the README column and the full size is one click away, which is why the small

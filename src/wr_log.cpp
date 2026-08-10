@@ -4,6 +4,7 @@
 
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <share.h>
@@ -105,6 +106,48 @@ const char *WrDataPath(const char *rel)
         }
     }
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// The clock
+// ---------------------------------------------------------------------------
+
+// Every timestamp this program writes into a file goes through here, and there
+// is exactly one reason for that: WRLINES_FAKE_NOW.
+//
+// Two stamps exist -- the board cache's "fetched" line and, once the extractor
+// is native, the .wrpath header's 0xF4. Neither is read back for any decision.
+// They are also the ONLY reason two runs over the same inputs do not produce
+// identical bytes, which makes them the only thing standing between "did the
+// port write the same file" and fc /b.
+//
+// So this is a feature before it is a test hook. Pinning it means you can
+// re-fetch a board or re-extract a map and diff the result against what you
+// had, and see only what actually changed. That it also makes the port
+// checkable at all is the reason it exists, and there is no sense pretending
+// otherwise -- but a user who sets it gets something real.
+//
+// Same environment variable and same semantics as the reference's _now(): a
+// value that will not parse as an integer is ignored rather than treated as
+// zero, because a typo should not silently backdate everything to 1970.
+long long WrNowEpoch(void)
+{
+    char v[64];
+    DWORD n = GetEnvironmentVariableA("WRLINES_FAKE_NOW", v, sizeof(v));
+    if (n > 0 && n < sizeof(v))
+    {
+        char *end = NULL;
+        long long pinned = _strtoi64(v, &end, 10);
+        if (end && end != v && *end == '\0')
+            return pinned;
+    }
+
+    // int(time.time()), which truncates toward zero rather than rounds.
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    unsigned long long ticks =
+        ((unsigned long long)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    return (long long)(ticks / 10000000ULL) - 11644473600LL;
 }
 
 // ---------------------------------------------------------------------------

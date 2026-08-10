@@ -1,17 +1,15 @@
 // wr_extract.cpp  --  see wr_extract.h.
 
 #include "wr_extract.h"
+#include "wr_api.h"
+#include "wr_maps.h"
+#include "wr_mtv.h"
 #include "wr_log.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-// Must match wrpath_extract.py: MMTV_MAGIC and OFF_MAPNAME.
-#define MTV_MAGIC "MMTV"
-#define MTV_MAPNAME_OFF 0x10
-#define MTV_MAPNAME_MAX 64
-#define MTV_PEEK_BYTES 0x50
 
 #define WR_EXTRACT_LINES 400
 #define WR_EXTRACT_LINE_MAX 200
@@ -31,6 +29,7 @@ static int g_forThisMap = 0;
 static int g_alreadyDone = 0;
 static int g_notYetDone = 0;
 static int g_knownBad = 0;
+static int g_headerBad = 0;     // of g_knownBad, how many failed the header gates
 
 static volatile LONG g_running = 0;
 static volatile LONG g_finished = 0;
@@ -39,8 +38,19 @@ static volatile LONG g_finished = 0;
 static HANDLE g_proc = NULL;
 static HANDLE g_job = NULL;
 static volatile LONG g_stopped = 0;     // this run ended because Stop was pressed
+static volatile LONG g_cancel = 0;      // asked to stop; the native path polls it
 static HANDLE g_readThread = NULL;
 static HANDLE g_countThread = NULL;
+static HANDLE g_nativeThread = NULL;
+
+// The job in flight, and the one that most recently ended. Both guarded by g_cs.
+// g_generation is bumped once per ending and read without the lock, which is all
+// an edge detector needs.
+static WrExtractRequest g_req = {WR_JOB_NONE};
+static int *g_ranks = NULL;
+static int g_rankCount = 0;
+static WrJobKind g_lastKind = WR_JOB_NONE;
+static volatile LONG g_generation = 0;
 
 static char g_lines[WR_EXTRACT_LINES][WR_EXTRACT_LINE_MAX];
 static int g_lineCount = 0;
@@ -73,44 +83,54 @@ static void PushLine(const char *s)
     LeaveCriticalSection(&g_cs);
 }
 
+// Every progress line in this file goes through here rather than straight to
+// PushLine. See WrExtractSetEmit in the header for why -- in short, it is what
+// lets a console front end run the same code and have its output diffed against
+// the reference implementation's.
+static WrEmitFn g_emit = NULL;
+
+static void Emit(const char *s)
+{
+    WrEmitFn fn = g_emit;
+    if (fn)
+        fn(s);
+    else
+        PushLine(s);
+}
+
+static void Emitf(const char *fmt, ...)
+{
+    char buf[WR_EXTRACT_LINE_MAX];
+    va_list ap;
+    va_start(ap, fmt);
+    _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
+    va_end(ap);
+    Emit(buf);
+}
+
+void WrExtractSetEmit(WrEmitFn fn) { g_emit = fn; }
+
 // ---------------------------------------------------------------------------
 // Counting
 // ---------------------------------------------------------------------------
 
-// Read the map name out of a demo's header without decompressing anything.
-static bool PeekMap(const char *path, char *out, int outLen)
-{
-    HANDLE h = CreateFileA(path, GENERIC_READ,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                           NULL, OPEN_EXISTING,
-                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
-    if (h == INVALID_HANDLE_VALUE)
-        return false;
-
-    unsigned char buf[MTV_PEEK_BYTES];
-    DWORD got = 0;
-    BOOL ok = ReadFile(h, buf, sizeof(buf), &got, NULL);
-    CloseHandle(h);
-    if (!ok || got < MTV_MAPNAME_OFF + 8)
-        return false;
-    if (memcmp(buf, MTV_MAGIC, 4) != 0)
-        return false;
-
-    int n = 0;
-    while (n < MTV_MAPNAME_MAX && (int)(MTV_MAPNAME_OFF + n) < (int)got &&
-           buf[MTV_MAPNAME_OFF + n] != 0)
-    {
-        unsigned char c = buf[MTV_MAPNAME_OFF + n];
-        if (c < 0x20 || c > 0x7E)
-            return false;
-        n++;
-    }
-    if (n <= 0 || n >= outLen)
-        return false;
-    memcpy(out, buf + MTV_MAPNAME_OFF, (size_t)n);
-    out[n] = '\0';
-    return true;
-}
+// There used to be a PeekMap here: forty lines that opened a demo, checked the
+// magic, and copied the map name out of offset 0x10. It was a partial, drifted
+// copy of the reference implementation's header parser -- it read one field of
+// eleven, applied none of the sanity gates, and had a printable-ASCII test the
+// reference does not have. Two parsers for one format is one parser too many,
+// and the one that was wrong was always going to be this one.
+//
+// WrMtvPeek is still one read and still no allocation -- 512 bytes now rather
+// than 80, which is inside the same disk block either way -- and it parses all
+// of it. What that buys the counter is the subject of the knownBad comment in
+// wr_extract.h: a demo whose header does not survive the gates can never be
+// extracted, and now says so at once instead of after a run has spent the time
+// finding out.
+//
+// Measured over the 6249 demos on this machine, nothing changed hands: the same
+// files are counted, under the same map names, and none fails a gate. That is
+// the result to want. The gates are there for the day the format moves.
 
 // ---------------------------------------------------------------------------
 // The failure record
@@ -243,10 +263,18 @@ static void CountInTree(const char *root, const char *map, const char *pathsDir)
         if (!dot || _stricmp(dot, ".mtv") != 0)
             continue;
 
-        char demoMap[80];
-        if (!PeekMap(full, demoMap, sizeof(demoMap)))
+        // A failed peek still fills in every field it managed to read before
+        // the gate that refused it -- see WrMtvPeek. So a demo with a broken
+        // header is still a demo FOR a map, and is counted against that map
+        // rather than vanishing from the total. An empty name is the other
+        // case: the file is not an MMTV at all and there is nothing to count
+        // it against.
+        char why[128];
+        WrMtvHeader hdr;
+        bool headerOk = WrMtvPeek(full, &hdr, why, sizeof(why));
+        if (!hdr.map[0])
             continue;
-        if (_stricmp(demoMap, map) != 0)
+        if (_stricmp(hdr.map, map) != 0)
             continue;
 
         g_forThisMap++;
@@ -268,9 +296,22 @@ static void CountInTree(const char *root, const char *map, const char *pathsDir)
             else
                 g_notYetDone++;     // out of date counts as work still to do
         }
-        else if (IsKnownBad(base, ((long long)fd.nFileSizeHigh << 32) |
+        else if (!headerOk ||
+                 IsKnownBad(base, ((long long)fd.nFileSizeHigh << 32) |
                                   fd.nFileSizeLow))
+        {
             g_knownBad++;
+            // Nothing in this library has ever failed a header gate, so if one
+            // does, the reason is worth having written down somewhere. Capped
+            // because a genuinely broken install would otherwise put a line in
+            // the log for every demo it owns, every time you change map.
+            if (!headerOk)
+            {
+                g_headerBad++;
+                if (g_headerBad <= 5)
+                    WrLogf("[!] extract: %s -- %s", fd.cFileName, why);
+            }
+        }
         else
             g_notYetDone++;
     } while (FindNextFileA(h, &fd));
@@ -289,6 +330,7 @@ static DWORD WINAPI CountThread(LPVOID)
     LeaveCriticalSection(&g_cs);
 
     g_forThisMap = g_alreadyDone = g_notYetDone = g_knownBad = 0;
+    g_headerBad = 0;
 
     if (map[0] && WrGameDir()[0])
     {
@@ -317,8 +359,9 @@ static DWORD WINAPI CountThread(LPVOID)
     InterlockedExchange(&g_counting, 0);
     if (g_notYetDone > 0 || g_knownBad > 0)
         WrLogf("extract: %s has %d demo%s, %d extracted, %d new, %d that failed "
-               "before", map, g_forThisMap, g_forThisMap == 1 ? "" : "s",
-               g_alreadyDone, g_notYetDone, g_knownBad);
+               "before (%d of those on the header alone)",
+               map, g_forThisMap, g_forThisMap == 1 ? "" : "s",
+               g_alreadyDone, g_notYetDone, g_knownBad, g_headerBad);
     return 0;
 }
 
@@ -407,8 +450,52 @@ static void FindInterpreter(void)
     WrLogf("extract: interpreter %s%s", g_interp, WrIsWine() ? " (under Wine)" : "");
 }
 
-const char *WrExtractInterpreter(void) { return g_interp; }
+const char *WrExtractStatus(void) { return g_interp; }
 bool WrExtractRunning(void) { return g_running != 0; }
+
+unsigned int WrExtractRunGeneration(void) { return (unsigned int)g_generation; }
+
+WrJobKind WrExtractLastKind(void)
+{
+    if (!g_csReady)
+        return WR_JOB_NONE;
+    EnterCriticalSection(&g_cs);
+    WrJobKind k = g_lastKind;
+    LeaveCriticalSection(&g_cs);
+    return k;
+}
+
+// The single exit. Every way a run can end -- clean, stopped, or failed before
+// it ever started -- comes through here.
+//
+// It used to be five places, all of them clearing g_running and only one of them
+// pushing a terminator or setting g_finished. That is why a launch that failed
+// early left the panel with an error and no full stop, and why the UI's
+// "did something just finish" edge could miss a job entirely: g_running was set
+// and cleared inside one call, between frames.
+static void EndRun(DWORD exitCode)
+{
+    char msg[128];
+    if (InterlockedExchange(&g_stopped, 0))
+        _snprintf_s(msg, sizeof(msg), _TRUNCATE, "--- stopped ---");
+    else
+        _snprintf_s(msg, sizeof(msg), _TRUNCATE,
+                    "--- finished, exit code %lu ---", exitCode);
+    Emit(msg);
+    WrLogf("extract: %s (exit code %lu)", msg, exitCode);
+
+    EnterCriticalSection(&g_cs);
+    g_lastKind = g_req.kind;
+    free(g_ranks);
+    g_ranks = NULL;
+    g_rankCount = 0;
+    LeaveCriticalSection(&g_cs);
+
+    InterlockedExchange(&g_cancel, 0);
+    InterlockedIncrement(&g_generation);
+    InterlockedExchange(&g_finished, 1);
+    InterlockedExchange(&g_running, 0);
+}
 
 struct ReadCtx { HANDLE pipe; };
 
@@ -433,7 +520,7 @@ static DWORD WINAPI ReadThread(LPVOID param)
             {
                 partial[used] = '\0';
                 if (used > 0)
-                    PushLine(partial);
+                    Emit(partial);
                 used = 0;
                 if (c != '\n')
                     partial[used++] = c;
@@ -447,7 +534,7 @@ static DWORD WINAPI ReadThread(LPVOID param)
     if (used > 0)
     {
         partial[used] = '\0';
-        PushLine(partial);
+        Emit(partial);
     }
 
     CloseHandle(ctx->pipe);
@@ -466,32 +553,23 @@ static DWORD WINAPI ReadThread(LPVOID param)
     g_job = NULL;
     LeaveCriticalSection(&g_cs);
 
+    DWORD code = 1;
     if (proc)
     {
         WaitForSingleObject(proc, INFINITE);
-        DWORD code = 1;
         GetExitCodeProcess(proc, &code);
-        char msg[128];
-        if (InterlockedExchange(&g_stopped, 0))
-            _snprintf_s(msg, sizeof(msg), _TRUNCATE, "--- stopped ---");
-        else
-            _snprintf_s(msg, sizeof(msg), _TRUNCATE,
-                        "--- finished, exit code %lu ---", code);
-        PushLine(msg);
-        WrLogf("extract: %s (exit code %lu)", msg, code);
         CloseHandle(proc);
     }
     if (job)
         CloseHandle(job);
 
-    InterlockedExchange(&g_finished, 1);
-    InterlockedExchange(&g_running, 0);
+    EndRun(code);
     return 0;
 }
 
 // A launch that got as far as a running child but no further. Kill it and let
-// go of everything, rather than clearing the running flag and orphaning both
-// the handle and the process.
+// go of everything, rather than reporting a failure and orphaning both the
+// handle and the process. The caller still has the latch and still ends the run.
 static void Abandon(void)
 {
     HANDLE proc = NULL, job = NULL;
@@ -513,11 +591,15 @@ static void Abandon(void)
     }
     if (proc)
         CloseHandle(proc);
-    InterlockedExchange(&g_running, 0);
 }
 
 void WrExtractStop(void)
 {
+    // The native path has no process to kill: it polls this and unwinds at the
+    // next check. Set it first and unconditionally, so a Stop pressed in the
+    // window between claiming the latch and the backend starting is not lost.
+    InterlockedExchange(&g_cancel, 1);
+
     // Terminate the JOB, not the process.
     //
     // The extractor runs a worker pool -- cores minus two by default -- and
@@ -536,13 +618,25 @@ void WrExtractStop(void)
     LeaveCriticalSection(&g_cs);
 
     if (!proc && !job)
+    {
+        // No child. Either nothing is running -- the flag set above is cleared
+        // by the next EndRun and does no harm -- or the job in flight is a
+        // native one, which has nothing to kill and stops itself.
+        if (g_running)
+        {
+            InterlockedExchange(&g_stopped, 1);
+            Emit("--- stopping; the work in flight has to reach its next "
+                 "checkpoint ---");
+            WrLogf("extract: stop -- cooperative");
+        }
         return;
+    }
 
     InterlockedExchange(&g_stopped, 1);
 
     if (job && TerminateJobObject(job, 1))
     {
-        PushLine("--- stopping, and taking the worker processes with it ---");
+        Emit("--- stopping, and taking the worker processes with it ---");
         WrLogf("extract: stop -- TerminateJobObject");
         return;
     }
@@ -551,8 +645,8 @@ void WrExtractStop(void)
     // stop and leaving python.exe processes running behind the panel.
     if (proc && TerminateProcess(proc, 1))
     {
-        PushLine("--- stopping the extractor; its worker processes may take a "
-                 "moment longer ---");
+        Emit("--- stopping the extractor; its worker processes may take a "
+             "moment longer ---");
         WrLogf("extract: stop -- TerminateProcess only (no job object)");
     }
 }
@@ -562,45 +656,177 @@ static int g_timeout = WR_EXTRACT_TIMEOUT_DEFAULT;
 void WrExtractSetTimeout(int seconds) { g_timeout = seconds < 0 ? 0 : seconds; }
 int WrExtractTimeout(void) { return g_timeout; }
 
-void WrExtractRun(bool retryFailed)
+// ---------------------------------------------------------------------------
+// The python backend
+// ---------------------------------------------------------------------------
+//
+// Everything from here to WrExtractSubmit goes when the last verb is ported.
+// It is kept behind one function -- BuildPythonArgs -- so that the typed request
+// and the command line it used to be can be checked against each other by
+// tests\test_seam.exe for as long as both exist.
+
+// The ticked places, through a file rather than argv.
+//
+// A selection has no natural bound -- "tick all" on a 20000-row board is a
+// legitimate thing to press -- and a command line has a 2048-byte one. This is
+// the workaround, and it exists only because the backend is a separate process;
+// when the fetcher is C the ranks array goes straight through and this goes.
+static bool WritePickFile(const WrExtractRequest *req, char *out, int cap)
 {
-    char extra[96];
-    _snprintf_s(extra, sizeof(extra), _TRUNCATE, "--skip-existing%s --timeout %d",
-                retryFailed ? " --retry-failed" : "", g_timeout);
-    WrExtractRunArgs(extra, true);
+    char rel[192];
+    _snprintf_s(rel, sizeof(rel), _TRUNCATE, "boards\\%s_g%d_t%d%d.pick",
+                req->map, req->gamemode, req->trackType, req->trackNum);
+    strncpy_s(out, cap, WrDataPath(rel), _TRUNCATE);
+
+    FILE *f = NULL;
+    if (fopen_s(&f, out, "w") != 0 || !f)
+        return false;
+    fprintf(f, "# WrLines: the places ticked in the Board tab, for --ranks-file.\n");
+    for (int i = 0; i < req->rankCount; i++)
+        fprintf(f, "%d\n", req->ranks[i]);
+    fclose(f);
+    return req->rankCount > 0;
 }
 
-// The one launcher. Extraction, the map index and a fetch are all the same
-// script with different flags, and all three want the same pipe, the same line
-// ring and the same "already running" guard -- so there is one of each rather
-// than three copies that can drift apart.
+// The request, as the flags wrpath_extract.py expects.
 //
-// `needsMap` is what makes the difference: extracting and fetching are about the
-// map you are standing in, indexing is not.
-void WrExtractRunArgs(const char *extraArgs, bool needsMap)
+// Byte-for-byte what the call sites used to format themselves -- that is the
+// whole point of it being one function, and test_seam holds it to it. `needsMap`
+// says whether the caller must also prepend --map for the map being played;
+// extraction is about where you are standing, the other three name their map in
+// the flags because the panel lets you point them at any map.
+static bool BuildPythonArgs(const WrExtractRequest *req, char *out, int cap,
+                            bool *needsMap)
 {
-    EnsureCs();
+    *needsMap = false;
+    out[0] = '\0';
+
+    switch (req->kind)
+    {
+    case WR_JOB_EXTRACT:
+        *needsMap = true;
+        _snprintf_s(out, cap, _TRUNCATE, "--skip-existing%s --timeout %d",
+                    req->retryFailed ? " --retry-failed" : "",
+                    req->timeoutSeconds);
+        return true;
+
+    case WR_JOB_INDEX_MAPS:
+        // Ported: NativeHandles claims this one, so nothing in the DLL reaches
+        // here any more. Kept because it is the recorded contract -- test_seam
+        // is what proves the struct produces the argv the call sites used to
+        // build, and deleting the line would delete the record for one saved
+        // line of a function that goes whole at the end of the port.
+        strncpy_s(out, cap, "--index-maps", _TRUNCATE);
+        return true;
+
+    case WR_JOB_BOARD:
+    {
+        // Ported at v0.6.0, and kept for the same reason --index-maps above is:
+        // this function is the recorded contract that a typed request produces
+        // the command line the nine call sites used to format by hand, and
+        // test_seam is what holds it to that. It goes whole, with the python
+        // backend, when the last verb is C.
+        char verb[64];
+        switch (req->boardMode)
+        {
+        case WR_BOARD_SLOWEST:
+            _snprintf_s(verb, sizeof(verb), _TRUNCATE,
+                        "--board --slowest --count %d", req->count);
+            break;
+        case WR_BOARD_SPREAD:
+            _snprintf_s(verb, sizeof(verb), _TRUNCATE,
+                        "--board --spread %d", req->spread);
+            break;
+        case WR_BOARD_FRIENDS:
+            strcpy_s(verb, sizeof(verb), "--board --friends");
+            break;
+        default:
+            // The "Fastest N" button is this with fromRank pinned to 1, which is
+            // why there is one window mode and not two.
+            _snprintf_s(verb, sizeof(verb), _TRUNCATE,
+                        "--board --from-rank %d --count %d",
+                        req->fromRank, req->count);
+            break;
+        }
+        _snprintf_s(out, cap, _TRUNCATE,
+                    "%s --map \"%s\" --gamemode %d --track-type %d --track-num %d",
+                    verb, req->map, req->gamemode, req->trackType, req->trackNum);
+        return true;
+    }
+
+    case WR_JOB_FETCH:
+        // Two shapes, because they answer two different questions. The Board tab
+        // asks for named places on a board it already has cached, so it passes a
+        // gamemode and a selection. The Maps tab is browsing a map it may never
+        // have loaded, so it passes an id and a count and lets the gamemode
+        // default.
+        if (req->rankCount > 0)
+        {
+            char pick[MAX_PATH];
+            if (!WritePickFile(req, pick, sizeof(pick)))
+                return false;
+            _snprintf_s(out, cap, _TRUNCATE,
+                        "--fetch --map \"%s\" --gamemode %d --track-type %d "
+                        "--track-num %d --ranks-file \"%s\"%s",
+                        req->map, req->gamemode, req->trackType, req->trackNum,
+                        pick, req->intoGame ? " --into-game" : "");
+        }
+        else
+        {
+            _snprintf_s(out, cap, _TRUNCATE,
+                        "--fetch --map \"%s\" --map-id %d --top %d "
+                        "--track-type %d --track-num %d%s%s",
+                        req->map, req->mapId, req->top, req->trackType,
+                        req->trackNum, req->intoGame ? " --into-game" : "",
+                        req->dryRun ? " --dry-run" : "");
+        }
+        return true;
+
+    default:
+        return false;
+    }
+}
+
+bool WrExtractTestPythonArgs(const WrExtractRequest *req, char *out, int cap,
+                             bool *needsMap)
+{
+    return BuildPythonArgs(req, out, cap, needsMap);
+}
+
+// Launch the script. Returns false having said why, in which case the caller
+// ends the run; the latch is already held either way.
+static bool StartPythonChild(const WrExtractRequest *req)
+{
     FindInterpreter();
     if (!g_interpFound)
     {
         // Say so in the panel. Returning silently makes the button look broken,
         // which is the worst way to find out Python is not installed.
-        PushLine(g_interp);
-        return;
+        Emit(g_interp);
+        return false;
     }
-    if (InterlockedCompareExchange(&g_running, 1, 0) != 0)
-        return;
+
+    char extraArgs[1024];
+    bool needsMap = false;
+    if (!BuildPythonArgs(req, extraArgs, sizeof(extraArgs), &needsMap))
+    {
+        Emit("nothing to run");
+        return false;
+    }
 
     char map[72];
     EnterCriticalSection(&g_cs);
     strcpy_s(map, sizeof(map), g_map);
-    g_lineCount = 0;
     LeaveCriticalSection(&g_cs);
 
     if (needsMap && !map[0])
     {
-        InterlockedExchange(&g_running, 0);
-        return;
+        // Extraction is the one verb about where you are standing, and the
+        // button that starts it is only drawn in a map -- so this is nearly
+        // unreachable. It used to return in silence anyway, which is the worst
+        // possible answer to a press.
+        Emit("no map loaded, so there is nothing to extract for");
+        return false;
     }
 
     char script[MAX_PATH];
@@ -608,9 +834,8 @@ void WrExtractRunArgs(const char *extraArgs, bool needsMap)
                 WrModuleDir());
     if (GetFileAttributesA(script) == INVALID_FILE_ATTRIBUTES)
     {
-        PushLine("wrpath_extract.py is not next to wrlines.dll");
-        InterlockedExchange(&g_running, 0);
-        return;
+        Emit("wrpath_extract.py is not next to wrlines.dll");
+        return false;
     }
 
     // -u because Python block-buffers stdout when it is not a terminal, and
@@ -623,7 +848,7 @@ void WrExtractRunArgs(const char *extraArgs, bool needsMap)
     _snprintf_s(cmd, sizeof(cmd), _TRUNCATE,
                 "\"%s\" %s-u \"%s\" %s--game \"%s\" %s",
                 g_interp, g_interpIsPy ? "-3 " : "", script, mapArg,
-                WrGameDir(), extraArgs ? extraArgs : "");
+                WrGameDir(), extraArgs);
 
     SECURITY_ATTRIBUTES sa;
     sa.nLength = sizeof(sa);
@@ -633,9 +858,8 @@ void WrExtractRunArgs(const char *extraArgs, bool needsMap)
     HANDLE rd = NULL, wr = NULL;
     if (!CreatePipe(&rd, &wr, &sa, 64 * 1024))
     {
-        PushLine("could not create a pipe for the script's output");
-        InterlockedExchange(&g_running, 0);
-        return;
+        Emit("could not create a pipe for the script's output");
+        return false;
     }
     SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
 
@@ -659,14 +883,11 @@ void WrExtractRunArgs(const char *extraArgs, bool needsMap)
 
     if (!ok)
     {
+        DWORD err = GetLastError();
         CloseHandle(rd);
-        char msg[256];
-        _snprintf_s(msg, sizeof(msg), _TRUNCATE,
-                    "could not start the interpreter (error %lu)", GetLastError());
-        PushLine(msg);
-        WrLogf("[!] extract: CreateProcess failed (%lu)", GetLastError());
-        InterlockedExchange(&g_running, 0);
-        return;
+        Emitf("could not start the interpreter (error %lu)", err);
+        WrLogf("[!] extract: CreateProcess failed (%lu)", err);
+        return false;
     }
 
     CloseHandle(pi.hThread);
@@ -697,22 +918,19 @@ void WrExtractRunArgs(const char *extraArgs, bool needsMap)
     g_proc = pi.hProcess;
     g_job = job;
     LeaveCriticalSection(&g_cs);
-    InterlockedExchange(&g_stopped, 0);
 
-    char msg[256];
-    _snprintf_s(msg, sizeof(msg), _TRUNCATE, "running: %s", cmd);
-    PushLine(msg);
-    WrLogf("extract: started for \"%s\"", map);
+    Emitf("running: %s", cmd);
+    WrLogf("extract: started for \"%s\"", map[0] ? map : req->map);
 
-    // From here on a failure has to tear the child down too, not just clear the
-    // running flag. Leaving g_proc set with no reader means the next launch
-    // overwrites it and the old handle leaks while its process runs on.
+    // From here on a failure has to tear the child down too, not just report
+    // itself. Leaving g_proc set with no reader means the next launch overwrites
+    // it and the old handle leaks while its process runs on.
     ReadCtx *ctx = (ReadCtx *)malloc(sizeof(ReadCtx));
     if (!ctx)
     {
         CloseHandle(rd);
         Abandon();
-        return;
+        return false;
     }
     ctx->pipe = rd;
 
@@ -727,7 +945,153 @@ void WrExtractRunArgs(const char *extraArgs, bool needsMap)
         CloseHandle(rd);
         free(ctx);
         Abandon();
+        return false;
     }
+
+    // ReadThread owns the ending from here.
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// The one slot
+// ---------------------------------------------------------------------------
+
+// How far the port has got, and the only place that knows.
+//
+// Each phase adds one kind here and deletes the branch of BuildPythonArgs that
+// used to serve it. When this returns true for all four, the python backend and
+// this function go together.
+static bool NativeHandles(WrJobKind kind)
+{
+    return kind == WR_JOB_INDEX_MAPS || kind == WR_JOB_BOARD;
+}
+
+// The one cancellation predicate the native side has.
+//
+// A board fetch is up to a hundred and seventy requests with a four-hundred
+// millisecond pause between them, so Stop has to be able to land inside the
+// pause and not only between pages. wr_api.cpp polls this eight times per
+// pause; what it costs is that a request already in flight still has to finish
+// or time out, which is the network timeout in wr_http.h and not this.
+static bool NativeAbort(void *)
+{
+    return g_cancel != 0;
+}
+
+// The native side of the slot.
+//
+// One thread per job, and it does everything the ReadThread did for a child
+// process: nothing else emits, and it ends with the same EndRun so the panel's
+// terminal line is identical whichever backend ran.
+//
+// The exit code is synthesised to match what the script would have returned --
+// cmd_index_maps answers 1 when there is no cache to read -- because the panel
+// prints it and a user comparing two runs should not be able to tell which one
+// they got.
+static DWORD WINAPI NativeThread(LPVOID)
+{
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+
+    // A copy, taken once, so the work below never reads the request while the
+    // UI thread could be filling in the next one.
+    WrExtractRequest req;
+    EnterCriticalSection(&g_cs);
+    req = g_req;
+    LeaveCriticalSection(&g_cs);
+
+    DWORD code = 1;
+    switch (req.kind)
+    {
+    case WR_JOB_INDEX_MAPS:
+        code = (WrMapsWriteIndex(WrGameDir(), Emit) > 0) ? 0 : 1;
+        break;
+
+    case WR_JOB_BOARD:
+    {
+        WrApiBoardArgs a;
+        memset(&a, 0, sizeof(a));
+        a.gameDir = WrGameDir();
+        a.map = req.map;
+        a.mapId = req.mapId;            // 0 from the panel: resolved by name,
+                                        // the same way the reference does it
+        a.gamemode = req.gamemode;
+        a.trackType = req.trackType;
+        a.trackNum = req.trackNum;
+        a.mode = req.boardMode;
+        a.fromRank = req.fromRank;
+        a.count = req.count;
+        a.spread = req.spread;
+        code = (DWORD)WrApiBoard(&a, Emit, NativeAbort, NULL);
+        break;
+    }
+
+    default:
+        Emit("nothing to run");
+        break;
+    }
+
+    EndRun(code);
+    return 0;
+}
+
+void WrExtractSubmit(const WrExtractRequest *req)
+{
+    EnsureCs();
+    if (!req || req->kind == WR_JOB_NONE)
+        return;
+
+    // The latch is claimed BEFORE the backend is chosen. That is what lets a
+    // ported verb and an unported one share one slot, one Stop and one pane.
+    if (InterlockedCompareExchange(&g_running, 1, 0) != 0)
+        return;
+
+    int *ranks = NULL;
+    if (req->rankCount > 0 && req->ranks)
+    {
+        ranks = (int *)malloc(sizeof(int) * (size_t)req->rankCount);
+        if (ranks)
+            memcpy(ranks, req->ranks, sizeof(int) * (size_t)req->rankCount);
+    }
+
+    EnterCriticalSection(&g_cs);
+    g_req = *req;
+    free(g_ranks);
+    g_ranks = ranks;
+    g_rankCount = ranks ? req->rankCount : 0;
+    g_req.ranks = g_ranks;
+    g_req.rankCount = g_rankCount;
+    g_lineCount = 0;
+    LeaveCriticalSection(&g_cs);
+
+    InterlockedExchange(&g_stopped, 0);
+    InterlockedExchange(&g_cancel, 0);
+
+    if (NativeHandles(req->kind))
+    {
+        if (g_nativeThread)
+        {
+            CloseHandle(g_nativeThread);
+            g_nativeThread = NULL;
+        }
+        g_nativeThread = CreateThread(NULL, 0, NativeThread, NULL, 0, NULL);
+        if (!g_nativeThread)
+        {
+            Emit("could not start a worker thread");
+            EndRun(1);
+        }
+        return;
+    }
+
+    if (!StartPythonChild(&g_req))
+        EndRun(1);
+}
+
+void WrExtractRun(bool retryFailed)
+{
+    WrExtractRequest req = {WR_JOB_EXTRACT};
+    req.retryFailed = retryFailed;
+    req.timeoutSeconds = g_timeout;
+    WrExtractSubmit(&req);
 }
 
 int WrExtractLineCount(void)

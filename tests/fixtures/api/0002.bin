@@ -1,0 +1,5 @@
+{"data":[
+{"rank":101,"time":50,"replayHash":"BBBB0101","downloadURL":"https://cdn.example/BBBB0101.mtv","createdAt":"2026-01-01T00:00:00Z","user":{"steamID":"76561198000000101","alias":"late"}},
+{"rank":102,"time":51,"downloadURL":"https://cdn.example/nope.mtv","createdAt":"2026-01-01T00:00:00Z","user":{"steamID":"76561198000000102","alias":"no replayHash, so dropped"}},
+{"rank":6,"time":43,"replayHash":"aaaa0004","downloadURL":"https://cdn.example/AAAA0004.mtv","createdAt":"2026-03-16T09:40:41.194Z","user":{"steamID":"76561198000000004","alias":"found later"}}
+],"totalCount":9108}

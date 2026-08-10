@@ -54,6 +54,7 @@ cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% tests\test_board.cpp ^
    /Fe:tests\test_board.exe /Fo:tests\ >nul
 if errorlevel 1 ( echo [!] test_board FAILED to build & exit /b 1 )
 
+
 rem test_rank links the real run store, because ranking is a property of what is
 rem loaded -- a harness that ranked its own private array would pass while the
 rem shipped function looked somewhere else.
@@ -104,6 +105,104 @@ cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% tests\test_settings.cpp ^
    /Fe:tests\test_settings.exe /Fo:tests\ >nul
 if errorlevel 1 ( echo [!] test_settings FAILED to build & exit /b 1 )
 
+rem test_json needs nothing but itself: wr_json.cpp includes no Windows header
+rem and calls nothing, which is the property that lets it be checked this hard.
+cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% tests\test_json.cpp ^
+   %S%\wr_json.cpp ^
+   /Fe:tests\test_json.exe /Fo:tests\ >nul
+if errorlevel 1 ( echo [!] test_json FAILED to build & exit /b 1 )
+
+rem test_maps links the real writer and the real reader and the real inflate,
+rem so what it checks is those three agreeing with each other and with the
+rem reference implementation's output -- which is the whole claim of this phase.
+rem miniz comes in as C, with the same options build.bat gives it.
+cl /nologo /c /O2 /W3 /DMINIZ_NO_ARCHIVE_APIS /DMINIZ_NO_DEFLATE_APIS ^
+   /DMINIZ_NO_STDIO /DMINIZ_NO_TIME /DMINIZ_NO_ZLIB_COMPATIBLE_NAMES ^
+   /Ithird_party\miniz third_party\miniz\miniz.c /Fo:tests\ >nul
+if errorlevel 1 ( echo [!] miniz FAILED to build for the harnesses & exit /b 1 )
+
+cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Itests /Ithird_party\miniz ^
+   tests\test_maps.cpp ^
+   %S%\wr_maps.cpp %S%\wr_msml.cpp %S%\wr_json.cpp %S%\wr_log.cpp tests\miniz.obj ^
+   /Fe:tests\test_maps.exe /Fo:tests\ >nul
+if errorlevel 1 ( echo [!] test_maps FAILED to build & exit /b 1 )
+
+rem The LZMA decoder, shared by the three harnesses below and by wrextract, the
+rem same way miniz.obj is. No options: third_party\VERSION.txt says why the
+rem obvious _7ZIP_ST is not one of them.
+cl /nologo /c /O2 /W3 /Ithird_party\lzma third_party\lzma\LzmaDec.c ^
+   /Fo:tests\ >nul
+if errorlevel 1 ( echo [!] LzmaDec FAILED to build for the harnesses & exit /b 1 )
+
+rem test_lzma checks how wr_mtv.cpp CALLS the decoder, not the decoder. See its
+rem header: LZMA_FINISH_ANY, the property bytes passed straight through, and a
+rem dictionary size that is not something to clamp are three decisions that
+rem could each have gone the other way, and each has a section.
+cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Itests /Ithird_party\lzma ^
+   tests\test_lzma.cpp ^
+   %S%\wr_mtv.cpp tests\LzmaDec.obj ^
+   /Fe:tests\test_lzma.exe /Fo:tests\ >nul
+if errorlevel 1 ( echo [!] test_lzma FAILED to build & exit /b 1 )
+
+rem test_mtv is mostly about refusal, and about the exact words used to refuse.
+rem Those words end up in _failed.txt, which both implementations read back to
+rem decide whether a demo is worth trying again -- so a reason string that
+rem differs from the reference's is a record that reads as a different failure.
+cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Itests /Ithird_party\lzma ^
+   tests\test_mtv.cpp ^
+   %S%\wr_mtv.cpp tests\LzmaDec.obj ^
+   /Fe:tests\test_mtv.exe /Fo:tests\ >nul
+if errorlevel 1 ( echo [!] test_mtv FAILED to build & exit /b 1 )
+
+rem test_api links the real API layer AND the real network client, and then
+rem never reaches the network -- api_tape.cpp answers every request from a
+rem checked-in recording, and a URL that is not in it is an error rather than a
+rem fetch. Linking wr_http.cpp anyway is deliberate: it means a request that
+rem escaped the tape would be a real request, and the harness asserts the count
+rem so it could not escape unnoticed.
+rem
+rem The recording under tests\fixtures\api is SYNTHETIC. A real one would be a
+rem hundred strangers' names and SteamID64s committed to a public repository,
+rem which is the same reason wrlines_data is gitignored at any depth. Parity
+rem against the live API is a local pre-release step; see tests\parity.ps1.
+cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Itests /Ithird_party\miniz ^
+   tests\test_api.cpp tests\api_tape.cpp ^
+   %S%\wr_api.cpp %S%\wr_http.cpp %S%\wr_board.cpp %S%\wr_msml.cpp ^
+   %S%\wr_json.cpp %S%\wr_log.cpp tests\miniz.obj winhttp.lib ^
+   /Fe:tests\test_api.exe /Fo:tests\ >nul
+if errorlevel 1 ( echo [!] test_api FAILED to build & exit /b 1 )
+
+rem test_seam links the real launcher, because the whole claim it checks is that
+rem the request struct turns back into the command line the call sites used to
+rem build by hand. A harness with its own copy of the formatting would agree
+rem with itself and say nothing about what ships.
+rem
+rem TEMPORARY. It goes with the python backend, once every verb is C.
+rem
+rem The link list grows with the port: wr_extract.cpp is the slot every verb is
+rem dispatched from, so it pulls in whatever has been ported so far. That is the
+rem cost of there being one slot, and it is the right cost.
+cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Ithird_party\miniz /Ithird_party\lzma ^
+   tests\test_seam.cpp ^
+   %S%\wr_extract.cpp %S%\wr_maps.cpp %S%\wr_msml.cpp %S%\wr_json.cpp ^
+   %S%\wr_mtv.cpp %S%\wr_api.cpp %S%\wr_http.cpp %S%\wr_board.cpp ^
+   %S%\wr_log.cpp tests\miniz.obj tests\LzmaDec.obj winhttp.lib ^
+   /Fe:tests\test_seam.exe /Fo:tests\ >nul
+if errorlevel 1 ( echo [!] test_seam FAILED to build & exit /b 1 )
+
+rem wrextract.exe is not a harness -- it runs nothing and asserts nothing. It is
+rem the console front end over the same functions the DLL calls, and it is how
+rem the port's output gets diffed against wrpath_extract.py's. Built here so it
+rem cannot rot; never run by this script, and never shipped.
+cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Itests /Ithird_party\miniz ^
+   /Ithird_party\lzma ^
+   tests\wrextract_main.cpp tests\api_tape.cpp ^
+   %S%\wr_maps.cpp %S%\wr_msml.cpp %S%\wr_json.cpp %S%\wr_mtv.cpp ^
+   %S%\wr_api.cpp %S%\wr_http.cpp %S%\wr_board.cpp ^
+   %S%\wr_log.cpp tests\miniz.obj tests\LzmaDec.obj winhttp.lib ^
+   /Fe:tests\wrextract.exe /Fo:tests\ >nul
+if errorlevel 1 ( echo [!] wrextract FAILED to build & exit /b 1 )
+
 del tests\*.obj >nul 2>&1
 
 set "RC=0"
@@ -117,6 +216,12 @@ tests\test_start.exe      || set "RC=1"
 tests\test_saveloc.exe    || set "RC=1"
 tests\test_live.exe       || set "RC=1"
 tests\test_settings.exe   || set "RC=1"
+tests\test_json.exe       || set "RC=1"
+tests\test_maps.exe       || set "RC=1"
+tests\test_lzma.exe       || set "RC=1"
+tests\test_mtv.exe        || set "RC=1"
+tests\test_api.exe        || set "RC=1"
+tests\test_seam.exe       || set "RC=1"
 
 if "%RC%"=="1" ( echo. & echo [!] SOME HARNESSES FAILED & exit /b 1 )
 echo.
