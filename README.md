@@ -25,12 +25,11 @@ Step 7 also picks up whatever demos the game had already downloaded by itself, s
 pressing even if you skip step 6. When there is nothing new to do it reads **Re-run extractor**
 instead — same button.
 
-> **Downloading** and **extracting** still need **Python** (`py.exe`, `python.exe` or
-> `python3.exe` on `PATH`) — the **Download** half of step 6 and all of step 7 run through
-> `wrpath_extract.py`, which ships next to the DLL. The panel tells you which interpreter it
-> found, or that it found none. This is being folded into the DLL a piece at a time and the
-> requirement will go away; the Maps tab and the leaderboard itself no longer need it, so
-> **Fastest 50** works with no Python installed at all.
+> **Extracting** still needs **Python** (`py.exe`, `python.exe` or `python3.exe` on `PATH`) —
+> step 7 runs through `wrpath_extract.py`, which ships next to the DLL. The panel tells you
+> which interpreter it found, or that it found none. This is being folded into the DLL a piece
+> at a time and the requirement will go away; as of v0.6.1 the map list, the leaderboard and
+> **downloading demos** are all the DLL's own work, so steps 1–6 need no Python at all.
 
 ---
 
@@ -111,7 +110,7 @@ built by a public GitHub Actions runner from a tagged commit, with a
 [build provenance attestation](https://github.com/ProtoAus/demo-line-practice-tool/attestations):
 
 ```
-gh attestation verify demo-line-practice-tool-v0.6.0.zip --repo ProtoAus/demo-line-practice-tool
+gh attestation verify demo-line-practice-tool-v0.6.1.zip --repo ProtoAus/demo-line-practice-tool
 ```
 
 VirusTotal for the current release: *(added at tag time)*
@@ -156,7 +155,10 @@ What replaced it is smaller but still checkable in a couple of minutes:
 - **Never on its own.** Nothing here runs on a timer, at startup, or on a map change. Every request
   is downstream of a button press.
 
-Everything else that reaches the network is still `wrpath_extract.py`, which you can read.
+From v0.6.1 that is the whole of it. Demos used to be downloaded by `wrpath_extract.py`; they are
+now fetched through the same one file, from the download link the leaderboard reply itself
+contained. Nothing else in the project reaches the network at all — the script that remains does
+extraction, and extraction reads files.
 
 Everything it creates lives in a `wrlines_data` folder next to the DLL. Nothing is written into your
 game install unless you press **send**, **local** or **watch** on a run — those copy one demo into

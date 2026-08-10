@@ -19,6 +19,7 @@
 //     --index-maps                 the map index          (P1)
 //     --file PATH --dump-body OUT  one demo's run body    (P2)
 //     --board                      a leaderboard window   (P3)
+//     --fetch                      demos onto disk        (P4)
 //     --api-record / --api-replay  a recorded conversation
 //
 // --dump-body is the most valuable of the four dumps and the reason the others
@@ -50,6 +51,7 @@
 // Run:    tests\wrextract.exe --game "<install>" --index-maps
 
 #include "wr_api.h"
+#include "wr_fetch.h"
 #include "wr_maps.h"
 #include "wr_msml.h"
 #include "wr_mtv.h"
@@ -110,6 +112,13 @@ static void Usage(void)
            "  --spread N         sample N places evenly across the board\n"
            "  --friends          look up wrlines_data\\friends.txt instead\n"
            "  --refresh          discard what is cached rather than adding\n"
+           "\n"
+           "  --fetch            download demos this machine does not have\n"
+           "  --dry-run          with --fetch, list them and stop\n"
+           "  --ranks SPEC       with --fetch, these places from the cache\n"
+           "  --ranks-file PATH  the same, read from a file\n"
+           "  --top N            with --fetch, consider the top N\n"
+           "  --into-game        also copy each demo where the game can see it\n"
            "\n"
            "  --api-record DIR   save every leaderboard reply under DIR\n"
            "  --api-replay DIR   answer every request from DIR, never the net\n"
@@ -193,9 +202,12 @@ int main(int argc, char **argv)
     bool indexMaps = false;
 
     bool board = false, slowest = false, friends = false, refresh = false;
+    bool fetch = false, dryRun = false, intoGame = false;
     const char *map = NULL;
+    const char *ranksSpec = NULL;
+    const char *ranksFile = NULL;
     int mapId = 0, gamemode = 1, trackType = 0, trackNum = 1;
-    int fromRank = 0, count = 0, spread = 0;
+    int fromRank = 0, count = 0, spread = 0, top = 0;
 
     for (int i = 1; i < argc; i++)
     {
@@ -231,6 +243,18 @@ int main(int argc, char **argv)
             friends = true;
         else if (strcmp(argv[i], "--refresh") == 0)
             refresh = true;
+        else if (strcmp(argv[i], "--fetch") == 0)
+            fetch = true;
+        else if (strcmp(argv[i], "--dry-run") == 0)
+            dryRun = true;
+        else if (strcmp(argv[i], "--into-game") == 0)
+            intoGame = true;
+        else if (strcmp(argv[i], "--top") == 0 && i + 1 < argc)
+            top = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--ranks") == 0 && i + 1 < argc)
+            ranksSpec = argv[++i];
+        else if (strcmp(argv[i], "--ranks-file") == 0 && i + 1 < argc)
+            ranksFile = argv[++i];
         else if (strcmp(argv[i], "--api-record") == 0 && i + 1 < argc)
             apiRecord = argv[++i];
         else if (strcmp(argv[i], "--api-replay") == 0 && i + 1 < argc)
@@ -314,6 +338,57 @@ int main(int argc, char **argv)
         else                a.mode = WR_BOARD_WINDOW;
 
         int rc = WrApiBoard(&a, EmitStdout, NULL, NULL);
+        WrTapeClose();
+        return rc;
+    }
+
+    if (fetch)
+    {
+        // The selection, if there is one. --ranks-file wins over --ranks, as
+        // it does in the reference: it overwrites ranks_spec rather than
+        // adding to it.
+        int *ranks = NULL;
+        int rankCount = 0;
+        if (ranksFile)
+        {
+            char err[256] = "";
+            rankCount = WrFetchParseRanksFile(ranksFile, NULL, 0, err, sizeof(err));
+            if (rankCount < 0)
+            {
+                printf("[!] cannot read the selection file: %s\n", err);
+                return 1;
+            }
+            ranks = (int *)malloc(sizeof(int) * (size_t)(rankCount ? rankCount : 1));
+            if (ranks)
+                WrFetchParseRanksFile(ranksFile, ranks, rankCount, err, sizeof(err));
+        }
+        else if (ranksSpec)
+        {
+            rankCount = WrFetchParseRanks(ranksSpec, NULL, 0);
+            ranks = (int *)malloc(sizeof(int) * (size_t)(rankCount ? rankCount : 1));
+            if (ranks)
+                WrFetchParseRanks(ranksSpec, ranks, rankCount);
+        }
+
+        WrFetchArgs a;
+        memset(&a, 0, sizeof(a));
+        a.gameDir = game;
+        a.map = map;
+        a.mapId = mapId;
+        a.gamemode = gamemode;
+        a.trackType = trackType;
+        a.trackNum = trackNum;
+        a.ranks = ranks;
+        a.rankCount = ranks ? rankCount : 0;
+        a.slowest = slowest;
+        a.fromRank = fromRank;
+        a.count = count;
+        a.top = top;
+        a.dryRun = dryRun;
+        a.intoGame = intoGame;
+
+        int rc = WrFetchRun(&a, EmitStdout, NULL, NULL);
+        free(ranks);
         WrTapeClose();
         return rc;
     }

@@ -2,6 +2,7 @@
 
 #include "wr_extract.h"
 #include "wr_api.h"
+#include "wr_fetch.h"
 #include "wr_maps.h"
 #include "wr_mtv.h"
 #include "wr_log.h"
@@ -755,6 +756,11 @@ static bool BuildPythonArgs(const WrExtractRequest *req, char *out, int cap,
     }
 
     case WR_JOB_FETCH:
+        // Ported at v0.6.1. Kept, like the two branches above, because this
+        // function is the recorded contract that a typed request produces the
+        // command line the call sites used to build -- and WritePickFile below
+        // is part of that record. Both go with the python backend at P5.
+        //
         // Two shapes, because they answer two different questions. The Board tab
         // asks for named places on a board it already has cached, so it passes a
         // gamemode and a selection. The Maps tab is browsing a map it may never
@@ -963,7 +969,8 @@ static bool StartPythonChild(const WrExtractRequest *req)
 // this function go together.
 static bool NativeHandles(WrJobKind kind)
 {
-    return kind == WR_JOB_INDEX_MAPS || kind == WR_JOB_BOARD;
+    return kind == WR_JOB_INDEX_MAPS || kind == WR_JOB_BOARD ||
+           kind == WR_JOB_FETCH;
 }
 
 // The one cancellation predicate the native side has.
@@ -1022,6 +1029,31 @@ static DWORD WINAPI NativeThread(LPVOID)
         a.count = req.count;
         a.spread = req.spread;
         code = (DWORD)WrApiBoard(&a, Emit, NativeAbort, NULL);
+        break;
+    }
+
+    case WR_JOB_FETCH:
+    {
+        WrFetchArgs a;
+        memset(&a, 0, sizeof(a));
+        a.gameDir = WrGameDir();
+        a.map = req.map;
+        a.mapId = req.mapId;
+        a.gamemode = req.gamemode;
+        a.trackType = req.trackType;
+        a.trackNum = req.trackNum;
+        // Straight through. This is the pay-off the request struct was
+        // built for at P0: the selection used to travel through a FILE
+        // because a command line is 2048 bytes and "tick all" is not bounded
+        // by anything. In process it is a pointer and a count.
+        a.ranks = req.ranks;
+        a.rankCount = req.rankCount;
+        a.fromRank = req.fromRank;
+        a.count = req.count;
+        a.top = req.top;
+        a.dryRun = req.dryRun;
+        a.intoGame = req.intoGame;
+        code = (DWORD)WrFetchRun(&a, Emit, NativeAbort, NULL);
         break;
     }
 

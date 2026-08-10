@@ -21,13 +21,12 @@ Step 5 also picks up whatever .mtv demos the game had already downloaded by
 itself, so it is worth pressing even if you skip step 4. When there is nothing
 new to do it reads "Re-run extractor" instead -- same button.
 
-Downloading and extracting still need Python (py.exe, python.exe or
-python3.exe on PATH): the "Download" half of step 4 and the whole of step 5 run
-through wrpath_extract.py, which is in this folder. The panel says which
-interpreter it found, or that it found none. This is being folded into the DLL
-a piece at a time and the requirement will go away -- the Maps tab and the
-leaderboard itself no longer need it, so "Fastest 50" works with no Python
-installed at all.
+Extracting still needs Python (py.exe, python.exe or python3.exe on PATH):
+step 5 runs through wrpath_extract.py, which is in this folder. The panel says
+which interpreter it found, or that it found none. This is being folded into
+the DLL a piece at a time and the requirement will go away -- as of v0.6.1 the
+map list, the leaderboard and downloading demos are all the DLL's own work, so
+steps 1 to 4 need no Python installed at all.
 
 
 KEYS
@@ -172,8 +171,10 @@ A NOTE ON YOUR DATA
     - It never runs on a timer, at startup, or on a map change. Only from a
       button.
 
-  Everything else that reaches the network is still wrpath_extract.py, which you
-  can read.
+  From v0.6.1 that is all of it. Demos used to be downloaded by the script and
+  are now fetched through that same one file. Nothing else here reaches the
+  network -- what the script still does is extraction, and extraction reads
+  files off your disk.
 
 
 Source, full documentation and issues:

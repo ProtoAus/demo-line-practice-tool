@@ -111,12 +111,20 @@ bool WrTapeOpen(const char *dir, bool record)
         return true;
     }
 
+    // AN EMPTY RECORDING IS NOT AN ERROR, and refusing one was a real bug.
+    //
+    // The reference's _tape_load wraps the open in try/except OSError and
+    // leaves the index empty, so a missing or empty index.txt is only ever
+    // noticed at the first request, as "not in the recording: <url>". Refusing
+    // to open one made every step that legitimately makes NO requests fail --
+    // and "--fetch --ranks" making zero leaderboard requests is the entire
+    // claim of that path, so the one step worth comparing was the one that
+    // could not run.
+    //
+    // The cost is that a mistyped --api-replay directory says "not in the
+    // recording" rather than "no such recording". That is what the reference
+    // says too, which is the property being bought here.
     IndexLoad();
-    if (g_indexCount == 0)
-    {
-        printf("[!] no recording in %s\n", dir);
-        return false;
-    }
     return true;
 }
 

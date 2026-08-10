@@ -120,6 +120,46 @@ void WrApiSetTransport(WrApiTransportFn fn, void *user, bool pace);
 typedef bool (*WrApiAbortFn)(void *user);
 
 // ---------------------------------------------------------------------------
+// The two pieces --fetch needs as well
+// ---------------------------------------------------------------------------
+//
+// Shared rather than copied, and the sharing is the reference's own shape:
+// cmd_fetch calls _fetch_window and _api_get exactly as cmd_board does. Two
+// pagers that agreed today would be two pagers by the next change.
+
+// GET, through the recording if one is installed. A demo body comes down this
+// same path -- the reference's _download calls _api_get like everything else --
+// which is what lets a whole fetch be recorded and replayed.
+bool WrApiGet(const char *url, unsigned char **out, size_t *lenOut,
+              char *err, int errCap);
+
+// The pause between requests, in slices so Stop lands inside it. False means
+// the abort predicate said give up.
+bool WrApiPace(WrApiAbortFn abort, void *user);
+
+// _fetch_window: ranks [first, first+count), 1-based, paged at WR_API_PAGE.
+//
+// `err` non-empty means it failed and the caller prints it. `stopped` means the
+// abort predicate fired; what has already arrived is still in `rows`, because
+// throwing away ninety pages because somebody pressed Stop is the behaviour the
+// reference only had because it was being killed rather than asked.
+struct WrApiWindow
+{
+    WrBoardCacheRow *rows;
+    int count, cap;
+    long long total;
+    bool haveTotal;             // the page carried totalCount AS AN INTEGER
+    int requests;
+    bool stopped;
+    char err[256];
+};
+
+void WrApiFetchWindow(WrApiWindow *w, int mapId, int gamemode, int trackType,
+                      int trackNum, int first, int count,
+                      WrApiAbortFn abort, void *abortUser);
+void WrApiWindowFree(WrApiWindow *w);
+
+// ---------------------------------------------------------------------------
 // --board
 // ---------------------------------------------------------------------------
 

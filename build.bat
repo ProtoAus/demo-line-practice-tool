@@ -100,7 +100,7 @@ set "SRC=%SRC% %S%\wr_timer.cpp %S%\wr_savelocs.cpp %S%\wr_maps.cpp"
 set "SRC=%SRC% %S%\wr_profile.cpp %S%\wr_board.cpp %S%\wr_intogame.cpp"
 set "SRC=%SRC% %S%\wr_start.cpp %S%\wr_settings.cpp"
 set "SRC=%SRC% %S%\wr_json.cpp %S%\wr_msml.cpp %S%\wr_mtv.cpp"
-set "SRC=%SRC% %S%\wr_http.cpp %S%\wr_api.cpp"
+set "SRC=%SRC% %S%\wr_http.cpp %S%\wr_api.cpp %S%\wr_fetch.cpp"
 
 rem IMGUI_USER_CONFIG is resolved by the preprocessor relative to the file that
 rem does the #include -- imgui\imgui.h -- and NOT relative to the working

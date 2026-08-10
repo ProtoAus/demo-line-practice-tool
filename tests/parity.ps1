@@ -30,6 +30,13 @@
 #
 #   -Verb board   a sequence of leaderboard fetches, byte-compared. See below.
 #
+#   -Verb fetch   demos actually downloaded, byte-compared, off the same kind of
+#                 recording -- the tape covers the demo bodies too, because both
+#                 implementations fetch them through the same getter the
+#                 leaderboard goes through. Plus the one contract whose failure
+#                 has no symptom: that the --into-game copy carries the source's
+#                 write time. See -Verb fetch below.
+#
 # Both sides are handed the same argv and, for -Verb body, write to the same
 # output path, so the line each prints is comparable character for character
 # rather than after some normalisation that could hide the difference it was
@@ -76,6 +83,7 @@
 #     tests\parity.ps1 -Game ... -Limit 50               # a smoke run
 #     tests\parity.ps1 -Game ... -Verb board -Map surf_demise
 #     tests\parity.ps1 -Game ... -Verb board -Map ... -Rerecord
+#     tests\parity.ps1 -Game ... -Verb fetch -Map surf_demise
 #
 # Exit code 0 if every demo with an oracle matched it.
 
@@ -84,7 +92,7 @@ param(
     [string]$Game,
 
     # Which comparison to run.
-    [ValidateSet("body", "board")]
+    [ValidateSet("body", "board", "fetch")]
     [string]$Verb = "body",
 
     # Where the two outputs are written and compared. Somewhere with room for
@@ -102,6 +110,12 @@ param(
     [int]$Gamemode = 1,
     [int]$TrackType = 0,
     [int]$TrackNum = 1,
+
+    # -Verb fetch: where in the board to take the two demos it downloads from.
+    # Not rank 1: the fastest run on a popular map is the one demo everybody
+    # already has, and a step that finds nothing to fetch proves nothing about
+    # fetching. Lower this on a quiet map.
+    [int]$FetchRank = 200,
 
     # -Verb board: fetch the API again even if a recording is already there.
     # Off by default, because a recording is reusable for ever and re-recording
@@ -353,6 +367,365 @@ if ($Verb -eq "board") {
     Write-Host ("  identical   {0} of {1} steps" -f $same, $steps.Count)
     Write-Host ("  MISMATCH    {0}" -f $mismatch)
     Write-Host "  report      $boardReport"
+    Write-Host ""
+    if ($mismatch -gt 0) { Write-Host "=== PARITY FAILED ==="; exit 1 }
+    Write-Host "=== parity holds ==="
+    exit 0
+}
+
+# ---------------------------------------------------------------------------
+# -Verb fetch
+# ---------------------------------------------------------------------------
+#
+# WHY THIS ONE RUNS THE PORT FROM THE REPOSITORY ROOT
+#
+# Both implementations decide "do I already have this run" by walking two trees:
+# the game's momtv, and their own demos directory. The game's is the same one for
+# both. Their own is not, and the reason is a detail of the reference: demo_roots
+# derives it from DEFAULT_OUT -- the script's own directory -- and NOT from
+# --out. So no value of --out can move it.
+#
+# That number is printed twice ("N demos on disk across every map", "N of M are
+# already here") and it decides what gets fetched, so two different sets are not
+# a comparison at all. The only way to make them the same set is to put the port
+# where the reference already is, which is what the copy to the repository root
+# does. It is deleted afterwards.
+#
+# WHAT THIS RUN TOUCHES, AND WHAT IT PUTS BACK
+#
+# A fetch writes real files: demos into wrlines_data\demos\<map>\, and with
+# --into-game a copy into the game's own replay folder. Both sides write the
+# same filename, because the filename is the replay hash, so each step runs the
+# reference, moves what it produced aside, runs the port, moves that aside, and
+# compares. Anything that was there BEFORE the run is left exactly where it was;
+# anything the run created is removed. The board cache the --ranks step needs is
+# backed up and restored for the same reason.
+#
+# THE TIMESTAMP, WHICH IS THE POINT OF THE --into-game STEP
+#
+# wr_intogame.h decides whether a file in the game's folder is one of ours by
+# matching size AND write time against our own copy. shutil.copy2 carries that
+# across; CopyFileA does not, and the port has to do it by hand. Nothing looks
+# wrong when it breaks -- the demo downloads, plays, and draws lines -- so it is
+# asserted here rather than trusted: on each side separately, the copy in the
+# game's folder must have the same write time, to the tick, as the copy in ours.
+
+if ($Verb -eq "fetch") {
+    if (-not $Map -and -not $MapId) {
+        Write-Host "[!] -Verb fetch needs -Map NAME (or -MapId N)"
+        exit 2
+    }
+
+    $tape    = Join-Path $Work "tape-fetch"
+    $refKeep = Join-Path $Work "fetch-ref"
+    $natKeep = Join-Path $Work "fetch-nat"
+
+    # Both sides, deliberately, in the same place. See the essay above.
+    $dataDir = Join-Path $root "wrlines_data"
+    $refOut  = Join-Path $dataDir "paths"
+    $portExe = Join-Path $root "wrextract.exe"
+
+    $name = if ($Map) { $Map } else { "map$MapId" }
+    $dest = Join-Path $dataDir "demos\$name"
+    $leaf = "{0}_g{1}_t{2}{3}.tsv" -f $name, $Gamemode, $TrackType, $TrackNum
+    $boardTsv = Join-Path $dataDir "boards\$leaf"
+    $boardBak = Join-Path $Work "boards-backup.tsv"
+
+    $env:WRLINES_FAKE_NOW = "1700000000"
+
+    $common = @("--game", $Game, "--gamemode", "$Gamemode",
+                "--track-type", "$TrackType", "--track-num", "$TrackNum")
+    if ($Map)   { $common += @("--map", $Map) }
+    if ($MapId) { $common += @("--map-id", "$MapId") }
+
+    Write-Host ""
+    Write-Host "=== wrlines parity: --fetch ==="
+    Write-Host "  reference   $ref"
+    Write-Host "  python      $pyVersion"
+    Write-Host "  port        $portExe  (a copy of tests\wrextract.exe)"
+    Write-Host "  map         $name  g$Gamemode t$TrackType$TrackNum"
+    Write-Host "  demos into  $dest"
+    Write-Host "  recording   $tape"
+    Write-Host ""
+
+    foreach ($d in @($refKeep, $natKeep)) {
+        if (Test-Path $d) { Remove-Item -Recurse -Force $d }
+        New-Item -ItemType Directory -Force -Path $d | Out-Null
+    }
+    Copy-Item -Force $exe $portExe
+    if (Test-Path $boardTsv) { Copy-Item -Force $boardTsv $boardBak }
+
+    # Everything already on disk in the two places a fetch writes to. Whatever
+    # is in these sets at the end has to still be there, untouched.
+    function Snapshot($dir) {
+        if (-not (Test-Path $dir)) { return @{} }
+        $h = @{}
+        foreach ($f in Get-ChildItem -File $dir) { $h[$f.Name] = $true }
+        return $h
+    }
+
+    $gameDir = Join-Path $Game "momentum\momtv\online"
+    $mapIdResolved = 0
+    $recordGameBefore = @{}
+
+    function Step-Tape($i) { Join-Path $tape ("f{0:d2}" -f $i) }
+
+    # A rank nobody is likely to already hold, so the download step actually
+    # downloads. Chosen from the middle of the board rather than the top: rank 1
+    # of a popular map is the one demo everybody has.
+    $steps = @(
+        @{ name  = "browse the top twelve"
+           args  = @("--fetch", "--dry-run", "--count", "12")
+           files = $false },
+        @{ name  = "download two of them"
+           args  = @("--fetch", "--from-rank", "$FetchRank", "--count", "2")
+           files = $true },
+        # The same rank the step above took, deliberately. Each step's downloads
+        # are moved out of the way as soon as it finishes, so by the time this
+        # one runs that run is missing again and it is certain to download --
+        # where a fresh rank is a guess about what this machine already holds,
+        # and a step that finds nothing to fetch never reaches the copy this is
+        # here to check.
+        @{ name  = "and into the game folder"
+           args  = @("--fetch", "--from-rank", "$FetchRank", "--count", "1",
+                     "--into-game")
+           files = $true; game = $true },
+        # The Board tab's tick-and-download: named places out of the cached
+        # board, costing no leaderboard request at all. 99999 is in there on
+        # purpose -- a rank outside the cached window is named rather than
+        # silently dropped, and that sentence has to match too.
+        @{ name  = "named places off the cache"
+           args  = @("--fetch", "--ranks", "3,7,99999")
+           files = $true }
+    )
+
+    # The cached board the last step reads. Written by the reference, once,
+    # from its own recording, so both sides read one identical file -- and put
+    # back afterwards, because it is the user's real cache.
+    $setupTape = Join-Path $tape "board"
+    $setupArgs = @("--board", "--count", "30")
+
+    # --- pass 1: the reference, live, recording ------------------------------
+    #
+    # Recorded into one directory per step for the same reason -Verb board does
+    # it: api_tape_open truncates index.txt and renumbers from 0001 every time
+    # the process starts.
+    $recorded = @()
+    if ($Rerecord -or -not (Test-Path (Step-Tape 0))) {
+        if (Test-Path $tape) { Remove-Item -Recurse -Force $tape }
+        Write-Host "  recording from the live API -- the only pass that touches"
+        Write-Host "  the network, and it pays for the demo bodies as well"
+        & $Python -3 $ref @common "--out" $refOut "--api-record" $setupTape `
+                  @setupArgs | Out-Null
+        Write-Host ("    {0,-26} {1}" -f "a board to pick from", "recorded")
+        for ($i = 0; $i -lt $steps.Count; $i++) {
+            $before = Snapshot $dest
+            $out = & $Python -3 $ref @common "--out" $refOut `
+                             "--api-record" (Step-Tape $i) @($steps[$i].args) 2>&1
+            $recorded += ,@(($out | Out-String).TrimEnd() -split "`r?`n")
+
+            # Recording downloads them FOR REAL, so take them straight back out
+            # -- both copies. Leaving them behind is not merely untidy: a demo
+            # still on disk is a demo both replay passes then find in the held
+            # set, and the download step they were meant to drive quietly
+            # becomes "already here; 0 to fetch" and proves nothing.
+            foreach ($f in (Get-ChildItem -File $dest -ErrorAction SilentlyContinue)) {
+                if (-not $before.ContainsKey($f.Name)) { Remove-Item -Force $f.FullName }
+            }
+            if (-not $mapIdResolved) {
+                foreach ($l in $recorded[$i]) {
+                    if ($l -match '^map \S+ \(id (\d+)\)') {
+                        $mapIdResolved = [int]$matches[1]
+                        break
+                    }
+                }
+                if ($mapIdResolved) {
+                    $recordGameBefore = Snapshot (Join-Path $gameDir "$mapIdResolved")
+                }
+            }
+            if ($steps[$i].game -and $mapIdResolved) {
+                $gp = Join-Path $gameDir "$mapIdResolved"
+                foreach ($f in (Get-ChildItem -File $gp -ErrorAction SilentlyContinue)) {
+                    if (-not $recordGameBefore.ContainsKey($f.Name)) {
+                        Remove-Item -Force $f.FullName
+                    }
+                }
+            }
+            Write-Host ("    {0,-26} {1}" -f $steps[$i].name, "recorded")
+        }
+    } else {
+        Write-Host "  reusing the recording already in $tape (-Rerecord to refetch)"
+    }
+
+    # The board the --ranks step reads, rebuilt from the recording so it holds
+    # the same thirty rows however long ago the recording was made.
+    & $Python -3 $ref @common "--out" $refOut "--api-replay" $setupTape `
+              @setupArgs | Out-Null
+
+    # The map id, so the game's replay folder can be found. Taken from what the
+    # reference PRINTS rather than resolved again here, so this script cannot
+    # have a second opinion about which map it is comparing.
+    if ($MapId) { $mapIdResolved = $MapId }
+
+    # --- passes 2 and 3, step by step ----------------------------------------
+    $same = 0; $mismatch = 0
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add("wrlines parity --fetch")
+    $lines.Add("python: $pyVersion")
+    $lines.Add("map:    $name g$Gamemode t$TrackType$TrackNum")
+    $lines.Add("")
+
+    # Run one side of one step: returns the stdout lines, and moves whatever it
+    # created out of the way into $keep so the other side starts from the same
+    # disk. Returns the created names too, so the two sides can be compared by
+    # name rather than by position.
+    function Run-Side($cmd, $argv, $keep, $wantGame) {
+        $beforeDest = Snapshot $dest
+        $gpath = if ($wantGame -and $mapIdResolved) {
+                     Join-Path $gameDir "$mapIdResolved" } else { $null }
+        $beforeGame = if ($gpath) { Snapshot $gpath } else { @{} }
+
+        $out = & $cmd @argv 2>&1
+        $text = ($out | Out-String).TrimEnd() -split "`r?`n"
+
+        $made = @()
+        foreach ($f in (Get-ChildItem -File $dest -ErrorAction SilentlyContinue)) {
+            if ($beforeDest.ContainsKey($f.Name)) { continue }
+            $made += $f.Name
+            Move-Item -Force $f.FullName (Join-Path $keep $f.Name)
+        }
+        $gmade = @()
+        if ($gpath -and (Test-Path $gpath)) {
+            foreach ($f in (Get-ChildItem -File $gpath)) {
+                if ($beforeGame.ContainsKey($f.Name)) { continue }
+                $gmade += $f.Name
+                Move-Item -Force $f.FullName (Join-Path $keep "game-$($f.Name)")
+            }
+        }
+        return @{ lines = $text; made = $made; gameMade = $gmade }
+    }
+
+    for ($i = 0; $i -lt $steps.Count; $i++) {
+        $s = $steps[$i]
+        $wantGame = [bool]$s.game
+
+        $r = Run-Side $Python (@("-3", $ref) + $common + @("--out", $refOut,
+                      "--api-replay", (Step-Tape $i)) + $s.args) $refKeep $wantGame
+        if (-not $mapIdResolved) {
+            foreach ($l in $r.lines) {
+                if ($l -match '^map \S+ \(id (\d+)\)') {
+                    $mapIdResolved = [int]$matches[1]
+                    break
+                }
+            }
+        }
+        $p = Run-Side $portExe ($common + @("--api-replay", (Step-Tape $i)) +
+                      $s.args) $natKeep $wantGame
+
+        $ok = ($r.lines.Count -eq $p.lines.Count)
+        if ($ok) {
+            for ($k = 0; $k -lt $r.lines.Count; $k++) {
+                if ($r.lines[$k] -ne $p.lines[$k]) {
+                    $ok = $false
+                    $lines.Add("LINE`t$($s.name)`tref: $($r.lines[$k])`tport: $($p.lines[$k])")
+                }
+            }
+        } else {
+            $lines.Add("COUNT`t$($s.name)`tref: $($r.lines.Count) lines`tport: $($p.lines.Count)")
+        }
+
+        # The demos themselves, by name, byte for byte.
+        $bytes = $true
+        if ($s.files) {
+            $wantNames = @($r.made | Sort-Object)
+            $gotNames  = @($p.made | Sort-Object)
+            if (($wantNames -join ",") -ne ($gotNames -join ",")) {
+                $bytes = $false
+                $lines.Add("NAMES`t$($s.name)`tref: $($wantNames -join ',')`tport: $($gotNames -join ',')")
+            } else {
+                if ($wantNames.Count -eq 0) {
+                    # Not a failure -- both sides agreed there was nothing to
+                    # fetch, which is a real answer. Recorded because it means
+                    # this step compared two messages and no bytes, and a run
+                    # where EVERY step says this has not checked a download.
+                    $lines.Add("NOTE`t$($s.name)`tboth sides already held every run asked for")
+                }
+                foreach ($n in $wantNames) {
+                    $a = (Get-FileHash -Algorithm SHA256 (Join-Path $refKeep $n)).Hash
+                    $b = (Get-FileHash -Algorithm SHA256 (Join-Path $natKeep $n)).Hash
+                    if ($a -ne $b) {
+                        $bytes = $false
+                        $lines.Add("BYTES`t$($s.name)`t$n`tref: $a`tport: $b")
+                    }
+                }
+            }
+        }
+
+        # And the contract with no symptom: within each side, the copy in the
+        # game's folder carries the write time of the copy in ours. Compared to
+        # the TICK -- a copy that quietly took a fresh stamp would still land in
+        # the same second as the download that produced it.
+        $stamped = $true
+        if ($wantGame) {
+            foreach ($side in @(@{k=$refKeep; who="ref"; made=$r.made},
+                                @{k=$natKeep; who="port"; made=$p.made})) {
+                if (@($side.made).Count -eq 0) {
+                    $stamped = $false
+                    $lines.Add("NOTHING`t$($s.name)`t$($side.who) downloaded nothing, so the copy was never made")
+                    continue
+                }
+                foreach ($n in $side.made) {
+                    $ours = Join-Path $side.k $n
+                    $g    = Join-Path $side.k "game-$n"
+                    if (-not (Test-Path $g)) {
+                        $stamped = $false
+                        $lines.Add("NOGAME`t$($s.name)`t$($side.who)`t$n never reached the game folder")
+                        continue
+                    }
+                    $t1 = (Get-Item $ours).LastWriteTimeUtc.Ticks
+                    $t2 = (Get-Item $g).LastWriteTimeUtc.Ticks
+                    if ($t1 -ne $t2) {
+                        $stamped = $false
+                        $lines.Add("MTIME`t$($s.name)`t$($side.who)`t$n`tours: $t1`tgame: $t2")
+                    }
+                }
+            }
+        }
+
+        if ($ok -and $bytes -and $stamped) { $same++ } else { $mismatch++ }
+        $verdict = if ($ok -and $bytes -and $stamped) { "identical" }
+                   elseif (-not $stamped) { "THE WRITE TIME DID NOT CARRY" }
+                   elseif (-not $bytes) { "DIFFERENT BYTES" }
+                   else { "DIFFERENT OUTPUT" }
+        Write-Host ("    {0,-26} {1}" -f $s.name, $verdict)
+    }
+
+    # --- put the disk back ----------------------------------------------------
+    Remove-Item -Force $portExe -ErrorAction SilentlyContinue
+    if (Test-Path $boardBak) {
+        Copy-Item -Force $boardBak $boardTsv
+    } else {
+        # There was no cache for this board before, so the one the setup step
+        # wrote is ours to take away again.
+        Remove-Item -Force $boardTsv -ErrorAction SilentlyContinue
+    }
+    if ((Test-Path $dest) -and -not (Get-ChildItem -Force $dest)) {
+        Remove-Item -Force $dest
+    }
+
+    $lines.Add("")
+    $lines.Add("identical: $same")
+    $lines.Add("MISMATCH:  $mismatch")
+    $lines.Add("")
+    $lines.Add("what was downloaded is under $refKeep and $natKeep; nothing was")
+    $lines.Add("left in wrlines_data or in the game install.")
+    $fetchReport = Join-Path $Work "report-fetch.txt"
+    Set-Content -Path $fetchReport -Value $lines -Encoding UTF8
+
+    Write-Host ""
+    Write-Host ("  identical   {0} of {1} steps" -f $same, $steps.Count)
+    Write-Host ("  MISMATCH    {0}" -f $mismatch)
+    Write-Host "  report      $fetchReport"
     Write-Host ""
     if ($mismatch -gt 0) { Write-Host "=== PARITY FAILED ==="; exit 1 }
     Write-Host "=== parity holds ==="

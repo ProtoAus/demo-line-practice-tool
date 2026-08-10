@@ -19,7 +19,7 @@ Two halves:
 
 | | |
 | --- | --- |
-| `wrpath_extract.py` | offline. Reads the `.mtv` demos the game already downloaded and writes small `.wrpath` files, and downloads new ones. Being folded into the DLL a piece at a time — the map index and the leaderboard have gone already. |
+| `wrpath_extract.py` | offline. Reads the `.mtv` demos on disk and writes small `.wrpath` files. Being folded into the DLL a piece at a time — the map index, the leaderboard and downloading have gone already, and extraction is the last of it. |
 | `wrlines.dll` | in-game. Reads `.wrpath`, draws the lines, and gives you a panel on **INSERT**. |
 
 The DLL never parses `.mtv`. It only ever reads a simple, versioned, CRC-checked array of
@@ -30,9 +30,9 @@ points.
 > called while it was being written.
 
 **Requires:** Windows x64, Momentum Mod Playtest (Strata Source), D3D11 or DXVK, and Python 3.8+
-for the parts still in the script — extraction and downloading. The Maps tab and the Board tab's
-leaderboard fetch need no interpreter. There is no 32-bit path anywhere in the game, so both
-binaries are x64.
+for the one part still in the script — extraction. The Maps tab, the Board tab's leaderboard
+fetch and downloading demos need no interpreter. There is no 32-bit path anywhere in the game, so
+both binaries are x64.
 **Linux works, through Proton** — see [Linux](#linux) below for why that is the answer rather
 than a native build.
 
@@ -1110,9 +1110,11 @@ direction, which makes this manners rather than permission:
   holds. The extractor gained a second search root rather than the downloader gaining write
   access to `momtv\`.
 
-**Reading a leaderboard lives in the DLL now, and downloading still does not.** That split is
-where v0.6.0 left it: `--board` is [src/wr_api.cpp](../src/wr_api.cpp) and `--fetch` is still a
-flag on `wrpath_extract.py`, which the DLL already knew how to launch and stream.
+**Both halves live in the DLL now.** v0.6.0 moved reading a leaderboard into
+[src/wr_api.cpp](../src/wr_api.cpp); v0.6.1 moved downloading into
+[src/wr_fetch.cpp](../src/wr_fetch.cpp), which is the last thing in this project that reached the
+network from anywhere else. A demo body now travels the same one file a leaderboard page does,
+to an address the leaderboard reply itself supplied.
 
 The cost of the first half is the one claim this project has had to give up. Until v0.5.1 the DLL
 linked no HTTP client at all and `dumpbin /dependents` proved it in one line — five system DLLs,
@@ -1193,6 +1195,31 @@ one to lay over each other, where caching that board in full costs a hundred and
 **Downloading from the board costs no leaderboard requests at all.** The cache stores the
 `downloadURL` the server itself handed back, so ticking rows and pressing download fetches only
 the demo bodies. Capped at 64 per press, and the cap is stated rather than silently truncating.
+
+Porting the download half at v0.6.1 turned up three things that are worth writing down, because
+each of them fails without saying anything:
+
+- **"Do I already have this run" is a set, and the names in it are not all hashes.** The reference
+  builds a Python `set` of every `.mtv` basename across the game's tree and ours. The port's first
+  version used a sorted array of 48-byte keys, which is roomy for a 40-character replay hash and
+  not for the names the game gives *your own* recordings under `momtv\local\` — those run to 64
+  characters here. Two of them alike for their first 47 collapse into one, and the visible effect
+  of a false "we already have that" is a demo that never downloads and no message. It also has to
+  be a set rather than a list: with `--into-game` the same run is in both trees, so a list counts
+  it twice and prints that count to the user.
+- **The copy into the game's folder has to carry the source's write time.** `shutil.copy2` does;
+  `CopyFileA` does not, and the port does it by hand with `GetFileTime`/`SetFileTime`. That
+  timestamp is how **take out** tells a demo we placed from one the game downloaded itself — see
+  ADOPTION in [src/wr_intogame.h](../src/wr_intogame.h) — and when it breaks the download still
+  works, the demo still plays, the lines still appear, and only the removal button quietly stops
+  recognising anything fetched after that day. `tests\parity.ps1 -Verb fetch` asserts it to the
+  tick on both sides, and `tests\test_fetch.exe` backdates a source by a year, which is the only
+  way to tell a carried stamp from a fresh one that lands in the same second.
+- **A recorded conversation with nothing in it is a valid recording.** The `--ranks` path's whole
+  claim is that it makes *zero* leaderboard requests, so its tape is an index file with no
+  entries — and the port refused to open one, which meant the single step most worth comparing
+  was the one step that could not run. The reference tolerates it and only complains at the first
+  unmatched request, so the port does too.
 
 **Gamemode has to be picked, and the map cannot tell you.** Momentum gives nearly every map a
 leaderboard in nearly every mode — all 546 surf maps in the local catalogue list twelve of them,

@@ -3375,8 +3375,8 @@ static void DrawBoardTab(void)
                "Nothing here reaches the network until it is on, and then only "
                "when a button is pressed. One request at a time, with a pause "
                "between them: this is free community infrastructure.\n\n"
-               "The buttons below are done inside the DLL and need no Python. "
-               "Downloading the demos themselves still runs the script.");
+               "Everything here is done inside the DLL and needs no Python -- "
+               "reading the board, and downloading the demos too.");
     if (g_fetchEnabled)
     {
         bool busy = WrExtractRunning();

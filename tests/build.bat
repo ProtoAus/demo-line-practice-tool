@@ -172,6 +172,17 @@ cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Itests /Ithird_party\miniz ^
    /Fe:tests\test_api.exe /Fo:tests\ >nul
 if errorlevel 1 ( echo [!] test_api FAILED to build & exit /b 1 )
 
+rem test_fetch is mostly about a selection a USER TYPED and about one timestamp
+rem whose failure has no symptom at all -- see the harness header. It links the
+rem real wr_fetch, which drags in the API layer and therefore the network
+rem client; nothing in it makes a request.
+cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Itests /Ithird_party\miniz ^
+   tests\test_fetch.cpp ^
+   %S%\wr_fetch.cpp %S%\wr_api.cpp %S%\wr_http.cpp %S%\wr_board.cpp ^
+   %S%\wr_msml.cpp %S%\wr_json.cpp %S%\wr_log.cpp tests\miniz.obj winhttp.lib ^
+   /Fe:tests\test_fetch.exe /Fo:tests\ >nul
+if errorlevel 1 ( echo [!] test_fetch FAILED to build & exit /b 1 )
+
 rem test_seam links the real launcher, because the whole claim it checks is that
 rem the request struct turns back into the command line the call sites used to
 rem build by hand. A harness with its own copy of the formatting would agree
@@ -186,7 +197,8 @@ cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Ithird_party\miniz /Ithird_party\lzma ^
    tests\test_seam.cpp ^
    %S%\wr_extract.cpp %S%\wr_maps.cpp %S%\wr_msml.cpp %S%\wr_json.cpp ^
    %S%\wr_mtv.cpp %S%\wr_api.cpp %S%\wr_http.cpp %S%\wr_board.cpp ^
-   %S%\wr_log.cpp tests\miniz.obj tests\LzmaDec.obj winhttp.lib ^
+   %S%\wr_fetch.cpp %S%\wr_log.cpp tests\miniz.obj tests\LzmaDec.obj ^
+   winhttp.lib ^
    /Fe:tests\test_seam.exe /Fo:tests\ >nul
 if errorlevel 1 ( echo [!] test_seam FAILED to build & exit /b 1 )
 
@@ -198,7 +210,7 @@ cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Itests /Ithird_party\miniz ^
    /Ithird_party\lzma ^
    tests\wrextract_main.cpp tests\api_tape.cpp ^
    %S%\wr_maps.cpp %S%\wr_msml.cpp %S%\wr_json.cpp %S%\wr_mtv.cpp ^
-   %S%\wr_api.cpp %S%\wr_http.cpp %S%\wr_board.cpp ^
+   %S%\wr_api.cpp %S%\wr_http.cpp %S%\wr_board.cpp %S%\wr_fetch.cpp ^
    %S%\wr_log.cpp tests\miniz.obj tests\LzmaDec.obj winhttp.lib ^
    /Fe:tests\wrextract.exe /Fo:tests\ >nul
 if errorlevel 1 ( echo [!] wrextract FAILED to build & exit /b 1 )
@@ -221,6 +233,7 @@ tests\test_maps.exe       || set "RC=1"
 tests\test_lzma.exe       || set "RC=1"
 tests\test_mtv.exe        || set "RC=1"
 tests\test_api.exe        || set "RC=1"
+tests\test_fetch.exe      || set "RC=1"
 tests\test_seam.exe       || set "RC=1"
 
 if "%RC%"=="1" ( echo. & echo [!] SOME HARNESSES FAILED & exit /b 1 )

@@ -44,7 +44,7 @@ void WrApiSetTransport(WrApiTransportFn fn, void *user, bool pace)
 
 // The pause between requests, in slices, so Stop does not have to wait it out.
 // False means the caller was asked to stop.
-static bool Pace(WrApiAbortFn abort, void *user)
+bool WrApiPace(WrApiAbortFn abort, void *user)
 {
     if (!g_pace)
         return !(abort && abort(user));
@@ -57,8 +57,8 @@ static bool Pace(WrApiAbortFn abort, void *user)
     return true;
 }
 
-static bool Get(const char *url, unsigned char **out, size_t *lenOut,
-                char *err, int errCap)
+bool WrApiGet(const char *url, unsigned char **out, size_t *lenOut,
+              char *err, int errCap)
 {
     if (g_transport)
         return g_transport(g_transportUser, url, out, lenOut, err, errCap);
@@ -635,38 +635,29 @@ static bool ResolveMap(const WrApiBoardArgs *a, WrEmitFn emit,
 // Fetching
 // ---------------------------------------------------------------------------
 
-struct RowBuf
+static bool WindowAdd(WrApiWindow *w, const WrBoardCacheRow *r)
 {
-    WrBoardCacheRow *v;
-    int n, cap;
-};
-
-static bool RowBufAdd(RowBuf *b, const WrBoardCacheRow *r)
-{
-    if (b->n >= b->cap)
+    if (w->count >= w->cap)
     {
-        int cap = b->cap ? b->cap * 2 : 128;
+        int cap = w->cap ? w->cap * 2 : 128;
         WrBoardCacheRow *grown =
-            (WrBoardCacheRow *)realloc(b->v, sizeof(*grown) * (size_t)cap);
+            (WrBoardCacheRow *)realloc(w->rows, sizeof(*grown) * (size_t)cap);
         if (!grown)
             return false;
-        b->v = grown;
-        b->cap = cap;
+        w->rows = grown;
+        w->cap = cap;
     }
-    b->v[b->n++] = *r;
+    w->rows[w->count++] = *r;
     return true;
 }
 
-// Everything a fetch strategy hands back, plus how it went.
-struct Fetch
+void WrApiWindowFree(WrApiWindow *w)
 {
-    RowBuf rows;
-    long long total;
-    bool haveTotal;
-    int reqs;
-    bool stopped;
-    char err[256];              // non-empty means the fetch failed
-};
+    free(w->rows);
+    memset(w, 0, sizeof(*w));
+}
+
+typedef WrApiWindow Fetch;
 
 // One page. False having filled f->err.
 static bool Leaderboard(Fetch *f, const char *url, WrBoardCacheRow *page,
@@ -674,9 +665,9 @@ static bool Leaderboard(Fetch *f, const char *url, WrBoardCacheRow *page,
 {
     unsigned char *body = NULL;
     size_t len = 0;
-    if (!Get(url, &body, &len, f->err, sizeof(f->err)))
+    if (!WrApiGet(url, &body, &len, f->err, sizeof(f->err)))
         return false;
-    f->reqs++;
+    f->requests++;
 
     int kept = WrApiParsePage((const char *)body, len, page, WR_API_PAGE,
                               entries, total, haveTotal);
@@ -691,13 +682,14 @@ static bool Leaderboard(Fetch *f, const char *url, WrBoardCacheRow *page,
         return false;
     }
     for (int i = 0; i < kept; i++)
-        RowBufAdd(&f->rows, &page[i]);
+        WindowAdd(f, &page[i]);
     return true;
 }
 
 // _fetch_window: ranks [first, first+count), 1-based, paged at WR_API_PAGE.
-static void FetchWindow(Fetch *f, const WrApiBoardArgs *a, int mapId, int first,
-                        int count, WrApiAbortFn abort, void *abortUser)
+void WrApiFetchWindow(WrApiWindow *f, int mapId, int gamemode, int trackType,
+                      int trackNum, int first, int count,
+                      WrApiAbortFn abort, void *abortUser)
 {
     WrBoardCacheRow page[WR_API_PAGE];
     int got = 0;
@@ -710,8 +702,8 @@ static void FetchWindow(Fetch *f, const WrApiBoardArgs *a, int mapId, int first,
             take = WR_API_PAGE;
 
         char url[512];
-        WrApiLeaderboardUrl(url, sizeof(url), mapId, a->gamemode, a->trackType,
-                            a->trackNum, take, first - 1 + got);
+        WrApiLeaderboardUrl(url, sizeof(url), mapId, gamemode, trackType,
+                            trackNum, take, first - 1 + got);
 
         int entries = 0;
         long long tc = 0;
@@ -730,7 +722,7 @@ static void FetchWindow(Fetch *f, const WrApiBoardArgs *a, int mapId, int first,
         got += entries;
         if (f->haveTotal && first - 1 + got >= f->total)
             break;
-        if (got < count && !Pace(abort, abortUser))
+        if (got < count && !WrApiPace(abort, abortUser))
         {
             f->stopped = true;
             return;
@@ -785,7 +777,7 @@ static void FetchSpread(Fetch *f, const WrApiBoardArgs *a, int mapId, int n,
         if (rank > f->total)
             rank = f->total;
 
-        if (!Pace(abort, abortUser)) { f->stopped = true; return; }
+        if (!WrApiPace(abort, abortUser)) { f->stopped = true; return; }
 
         WrApiLeaderboardUrl(url, sizeof(url), mapId, a->gamemode, a->trackType,
                             a->trackNum, 1, (int)(rank - 1));
@@ -817,7 +809,7 @@ static void FetchFriends(Fetch *f, const WrApiBoardArgs *a, int mapId,
         if (!Leaderboard(f, url, page, &entries, &tc, &haveTc))
             return;
 
-        if (i + WR_API_FRIEND_BATCH < count && !Pace(abort, abortUser))
+        if (i + WR_API_FRIEND_BATCH < count && !WrApiPace(abort, abortUser))
         {
             f->stopped = true;
             return;
@@ -905,7 +897,7 @@ int WrApiBoard(const WrApiBoardArgs *a, WrEmitFn emit,
         FetchFriends(&f, a, mapId, ids, n, abort, abortUser);
         free(ids);
         if (!f.err[0])
-            Emitf(emit, "%d of them have a run on this track", f.rows.n);
+            Emitf(emit, "%d of them have a run on this track", f.count);
         // A friends lookup learns nothing about the board's size -- the
         // reference leaves `total` as None here -- so f.haveTotal stays false
         // and whatever the file already knew survives the write.
@@ -932,14 +924,14 @@ int WrApiBoard(const WrApiBoardArgs *a, WrEmitFn emit,
         // buffer that is thrown away rather than into f.rows.
         unsigned char *body = NULL;
         size_t len = 0;
-        if (!Get(url, &body, &len, f.err, sizeof(f.err)))
+        if (!WrApiGet(url, &body, &len, f.err, sizeof(f.err)))
         {
             Emitf(emit, "[!] leaderboard request failed: %s", f.err);
             WrBoardCacheFree(&held);
-            free(f.rows.v);
+            WrApiWindowFree(&f);
             return 1;
         }
-        f.reqs++;
+        f.requests++;
         int kept = WrApiParsePage((const char *)body, len, probe, WR_API_PAGE,
                                   &entries, &tc, &haveTc);
         free(body);
@@ -948,7 +940,7 @@ int WrApiBoard(const WrApiBoardArgs *a, WrEmitFn emit,
             Emitf(emit, "[!] leaderboard request failed: the reply was not a "
                         "leaderboard page");
             WrBoardCacheFree(&held);
-            free(f.rows.v);
+            WrApiWindowFree(&f);
             return 1;
         }
 
@@ -957,7 +949,7 @@ int WrApiBoard(const WrApiBoardArgs *a, WrEmitFn emit,
         {
             Emitf(emit, "no runs on this track.");
             WrBoardCacheFree(&held);
-            free(f.rows.v);
+            WrApiWindowFree(&f);
             return 0;
         }
         long long first = total - count + 1;
@@ -966,7 +958,7 @@ int WrApiBoard(const WrApiBoardArgs *a, WrEmitFn emit,
         Emitf(emit, "the board holds %lld runs; taking ranks %lld-%lld",
               total, first, total);
 
-        if (!Pace(abort, abortUser))
+        if (!WrApiPace(abort, abortUser))
         {
             f.stopped = true;
             f.total = total;
@@ -977,9 +969,10 @@ int WrApiBoard(const WrApiBoardArgs *a, WrEmitFn emit,
             // Deliberately NOT seeded with the probe's total before the window
             // runs. `total = t2 if isinstance(t2, int) else total` means the
             // window's own answer wins and the probe's is only the fallback,
-            // and seeding would quietly invert that -- FetchWindow keeps the
+            // and seeding would quietly invert that -- WrApiFetchWindow keeps
             // first total it sees and would then keep this one for ever.
-            FetchWindow(&f, a, mapId, (int)first, count, abort, abortUser);
+            WrApiFetchWindow(&f, mapId, a->gamemode, a->trackType, a->trackNum,
+                             (int)first, count, abort, abortUser);
             if (!f.haveTotal)
             {
                 f.total = total;
@@ -993,7 +986,8 @@ int WrApiBoard(const WrApiBoardArgs *a, WrEmitFn emit,
         int reqs = (count + WR_API_PAGE - 1) / WR_API_PAGE;
         Emitf(emit, "taking ranks %d-%d, which is %d request%s",
               first, first + count - 1, reqs, count <= WR_API_PAGE ? "" : "s");
-        FetchWindow(&f, a, mapId, first, count, abort, abortUser);
+        WrApiFetchWindow(&f, mapId, a->gamemode, a->trackType, a->trackNum,
+                         first, count, abort, abortUser);
     }
 
     if (f.err[0])
@@ -1003,30 +997,30 @@ int WrApiBoard(const WrApiBoardArgs *a, WrEmitFn emit,
         // try/except come out of this one line.
         Emitf(emit, "[!] leaderboard request failed: %s", f.err);
         WrBoardCacheFree(&held);
-        free(f.rows.v);
+        WrApiWindowFree(&f);
         return 1;
     }
 
     // Stop pressed before a single row arrived. Checked before the line below,
     // which would otherwise tell somebody who had just cancelled that their map
     // has no runs on it.
-    if (f.stopped && f.rows.n == 0)
+    if (f.stopped && f.count == 0)
     {
         Emitf(emit, "stopped after %d request%s; nothing had arrived yet",
-              f.reqs, f.reqs == 1 ? "" : "s");
+              f.requests, f.requests == 1 ? "" : "s");
         WrBoardCacheFree(&held);
-        free(f.rows.v);
+        WrApiWindowFree(&f);
         return 1;
     }
 
-    if (f.rows.n == 0 && held.count == 0)
+    if (f.count == 0 && held.count == 0)
     {
         if (emit)
             emit("no runs on this track. If the map has stages or bonuses, the "
                  "main track can be empty while the stages are not -- try "
                  "--track-type 1 --track-num 1, and check the gamemode.");
         WrBoardCacheFree(&held);
-        free(f.rows.v);
+        WrApiWindowFree(&f);
         return 0;
     }
 
@@ -1036,8 +1030,8 @@ int WrApiBoard(const WrApiBoardArgs *a, WrEmitFn emit,
     // rank of anything re-fetched -- and keeps its position, which is what
     // makes the written order reproducible.
     int fresh = 0;
-    for (int i = 0; i < f.rows.n; i++)
-        if (WrBoardCacheMerge(&held, &f.rows.v[i]))
+    for (int i = 0; i < f.count; i++)
+        if (WrBoardCacheMerge(&held, &f.rows[i]))
             fresh++;
 
     _snprintf_s(held.map, sizeof(held.map), _TRUNCATE, "%s", name);
@@ -1063,7 +1057,7 @@ int WrApiBoard(const WrApiBoardArgs *a, WrEmitFn emit,
     }
 
     Emitf(emit, "%d request%s, %d rows returned, %d new; %d of %s now cached",
-          f.reqs, f.reqs == 1 ? "" : "s", f.rows.n, fresh, held.count,
+          f.requests, f.requests == 1 ? "" : "s", f.count, fresh, held.count,
           totalShown);
     Emitf(emit, "-> %s", path);
 
@@ -1072,9 +1066,9 @@ int WrApiBoard(const WrApiBoardArgs *a, WrEmitFn emit,
     // which the reference could not do because it was being killed.
     if (f.stopped)
         Emitf(emit, "stopped after %d request%s; what had arrived was kept",
-              f.reqs, f.reqs == 1 ? "" : "s");
+              f.requests, f.requests == 1 ? "" : "s");
 
     WrBoardCacheFree(&held);
-    free(f.rows.v);
+    WrApiWindowFree(&f);
     return wrote ? 0 : 1;
 }
