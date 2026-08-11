@@ -207,7 +207,22 @@ void WrEnergyDefaults(void)
 {
     g_energy.gravity = 800.0f;
 
-    g_energy.showHud = true;
+    // OFF by default as of v0.9.0, and this is a change of posture rather than
+    // a tweak.
+    //
+    // A first run should draw lines and nothing else. This is a box of numbers
+    // that appears beside the crosshair the moment the tool is injected, before
+    // anybody has asked for a readout or knows what "carried" means -- and the
+    // thing people install this for is the lines. Both boxes are now off until
+    // asked for, which at least makes the rule simple: the world gets drawn on,
+    // the screen does not.
+    //
+    // The cost is discoverability and it is real. The corner block has END; this
+    // has no key of its own, so it is found in the panel or not at all. Hence
+    // the note beside its checkbox in the Energy tab and the line in README.md.
+    // Anybody who already has it on keeps it: settings.cfg is read OVER these
+    // defaults, so only a fresh install is quiet.
+    g_energy.showHud = false;
     g_energy.hudOffsetX = 72.0f;
     g_energy.hudOffsetY = 0.0f;
     // Left at a positive offset is exactly what the old sign trick did with a

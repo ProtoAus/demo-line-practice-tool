@@ -4391,6 +4391,14 @@ static void DrawEnergyTab(void)
 
     ImGui::SeparatorText("Crosshair readout");
     ImGui::Checkbox("Show beside the crosshair", &g_energy.showHud);
+    ImGui::SameLine();
+    HelpMarker("Off by default since v0.9.0, so a fresh install draws lines and "
+               "nothing else -- the lines are what people come for, and a box of "
+               "numbers appearing at the crosshair before anybody asked for one "
+               "is not.\n\n"
+               "This is the glanceable readout; the corner block below is the "
+               "detailed one and has END to itself. Turn either on here and it "
+               "is remembered.");
     ImGui::SetNextItemWidth(150.0f);
     const char *kAlignX[3] = { "left of it", "centred on it", "right of it" };
     if (g_energy.hudAlignX < 0 || g_energy.hudAlignX > 2)

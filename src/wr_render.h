@@ -206,7 +206,21 @@ void WrRenderRefreshScales(void);
 
 // Which colour range is live, for the on-screen key. Writes the pair the
 // current lineColour mode is actually using.
+//
+// The POOLED pair, which is the whole answer only while one leg is on screen.
+// See below.
 void WrRenderColourRange(float *lo, float *hi, bool *scaled);
+
+// How many legs are being scaled separately right now; 0 when auto-scaling is
+// off.
+//
+// More than one means there is no single range that is true of the picture: each
+// leg is fitted to its own runs, so the value at the red end differs between a
+// stage and the main track. The key has to stop printing numbers at that point,
+// and WR_LINE_ENERGY has to stop claiming "the same colour means the same energy
+// on every line" -- which is exactly the sort of promise that survives a change
+// nobody connected it to. See wr_scale.h.
+int WrRenderScaledLegCount(void);
 
 // What a label on the line may say. Any combination; empty draws nothing.
 #define WR_LABEL_SPEED  (1u << 0)

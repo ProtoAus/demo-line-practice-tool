@@ -63,6 +63,11 @@ instead — same button.
 
 Both pages can be open at once. All but `INSERT` are rebindable, and the **About** tab lists them
 as they are currently bound.
+
+> **Nothing is drawn on your screen until you ask for it.** As of v0.9.0 the energy readout beside
+> the crosshair is off by default, alongside the corner block that already was — a fresh install
+> draws lines in the world and leaves the screen alone. Both are in **Energy** in the full panel,
+> and turning either on is remembered. If you had one on already, it stays on.
 They are **read, not swallowed**, so if one collides with something you have bound, the game still
 acts on it too.
 

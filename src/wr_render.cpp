@@ -24,6 +24,7 @@
 #include "wr_path.h"
 #include "wr_steam.h"
 #include "wr_energy.h"
+#include "wr_scale.h"
 #include "wr_start.h"
 // The run clock, and the note a save-loc restore leaves. Both existed only
 // inside the panel until now, which is why the restore looked like it did
@@ -492,31 +493,19 @@ static unsigned int EnabledKey(void)
     return h;
 }
 
-// The leg the picture is about: the one the enabled runs are on. Mixed legs --
-// which the full panel can produce and the quick menu cannot -- fall back to
-// every enabled run, because a range fitted to one of two legs on screen would
-// be wrong about the other in a way nobody could see.
-static bool EnabledLeg(unsigned char *type, unsigned char *num)
-{
-    bool found = false;
-    for (int i = 0; i < WrRunCount(); i++)
-    {
-        const WrRun *r = WrRunAt(i);
-        if (!r || !r->enabled || r->pointCount < 2)
-            continue;
-        if (!found)
-        {
-            *type = r->trackType;
-            *num = r->trackNum;
-            found = true;
-        }
-        else if (r->trackType != *type || r->trackNum != *num)
-        {
-            return false;           // more than one leg on screen
-        }
-    }
-    return found;
-}
+// One range per leg, rather than one for the picture. See wr_scale.h for what
+// was wrong with the alternative -- briefly: this used to notice that two legs
+// were on and give up, pooling everything, so enabling a stage turned the
+// feature off without saying so.
+//
+// Three tables because the three quantities are on scales two orders of
+// magnitude apart and only one is ever wanted at a time; the speed one is filled
+// always because it costs nothing (every run measured its own extremes at load)
+// and the energy passes only for the mode that is on.
+static WrLegScale g_legSpeed[WR_SCALE_MAX_LEGS];
+static WrLegScale g_legEnergy[WR_SCALE_MAX_LEGS];
+static WrLegScale g_legRel[WR_SCALE_MAX_LEGS];
+static int g_legsOn = 0;            // how many legs got any data at all
 
 void WrRenderRefreshScales(void)
 {
@@ -539,7 +528,8 @@ void WrRenderRefreshScales(void)
     g_scaleGravity = g_energy.gravity;
 
     // Off: the derived pair is the slider pair, exactly. Every run's shownRank
-    // goes back to 0, which WrRunColour reads as "no opinion".
+    // goes back to 0, which WrRunColour reads as "no opinion", and the leg
+    // tables are emptied so nothing downstream can read a stale one.
     if (!g_render.autoScale)
     {
         g_render.useSpeedMin = g_render.speedMin;
@@ -548,6 +538,10 @@ void WrRenderRefreshScales(void)
         g_render.useEnergyMax = g_render.energyMax;
         g_render.useEnergyRelMin = g_render.energyRelMin;
         g_render.useEnergyRelMax = g_render.energyRelMax;
+        WrLegScaleReset(g_legSpeed, WR_SCALE_MAX_LEGS);
+        WrLegScaleReset(g_legEnergy, WR_SCALE_MAX_LEGS);
+        WrLegScaleReset(g_legRel, WR_SCALE_MAX_LEGS);
+        g_legsOn = 0;
         for (int i = 0; i < WrRunCount(); i++)
         {
             WrRun *r = WrRunAt(i);
@@ -556,40 +550,57 @@ void WrRenderRefreshScales(void)
         return;
     }
 
-    unsigned char legType = 0, legNum = 0;
-    const bool oneLeg = EnabledLeg(&legType, &legNum);
+    WrLegScaleReset(g_legSpeed, WR_SCALE_MAX_LEGS);
+    WrLegScaleReset(g_legEnergy, WR_SCALE_MAX_LEGS);
+    WrLegScaleReset(g_legRel, WR_SCALE_MAX_LEGS);
 
-    // --- rank, among what is on ---------------------------------------------
+    // --- rank, among what is on, WITHIN EACH LEG -----------------------------
     //
     // The store is time-sorted, so walking it in order and counting the enabled
-    // runs of the leg IS the placing. No sort, no comparison.
+    // runs of a leg IS the placing on that leg. No sort, no comparison.
+    //
+    // Per leg rather than pooled, and the key on screen has said so all along:
+    // "placed within each leg -- a bonus cannot out-place a main run". A
+    // 34-second bonus taking first place from a 52-second main track is exactly
+    // plausible enough not to be noticed.
     {
-        int on = 0;
+        // Two passes: the first counts each leg's members, the second hands out
+        // places -- a run has to be told how many it placed among, and that is
+        // not known until its leg has been walked.
         for (int i = 0; i < WrRunCount(); i++)
         {
             const WrRun *r = WrRunAt(i);
-            if (r && r->enabled && r->pointCount >= 2 &&
-                (!oneLeg || (r->trackType == legType && r->trackNum == legNum)))
-                on++;
+            if (!r || !r->enabled || r->pointCount < 2)
+                continue;
+            const int slot = WrLegScaleSlot(g_legSpeed, WR_SCALE_MAX_LEGS,
+                                            r->trackType, r->trackNum);
+            if (slot >= 0)
+                g_legSpeed[slot].members++;
         }
-        int place = 0;
         for (int i = 0; i < WrRunCount(); i++)
         {
             WrRun *r = WrRunAt(i);
             if (!r)
                 continue;
-            if (r->enabled && r->pointCount >= 2 &&
-                (!oneLeg || (r->trackType == legType && r->trackNum == legNum)))
+            int slot = -1;
+            if (r->enabled && r->pointCount >= 2)
+                slot = WrLegScaleFind(g_legSpeed, WR_SCALE_MAX_LEGS,
+                                      r->trackType, r->trackNum);
+            if (slot >= 0)
             {
-                r->shownRank = ++place;
-                r->shownOutOf = on;
+                r->shownRank = ++g_legSpeed[slot].placed;
+                r->shownOutOf = g_legSpeed[slot].members;
             }
             else
             {
+                // Not enabled, too short, or past WR_SCALE_MAX_LEGS. All three
+                // read as "no opinion" downstream, which falls back to the
+                // leaderboard placing rather than inventing one.
                 r->shownRank = 0;
                 r->shownOutOf = 0;
             }
         }
+        g_legsOn = WrLegScaleCount(g_legSpeed, WR_SCALE_MAX_LEGS);
     }
 
     // --- speed, which costs nothing ------------------------------------------
@@ -597,6 +608,10 @@ void WrRenderRefreshScales(void)
     // Every run measured its own extremes at load and nothing has read them
     // since -- wr_path.h has said "for colour-by-speed" beside them the whole
     // time. This is that field finding its consumer.
+    //
+    // The pooled pair is kept as well as the per-leg ones: it is what the live
+    // trail uses (it is on no leg), what a seventeenth leg falls back to, and
+    // what every mode's ramp lookup is parameterised on.
     {
         float lo = 1e30f, hi = -1e30f;
         for (int i = 0; i < WrRunCount(); i++)
@@ -606,6 +621,10 @@ void WrRenderRefreshScales(void)
                 continue;
             if (r->speedMin < lo) lo = r->speedMin;
             if (r->speedMax > hi) hi = r->speedMax;
+
+            const int slot = WrLegScaleFind(g_legSpeed, WR_SCALE_MAX_LEGS,
+                                            r->trackType, r->trackNum);
+            WrLegScaleAdd(g_legSpeed, slot, r->speedMin, r->speedMax);
         }
         if (lo <= hi && hi - lo > 1.0f)
         {
@@ -625,11 +644,13 @@ void WrRenderRefreshScales(void)
     // is a live setting, so it cannot be precomputed at load the way speed is --
     // and it needs no sqrt, so the pass is an add and a multiply per point.
     // Twenty runs of ten thousand points is about a third of a millisecond, paid
-    // when the set changes rather than per frame.
+    // when the set changes rather than per frame. Filling the per-leg table adds
+    // one lookup per RUN, not per point.
     const bool wantAbs = (g_render.lineColour == WR_LINE_ENERGY);
     const bool wantRel = (g_render.lineColour == WR_LINE_ENERGY_REL);
     if (wantAbs || wantRel)
     {
+        WrLegScale *legs = wantAbs ? g_legEnergy : g_legRel;
         float lo = 1e30f, hi = -1e30f;
         for (int i = 0; i < WrRunCount(); i++)
         {
@@ -640,12 +661,21 @@ void WrRenderRefreshScales(void)
             const int from = (g_render.hidePreRoll && r->startTrusted &&
                               r->startIndex < r->pointCount)
                                  ? r->startIndex : 0;
+            float rlo = 1e30f, rhi = -1e30f;
             for (int k = from; k < r->pointCount; k++)
             {
                 const float e = WrEnergyOf(r->points[k].pos, r->points[k].vel) - base;
-                if (e < lo) lo = e;
-                if (e > hi) hi = e;
+                if (e < rlo) rlo = e;
+                if (e > rhi) rhi = e;
             }
+            if (rlo > rhi)
+                continue;                   // no points in range at all
+            if (rlo < lo) lo = rlo;
+            if (rhi > hi) hi = rhi;
+
+            const int slot = WrLegScaleSlot(legs, WR_SCALE_MAX_LEGS,
+                                            r->trackType, r->trackNum);
+            WrLegScaleAdd(legs, slot, rlo, rhi);
         }
         if (lo <= hi && hi - lo > 1.0f)
         {
@@ -667,6 +697,53 @@ void WrRenderRefreshScales(void)
         g_render.useEnergyRelMin = g_render.energyRelMin;
         g_render.useEnergyRelMax = g_render.energyRelMax;
     }
+}
+
+// The pair a particular RUN is coloured against, for the mode that is on.
+//
+// This is the whole of per-leg scaling as the renderer sees it: the ramp lookup
+// downstream is parameterised on a normalised t, so varying which lo and hi
+// produce that t is all it takes. Falls back to the pooled pair whenever the
+// leg has no usable range of its own -- a single run of constant speed, a leg
+// past WR_SCALE_MAX_LEGS, or auto-scaling off, in which case the pooled pair IS
+// the user's sliders.
+static void RunColourRange(const WrRun *run, float *lo, float *hi)
+{
+    float a, b;
+    const WrLegScale *legs = NULL;
+    if (g_render.lineColour == WR_LINE_ENERGY)
+    {
+        a = g_render.useEnergyMin;  b = g_render.useEnergyMax;  legs = g_legEnergy;
+    }
+    else if (g_render.lineColour == WR_LINE_ENERGY_REL)
+    {
+        a = g_render.useEnergyRelMin; b = g_render.useEnergyRelMax; legs = g_legRel;
+    }
+    else
+    {
+        a = g_render.useSpeedMin;   b = g_render.useSpeedMax;   legs = g_legSpeed;
+    }
+
+    if (run && g_render.autoScale)
+    {
+        const int slot = WrLegScaleFind(legs, WR_SCALE_MAX_LEGS, run->trackType,
+                                        run->trackNum);
+        if (WrLegScaleUsable(legs, slot))
+        {
+            a = legs[slot].lo;
+            b = legs[slot].hi;
+        }
+    }
+    *lo = a;
+    *hi = b;
+}
+
+// How many legs are being scaled separately right now. 0 or 1 means the key can
+// still print real numbers; more than that and it cannot, because there is no
+// single pair that is true of every line on screen.
+int WrRenderScaledLegCount(void)
+{
+    return g_render.autoScale ? g_legsOn : 0;
 }
 
 void WrRenderColourRange(float *lo, float *hi, bool *scaled)
@@ -811,6 +888,12 @@ struct WrPathDraw
     // behind it at all. Computing it from `first` would silently colour against
     // the walk-in whenever that toggle was off.
     float startEnergy;
+
+    // The ends of the colour ramp for THIS path, for whichever mode is on.
+    // Per run rather than read from g_render here, because with auto-scaling on
+    // they come from the run's own LEG -- see wr_scale.h. Resolved once by the
+    // caller; two stages on screen are two ramps and this is where they differ.
+    float cLo, cHi;
 };
 
 static void EmitPath(ImDrawList *dl, const WrPathDraw &d)
@@ -1009,8 +1092,7 @@ static void EmitPath(ImDrawList *dl, const WrPathDraw &d)
         else if (g_render.lineColour == WR_LINE_SPEED && velScale > 0.0f)
         {
             float speed = WrLength(pts[i].vel) * velScale;
-            float t = WrClampF((speed - g_render.useSpeedMin) /
-                               (g_render.useSpeedMax - g_render.useSpeedMin + 1e-3f),
+            float t = WrClampF((speed - d.cLo) / (d.cHi - d.cLo + 1e-3f),
                                0.0f, 1.0f);
             int cBucket = (int)(t * (COLOUR_BUCKETS - 1) + 0.5f);
             colour = WithAlpha(SpeedColour(g_render.useSpeedMin +
@@ -1030,8 +1112,7 @@ static void EmitPath(ImDrawList *dl, const WrPathDraw &d)
             // deliberate too -- a second ramp for a second quantity would be
             // one more thing to learn for no gain.
             float e = WrEnergyOf(pts[i].pos, pts[i].vel);
-            float t = WrClampF((e - g_render.useEnergyMin) /
-                               (g_render.useEnergyMax - g_render.useEnergyMin + 1e-3f),
+            float t = WrClampF((e - d.cLo) / (d.cHi - d.cLo + 1e-3f),
                                0.0f, 1.0f);
             int cBucket = (int)(t * (COLOUR_BUCKETS - 1) + 0.5f);
             colour = WithAlpha(SpeedColour(g_render.useSpeedMin +
@@ -1051,8 +1132,7 @@ static void EmitPath(ImDrawList *dl, const WrPathDraw &d)
             // lower than another is not penalised for it -- which is the right
             // question when the answer wanted is "who held onto what they had".
             float e = WrEnergyOf(pts[i].pos, pts[i].vel) - d.startEnergy;
-            float t = WrClampF((e - g_render.useEnergyRelMin) /
-                               (g_render.useEnergyRelMax - g_render.useEnergyRelMin + 1e-3f),
+            float t = WrClampF((e - d.cLo) / (d.cHi - d.cLo + 1e-3f),
                                0.0f, 1.0f);
             int cBucket = (int)(t * (COLOUR_BUCKETS - 1) + 0.5f);
             colour = WithAlpha(SpeedColour(g_render.useSpeedMin +
@@ -2472,9 +2552,24 @@ static void EmitEfficiencyLegend(ImDrawList *dl)
         WrRenderColourRange(&lo, &hi, &scaled);
         const char *unit = relOn ? "from its own start"
                                  : (nrgOn ? "units of height" : "u/s");
-        _snprintf_s(sLo, sizeof(sLo), _TRUNCATE, "%.0f %s and below", lo, unit);
-        _snprintf_s(sMid, sizeof(sMid), _TRUNCATE, "%.0f", (lo + hi) * 0.5f);
-        _snprintf_s(sHi, sizeof(sHi), _TRUNCATE, "%.0f and above", hi);
+
+        // MORE THAN ONE LEG AND THERE IS NO NUMBER TO PRINT. Each leg is scaled
+        // to its own runs, so the value at the red end is different on a stage
+        // than on the main track, and one figure would be false about every line
+        // but one. Say what the colour means instead of what it measures.
+        const int legs = WrRenderScaledLegCount();
+        if (legs > 1)
+        {
+            strcpy_s(sLo, sizeof(sLo), "lowest on its own leg");
+            strcpy_s(sMid, sizeof(sMid), "the middle of that leg");
+            strcpy_s(sHi, sizeof(sHi), "highest on its own leg");
+        }
+        else
+        {
+            _snprintf_s(sLo, sizeof(sLo), _TRUNCATE, "%.0f %s and below", lo, unit);
+            _snprintf_s(sMid, sizeof(sMid), _TRUNCATE, "%.0f", (lo + hi) * 0.5f);
+            _snprintf_s(sHi, sizeof(sHi), _TRUNCATE, "%.0f and above", hi);
+        }
 
         rows[n].colour = SpeedColour(lo);                 rows[n].dim = false;
         rows[n++].text = sLo;
@@ -2500,9 +2595,17 @@ static void EmitEfficiencyLegend(ImDrawList *dl)
             // The one thing that is not obvious about the energy mode, and the
             // reason it is worth having at all: it is an absolute height, so the
             // same colour on two different lines is the same energy.
+            //
+            // WHICH IS FALSE THE MOMENT TWO LEGS ARE SCALED SEPARATELY, so it is
+            // not said then. A key that keeps a promise the picture has stopped
+            // keeping is worse than no key: it is the one place somebody would
+            // go to check.
             foots[nf++] = "energy = height + speed^2 / 2g, in world units";
-            foots[nf++] = "absolute, so the same colour means the same energy on "
-                          "every line";
+            foots[nf++] = (legs > 1)
+                ? "each leg has its own ramp, so colours compare WITHIN a leg, "
+                  "not across"
+                : "absolute, so the same colour means the same energy on "
+                  "every line";
         }
         else
         {
@@ -2513,7 +2616,10 @@ static void EmitEfficiencyLegend(ImDrawList *dl)
         // Said in the key rather than only in the panel, because this is the one
         // place a colour can change meaning without anybody touching a setting:
         // enable another run and the ends move.
-        if (scaled)
+        if (scaled && legs > 1)
+            foots[nf++] = "each leg scaled to its own runs -- the main track and "
+                          "a stage are not on one ramp";
+        else if (scaled)
             foots[nf++] = "scaled to the runs currently on screen";
     }
 
@@ -3416,6 +3522,7 @@ void WrRenderWorld(void)
         d.thickness = g_render.thickness;
         d.lift = 0.0f;
         d.startEnergy = RunStartEnergy(run);
+        RunColourRange(run, &d.cLo, &d.cHi);
         EmitPath(dl, d);
         EmitTurns(dl, run, false);
         EmitTurns(dl, run, true);
@@ -3445,6 +3552,7 @@ void WrRenderWorld(void)
             d.thickness = g_render.thickness * g_render.pickThickBoost;
             d.lift = 0.35f;
             d.startEnergy = RunStartEnergy(run);
+            RunColourRange(run, &d.cLo, &d.cHi);
             EmitPath(dl, d);
             EmitTurns(dl, run, false);
             EmitTurns(dl, run, true);
@@ -3488,6 +3596,10 @@ void WrRenderWorld(void)
             // Where your own recording began, which is the closest thing your
             // line has to a start.
             d.startEnergy = WrEnergyOf(live[0].pos, live[0].vel);
+            // NULL: your own line is on no leg, so it gets the pooled range.
+            // Colouring it against one stage's ramp would be picking a leg for
+            // it, and there is no honest way to pick.
+            RunColourRange(NULL, &d.cLo, &d.cHi);
             EmitPath(dl, d);
         }
     }

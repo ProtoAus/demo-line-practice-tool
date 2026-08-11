@@ -95,6 +95,7 @@ static bool g_wantBoard = false;
 static unsigned char g_wantBoardType = 0, g_wantBoardNum = 1;
 static int g_wantBoardFrom = 1;         // 1-based rank to start at
 static int g_wantBoardCount = WR_QUICK_TOP_DEFAULT;
+static bool g_wantBoardSlowest = false; // the last `count`, not from `from`
 
 // How many places the table is showing. Starts at the setting and grows by the
 // same step each time "show more" is pressed, up to the row array.
@@ -104,14 +105,41 @@ static int g_wantBoardCount = WR_QUICK_TOP_DEFAULT;
 // again is the ordinary case.
 static int g_showTop = WR_QUICK_TOP_DEFAULT;
 
+// Which end of the board the table is showing.
+//
+// WHY THE SLOW END IS WORTH A CONTROL. The fastest runs are the hardest to
+// follow: a 37-second surf_demise world record is not a line a learner can
+// trace, and the 79-second run at rank 9108 is. wr_board.h has said so since the
+// Board tab was written, and this page -- the one aimed at somebody who has just
+// installed the thing -- could only ever show the top.
+//
+// It is a VIEW and not just a fetch, because the cache accumulates: after asking
+// for both ends, one rank-sorted file holds ranks 1-20 and 9089-9108, and a
+// reader that takes the first twenty lines will never show the second group no
+// matter how many times it is fetched.
+enum { END_FAST = 0, END_SLOW };
+static int g_end = END_FAST;
+
 // Which legs this session has already offered to read, so that switching back
 // and forth across the chips is not one request each way.
 //
 // A leg that came back EMPTY is in here too, and that is the point: a stage with
 // no runs would otherwise be asked about every single time it is selected, for
 // ever, and the answer would be the same every time.
+//
+// Keyed by (leg, end): the two ends of a board are two different questions, and
+// having asked about the top of a stage says nothing about whether its tail has
+// been looked at.
 static unsigned short g_asked[MAX_LEGS_ASKED];
 static int g_askedCount = 0;
+
+// The display order. A separate array rather than sorting g_rows, and that is
+// load-bearing: the ticks are keyed by hash, the status cells and g_rowState are
+// keyed by ROW INDEX, and a sort applied to the rows but not to one of those
+// would put "gave up" on somebody else's run.
+static int g_order[WR_QUICK_TOP_MAX];
+static int g_orderCount = 0;
+static bool g_resort = true;
 
 static unsigned int g_lastExtractGen = 0;
 static unsigned int g_lastStoreGen = 0;
@@ -342,26 +370,39 @@ static void ReloadRows(void)
     char path[MAX_PATH];
     BoardPathForLeg(path, sizeof(path), g_leg);
 
+    // Which end. The cache holds every window ever asked for in one rank-sorted
+    // file, so this is the only thing that decides whether the tail is reachable
+    // at all.
     int mapId = 0;
-    int n = WrBoardParseFile(path, g_rows, top, &g_boardTotal, &g_boardFetched,
-                             &mapId);
+    int n = (g_end == END_SLOW)
+                ? WrBoardParseTail(path, g_rows, top, &g_boardTotal,
+                                   &g_boardFetched, &mapId)
+                : WrBoardParseFile(path, g_rows, top, &g_boardTotal,
+                                   &g_boardFetched, &mapId);
     if (n < 0)
         return;                     // nothing cached; not an error
     g_rowCount = n;
     if (mapId > 0)
         g_mapId = mapId;
+
+    // The order is about these rows and they have just been replaced.
+    g_resort = true;
 }
 
 static WrRun *RunWithHash(const char *hash);
 static bool DemoPath(const char *hash, char *out, int cap);
+static int FindPick(const char *hash);
 
 // ---------------------------------------------------------------------------
 // Asking for a board
 // ---------------------------------------------------------------------------
 
+// The leg and which end of it, in one value. The end is the top bit of the type
+// byte, which is free: trackType is 0, 1 or 2.
 static unsigned short LegKey(unsigned char type, unsigned char num)
 {
-    return (unsigned short)(((unsigned short)type << 8) | num);
+    const unsigned short t = (unsigned short)(type | (g_end == END_SLOW ? 0x80 : 0));
+    return (unsigned short)((t << 8) | num);
 }
 
 static bool AlreadyAsked(unsigned char type, unsigned char num)
@@ -404,13 +445,36 @@ static void WantBoard(unsigned char type, unsigned char num, int from, int count
     g_wantBoardNum = num;
     g_wantBoardFrom = from < 1 ? 1 : from;
     g_wantBoardCount = count < 1 ? SHOW_MORE_STEP : count;
+    g_wantBoardSlowest = false;
+    g_nextPollAt = 0;
+}
+
+// The tail, which is one request rather than a walk down to it: every page the
+// API returns carries totalCount, so the pager reads the size and then lands on
+// the end. WR_BOARD_SLOWEST is that, and it has been in the job dispatch since
+// the Board tab was written.
+static void WantSlowest(unsigned char type, unsigned char num, int count)
+{
+    if (!g_quick.network)
+        return;
+    g_wantBoard = true;
+    g_wantBoardType = type;
+    g_wantBoardNum = num;
+    g_wantBoardFrom = 0;
+    g_wantBoardCount = count < 1 ? SHOW_MORE_STEP : count;
+    g_wantBoardSlowest = true;
     g_nextPollAt = 0;
 }
 
 // The automatic half: the leg you are looking at, once, when it is empty.
+//
+// THE FAST END ONLY. The tail is a second request about the same leg and it is
+// worth having asked for, which makes it a decision rather than a default -- and
+// a page that quietly fetched both ends of every leg you walked past would be
+// twice the traffic for a view most people never open.
 static void MaybeAutoRead(void)
 {
-    if (!g_quick.network || g_legCount <= 0 || g_wantBoard)
+    if (!g_quick.network || g_legCount <= 0 || g_wantBoard || g_end != END_FAST)
         return;
 
     const unsigned char type = g_legs[g_leg].type;
@@ -431,6 +495,25 @@ static void MaybeAutoRead(void)
     WantBoard(type, num, 1, g_quick.top);
 }
 
+// How far along the chain each row is, as a number the status column can be
+// sorted on. Exactly the order the cells are chosen in below, so what you read
+// and what you sort by cannot disagree.
+static int g_pickedRank[WR_QUICK_TOP_MAX];
+
+static void RefreshPickedRank(void)
+{
+    for (int i = 0; i < g_rowCount; i++)
+    {
+        const int pi = FindPick(g_rows[i].hash);
+        if (pi >= 0 && g_picks[pi].failed)      g_pickedRank[i] = 5;  // gave up
+        else if (pi >= 0 && g_picks[pi].done)   g_pickedRank[i] = 0;  // drawn
+        else if (pi >= 0)                       g_pickedRank[i] = 1;  // working
+        else if (g_rowState[i] == ROW_READY)    g_pickedRank[i] = 2;
+        else if (g_rowState[i] == ROW_ON_DISK)  g_pickedRank[i] = 3;
+        else                                    g_pickedRank[i] = 4;
+    }
+}
+
 static void RefreshRowState(void)
 {
     for (int i = 0; i < g_rowCount; i++)
@@ -444,6 +527,89 @@ static void RefreshRowState(void)
         g_rowState[i] = DemoPath(g_rows[i].hash, path, sizeof(path))
                             ? ROW_ON_DISK : ROW_NOTHING;
     }
+    // The status column can be sorted on, and it has just changed under it.
+    RefreshPickedRank();
+    g_resort = true;
+}
+
+// ---------------------------------------------------------------------------
+// The order the rows are drawn in
+// ---------------------------------------------------------------------------
+//
+// Same shape as the Board tab's -- an order array, a file-static pointer to the
+// specs for the duration of the qsort, and rank breaking every tie so the order
+// cannot wobble between frames. Two tables sorting rows of the same type should
+// not have two different sorts.
+//
+// EVERY COLUMN, INCLUDING THE TWO WITH NO HEADING. Those two are the reason this
+// exists: the tick column sorts what you have asked for to the top, and the
+// status column sorts by how far along the chain each row is. Neither has a name
+// to click, so both get a heading of one space rather than nothing at all --
+// ImGui gives an empty header no width to hit.
+
+enum
+{
+    QCOL_TICK = 1,
+    QCOL_RANK,
+    QCOL_TIME,
+    QCOL_RUNNER,
+    QCOL_STATE,
+};
+
+static const ImGuiTableSortSpecs *g_specs = NULL;
+
+// The name the table actually draws: the live Steam persona when we have one,
+// and the alias the board was cached with otherwise. Sorting the cached alias
+// while showing the persona would look like a sort that does not work.
+static const char *RowName(const WrBoardRow *r)
+{
+    const char *persona = WrSteamPersona(r->steamId);
+    return (persona && *persona) ? persona : r->alias;
+}
+
+static int CompareQuickColumn(int ia, int ib, ImGuiID col)
+{
+    const WrBoardRow *a = &g_rows[ia], *b = &g_rows[ib];
+    switch (col)
+    {
+    case QCOL_TICK:
+    {
+        // Ticked first, ascending -- "show me the ones I asked for".
+        const int ta = (FindPick(a->hash) >= 0) ? 0 : 1;
+        const int tb = (FindPick(b->hash) >= 0) ? 0 : 1;
+        return ta - tb;
+    }
+    case QCOL_RANK:
+        return a->rank == b->rank ? 0 : (a->rank < b->rank ? -1 : 1);
+    case QCOL_TIME:
+        return a->time == b->time ? 0 : (a->time < b->time ? -1 : 1);
+    case QCOL_RUNNER:
+        return _stricmp(RowName(a), RowName(b));
+    case QCOL_STATE:
+        // How far along: drawn, working, ready, on disk, nothing, gave up. Ties
+        // fall through to rank below, so a page of untouched rows still reads
+        // as a leaderboard.
+        return g_pickedRank[ia] - g_pickedRank[ib];
+    default:
+        return 0;
+    }
+}
+
+static int __cdecl CompareQuickRows(const void *pa, const void *pb)
+{
+    const int ia = *(const int *)pa, ib = *(const int *)pb;
+    if (ia < 0 || ia >= g_rowCount || ib < 0 || ib >= g_rowCount || !g_specs)
+        return 0;
+    for (int s = 0; s < g_specs->SpecsCount; s++)
+    {
+        const ImGuiTableColumnSortSpecs *spec = &g_specs->Specs[s];
+        const int c = CompareQuickColumn(ia, ib, spec->ColumnUserID);
+        if (c != 0)
+            return spec->SortDirection == ImGuiSortDirection_Ascending ? c : -c;
+    }
+    // Rank breaks every tie, so the order is total and cannot wobble.
+    const int ra = g_rows[ia].rank, rb = g_rows[ib].rank;
+    return ra == rb ? 0 : (ra < rb ? -1 : 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -739,7 +905,7 @@ static void SubmitBoard(void)
     req.gamemode = g_mode;
     req.trackType = g_wantBoardType;
     req.trackNum = g_wantBoardNum;
-    req.boardMode = WR_BOARD_WINDOW;
+    req.boardMode = g_wantBoardSlowest ? WR_BOARD_SLOWEST : WR_BOARD_WINDOW;
     req.fromRank = g_wantBoardFrom;
     req.count = g_wantBoardCount;
 
@@ -747,7 +913,8 @@ static void SubmitBoard(void)
     {
         g_wantBoard = false;
         _snprintf_s(g_note, sizeof(g_note), _TRUNCATE,
-                    "reading the %s leaderboard...",
+                    "reading the %s of the %s leaderboard...",
+                    g_wantBoardSlowest ? "slow end" : "top",
                     WrTrackNameOf(g_wantBoardType, g_wantBoardNum));
     }
 }
@@ -1014,6 +1181,7 @@ void WrQuickOnMapChanged(const char *map)
     g_wantBoard = false;
     g_showTop = g_quick.top;
     g_askedCount = 0;           // a new map is a new set of legs to ask about
+    g_end = END_FAST;
     g_note[0] = '\0';
     g_nextPollAt = 0;
 
@@ -1125,6 +1293,25 @@ static void DrawLegChips(void)
     }
 }
 
+// TWO ROWS OF CIRCLES, not one row and a tick box, and not one row of six.
+//
+// The tick box was reported as looking wrong beside the radio buttons, and it
+// did -- but the fix is not to fold rank in with them, because they are not the
+// same kind of thing. The row below varies colour ALONG a line: speed at this
+// point, energy at this point. Rank colours a whole run by where it placed. One
+// is a measurement down the line and the other is an identity for the line, so
+// they COMPOSE: rank sets what a run's base colour is, and efficiency shades
+// from that base.
+//
+// Merging them into one exclusive list would have destroyed that -- and quietly,
+// since nothing on screen would say the combination had stopped being available.
+// Two rows of radio buttons answer the actual complaint (no tick box among the
+// circles) and cost nothing.
+//
+// The second row also reaches WR_RANK_BY_TIME, which this page could not select
+// at all before: not an even spread across the field, but shaded by how far off
+// the best each run is -- so on a board where everyone is within a second of the
+// record, everyone stays green, because they are all nearly as fast.
 static void DrawColourRow(void)
 {
     ImGui::SeparatorText("Colour");
@@ -1132,32 +1319,50 @@ static void DrawColourRow(void)
     static const char *kNames[WR_LINE_MODE_COUNT] = {
         "off", "speed", "energy", "energy (relative)", "efficiency"
     };
+    ImGui::TextDisabled("along the line");
+    ImGui::SameLine();
     for (int i = 0; i < WR_LINE_MODE_COUNT; i++)
     {
-        if (i > 0)
-            ImGui::SameLine();
+        ImGui::SameLine();
         if (ImGui::RadioButton(kNames[i], g_render.lineColour == i))
             g_render.lineColour = i;
     }
 
-    bool byRank = (g_render.rankColour != WR_RANK_OFF);
-    if (ImGui::Checkbox("by rank", &byRank))
-        g_render.rankColour = byRank ? WR_RANK_BY_PLACING : WR_RANK_OFF;
+    static const char *kRank[WR_RANK_MODE_COUNT] = {
+        "off", "by placing", "by time"
+    };
+    ImGui::TextDisabled("whole run");
     ImGui::SameLine();
-    Marker("Colours each whole line by where it placed, rather than colouring "
-           "ALONG the line the way the row above does. The two compose: rank "
-           "sets what a run's base colour is and efficiency shades from it.");
+    for (int i = 0; i < WR_RANK_MODE_COUNT; i++)
+    {
+        ImGui::SameLine();
+        char id[48];
+        _snprintf_s(id, sizeof(id), _TRUNCATE, "%s##rank", kRank[i]);
+        if (ImGui::RadioButton(id, g_render.rankColour == i))
+            g_render.rankColour = i;
+    }
+    ImGui::SameLine();
+    Marker("Colours each whole line by where it placed on its own leg, rather "
+           "than colouring ALONG the line the way the row above does.\n\n"
+           "The two compose, which is why they are two rows: rank sets what a "
+           "run's base colour is and efficiency shades from it. Turning one on "
+           "does not turn the other off.\n\n"
+           "by placing spreads the field evenly. by time shades by how far off "
+           "the best each run is, so a board where everybody is within a second "
+           "of the record stays green -- because they are all nearly as fast.");
 
-    ImGui::SameLine();
     ImGui::Checkbox("scale to what is on", &g_render.autoScale);
     ImGui::SameLine();
     Marker("Takes the ends of the colour range from the runs you actually have "
-           "on, on the leg you are looking at, instead of from two fixed "
-           "numbers.\n\n"
+           "on, instead of from two fixed numbers.\n\n"
            "It matters most on the slow end of a board. A 250-3500 speed ramp "
            "spends most of its length on speeds a learner's run never reaches, "
            "so every line looks the same colour; scaled to the runs on screen, "
            "the ramp covers what those runs actually did.\n\n"
+           "Each LEG is scaled to its own runs. Turn on a stage as well as the "
+           "main track and they get a ramp each, rather than one range covering "
+           "the gap between them -- which would leave both of them in a fraction "
+           "of it. The key on screen says so when it is happening.\n\n"
            "Turning it off puts your own sliders back exactly as they were.");
 }
 
@@ -1261,6 +1466,34 @@ void WrQuickDraw(void)
     const unsigned char legType = g_legCount ? g_legs[g_leg].type : 0;
     const unsigned char legNum = g_legCount ? g_legs[g_leg].num : 1;
 
+    // Which end of it. Two radio buttons rather than a tick box, because they
+    // are two views of one board and not a modifier on one view.
+    {
+        int end = g_end;
+        if (ImGui::RadioButton("fastest", end == END_FAST))
+            end = END_FAST;
+        ImGui::SameLine();
+        if (ImGui::RadioButton("slowest", end == END_SLOW))
+            end = END_SLOW;
+        ImGui::SameLine();
+        Marker("The slow end of the same leaderboard.\n\n"
+               "Worth having because the fastest runs are the hardest to "
+               "follow: a 37-second surf_demise world record is not a line "
+               "anybody can trace, and the 79-second run at rank 9,108 is.\n\n"
+               "It costs one request -- every page the server sends carries the "
+               "size of the board, so reaching the end is not a walk down to "
+               "it. Nothing down here is read automatically; the top of a leg "
+               "is.");
+
+        if (end != g_end)
+        {
+            g_end = end;
+            g_showTop = g_quick.top;
+            g_rowsStale = true;
+            g_nextPollAt = 0;       // decide about the new end on the next tick
+        }
+    }
+
     if (g_rowsStale)
     {
         ReloadRows();
@@ -1285,10 +1518,24 @@ void WrQuickDraw(void)
             // leg and came back with nothing -- an empty stage board, or a
             // request that failed. Asking again is then a decision rather than a
             // default, so it is a button.
+            //
+            // On the slow end it is the ONLY way in: nothing is read down there
+            // automatically, so the first visit always lands here.
             char lbl[64];
-            _snprintf_s(lbl, sizeof(lbl), _TRUNCATE, "Read the top %d", g_quick.top);
-            if (ImGui::Button(lbl))
-                WantBoard(legType, legNum, 1, g_quick.top);
+            if (g_end == END_SLOW)
+            {
+                _snprintf_s(lbl, sizeof(lbl), _TRUNCATE, "Read the slowest %d",
+                            g_quick.top);
+                if (ImGui::Button(lbl))
+                    WantSlowest(legType, legNum, g_quick.top);
+            }
+            else
+            {
+                _snprintf_s(lbl, sizeof(lbl), _TRUNCATE, "Read the top %d",
+                            g_quick.top);
+                if (ImGui::Button(lbl))
+                    WantBoard(legType, legNum, 1, g_quick.top);
+            }
         }
     }
     else if (g_boardFetched > 0)
@@ -1311,19 +1558,53 @@ void WrQuickDraw(void)
         const float footer = ImGui::GetFrameHeightWithSpacing() * 5.5f;
         if (ImGui::BeginTable("quickrows", 5,
                               ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-                              ImGuiTableFlags_SizingStretchProp,
+                              ImGuiTableFlags_SizingStretchProp |
+                              ImGuiTableFlags_Sortable |
+                              ImGuiTableFlags_SortMulti,
                               ImVec2(0.0f, -footer)))
         {
-            ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 26.0f);
-            ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 40.0f);
-            ImGui::TableSetupColumn("time", ImGuiTableColumnFlags_WidthFixed, 78.0f);
-            ImGui::TableSetupColumn("runner");
-            ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 130.0f);
+            // A single space, not "", for the two unnamed columns: an empty
+            // header has no width to click and the whole point of making them
+            // sortable is that they are the two most useful sorts here -- what
+            // you ticked, and how far along it is.
+            ImGui::TableSetupColumn(" ", ImGuiTableColumnFlags_WidthFixed, 26.0f,
+                                    QCOL_TICK);
+            ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed |
+                                         ImGuiTableColumnFlags_DefaultSort,
+                                    40.0f, QCOL_RANK);
+            ImGui::TableSetupColumn("time", ImGuiTableColumnFlags_WidthFixed,
+                                    78.0f, QCOL_TIME);
+            ImGui::TableSetupColumn("runner", ImGuiTableColumnFlags_WidthStretch,
+                                    0.0f, QCOL_RUNNER);
+            ImGui::TableSetupColumn("  ", ImGuiTableColumnFlags_WidthFixed,
+                                    130.0f, QCOL_STATE);
             ImGui::TableSetupScrollFreeze(0, 1);
             ImGui::TableHeadersRow();
 
-            for (int i = 0; i < g_rowCount; i++)
+            if (g_orderCount != g_rowCount)
             {
+                for (int i = 0; i < g_rowCount; i++)
+                    g_order[i] = i;
+                g_orderCount = g_rowCount;
+                g_resort = true;
+            }
+
+            ImGuiTableSortSpecs *specs = ImGui::TableGetSortSpecs();
+            if (specs && specs->SpecsCount > 0 && g_rowCount > 1 &&
+                (specs->SpecsDirty || g_resort))
+            {
+                g_specs = specs;
+                qsort(g_order, (size_t)g_rowCount, sizeof(int), CompareQuickRows);
+                g_specs = NULL;
+                specs->SpecsDirty = false;
+            }
+            g_resort = false;
+
+            for (int k = 0; k < g_rowCount; k++)
+            {
+                const int i = g_order[k];
+                if (i < 0 || i >= g_rowCount)
+                    continue;
                 const WrBoardRow *r = &g_rows[i];
                 ImGui::TableNextRow();
                 ImGui::PushID(i);
@@ -1407,21 +1688,29 @@ void WrQuickDraw(void)
                     ReloadRows();
                     RefreshRowState();
                     // Still short after re-reading, so the places are genuinely
-                    // not cached and this is where a request is owed.
+                    // not cached and this is where a request is owed. Which
+                    // places depends on which way the table is going: forwards
+                    // it is the next window down, and at the slow end it is a
+                    // deeper tail, which comes back in one request for the whole
+                    // of it rather than a walk backwards.
                     if (g_rowCount < g_showTop)
-                        WantBoard(legType, legNum, g_rowCount + 1,
-                                  g_showTop - g_rowCount);
+                    {
+                        if (g_end == END_SLOW)
+                            WantSlowest(legType, legNum, g_showTop);
+                        else
+                            WantBoard(legType, legNum, g_rowCount + 1,
+                                      g_showTop - g_rowCount);
+                    }
                 }
                 ImGui::SameLine();
                 ImGui::TextDisabled("showing %d", g_rowCount);
                 ImGui::SameLine();
-                Marker("Adds the next twenty places. If they are already cached "
-                       "-- from the Board tab, or from pressing this before -- "
-                       "it costs no request at all.\n\n"
+                Marker("Adds the next twenty places at whichever end you are "
+                       "looking at. If they are already cached -- from the Board "
+                       "tab, or from pressing this before -- it costs no request "
+                       "at all.\n\n"
                        "The full panel is the place to go past a hundred, or to "
-                       "reach the slow end of a board, which is often the more "
-                       "useful end: a 37-second world record is not a line a "
-                       "learner can trace and the run at rank 9,000 is.");
+                       "land somewhere in the middle of a board.");
             }
         }
     }
@@ -1429,9 +1718,22 @@ void WrQuickDraw(void)
     // --- the buttons --------------------------------------------------------
     if (g_rowCount > 0)
     {
-        if (ImGui::Button("Top 5"))
-            for (int i = 0; i < 5 && i < g_rowCount; i++)
-                PickAdd(&g_rows[i], legType, legNum);
+        // THE FIRST FIVE AS DISPLAYED, not the five fastest, and the label says
+        // so. It used to be "Top 5" over an unsorted rank list, where the two
+        // meant the same thing; with a sort and a slow end they do not, and a
+        // button that quietly ignored both would be the one control on the page
+        // that did not act on the table in front of it.
+        if (ImGui::Button("Tick first 5"))
+            for (int k = 0; k < 5 && k < g_rowCount; k++)
+            {
+                const int i = (k < g_orderCount) ? g_order[k] : k;
+                if (i >= 0 && i < g_rowCount)
+                    PickAdd(&g_rows[i], legType, legNum);
+            }
+        ImGui::SameLine();
+        Marker("The first five rows as the table is currently sorted -- so at the "
+               "slow end, sorted by rank, it is the five slowest runs on the "
+               "board.");
         ImGui::SameLine();
         if (ImGui::Button("Clear"))
         {

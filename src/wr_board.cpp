@@ -441,6 +441,29 @@ bool WrBoardWriteCache(const char *path, const WrBoardCache *c)
 
 // --- what the table reads ---------------------------------------------------
 
+// A row without a rank or a hash is not a row. The writer produces neither as
+// empty, so this only fires on a hand-edited file -- which is exactly when
+// quietly keeping half a record is worst. It is a DISPLAY rule and not a format
+// rule, which is why it is here and not in the reader: the fetcher must
+// round-trip such a row unchanged rather than silently delete it from somebody's
+// cache.
+static bool RowIsShowable(const WrBoardCacheRow *s)
+{
+    return s->rank > 0 && s->hash[0] != '\0';
+}
+
+static void ToDisplayRow(WrBoardRow *r, const WrBoardCacheRow *s)
+{
+    memset(r, 0, sizeof(*r));
+    r->rank = s->rank;
+    r->time = (float)s->time;
+    r->steamId = _strtoui64(s->steamId, NULL, 10);
+    strncpy_s(r->alias, sizeof(r->alias), s->alias, _TRUNCATE);
+    strncpy_s(r->hash, sizeof(r->hash), s->hash, _TRUNCATE);
+    r->dateEpoch = s->epoch;
+    strncpy_s(r->url, sizeof(r->url), s->url, _TRUNCATE);
+}
+
 int WrBoardParseFile(const char *path, WrBoardRow *out, int maxRows,
                      int *total, long long *fetched, int *mapId)
 {
@@ -458,28 +481,67 @@ int WrBoardParseFile(const char *path, WrBoardRow *out, int maxRows,
 
     int n = 0;
     for (int i = 0; i < c.count && n < maxRows; i++)
+        if (RowIsShowable(&c.rows[i]))
+            ToDisplayRow(&out[n++], &c.rows[i]);
+
+    WrBoardCacheFree(&c);
+    return n;
+}
+
+// The LAST `maxRows` of a cache, for reading a board from its slow end.
+//
+// WHY THERE IS A SECOND FUNCTION AND NOT A SECOND PARAMETER. The signature above
+// is what tests\test_board.exe and the Board tab already call; moving it to add
+// a flag would touch every caller to say "no, still the top" and buy nothing.
+//
+// WHY IT COSTS MORE, AND WHY THAT IS ACCEPTABLE. The reader stops at `maxRows`,
+// so asking for the top twenty of a rank-sorted file really is a twenty-line
+// read. A tail cannot be: nothing in the format says where the end is until you
+// have reached it, so this reads the cache WHOLE and keeps the last few. Bounded
+// by what you have fetched rather than by the board -- a cache is the windows
+// you asked for, not the leaderboard, and the largest one here is 39 KB for a
+// board of nine thousand runs. It belongs on a leg change and would be silly per
+// frame.
+//
+// The rows come back in rank order, as the file has them. This is a window onto
+// the end, not a reversal.
+int WrBoardParseTail(const char *path, WrBoardRow *out, int maxRows,
+                     int *total, long long *fetched, int *mapId)
+{
+    if (total)   *total = 0;
+    if (fetched) *fetched = 0;
+    if (mapId)   *mapId = 0;
+    if (maxRows < 1)
+        return 0;
+
+    WrBoardCache c;
+    if (!WrBoardReadCache(path, &c, 0))      // 0 -- no limit; we need the end
+        return -1;
+
+    if (total)   *total = atoi(c.total);
+    if (fetched) *fetched = _atoi64(c.fetched);
+    if (mapId)   *mapId = atoi(c.mapId);
+
+    // Count the showable rows first, so the ones dropped by the display rule
+    // above do not eat into the window. Counting is cheaper than the copy and
+    // the file is already in memory.
+    int showable = 0;
+    for (int i = 0; i < c.count; i++)
+        if (RowIsShowable(&c.rows[i]))
+            showable++;
+
+    int skip = showable - maxRows;
+    if (skip < 0)
+        skip = 0;
+
+    int seen = 0, n = 0;
+    for (int i = 0; i < c.count && n < maxRows; i++)
     {
-        const WrBoardCacheRow *s = &c.rows[i];
-
-        // A row without a rank or a hash is not a row. The writer produces
-        // neither as empty, so this only fires on a hand-edited file -- which
-        // is exactly when quietly keeping half a record is worst. It is a
-        // DISPLAY rule and not a format rule, which is why it is here and not
-        // in the reader: the fetcher must round-trip such a row unchanged
-        // rather than silently delete it from somebody's cache.
-        if (s->rank <= 0 || !s->hash[0])
+        if (!RowIsShowable(&c.rows[i]))
             continue;
-
-        WrBoardRow r;
-        memset(&r, 0, sizeof(r));
-        r.rank = s->rank;
-        r.time = (float)s->time;
-        r.steamId = _strtoui64(s->steamId, NULL, 10);
-        strncpy_s(r.alias, sizeof(r.alias), s->alias, _TRUNCATE);
-        strncpy_s(r.hash, sizeof(r.hash), s->hash, _TRUNCATE);
-        r.dateEpoch = s->epoch;
-        strncpy_s(r.url, sizeof(r.url), s->url, _TRUNCATE);
-        out[n++] = r;
+        if (seen++ < skip)
+            continue;
+        ToDisplayRow(&out[n++], &c.rows[i]);
     }
 
     WrBoardCacheFree(&c);

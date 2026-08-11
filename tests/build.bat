@@ -113,6 +113,15 @@ cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% tests\test_quick.cpp ^
    /Fe:tests\test_quick.exe /Fo:tests\ >nul
 if errorlevel 1 ( echo [!] test_quick FAILED to build & exit /b 1 )
 
+rem test_scale links nothing either -- wr_scale.h is static inline like the rest
+rem of this project's pure logic. It checks that each LEG of a map gets its own
+rem colour range: the old code noticed two legs on screen and pooled them, which
+rem turned auto-scaling off without saying so, and pooling legs that sit four
+rem thousand units apart leaves each of them a fraction of the ramp.
+cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% tests\test_scale.cpp ^
+   /Fe:tests\test_scale.exe /Fo:tests\ >nul
+if errorlevel 1 ( echo [!] test_scale FAILED to build & exit /b 1 )
+
 rem test_json needs nothing but itself: wr_json.cpp includes no Windows header
 rem and calls nothing, which is the property that lets it be checked this hard.
 cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% tests\test_json.cpp ^
@@ -291,6 +300,7 @@ tests\test_saveloc.exe    || set "RC=1"
 tests\test_live.exe       || set "RC=1"
 tests\test_settings.exe   || set "RC=1"
 tests\test_quick.exe      || set "RC=1"
+tests\test_scale.exe      || set "RC=1"
 tests\test_json.exe       || set "RC=1"
 tests\test_maps.exe       || set "RC=1"
 tests\test_lzma.exe       || set "RC=1"

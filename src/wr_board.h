@@ -105,6 +105,18 @@ const WrBoardRow *WrBoardAt(int index);
 int WrBoardParseFile(const char *path, WrBoardRow *out, int maxRows,
                      int *total, long long *fetched, int *mapId);
 
+// The same, from the other end: the LAST `maxRows` rows of the cache, still in
+// rank order. For the slow end of a board, which is the end a learner can
+// actually follow -- see the note at the top of this file.
+//
+// A second function rather than a flag on the one above, because that signature
+// is what the Board tab and tests\test_board.exe already call. It is also
+// dearer: the reader stops at `maxRows` going forwards, and nothing in the
+// format says where the end is until you get there, so this reads the whole
+// cache. Fine on a leg change; not for a draw path.
+int WrBoardParseTail(const char *path, WrBoardRow *out, int maxRows,
+                     int *total, long long *fetched, int *mapId);
+
 // ---------------------------------------------------------------------------
 // The cache file itself
 // ---------------------------------------------------------------------------

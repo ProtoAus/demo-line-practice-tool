@@ -1228,6 +1228,53 @@ itself cannot live in `settings.cfg`, which promises in writing to hold no names
 no record of what was watched — a list of replay hashes you chose to watch is exactly what that
 promise excludes, so it sits under `wrlines_data` with everything else that names other players.
 
+### The slow end, and a table that can be sorted
+
+Two things the page could not do, and both are about the twenty rows in front of you rather than
+about the chain behind them.
+
+**It could only show the top.** The fastest runs are the hardest to follow — a 37-second
+`surf_demise` world record is not a line anybody can trace, and the 79-second run at rank 9,108 is —
+and `wr_board.h` has said exactly that since the Board tab was written. `WR_BOARD_SLOWEST` was
+already in the job dispatch and already wired to a button in the full panel, so the fetch was never
+the problem. The *display* was: the cache accumulates into one rank-sorted file, so after asking for
+both ends it holds ranks 1–20 and 9,089–9,108, and a reader that takes the first twenty lines will
+never reach the second group no matter how many times it is fetched.
+
+Hence `WrBoardParseTail`, a second reader rather than a flag on the first — that signature is what
+the Board tab and `test_board` already call, and changing it would touch every caller to say "no,
+still the top". It is dearer, and the comment says so: the forward reader stops at `maxRows`, so the
+top twenty of a rank-sorted file really is a twenty-line read, while nothing in the format says
+where the end is until you reach it. It reads the cache whole. That is bounded by the windows you
+have asked for rather than by the board — the largest one on this machine is 39 KB for a board of
+nine thousand runs — and it belongs on a leg change, not on a draw path.
+
+The one thing it must not do is measure the window against the raw row count. The display rule drops
+a row with no rank or no hash, so counting rows the file holds rather than rows a table would *show*
+would return two fewer than asked for on a cache with two junk rows at the front — the last places
+on the board, quietly missing. There is a check for that.
+
+**And it could not be sorted.** The Board tab has had a sortable table since it was written, so this
+is the same order array, the same file-static specs pointer for the duration of the `qsort`, and the
+same rule that rank breaks every tie so the order cannot wobble between frames. All five columns,
+including the two with no heading — those two are the reason it is worth doing at all: the tick
+column sorts what you have asked for to the top, and the status column sorts by how far along the
+chain each row is. Both get a heading of one space rather than an empty string, because an empty
+header has no width to click.
+
+Two details that would each have been a bug. The runner column sorts on the name the table actually
+**draws** — the live Steam persona when we have one, the cached alias otherwise — because sorting
+the alias while showing the persona looks exactly like a sort that does not work. And the order is a
+separate array rather than a resorted `g_rows`: the ticks are keyed by hash and the status cells by
+row index, so a sort applied to the rows but not to one of those would put *gave up* on somebody
+else's run.
+
+The button underneath ticks the first five **as displayed**, and is named for that. It was "Top 5"
+over an unsorted rank list where the two meant the same thing; with a sort and a slow end they do
+not, and a button that quietly ignored both would be the one control on the page that did not act on
+the table in front of it. At the slow end, sorted by rank, "tick first 5" is the five slowest runs
+on the board — which is the point of having gone there.
+
 ### One byte, and two features that could not work
 
 The quick page shipped saying **"that demo could not be read"** about five runs whose `.wrpath`
@@ -1331,6 +1378,46 @@ something else would be a lie.
 It is behind a dirty stamp, not recomputed per frame, for the reason written beside `rank` in
 `wr_path.h`: the renderer asks for a run's colour once for the line, again for its name tag, its
 ramp numbers, its checkpoints and its comparison ring.
+
+### One ramp per leg, because a stage and the main track are not comparable
+
+The version above had a hole in it, and the hole was the second thing you would try. Turn on
+auto-scaling, enable a stage as well as the main track, and it silently stopped working: the code
+noticed more than one leg was on screen and gave up, pooling every enabled run into one range.
+
+Pooling is not a neutral fallback. Momentum cuts a map into legs and they do not live in the same
+place — a stage of surf_utopia sits thousands of units above the one before it, a bonus is thirty
+seconds where the main track is ninety. The union of two legs' energy bands is mostly the empty gap
+between them, so each leg gets a fraction of the ramp and every line on it comes out one flat
+colour. Which is precisely the failure auto-scaling exists to fix, reappearing one checkbox later,
+with nothing on screen to say it had.
+
+So there is a range per leg now — speed, energy and energy-relative, in three small fixed tables
+keyed by `(trackType, trackNum)`. The renderer resolves one pair per run and puts it on
+`WrPathDraw`, which already carried a per-run `startEnergy` for the same kind of reason; the ramp
+lookup downstream is parameterised on a normalised `t`, so varying which `lo` and `hi` produce that
+`t` is the whole of it. Two stages on screen are two ramps.
+
+Rank went the same way, and there it is not a new idea at all — the on-screen key has read *placed
+within each leg — a bonus cannot out-place a main run* since rank colouring shipped, and
+`test_rank.cpp` exists because a 34-second bonus taking first place from a 52-second main track is
+entirely plausible right up until you notice it is on the wrong line. The placing pass now groups by
+leg in the same table as everything else.
+
+**The cost is a promise, and it had to be given up out loud.** `WR_LINE_ENERGY`'s key says
+*absolute, so the same colour means the same energy on every line* — that is the whole reason the
+absolute mode exists next to the relative one, and it is **false** once two legs are scaled apart.
+So the key stops saying it: with more than one leg scaled, the numeric labels become *lowest on its
+own leg / the middle of that leg / highest on its own leg* and a footer says each leg has its own
+ramp. A legend that keeps a promise the picture has stopped keeping is worse than no legend, because
+it is the one place somebody would go to check.
+
+Past sixteen legs at once the table is full and everything falls back to the pooled range — the old
+behaviour, which is coarse and visible rather than wrong and silent. Your own live line is on no leg
+and keeps the pooled range too; picking a stage for it would be picking one arbitrarily.
+
+The pure part is `src/wr_scale.h`, `static inline` with the rest of this project's testable logic,
+so `tests\test_scale.exe` links nothing at all.
 
 ### Downloading demos
 
@@ -2320,7 +2407,9 @@ wr_matrixlife.h     when a chosen matrix has died -- pure logic, tested
 wr_pacing.h         when the next frame may be presented -- pure logic, tested
 wr_budget.h         gross gain/loss without counting noise -- pure logic, tested
 wr_stress.h         the air-strafing ceiling and efficiency -- pure logic, tested
-wr_quick.h          the quick page's chain, as a decision -- pure logic, tested
+wr_quick.h          the quick page's chain, as a decision, and which leaderboard
+                    a map's name implies -- pure logic, tested
+wr_scale.h          one colour range per leg of a map -- pure logic, tested
 wr_ui               the full panel on INSERT
 tests\              standalone harnesses -- tests\build.bat builds and runs all
                     of them. Most link the real .cpp files, because the

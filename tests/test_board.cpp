@@ -362,6 +362,69 @@ int main(void)
     }
 
     // -----------------------------------------------------------------------
+    printf("\nthe slow end of a board, which is the end worth watching\n");
+    {
+        // A cache with a GAP in it, which is the ordinary shape: the top of the
+        // board and the bottom of it, fetched separately, in one rank-sorted
+        // file. Reading the first N of this can never reach the second group no
+        // matter how many times it is fetched -- which is the whole reason there
+        // is a second reader.
+        Write("# total\t9108\n"
+              "# rank\ttime\tsteamid\talias\thash\tepoch\turl\n"
+              "1\t37.100000\t1\tfirst\tH1\t0\t\n"
+              "2\t37.200000\t2\tsecond\tH2\t0\t\n"
+              "3\t37.300000\t3\tthird\tH3\t0\t\n"
+              "9106\t78.000000\t4\tslowA\tH4\t0\t\n"
+              "9107\t79.000000\t5\tslowB\tH5\t0\t\n"
+              "9108\t80.000000\t6\tslowC\tH6\t0\t\n");
+
+        int total = 0;
+        int n = WrBoardParseTail(kPath, rows, 2, &total, NULL, NULL);
+        Check(n == 2, "asking for two gives two");
+        Check(rows[0].rank == 9107 && rows[1].rank == 9108,
+              "and they are the last two, not the first two");
+        Check(rows[0].rank < rows[1].rank,
+              "still in rank order -- a window on the end, not a reversal");
+        Check(total == 9108, "the header still comes back with them");
+
+        n = WrBoardParseFile(kPath, rows, 2, NULL, NULL, NULL);
+        Check(n == 2 && rows[0].rank == 1,
+              "and the forward reader is untouched by any of this");
+
+        n = WrBoardParseTail(kPath, rows, 64, NULL, NULL, NULL);
+        Check(n == 6, "asking for more than there is gives everything");
+        Check(rows[0].rank == 1 && rows[5].rank == 9108,
+              "from the true first to the true last");
+
+        n = WrBoardParseTail(kPath, rows, 0, NULL, NULL, NULL);
+        Check(n == 0, "asking for none gives none");
+
+        n = WrBoardParseTail("tests\\_board_does_not_exist.tsv", rows, 8,
+                             NULL, NULL, NULL);
+        Check(n == -1, "and a file that is not there is -1, as it is forwards");
+    }
+
+    // -----------------------------------------------------------------------
+    printf("\nthe tail counts the rows a table would SHOW\n");
+    {
+        // The display rule drops a row with no rank or no hash. If the window
+        // were measured against the raw count instead, a cache with two junk
+        // rows at the front would silently return two fewer than asked for --
+        // the last places on the board, quietly missing.
+        Write("# rank\ttime\tsteamid\talias\thash\tepoch\turl\n"
+              "0\t1.000000\t1\tnorank\tZZ\t0\t\n"
+              "0\t1.000000\t2\tnorank2\tYY\t0\t\n"
+              "7\t70.000000\t3\tkeepA\tH7\t0\t\n"
+              "8\t80.000000\t4\tkeepB\tH8\t0\t\n"
+              "9\t90.000000\t5\tkeepC\tH9\t0\t\n");
+
+        int n = WrBoardParseTail(kPath, rows, 3, NULL, NULL, NULL);
+        Check(n == 3, "three asked for, three returned");
+        Check(rows[0].rank == 7 && rows[2].rank == 9,
+              "and they are the last three SHOWABLE rows");
+    }
+
+    // -----------------------------------------------------------------------
     printf("\ngamemode names come from Momentum's own enum\n");
     {
         Check(strcmp(WrGamemodeName(1), "surf") == 0, "1 is surf");
