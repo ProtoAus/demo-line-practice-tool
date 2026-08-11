@@ -19,14 +19,12 @@ rem no path in it.
 setlocal
 cd /d "%~dp0\.."
 
-set "VCVARS=C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvarsall.bat"
-if not exist "%VCVARS%" set "VCVARS=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat"
-if not exist "%VCVARS%" (
-    echo [!] Could not find vcvarsall.bat. Edit VCVARS at the top of this script.
-    exit /b 1
-)
-call "%VCVARS%" x64 >nul
-if errorlevel 1 ( echo [!] vcvarsall x64 failed & exit /b 1 )
+rem Finding the toolchain is vcvars.bat's job, shared with build.bat. It used to
+rem be two hardcoded BuildTools paths here, which worked on this machine and not
+rem on the release runner -- that has VS 2022 Enterprise -- so the v0.7.0 tag
+rem built the DLL and then failed on this line. See the essay in vcvars.bat.
+call "%~dp0..\vcvars.bat"
+if errorlevel 1 exit /b 1
 
 set "DEFS=/DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS"
 set "S=src"

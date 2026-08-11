@@ -17,31 +17,6 @@ rem under DXVK. dxguid.lib is just a static GUID blob with no DLL behind it.
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
-rem Finding the toolchain: an explicit override first, then vswhere, then the
-rem two hardcoded BuildTools paths that used to be all there was.
-rem
-rem vswhere is installed by every VS 2017+ setup and lives at a fixed path, so
-rem it finds Community, Professional and Enterprise as well as BuildTools. That
-rem matters beyond convenience: the GitHub Actions runner has VS 2022
-rem ENTERPRISE, so without this the release workflow cannot call this script at
-rem all. The hardcoded paths stay as a fallback so a machine that built
-rem yesterday still builds today.
-if defined WRLINES_VCVARS set "VCVARS=%WRLINES_VCVARS%"
-if not defined VCVARS (
-    set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
-    if exist "!VSWHERE!" for /f "usebackq tokens=*" %%i in (
-        `"!VSWHERE!" -latest -products * ^
-           -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 ^
-           -property installationPath`
-    ) do set "VCVARS=%%i\VC\Auxiliary\Build\vcvarsall.bat"
-)
-if not defined VCVARS set "VCVARS=C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvarsall.bat"
-if not exist "%VCVARS%" set "VCVARS=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat"
-if not exist "%VCVARS%" (
-    echo [!] Could not find vcvarsall.bat. Set WRLINES_VCVARS to its full path.
-    exit /b 1
-)
-
 rem WrLines never unloads (see dllmain.cpp), so while the game is running the
 rem loaded wrlines.dll cannot be overwritten. Catch that here rather than let the
 rem linker report it 30 seconds later as a bare LNK1104.
@@ -53,8 +28,11 @@ if not errorlevel 1 (
     exit /b 1
 )
 
-call "%VCVARS%" x64 >nul
-if errorlevel 1 ( echo [!] vcvarsall x64 failed & exit /b 1 )
+rem Finding the toolchain is vcvars.bat's job, and it is a separate file because
+rem tests\build.bat needs exactly the same lookup and the two copies had already
+rem drifted -- see the essay at the top of it.
+call "%~dp0vcvars.bat"
+if errorlevel 1 exit /b 1
 
 if not exist imgui\imgui.cpp (
     echo [!] imgui\ is missing. Fetch it with:
