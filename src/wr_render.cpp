@@ -839,11 +839,19 @@ unsigned int WrRunColour(const WrRun *run)
     return RankRampColour(t);
 }
 
-// Blue -> cyan -> green -> yellow -> red across the configured speed range.
-static unsigned int SpeedColour(float speed)
+// Blue -> cyan -> green -> yellow -> red, across a position in the ramp.
+//
+// SEPARATED FROM THE RANGE, and that is a fix rather than tidying. Every caller
+// used to hand this a VALUE, which it normalised by the speed range -- including
+// the energy modes and including the on-screen key, which is how the key's
+// middle swatch came to be wrong: SpeedColour(2000) on an energy range of
+// 0..4000 asks where 2000 sits between 250 and 3500, not where it sits in the
+// range being described. The ends survived it only because they clamp.
+//
+// One quantity per mode, three modes, one ramp. What varies is where a point
+// falls in its own range, and that is a number between 0 and 1.
+static unsigned int RampColour(float t)
 {
-    float t = (speed - g_render.useSpeedMin) /
-              (g_render.useSpeedMax - g_render.useSpeedMin + 1e-3f);
     t = WrClampF(t, 0.0f, 1.0f);
     float r, g, b;
     if (t < 0.25f)      { float u = t / 0.25f;          r = 0.0f;      g = u;          b = 1.0f; }
@@ -1095,9 +1103,8 @@ static void EmitPath(ImDrawList *dl, const WrPathDraw &d)
             float t = WrClampF((speed - d.cLo) / (d.cHi - d.cLo + 1e-3f),
                                0.0f, 1.0f);
             int cBucket = (int)(t * (COLOUR_BUCKETS - 1) + 0.5f);
-            colour = WithAlpha(SpeedColour(g_render.useSpeedMin +
-                        (g_render.useSpeedMax - g_render.useSpeedMin) *
-                        ((float)cBucket / (COLOUR_BUCKETS - 1))), a01);
+            colour = WithAlpha(RampColour((float)cBucket /
+                                          (COLOUR_BUCKETS - 1)), a01);
             bucket = fBucket * COLOUR_BUCKETS + cBucket;
         }
         else if (g_render.lineColour == WR_LINE_ENERGY && velScale > 0.0f)
@@ -1115,9 +1122,8 @@ static void EmitPath(ImDrawList *dl, const WrPathDraw &d)
             float t = WrClampF((e - d.cLo) / (d.cHi - d.cLo + 1e-3f),
                                0.0f, 1.0f);
             int cBucket = (int)(t * (COLOUR_BUCKETS - 1) + 0.5f);
-            colour = WithAlpha(SpeedColour(g_render.useSpeedMin +
-                        (g_render.useSpeedMax - g_render.useSpeedMin) *
-                        ((float)cBucket / (COLOUR_BUCKETS - 1))), a01);
+            colour = WithAlpha(RampColour((float)cBucket /
+                                          (COLOUR_BUCKETS - 1)), a01);
             bucket = fBucket * COLOUR_BUCKETS + cBucket;
         }
         else if (g_render.lineColour == WR_LINE_ENERGY_REL && velScale > 0.0f)
@@ -1135,9 +1141,8 @@ static void EmitPath(ImDrawList *dl, const WrPathDraw &d)
             float t = WrClampF((e - d.cLo) / (d.cHi - d.cLo + 1e-3f),
                                0.0f, 1.0f);
             int cBucket = (int)(t * (COLOUR_BUCKETS - 1) + 0.5f);
-            colour = WithAlpha(SpeedColour(g_render.useSpeedMin +
-                        (g_render.useSpeedMax - g_render.useSpeedMin) *
-                        ((float)cBucket / (COLOUR_BUCKETS - 1))), a01);
+            colour = WithAlpha(RampColour((float)cBucket /
+                                          (COLOUR_BUCKETS - 1)), a01);
             bucket = fBucket * COLOUR_BUCKETS + cBucket;
         }
         else
@@ -2571,11 +2576,11 @@ static void EmitEfficiencyLegend(ImDrawList *dl)
             _snprintf_s(sHi, sizeof(sHi), _TRUNCATE, "%.0f and above", hi);
         }
 
-        rows[n].colour = SpeedColour(lo);                 rows[n].dim = false;
+        rows[n].colour = RampColour(0.0f);   rows[n].dim = false;
         rows[n++].text = sLo;
-        rows[n].colour = SpeedColour((lo + hi) * 0.5f);   rows[n].dim = false;
+        rows[n].colour = RampColour(0.5f);   rows[n].dim = false;
         rows[n++].text = sMid;
-        rows[n].colour = SpeedColour(hi);                 rows[n].dim = false;
+        rows[n].colour = RampColour(1.0f);   rows[n].dim = false;
         rows[n++].text = sHi;
 
         if (relOn)

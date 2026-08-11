@@ -1419,6 +1419,15 @@ and keeps the pooled range too; picking a stage for it would be picking one arbi
 The pure part is `src/wr_scale.h`, `static inline` with the rest of this project's testable logic,
 so `tests\test_scale.exe` links nothing at all.
 
+One thing fell out of writing the key, and it had been wrong for as long as the key existed.
+`SpeedColour` took a **value** and normalised it by the speed range — every caller, in every mode,
+including the key's own swatches. So on an energy range of 0–4000 the middle swatch asked where
+2,000 sits between 250 and 3,500 and drew that colour, which is not the middle of anything; the two
+end swatches survived only because they clamp. The ramp takes a **position** now — one quantity per
+mode, three modes, one gradient, and where a point falls in its own range is a number between 0 and
+1. The lines are unchanged (their callers were already round-tripping a fraction out through the
+speed range and back); the key's middle swatch is now the colour it claims to be.
+
 ### Downloading demos
 
 There was no good way to see what existed. `surf_demise` has **9,104 runs on its main track**;
