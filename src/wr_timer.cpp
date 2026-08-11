@@ -402,7 +402,7 @@ void WrTimerTick(const Vec3 &cam, float dt)
         // the start line, and if both happen in one frame the save-loc is the
         // one that was actually asked for.
         if (g_start.autoAnchor && WrEnergyAnchorSource() != WR_ANCHOR_MANUAL)
-            WrEnergyAnchorToStartZone(crossed->centre);
+            WrEnergyAnchorToStartZone(WrStartZoneAnchor(crossed));
         if (g_start.autoZeroClock)
         {
             char why[64];

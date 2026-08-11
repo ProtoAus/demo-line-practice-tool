@@ -4139,7 +4139,7 @@ static void DrawEnergyTab(void)
 
                 ImGui::TableSetColumnIndex(5);
                 if (ImGui::SmallButton("anchor here"))
-                    WrEnergyAnchorToStartZone(z->centre);
+                    WrEnergyAnchorToStartZone(WrStartZoneAnchor(z));
 
                 ImGui::PopID();
             }

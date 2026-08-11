@@ -69,6 +69,28 @@ struct WrStartZone
     float radius;           // horizontal, the ARMING region
     float zLo, zHi;         // the floor band, so a ledge above is not "inside"
 
+    // The floor itself, and whether there is one.
+    //
+    // Most starts are a flat pad, and when they are, every recovered start on the
+    // leg sits within a few units of one horizontal plane. That is a thing the
+    // members can be ASKED rather than assumed: `flat` is true when the p90
+    // deviation from planeZ is under FLAT_PAD_UNITS, and it is false on a leg
+    // whose starts are spread down a ramp or across a stairwell.
+    //
+    // Two things read it, and both are about the disc being the wrong shape.
+    // points[startIndex] is where each clock STARTED, i.e. on the way out, so
+    // the fitted circle is centred on the exit and part of the real pad falls
+    // outside it -- stand there and nothing arms. On a flat leg the arming circle
+    // is therefore allowed to grow, because the floor band is doing the work of
+    // saying where you are and a wrongly armed state still cannot fire without
+    // crossing the plane outward at speed.
+    //
+    // And planeZ, not centre.z, is the height to anchor the energy readout at:
+    // centre is one member, chosen for being the medoid, and its own z is that
+    // member's rather than the pad's.
+    float planeZ;
+    bool flat;
+
     float spread;           // p90 distance from the centre
     float alongSpread;      // p90 along outDir -- the trigger plane's own error
 
@@ -115,9 +137,19 @@ void WrStartTick(const Vec3 &cam, float dt, bool teleported);
 bool WrStartTakeCrossed(const WrStartZone **which);
 
 // The circle's radius as it is actually used: the fitted value with the
-// "circle size" setting applied. Read this, not WrStartZone::radius, which is
-// what the runs measured before the user scaled it.
+// "circle size" setting applied, and with the flat-pad allowance if the leg has
+// one. Read this, not WrStartZone::radius, which is what the runs measured
+// before either was applied.
 float WrStartZoneRadius(const WrStartZone *z);
+
+// Where to anchor the energy readout for this zone.
+//
+// centre with planeZ substituted on a flat leg, and centre itself otherwise.
+// ONE function because there are two call sites -- the automatic anchor on the
+// crossing edge and the button in the panel -- and two copies of a rule about
+// which height to use is two chances to anchor at different heights for the same
+// zone.
+Vec3 WrStartZoneAnchor(const WrStartZone *z);
 
 int WrStartZoneCount(void);
 const WrStartZone *WrStartZoneAt(int i);

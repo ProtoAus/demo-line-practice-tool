@@ -44,6 +44,50 @@ WrStartSettings g_start;
 // define is noise. Falls back to leaving the cylinder.
 #define OUTDIR_MIN_SPEED 60.0f
 
+// How near one horizontal plane every recovered start has to sit before the leg
+// counts as having a flat pad.
+//
+// 48 units is about a step and a half in Source, so a pad with a lip or a
+// doorway still reads as flat and a start spread down a ramp does not. It is
+// deliberately much smaller than the floor band (zLo/zHi span 320 units before
+// the members contribute anything), because that band exists to reject a ledge
+// overhead and this exists to assert something.
+#define FLAT_PAD_UNITS 48.0f
+
+// How much the arming circle may grow on a leg whose pad is flat.
+//
+// The fitted circle is centred on where clocks STARTED, which is the way out of
+// the real trigger rather than the middle of the pad -- wr_start.h says so at
+// the top. So part of the pad is reliably outside it, and standing on that part
+// arms nothing. On a flat leg the floor band is a strong enough statement of
+// where you are to carry a bigger circle, and firing still needs the plane
+// crossed outward at speed, which only happens at the actual start.
+#define FLAT_PAD_BOOST 1.75f
+
+// How much faster than stillSpeed you may be going and still count as being AT
+// the start rather than through it.
+//
+// The other way of being at the start is not standing still: it is moving across
+// the pad without changing height -- strafing about at 400 u/s working up to the
+// line -- and until this existed it armed nothing, so the anchor was never taken
+// and the clock never zeroed unless you first came to a stop.
+//
+// "Without changing height" needs no test of its own. WrEnergyOnGround is
+// already exactly that measurement and a better one than an instantaneous |vz|
+// would be: settled within six units of one height, at under 30 u/s vertical,
+// for a twentieth of a second. Adding a second vertical threshold here would be
+// a restatement of another module's constant that goes quietly wrong the day
+// that constant moves.
+//
+// What is left to bound is the horizontal speed, and this is why: on a map whose
+// route passes back over its own start pad, everything on the ground inside the
+// floor band would otherwise arm, and crossing the fitted plane outward would
+// zero the clock in the middle of a run. Six times stillSpeed is 1200 u/s by
+// default -- well past any speed you reach preparing a start, well short of a
+// surf line in flight -- and it keeps stillSpeed meaning something in both
+// halves of the test rather than becoming dead.
+#define FLAT_SPEED_FACTOR 6.0f
+
 static WrStartZone g_zones[WR_MAX_START_ZONES];
 static int g_zoneCount = 0;
 static unsigned int g_builtFrom = 0;
@@ -262,6 +306,43 @@ static void BuildZones(void)
         z->zLo = zLo - 128.0f;
         z->zHi = zHi + 192.0f;
 
+        // Is there a floor, and where is it?
+        //
+        // The MEDIAN height of the members, not the mean and not the medoid's
+        // own -- for the reason the medoid exists in the first place. One start
+        // recovered onto a ledge would drag a mean, and centre.z is whichever
+        // single member happened to be most central horizontally, which says
+        // nothing about height.
+        {
+            float zs[MEDOID_CAP];
+            for (int a = 0; a < n; a++)
+                zs[a] = pos[a].z;
+            // Selection to the middle only: n is at most 128 and this runs once
+            // per leg per store reload, so a full sort would be work nobody
+            // reads.
+            const int mid = n / 2;
+            for (int a = 0; a <= mid; a++)
+            {
+                int m = a;
+                for (int b = a + 1; b < n; b++)
+                    if (zs[b] < zs[m])
+                        m = b;
+                float t = zs[a]; zs[a] = zs[m]; zs[m] = t;
+            }
+            z->planeZ = zs[mid];
+
+            float dz[MEDOID_CAP];
+            for (int a = 0; a < n; a++)
+            {
+                float d = pos[a].z - z->planeZ;
+                dz[a] = d < 0.0f ? -d : d;
+            }
+            // The same p90 the horizontal spread uses, at a finer bucket: this
+            // is deciding a yes or no at 48 units, not sizing a circle that then
+            // gets clamped into a 384-unit window.
+            z->flat = (P90(dz, n, 8.0f, 24) <= FLAT_PAD_UNITS);
+        }
+
         g_zoneCount++;
     }
 }
@@ -287,10 +368,31 @@ float WrStartZoneRadius(const WrStartZone *z)
 {
     if (!z)
         return 0.0f;
-    return WrClampF(z->radius * g_start.radiusScale, RADIUS_MIN * 0.4f,
+    const float boost = z->flat ? FLAT_PAD_BOOST : 1.0f;
+    return WrClampF(z->radius * g_start.radiusScale * boost, RADIUS_MIN * 0.4f,
                     RADIUS_MAX * 3.0f);
 }
 
+Vec3 WrStartZoneAnchor(const WrStartZone *z)
+{
+    if (!z)
+        return WrVec(0.0f, 0.0f, 0.0f);
+    Vec3 a = z->centre;
+    if (z->flat)
+        a.z = z->planeZ;
+    return a;
+}
+
+// The floor band FIRST, and it is not only a cheap reject.
+//
+// It is the honest half of the test. The band is fitted from where two hundred
+// players' clocks actually started and is a few hundred units tall; the circle
+// is centred on the exit of the trigger rather than on the pad, so it is the
+// half that is known to be in the wrong place. Ordering the two says which one
+// is load-bearing -- and on a flat leg the circle is deliberately generous,
+// which only makes sense if the band has already established that you are
+// standing on the same floor those clocks started on rather than three storeys
+// above it.
 static bool Inside(const WrStartZone *z, const Vec3 &cam)
 {
     if (cam.z < z->zLo || cam.z > z->zHi)
@@ -485,8 +587,27 @@ void WrStartTick(const Vec3 &cam, float dt, bool teleported)
         // trigger: an apex inside a 512-unit cylinder at under 200 u/s is the
         // top of a hop on the start pad, so the wrong answer and the right
         // answer are the same answer.
-        bool still = (speed < g_start.stillSpeed) && WrEnergyOnGround();
-        g_armFor = still ? g_armFor + dt : 0.0f;
+        const bool onGround = WrEnergyOnGround();
+        bool still = (speed < g_start.stillSpeed) && onGround;
+
+        // The second way of being at the start: moving across the pad without
+        // changing height. See FLAT_SPEED_FACTOR for why there is no vertical
+        // test here and why there is a horizontal one.
+        //
+        // EVERY GATE HERE MATTERS, and the important one is not on this line.
+        // This branch is only reachable from WR_START_INSIDE, which means
+        // PickZone already put you inside a fitted zone -- inside its floor band
+        // and inside its circle. A flat corridor in the middle of the map is
+        // inside neither and cannot reach this line at all. That is the whole
+        // safety argument, and it is why this is an extra way to satisfy an
+        // existing state rather than a new route into it: wr_energy.h records
+        // what happened the last time an anchor could re-arm somewhere it had no
+        // business re-arming, and the symptom was not a noisy number, it was a
+        // number whose origin moved.
+        const bool alongFloor =
+            onGround && speed < g_start.stillSpeed * FLAT_SPEED_FACTOR;
+
+        g_armFor = (still || alongFloor) ? g_armFor + dt : 0.0f;
         if (g_armFor >= ARM_SECONDS && g_settle <= 0.0f)
         {
             g_state = WR_START_ARMED;
@@ -494,11 +615,11 @@ void WrStartTick(const Vec3 &cam, float dt, bool teleported)
         }
         else if (g_settle > 0.0f)
             strcpy_s(g_why, sizeof(g_why), "settling after a teleport");
-        else if (!WrEnergyOnGround())
+        else if (!onGround)
             strcpy_s(g_why, sizeof(g_why), "in the start, but not on the ground");
         else
             _snprintf_s(g_why, sizeof(g_why), _TRUNCATE,
-                        "in the start, but moving at %.0f u/s", speed);
+                        "in the start, but going through it at %.0f u/s", speed);
         return;
     }
 

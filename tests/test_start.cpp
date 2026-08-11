@@ -86,6 +86,36 @@ static WrRun MakeRun(int n, float dt, int prerollTicks, int trackType,
     return r;
 }
 
+// One frame of a camera moving along +y, fed to the real sampler and the real
+// start machine in the order dllmain feeds them.
+static const float kStep = 0.016f;
+
+static void Step(Vec3 *cam, float speed, bool bob)
+{
+    static int phase = 0;
+    cam->y += speed * kStep;
+    // Bobbing puts a real vertical velocity on the camera, which is what makes
+    // WrEnergyOnGround false. Used only to pass time.
+    cam->z = 128.0f + (bob ? ((phase++ & 1) ? 40.0f : -40.0f) : 0.0f);
+    g_fakeCam = *cam;
+    g_haveCam = true;
+    WrEnergySample(*cam, kStep);
+    WrStartTick(*cam, kStep, false);
+}
+
+// WrStartReset arms a one-second settle -- nothing may fire until the velocity
+// filter has converged -- so a case that only runs for half a second passes by
+// being too early rather than by being right. This burns it off with motion
+// that cannot arm anything: airborne, by bobbing, and slow.
+//
+// A helper because getting it wrong is silent. Every must-not-fire case below
+// would still pass, and would be proving nothing at all.
+static void BurnSettle(Vec3 *cam)
+{
+    for (int i = 0; i < 80; i++)
+        Step(cam, 100.0f, true);
+}
+
 int main(void)
 {
     printf("\n=== wrlines run start and start zones ===\n");
@@ -249,6 +279,176 @@ int main(void)
             Check(z->trusted == 2 && z->members == 2, "both members placed");
             Check(!z->approx, "so it is not marked approximate");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // The two flat-start heuristics, and the case that must NOT fire.
+    //
+    // wr_energy.cpp's history has two ordering defects in it -- a reference that
+    // re-armed at the apex of a jump, and a pair of statements whose order was
+    // load-bearing -- and both had the same symptom: not a noisy number, but a
+    // number whose origin moved. Anything that widens when the anchor may be
+    // taken has to be pinned in both directions, so there is a must-fire case
+    // and a must-not-fire case for each.
+    printf("\na flat pad is recognised as one\n");
+    {
+        WrRun runs[2];
+        runs[0] = MakeRun(2000, dt, 48, 0, 1);
+        runs[1] = MakeRun(2000, dt, 48, 0, 1);
+        for (int i = 0; i < 2; i++)
+        {
+            WrPathTestFindStart(&runs[i], 0, false);
+            runs[i].enabled = true;
+        }
+        WrPathTestLoad(runs, 2);
+        WrStartReset();
+        g_haveCam = true;
+        g_fakeCam = WrVec(0.0f, 0.0f, 128.0f);
+        WrStartTick(g_fakeCam, 0.016f, false);
+
+        const WrStartZone *z = WrStartZoneAt(0);
+        Check(z != NULL, "the zone is fitted");
+        if (z)
+        {
+            Check(z->flat, "every recorded start is on one plane, so it is flat");
+            Check(fabsf(z->planeZ - 64.0f) < 1.0f, "and the plane is at the floor");
+            // The point of planeZ: centre is the medoid, chosen for being
+            // horizontally central, and its own height is one member's.
+            Check(fabsf(WrStartZoneAnchor(z).z - z->planeZ) < 0.01f,
+                  "so the anchor is taken at the plane, not at one member");
+            Check(WrStartZoneRadius(z) > z->radius * 1.5f,
+                  "and the arming circle is allowed to cover the whole pad");
+        }
+    }
+
+    printf("\na start spread down a slope is not\n");
+    {
+        // The safety case for both halves. Runs that begin at heights hundreds
+        // of units apart are not a pad, and neither the bigger circle nor the
+        // fitted plane may be claimed for them.
+        WrRun runs[3];
+        runs[0] = MakeRun(2000, dt, 48, 0, 1);
+        runs[1] = MakeRun(2000, dt, 48, 0, 1);
+        runs[2] = MakeRun(2000, dt, 48, 0, 1);
+        for (int i = 0; i < 3; i++)
+        {
+            for (int k = 0; k < runs[i].pointCount; k++)
+                runs[i].points[k].pos.z += (float)i * 220.0f;
+            WrPathTestFindStart(&runs[i], 0, false);
+            runs[i].startPos = runs[i].points[runs[i].startIndex].pos;
+            runs[i].enabled = true;
+        }
+        WrPathTestLoad(runs, 3);
+        WrStartReset();
+        g_fakeCam = WrVec(0.0f, 0.0f, 300.0f);
+        WrStartTick(g_fakeCam, 0.016f, false);
+
+        const WrStartZone *z = WrStartZoneAt(0);
+        Check(z != NULL, "a zone is still fitted");
+        if (z)
+        {
+            Check(!z->flat, "but it is not called flat");
+            Check(fabsf(WrStartZoneRadius(z) - z->radius) < 0.01f,
+                  "so the circle stays the size the runs measured");
+            Check(fabsf(WrStartZoneAnchor(z).z - z->centre.z) < 0.01f,
+                  "and the anchor stays on a real recorded start");
+        }
+    }
+
+    printf("\nmoving across the pad arms, without standing still first\n");
+    {
+        WrRun runs[2];
+        runs[0] = MakeRun(2000, dt, 48, 0, 1);
+        runs[1] = MakeRun(2000, dt, 48, 0, 1);
+        for (int i = 0; i < 2; i++)
+        {
+            WrPathTestFindStart(&runs[i], 0, false);
+            runs[i].enabled = true;
+        }
+        WrPathTestLoad(runs, 2);
+        WrStartReset();
+        WrEnergyReset();
+
+        // Sideways across the pad at 400 u/s -- twice stillSpeed, so the old
+        // test could never arm on it -- at a constant height. The camera is fed
+        // to the REAL sampler, because "on the ground" is its measurement and a
+        // harness that asserted its own would be testing the harness.
+        Vec3 cam = WrVec(-40.0f, -200.0f, 128.0f);
+        BurnSettle(&cam);
+        for (int i = 0; i < 40; i++)
+            Step(&cam, 400.0f, false);
+
+        Check(WrEnergyHorizontalSpeed() > g_start.stillSpeed,
+              "it is moving faster than the standing-still test allows");
+        Check(WrEnergyOnGround(), "and its height is not changing");
+        Check(WrStartZoneHere() != NULL, "it is inside the fitted start");
+        Check(WrStartStateNow() == WR_START_ARMED, "so it arms");
+    }
+
+    printf("\nand a flat corridor in the middle of the map does not\n");
+    {
+        // THE CASE THIS WHOLE SECTION EXISTS FOR. Identical motion -- flat,
+        // on the ground, same speed -- a long way from any fitted start. If
+        // being flat were on its own enough to arm, the anchor would jump to
+        // the middle of a run, which is the defect wr_energy.h already records
+        // having been fixed once.
+        WrStartReset();
+        WrEnergyReset();
+
+        Vec3 cam = WrVec(9000.0f, 9000.0f, 128.0f);
+        BurnSettle(&cam);
+        for (int i = 0; i < 40; i++)
+            Step(&cam, 400.0f, false);
+
+        Check(WrEnergyOnGround(), "it is just as flat and just as grounded");
+        Check(WrStartZoneHere() == NULL, "but it is not in any start");
+        Check(WrStartStateNow() == WR_START_AWAY, "and nothing arms");
+        const WrStartZone *w = NULL;
+        Check(!WrStartTakeCrossed(&w), "so nothing can fire either");
+        Check(WrStartWhyNot()[0] != '\0', "and it says how far off it is");
+    }
+
+    printf("\nnor does a run passing through its own start at speed\n");
+    {
+        // The exposure the horizontal bound exists for: on a map whose route
+        // comes back over its own start pad, everything on the ground inside the
+        // floor band would otherwise arm, and crossing the plane outward would
+        // zero the clock in the middle of a run.
+        WrRun runs[2];
+        runs[0] = MakeRun(2000, dt, 48, 0, 1);
+        runs[1] = MakeRun(2000, dt, 48, 0, 1);
+        for (int i = 0; i < 2; i++)
+        {
+            WrPathTestFindStart(&runs[i], 0, false);
+            runs[i].enabled = true;
+        }
+        WrPathTestLoad(runs, 2);
+
+        // The circle is widened for the HARNESS's benefit, not the test's: at
+        // 1600 u/s a default 224-unit circle is crossed in a seventh of a
+        // second, so the camera would be outside the zone before the arming
+        // window had elapsed and this case would pass by not being in a start at
+        // all. The WrStartZoneHere check below is what holds it to the real
+        // question.
+        const float wasScale = g_start.radiusScale;
+        g_start.radiusScale = 4.0f;
+
+        WrStartReset();
+        WrEnergyReset();
+
+        Vec3 cam = WrVec(-40.0f, -700.0f, 128.0f);
+        BurnSettle(&cam);
+        for (int i = 0; i < 30; i++)
+            Step(&cam, 1600.0f, false);
+
+        Check(WrEnergyHorizontalSpeed() > g_start.stillSpeed * 6.0f,
+              "it is going through, not setting up");
+        Check(WrEnergyOnGround(), "flat and grounded, exactly like the pad case");
+        Check(WrStartZoneHere() != NULL, "and genuinely inside the start");
+        Check(WrStartStateNow() != WR_START_ARMED,
+              "so the only difference is the speed, and it does not arm");
+
+        g_start.radiusScale = wasScale;
     }
 
     // -----------------------------------------------------------------------

@@ -1887,6 +1887,48 @@ every arc — its own header says so — and it is safe here precisely because i
 condition: an apex inside a 512-unit cylinder at under 200 u/s is a hop on the start pad, so
 the wrong answer and the right answer are the same answer.
 
+### Most starts are flat, and the runs can be asked
+
+Two things were wrong with that, and both come from the same place: the fitted circle is centred
+on the **exit** of the real trigger, so part of the actual pad is reliably outside it. Stand
+there and nothing arms. And "slow" is not the only way to be at a start — strafing about at
+400 u/s working up to the line is not standing still and is not a run in progress either, and
+until v0.8.1 it armed nothing at all, so the anchor was never taken and the clock never zeroed
+unless you first came to a stop.
+
+The fix for both is one observation: **most starts are a flat pad, and that is a thing the runs
+can be asked rather than assumed.** Every recovered start on a leg sits within a few units of one
+horizontal plane when there is a pad, and does not when the starts are spread down a ramp. So
+`WrStartZone` gains a fitted `planeZ` — the *median* member height, for the same reason the
+centre is a medoid — and a `flat` flag, true when the p90 deviation from it is under 48 units,
+about a step and a half in Source.
+
+Three things read it. The arming circle is allowed to grow on a flat leg, because the floor band
+is then a strong enough statement of where you are to carry a bigger circle. The energy anchor is
+taken at `planeZ` rather than at `centre.z`, which is one member's height chosen for being
+horizontally central and says nothing about the floor. And the "inside" test leads with the floor
+band — it always did, but now it matters why: the band is the half fitted from where two hundred
+clocks actually started, and the circle is the half known to be in the wrong place.
+
+The second change turned out to need **less** code than planned. "Moving without changing height"
+does not want a vertical-speed test of its own, because `WrEnergyOnGround` already *is* that
+measurement and a better one: settled within six units of one height, at under 30 u/s vertical,
+for a twentieth of a second. Adding a second threshold would have restated another module's
+constant and gone quietly wrong the day that constant moved. What was left to bound was the
+*horizontal* speed — on a map whose route comes back over its own start pad, everything on the
+ground inside the floor band would otherwise arm, and crossing the plane outward would zero the
+clock in the middle of a run.
+
+`wr_energy.cpp` carries two ordering defects in its history and both had the same symptom: not a
+noisy number, but a number whose **origin moved**. So anything that widens when the anchor may be
+taken is pinned in both directions. `tests\test_start.exe` has a must-fire case — flat, grounded,
+400 u/s, inside a fitted zone, arms — and two must-not-fire cases: the identical motion in a flat
+corridor nowhere near a start, and the identical motion *inside* the start at 1600 u/s. Each
+asserts `WrStartZoneHere()` explicitly, so a case cannot pass by being somewhere else than it
+claims; and each burns the one-second post-reset settle first, so it cannot pass by being too
+early. Removing the speed bound makes the third one fail, which is the only evidence that it is a
+test rather than a decoration.
+
 The circle, the way out and the trigger line are drawn in the world, with a band either side of
 the line that is the **measured p90 spread** of where those clocks started. Anything that
 infers a place from data ought to show its error bars.
