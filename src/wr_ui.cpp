@@ -51,11 +51,13 @@ static int g_hudCycleKey = VK_NEXT;         // page down: next centre-box mode
 static int g_hudCycleBackKey = VK_PRIOR;    // page up: previous
 static int g_pickToggleKey = VK_HOME;       // the "whose line is this" plate
 static int g_overlayToggleKey = VK_END;     // the corner block
+static int g_quickKey = VK_DELETE;          // the quick menu
 
 int WrUiHudCycleKey(void) { return g_hudCycleKey; }
 int WrUiHudCycleBackKey(void) { return g_hudCycleBackKey; }
 int WrUiPickToggleKey(void) { return g_pickToggleKey; }
 int WrUiOverlayToggleKey(void) { return g_overlayToggleKey; }
+int WrUiQuickKey(void) { return g_quickKey; }
 
 // The one list of bindable keys, and the one place a virtual key is turned into
 // a name. There used to be two near-identical copies of this, one per binding,
@@ -110,13 +112,18 @@ static void KeyBindCombo(const char *label, int *key)
     if (!*key)
         return;
 
-    const int *others[3];
-    const char *what[3];
+    // Five now, and the quick menu is in the list rather than being a fixed key
+    // for a reason worth stating: Delete was ALREADY offered here for the four
+    // HUD toggles, so a hard-coded Delete would have been the one collision this
+    // check could not mention.
+    const int *others[4];
+    const char *what[4];
     int n = 0;
     if (key != &g_hudCycleKey)     { others[n] = &g_hudCycleKey;     what[n++] = "next mode"; }
     if (key != &g_hudCycleBackKey) { others[n] = &g_hudCycleBackKey; what[n++] = "previous mode"; }
     if (key != &g_pickToggleKey)   { others[n] = &g_pickToggleKey;   what[n++] = "the line plate"; }
     if (key != &g_overlayToggleKey) { others[n] = &g_overlayToggleKey; what[n++] = "the corner block"; }
+    if (key != &g_quickKey)        { others[n] = &g_quickKey;        what[n++] = "the quick menu"; }
 
     for (int i = 0; i < n; i++)
     {
@@ -2005,6 +2012,37 @@ static void DrawDisplayTab(void)
     if (g_render.lineColour < 0 || g_render.lineColour >= WR_LINE_MODE_COUNT)
         g_render.lineColour = WR_LINE_FLAT;
     ImGui::Combo("##linecolour", &g_render.lineColour, kLine, WR_LINE_MODE_COUNT);
+
+    if (g_render.lineColour != WR_LINE_FLAT ||
+        g_render.rankColour != WR_RANK_OFF)
+    {
+        ImGui::Checkbox("Scale the range to the runs that are on",
+                        &g_render.autoScale);
+        ImGui::SameLine();
+        HelpMarker(
+            "Takes the ends of the ramp from the runs currently enabled, on the "
+            "leg they are on, instead of from the sliders below.\n\n"
+            "The fixed range is 250 to 3500 u/s, which is right for the top of a "
+            "board and mostly wasted on the rest of it: a run that lives between "
+            "400 and 1200 occupies a fifth of the ramp and comes out one colour. "
+            "Scaled, the ramp covers what the lines on screen actually did.\n\n"
+            "Rank scales too, and that is the bigger change: with four lines on "
+            "screen, colour-by-rank spends its whole ramp on those four rather "
+            "than on the nine thousand runs they were picked from. The Runs "
+            "list still reports the true leaderboard placing, which does not "
+            "move.\n\n"
+            "Your sliders are not touched. Turning this off puts the exact "
+            "numbers you set back, because they were never overwritten.");
+        if (g_render.autoScale)
+        {
+            float lo = 0.0f, hi = 0.0f;
+            bool scaled = false;
+            WrRenderColourRange(&lo, &hi, &scaled);
+            if (g_render.lineColour != WR_LINE_FLAT &&
+                g_render.lineColour != WR_LINE_EFFICIENCY)
+                ImGui::TextDisabled("currently %.0f to %.0f", lo, hi);
+        }
+    }
 
     if (g_render.lineColour == WR_LINE_SPEED)
     {
@@ -3930,6 +3968,14 @@ static void DrawEnergyTab(void)
     HelpMarker("Turns the corner block off and on. It is off by default, so this "
                "is how you get it without opening the panel.");
 
+    KeyBindCombo("Quick menu", &g_quickKey);
+    ImGui::SameLine();
+    HelpMarker("Opens the one-page panel: the top runs of each leg of the map "
+               "you are on, with a tick box that downloads, extracts and draws "
+               "each one for you.\n\n"
+               "It is the short way round everything this panel can do at "
+               "length. Both can be open at once, and Escape closes both.");
+
     // --- the anchor ---------------------------------------------------------
     ImGui::SeparatorText("Anchor");
     WrAnchorSource src = WrEnergyAnchorSource();
@@ -5195,6 +5241,7 @@ void WrUiRegisterSettings(void)
     WrSettingsInt("key.hudCyclePrev", &g_hudCycleBackKey, 0, 255);
     WrSettingsInt("key.pickToggle", &g_pickToggleKey, 0, 255);
     WrSettingsInt("key.overlayToggle", &g_overlayToggleKey, 0, 255);
+    WrSettingsInt("key.quickMenu", &g_quickKey, 0, 255);
 
     WrSettingsBool("graph.byTime", &g_gByTime);
     WrSettingsBool("graph.normalise", &g_gNormalise);

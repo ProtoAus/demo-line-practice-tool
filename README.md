@@ -15,7 +15,19 @@ See the route, see where they carried speed and where you don't.
 2. **Unzip it** anywhere you like.
 3. **Start Momentum Mod and load into a map.**
 4. **Double-click `wrinject.exe`.**
-5. **Press `INSERT`** in game.
+5. **Press `DELETE`** in game.
+6. Press **Allow it to look**, pick a **stage** if the map has any, and **tick a run**.
+
+That is the whole of it. Ticking a run downloads the demo, reads it and puts the line on screen,
+one after the other, in the background — you can close the page and keep playing while it works.
+The ticks are remembered per map, so the lines come back next time you load it.
+
+### The long way round
+
+`INSERT` opens the full panel, which is the same capability with every decision left to you: nine
+tabs, any map rather than the one you are standing in, whole leaderboards rather than the top
+twenty, and every setting the quick page leaves out.
+
 6. **Board** tab → tick **Allow downloading** → press **Fastest 50** → tick the rows you want →
    **Download**. That is the map's real leaderboard, and it is where the demos come from.
    Nothing reaches the network until that checkbox is on.
@@ -36,13 +48,15 @@ instead — same button.
 
 | key | |
 | --- | --- |
-| `INSERT` | show / hide the panel |
-| `ESC` | close it |
+| `DELETE` | the quick page — the map's top runs, tick one to see it |
+| `INSERT` | show / hide the full panel |
+| `ESC` | close both |
 | `Page Down` / `Page Up` | the box at your crosshair — next / previous mode |
 | `Home` | *whose line am I looking at* — off by default |
 | `End` | the corner block — off by default |
 
-All but `INSERT` are rebindable, and the **About** tab lists them as they are currently bound.
+Both pages can be open at once. All but `INSERT` are rebindable, and the **About** tab lists them
+as they are currently bound.
 They are **read, not swallowed**, so if one collides with something you have bound, the game still
 acts on it too.
 
@@ -151,12 +165,30 @@ What replaced it is smaller but still checkable in a couple of minutes:
   User-Agent says `WrLines/<version>` and links here, and that is everything it sends that it did
   not have to. The one request that names SteamID64s names your *friends'*, because you pressed a
   button that says it will look them up — and it is the same list the Steam client already has.
-- **Never on its own.** Nothing here runs on a timer, at startup, or on a map change. Every request
-  is downstream of a button press.
+- **Never on its own.** Nothing here runs on a timer or at startup. Every request is downstream of
+  something you pressed.
 
 From v0.6.1 that is the whole of it, and from **v0.7.0 there is nothing else in the project at
 all**: the last thing the Python script did was extraction, extraction reads files off your disk,
 and it now happens inside the DLL. `wrpath_extract.py` is not in the download.
+
+### What v0.8.0 changed, and it is worth reading
+
+The quick page on `DELETE` fills itself in, and filling itself in means reading a leaderboard
+without you pressing a button each time. So the fence moved, and it is a real change rather than a
+detail:
+
+- **The full panel is unchanged.** *Allow downloading* still defaults to off and still resets every
+  launch, so nothing in the Board or Maps tabs reaches the network without a press in that session.
+- **The quick page asks once, and remembers.** *Allow it to look* is a persisted setting, off until
+  you turn it on. After that the page reads a leaderboard by itself — **one** board, for the leg you
+  are actually looking at, and only when nothing is cached for it. Switching to a stage you have
+  never opened is one request; going back to it is none.
+- **Demos are still never downloaded on their own.** A demo body only ever comes down because you
+  ticked a run.
+
+If you would rather it never asked, leave that setting off: the page still works from whatever is
+already cached, and the button to fetch a board by hand is the one that was always there.
 
 Everything it creates lives in a `wrlines_data` folder next to the DLL. Nothing is written into your
 game install unless you press **send**, **local** or **watch** on a run — those copy one demo into

@@ -103,6 +103,16 @@ cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% tests\test_settings.cpp ^
    /Fe:tests\test_settings.exe /Fo:tests\ >nul
 if errorlevel 1 ( echo [!] test_settings FAILED to build & exit /b 1 )
 
+rem test_quick links NOTHING, and that is the point. WrQuickDecide is a static
+rem inline in wr_quick.h with the rest of this project's pure logic, so the quick
+rem menu's state machine can be driven without ImGui, a job slot or a run store.
+rem What it is really checking is that a run which cannot be got STOPS being
+rem tried and says why -- a chain that silently retries looks exactly like one
+rem that is still working, for ever.
+cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% tests\test_quick.cpp ^
+   /Fe:tests\test_quick.exe /Fo:tests\ >nul
+if errorlevel 1 ( echo [!] test_quick FAILED to build & exit /b 1 )
+
 rem test_json needs nothing but itself: wr_json.cpp includes no Windows header
 rem and calls nothing, which is the property that lets it be checked this hard.
 cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% tests\test_json.cpp ^
@@ -280,6 +290,7 @@ tests\test_start.exe      || set "RC=1"
 tests\test_saveloc.exe    || set "RC=1"
 tests\test_live.exe       || set "RC=1"
 tests\test_settings.exe   || set "RC=1"
+tests\test_quick.exe      || set "RC=1"
 tests\test_json.exe       || set "RC=1"
 tests\test_maps.exe       || set "RC=1"
 tests\test_lzma.exe       || set "RC=1"

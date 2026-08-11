@@ -12,7 +12,37 @@ struct ID3D11DeviceContext;
 // installs the Present / ResizeBuffers hooks. Returns false if it gave up.
 bool WrHookInit(void);
 
-bool WrMenuOpen(void);
+// --- panels, and the one thing they share -----------------------------------
+//
+// There are two now: the full panel on Insert and the quick one on Delete. They
+// are independent as far as being ON SCREEN goes, and they are not independent
+// at all as far as INPUT goes -- there is one window procedure, one virtual
+// cursor and one matrix-scan hold between them, and the game gets its input back
+// exactly when the last of them closes.
+//
+// So "open" became a bitmask and WrMenuOpen kept its meaning: ANY panel is up.
+// Its eight consumers -- the cursor, the draw decision, the message handler, the
+// scan hold -- all wanted that question and not "is the main panel up", so none
+// of them changed. What changed is that subclassing the window happens on the
+// 0 <-> non-zero EDGE, so closing one panel while the other is still open no
+// longer blinds the one left behind.
+//
+// A bitmask rather than a count because the same panel can be told to open twice
+// -- the hotkey thread and the X button both go through here -- and a count
+// would then need one close per open, which nothing tracks.
+enum WrPanel
+{
+    WR_PANEL_MAIN  = 1 << 0,        // Insert
+    WR_PANEL_QUICK = 1 << 1         // Delete
+};
+#define WR_PANEL_ALL (WR_PANEL_MAIN | WR_PANEL_QUICK)
+
+bool WrMenuOpen(void);              // any of them
+bool WrPanelOpen(unsigned int which);
+void WrSetPanelOpen(unsigned int which, bool open);
+
+// WR_PANEL_MAIN, spelled the way it was before there were two. Kept because the
+// X button and every settings site say "the menu" and mean this one.
 void WrSetMenuOpen(bool open);
 
 HWND WrGameWindow(void);

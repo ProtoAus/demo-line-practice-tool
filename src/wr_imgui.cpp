@@ -4,6 +4,7 @@
 #include "wr_hook.h"
 #include "wr_log.h"
 #include "wr_ui.h"
+#include "wr_quick.h"
 #include "wr_render.h"
 
 #include <d3d11.h>
@@ -229,10 +230,16 @@ void WrImGuiFrame(void)
     // decided whether this frame draws anything at all.
     WrRenderWorld();
 
+    // Both panels are drawn from the same stage timer. They are two windows in
+    // one ImGui frame, not two frames, so the cost of the pair is the number
+    // Diagnostics should be showing.
     if (WrMenuOpen())
     {
         WrStageBegin(WR_STAGE_UI);
-        WrUiDraw();
+        if (WrPanelOpen(WR_PANEL_MAIN))
+            WrUiDraw();
+        if (WrPanelOpen(WR_PANEL_QUICK))
+            WrQuickDraw();
         WrStageEnd(WR_STAGE_UI);
     }
 

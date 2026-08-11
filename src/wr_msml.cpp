@@ -83,6 +83,8 @@ static bool ReadMap(WrJson *j, WrMsmlMap *m)
     m->name[0] = '\0';
     m->tier = 0;
     m->modes = 0;
+    m->stages = 0;
+    m->bonuses = 0;
 
     bool haveId = false, haveName = false;
     if (!WrJsonEnterObject(j))
@@ -115,7 +117,7 @@ static bool ReadMap(WrJson *j, WrMsmlMap *m)
             {
                 if (!WrJsonEnterObject(j))
                     continue;
-                int trackType = -1, tier = 0, mode = -1;
+                int trackType = -1, tier = 0, mode = -1, trackNum = -1;
                 bool haveTier = false;
                 char lk[32];
                 while (WrJsonNextMember(j, lk, sizeof(lk)))
@@ -125,6 +127,12 @@ static bool ReadMap(WrJson *j, WrMsmlMap *m)
                         bool ok = false;
                         long long v = WrJsonInt(j, -1, &ok);
                         trackType = ok ? (int)v : -1;
+                    }
+                    else if (strcmp(lk, "trackNum") == 0)
+                    {
+                        bool ok = false;
+                        long long v = WrJsonInt(j, -1, &ok);
+                        trackNum = ok ? (int)v : -1;
                     }
                     else if (strcmp(lk, "tier") == 0)
                     {
@@ -154,6 +162,19 @@ static bool ReadMap(WrJson *j, WrMsmlMap *m)
                     m->tier = tier;
                 if (mode >= 0 && mode < 32)
                     m->modes |= (1u << mode);
+
+                // The highest leg number of each kind, across every gamemode.
+                // Across, and not per mode, because how a map is cut up is a
+                // property of the map: a stage exists whether or not anybody has
+                // ever run it in bhop. Capped at 255 by the field, which is two
+                // orders of magnitude past any real map.
+                if (trackNum > 0 && trackNum <= 255)
+                {
+                    if (trackType == 1 && trackNum > m->stages)
+                        m->stages = (unsigned char)trackNum;
+                    else if (trackType == 2 && trackNum > m->bonuses)
+                        m->bonuses = (unsigned char)trackNum;
+                }
             }
         }
         else

@@ -6,6 +6,8 @@
 #include "wr_start.h"
 #include "wr_limit.h"
 #include "wr_profile.h"
+#include "wr_quick.h"
+#include "wr_board.h"           // WR_GAMEMODE_COUNT, for the quick menu's range
 #include "wr_log.h"
 
 #include <stdio.h>
@@ -214,6 +216,13 @@ static void RegisterLimit(void)
     WrSettingsFloat("cap.targetFps", &g_limit.targetFps, 10.0f, 1000.0f);
     WrSettingsFloat("cap.headroomHz", &g_limit.headroomHz, 0.0f, 60.0f);
     WrSettingsFloat("cap.spinMs", &g_limit.spinMs, 0.0f, 10.0f);
+}
+
+static void RegisterQuick(void)
+{
+    WrSettingsBool("quick.network", &g_quick.network);
+    WrSettingsInt("quick.top", &g_quick.top, 1, WR_QUICK_TOP_MAX);
+    WrSettingsInt("quick.gamemode", &g_quick.gamemode, 1, WR_GAMEMODE_COUNT);
 }
 
 static void RegisterProfile(void)
@@ -442,6 +451,7 @@ void WrSettingsInit(void)
         RegisterStart();
         RegisterLimit();
         RegisterProfile();
+        RegisterQuick();
         WrUiRegisterSettings();
         g_registered = true;
 

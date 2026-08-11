@@ -38,6 +38,7 @@
 #include "wr_start.h"
 #include "wr_intogame.h"
 #include "wr_settings.h"
+#include "wr_quick.h"
 
 #include "imgui.h"
 
@@ -67,6 +68,7 @@ void WrIdleTick(void)
         strcpy_s(g_lastMap, sizeof(g_lastMap), map);
         WrPathLoadMap(map);
         WrUiOnMapChanged(map);
+        WrQuickOnMapChanged(map);
         WrLiveClear();
         WrEnergyReset();
         WrTimerReset();
@@ -175,6 +177,12 @@ void WrIdleTick(void)
             WrExtractOnMapChanged(keep);
         }
     }
+
+    // The quick menu's chain, and it runs WHETHER OR NOT THAT PANEL IS OPEN --
+    // which is the whole of "it downloads and extracts in the background". It is
+    // also what re-applies the ticks after the reload just above, since a reload
+    // turns every run off. Last, so it sees this frame's finished job.
+    WrQuickTick();
 }
 
 // One edge latch. Every key here is a thing you want to change mid-run, which is
@@ -194,11 +202,19 @@ static DWORD WINAPI HotkeyThread(LPVOID)
 {
     bool down = false;
     bool cycleDown = false, cycleBackDown = false;
-    bool pickDown = false, overlayDown = false;
+    bool pickDown = false, overlayDown = false, quickDown = false;
     for (;;)
     {
         if (Pressed(TOGGLE_KEY, &down))
             WrSetMenuOpen(!WrMenuOpen());
+
+        // The quick menu. Bindable, unlike Insert above -- Delete is already in
+        // the panel's list of bindable keys and was already offered for the four
+        // HUD toggles, so leaving this one a fixed #define would have let a
+        // player bind Delete to the corner block and then wonder why it also
+        // opened a window.
+        if (Pressed(WrUiQuickKey(), &quickDown))
+            WrSetPanelOpen(WR_PANEL_QUICK, !WrPanelOpen(WR_PANEL_QUICK));
 
         // Page Down and Page Up step the centre box's mode.
         if (Pressed(WrUiHudCycleKey(), &cycleDown))
@@ -228,6 +244,7 @@ static DWORD WINAPI InitThread(LPVOID)
     WrEnergyDefaults();
     WrStartDefaults();
     WrLimitDefaults();
+    WrQuickDefaults();
 
     // AFTER the defaults, never before: the file is read OVER them, so a key it
     // does not carry keeps whatever the default put there. That is what lets an

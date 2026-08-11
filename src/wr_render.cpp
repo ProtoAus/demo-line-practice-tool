@@ -123,6 +123,20 @@ void WrRenderDefaults(void)
     g_render.energyRelMin = -500.0f;
     g_render.energyRelMax = 2000.0f;
 
+    // Off, so nothing about an existing install changes until it is asked for.
+    // The quick menu offers it because that is where somebody with four lines on
+    // screen and no idea what 250..3500 means will be standing.
+    g_render.autoScale = false;
+
+    // Seeded so the very first frame -- before WrRenderRefreshScales has run --
+    // draws with the sliders rather than with zeros.
+    g_render.useSpeedMin = g_render.speedMin;
+    g_render.useSpeedMax = g_render.speedMax;
+    g_render.useEnergyMin = g_render.energyMin;
+    g_render.useEnergyMax = g_render.energyMax;
+    g_render.useEnergyRelMin = g_render.energyRelMin;
+    g_render.useEnergyRelMax = g_render.energyRelMax;
+
     // On. The pre-roll is not part of the run, and showing it is what makes a
     // line appear to start somewhere the player was not yet racing.
     g_render.hidePreRoll = true;
@@ -448,6 +462,231 @@ static float RunStartEnergy(const WrRun *run)
     return WrEnergyOf(run->points[i].pos, run->points[i].vel);
 }
 
+// ---------------------------------------------------------------------------
+// Auto-scaling
+// ---------------------------------------------------------------------------
+//
+// See WrRenderRefreshScales in wr_render.h for why this is behind a stamp.
+
+static unsigned int g_scaleStoreGen = 0xFFFFFFFFu;
+static unsigned int g_scaleEnabledKey = 0;
+static int g_scaleMode = -1;
+static int g_scaleRank = -1;
+static bool g_scaleWasOn = false;
+static float g_scaleGravity = 0.0f;
+
+// A cheap hash of WHICH runs are on. Not a count: swapping one run for another
+// leaves the count alone and changes every answer below.
+static unsigned int EnabledKey(void)
+{
+    unsigned int h = 2166136261u;
+    for (int i = 0; i < WrRunCount(); i++)
+    {
+        const WrRun *r = WrRunAt(i);
+        if (r && r->enabled)
+        {
+            h ^= (unsigned int)i;
+            h *= 16777619u;
+        }
+    }
+    return h;
+}
+
+// The leg the picture is about: the one the enabled runs are on. Mixed legs --
+// which the full panel can produce and the quick menu cannot -- fall back to
+// every enabled run, because a range fitted to one of two legs on screen would
+// be wrong about the other in a way nobody could see.
+static bool EnabledLeg(unsigned char *type, unsigned char *num)
+{
+    bool found = false;
+    for (int i = 0; i < WrRunCount(); i++)
+    {
+        const WrRun *r = WrRunAt(i);
+        if (!r || !r->enabled || r->pointCount < 2)
+            continue;
+        if (!found)
+        {
+            *type = r->trackType;
+            *num = r->trackNum;
+            found = true;
+        }
+        else if (r->trackType != *type || r->trackNum != *num)
+        {
+            return false;           // more than one leg on screen
+        }
+    }
+    return found;
+}
+
+void WrRenderRefreshScales(void)
+{
+    const unsigned int sgen = WrRunStoreGeneration();
+    const unsigned int ekey = EnabledKey();
+
+    const bool same = (sgen == g_scaleStoreGen && ekey == g_scaleEnabledKey &&
+                       g_render.lineColour == g_scaleMode &&
+                       g_render.rankColour == g_scaleRank &&
+                       g_render.autoScale == g_scaleWasOn &&
+                       g_energy.gravity == g_scaleGravity);
+    if (same)
+        return;
+
+    g_scaleStoreGen = sgen;
+    g_scaleEnabledKey = ekey;
+    g_scaleMode = g_render.lineColour;
+    g_scaleRank = g_render.rankColour;
+    g_scaleWasOn = g_render.autoScale;
+    g_scaleGravity = g_energy.gravity;
+
+    // Off: the derived pair is the slider pair, exactly. Every run's shownRank
+    // goes back to 0, which WrRunColour reads as "no opinion".
+    if (!g_render.autoScale)
+    {
+        g_render.useSpeedMin = g_render.speedMin;
+        g_render.useSpeedMax = g_render.speedMax;
+        g_render.useEnergyMin = g_render.energyMin;
+        g_render.useEnergyMax = g_render.energyMax;
+        g_render.useEnergyRelMin = g_render.energyRelMin;
+        g_render.useEnergyRelMax = g_render.energyRelMax;
+        for (int i = 0; i < WrRunCount(); i++)
+        {
+            WrRun *r = WrRunAt(i);
+            if (r) { r->shownRank = 0; r->shownOutOf = 0; }
+        }
+        return;
+    }
+
+    unsigned char legType = 0, legNum = 0;
+    const bool oneLeg = EnabledLeg(&legType, &legNum);
+
+    // --- rank, among what is on ---------------------------------------------
+    //
+    // The store is time-sorted, so walking it in order and counting the enabled
+    // runs of the leg IS the placing. No sort, no comparison.
+    {
+        int on = 0;
+        for (int i = 0; i < WrRunCount(); i++)
+        {
+            const WrRun *r = WrRunAt(i);
+            if (r && r->enabled && r->pointCount >= 2 &&
+                (!oneLeg || (r->trackType == legType && r->trackNum == legNum)))
+                on++;
+        }
+        int place = 0;
+        for (int i = 0; i < WrRunCount(); i++)
+        {
+            WrRun *r = WrRunAt(i);
+            if (!r)
+                continue;
+            if (r->enabled && r->pointCount >= 2 &&
+                (!oneLeg || (r->trackType == legType && r->trackNum == legNum)))
+            {
+                r->shownRank = ++place;
+                r->shownOutOf = on;
+            }
+            else
+            {
+                r->shownRank = 0;
+                r->shownOutOf = 0;
+            }
+        }
+    }
+
+    // --- speed, which costs nothing ------------------------------------------
+    //
+    // Every run measured its own extremes at load and nothing has read them
+    // since -- wr_path.h has said "for colour-by-speed" beside them the whole
+    // time. This is that field finding its consumer.
+    {
+        float lo = 1e30f, hi = -1e30f;
+        for (int i = 0; i < WrRunCount(); i++)
+        {
+            const WrRun *r = WrRunAt(i);
+            if (!r || !r->enabled || r->pointCount < 2)
+                continue;
+            if (r->speedMin < lo) lo = r->speedMin;
+            if (r->speedMax > hi) hi = r->speedMax;
+        }
+        if (lo <= hi && hi - lo > 1.0f)
+        {
+            g_render.useSpeedMin = lo;
+            g_render.useSpeedMax = hi;
+        }
+        else
+        {
+            g_render.useSpeedMin = g_render.speedMin;
+            g_render.useSpeedMax = g_render.speedMax;
+        }
+    }
+
+    // --- energy, which costs a pass over points ------------------------------
+    //
+    // Only for the mode that is actually on. Energy is z + |v|^2/2g and gravity
+    // is a live setting, so it cannot be precomputed at load the way speed is --
+    // and it needs no sqrt, so the pass is an add and a multiply per point.
+    // Twenty runs of ten thousand points is about a third of a millisecond, paid
+    // when the set changes rather than per frame.
+    const bool wantAbs = (g_render.lineColour == WR_LINE_ENERGY);
+    const bool wantRel = (g_render.lineColour == WR_LINE_ENERGY_REL);
+    if (wantAbs || wantRel)
+    {
+        float lo = 1e30f, hi = -1e30f;
+        for (int i = 0; i < WrRunCount(); i++)
+        {
+            const WrRun *r = WrRunAt(i);
+            if (!r || !r->enabled || r->pointCount < 2)
+                continue;
+            const float base = wantRel ? RunStartEnergy(r) : 0.0f;
+            const int from = (g_render.hidePreRoll && r->startTrusted &&
+                              r->startIndex < r->pointCount)
+                                 ? r->startIndex : 0;
+            for (int k = from; k < r->pointCount; k++)
+            {
+                const float e = WrEnergyOf(r->points[k].pos, r->points[k].vel) - base;
+                if (e < lo) lo = e;
+                if (e > hi) hi = e;
+            }
+        }
+        if (lo <= hi && hi - lo > 1.0f)
+        {
+            if (wantAbs) { g_render.useEnergyMin = lo; g_render.useEnergyMax = hi; }
+            else         { g_render.useEnergyRelMin = lo; g_render.useEnergyRelMax = hi; }
+        }
+        else
+        {
+            g_render.useEnergyMin = g_render.energyMin;
+            g_render.useEnergyMax = g_render.energyMax;
+            g_render.useEnergyRelMin = g_render.energyRelMin;
+            g_render.useEnergyRelMax = g_render.energyRelMax;
+        }
+    }
+    else
+    {
+        g_render.useEnergyMin = g_render.energyMin;
+        g_render.useEnergyMax = g_render.energyMax;
+        g_render.useEnergyRelMin = g_render.energyRelMin;
+        g_render.useEnergyRelMax = g_render.energyRelMax;
+    }
+}
+
+void WrRenderColourRange(float *lo, float *hi, bool *scaled)
+{
+    float a = g_render.useSpeedMin, b = g_render.useSpeedMax;
+    if (g_render.lineColour == WR_LINE_ENERGY)
+    {
+        a = g_render.useEnergyMin;
+        b = g_render.useEnergyMax;
+    }
+    else if (g_render.lineColour == WR_LINE_ENERGY_REL)
+    {
+        a = g_render.useEnergyRelMin;
+        b = g_render.useEnergyRelMax;
+    }
+    if (lo) *lo = a;
+    if (hi) *hi = b;
+    if (scaled) *scaled = g_render.autoScale;
+}
+
 unsigned int WrRunColour(const WrRun *run)
 {
     if (!run)
@@ -455,8 +694,21 @@ unsigned int WrRunColour(const WrRun *run)
     if (g_render.rankColour == WR_RANK_OFF)
         return run->colour;
 
+    // Among what is on screen when auto-scaling is asked for, and among the
+    // whole leg otherwise. shownRank is 0 when nothing has computed it, which
+    // falls through to the leaderboard placing -- so a store still loading, or
+    // auto-scaling off, behaves exactly as it did.
     int total = 0;
-    int rank = WrRunRankInTrack(run, &total);
+    int rank = 0;
+    if (g_render.autoScale && run->shownRank > 0)
+    {
+        rank = run->shownRank;
+        total = run->shownOutOf;
+    }
+    else
+    {
+        rank = WrRunRankInTrack(run, &total);
+    }
     if (rank <= 0)
         return run->colour;
 
@@ -469,12 +721,18 @@ unsigned int WrRunColour(const WrRun *run)
         // How far off the best this run is, as a fraction of the best. Truthful
         // rather than even: on a board where everyone is within a second of the
         // record, everyone stays green, because they are all nearly as fast.
+        //
+        // "The best" has to mean the same field the placing was taken from, or
+        // the two disagree: with auto-scaling on, rank 1 is the fastest run ON
+        // SCREEN, and measuring everyone's deficit against a faster run that is
+        // not drawn would push the whole field red for no visible reason.
+        const bool scaled = (g_render.autoScale && run->shownRank > 0);
         const WrRun *best = NULL;
         for (int i = 0; i < WrRunCount(); i++)
         {
             const WrRun *c = WrRunAt(i);
             if (c && c->pointCount >= 2 && c->trackType == run->trackType &&
-                c->trackNum == run->trackNum)
+                c->trackNum == run->trackNum && (!scaled || c->enabled))
             {
                 best = c;       // store is time-sorted, so the first match is it
                 break;
@@ -507,8 +765,8 @@ unsigned int WrRunColour(const WrRun *run)
 // Blue -> cyan -> green -> yellow -> red across the configured speed range.
 static unsigned int SpeedColour(float speed)
 {
-    float t = (speed - g_render.speedMin) /
-              (g_render.speedMax - g_render.speedMin + 1e-3f);
+    float t = (speed - g_render.useSpeedMin) /
+              (g_render.useSpeedMax - g_render.useSpeedMin + 1e-3f);
     t = WrClampF(t, 0.0f, 1.0f);
     float r, g, b;
     if (t < 0.25f)      { float u = t / 0.25f;          r = 0.0f;      g = u;          b = 1.0f; }
@@ -751,12 +1009,12 @@ static void EmitPath(ImDrawList *dl, const WrPathDraw &d)
         else if (g_render.lineColour == WR_LINE_SPEED && velScale > 0.0f)
         {
             float speed = WrLength(pts[i].vel) * velScale;
-            float t = WrClampF((speed - g_render.speedMin) /
-                               (g_render.speedMax - g_render.speedMin + 1e-3f),
+            float t = WrClampF((speed - g_render.useSpeedMin) /
+                               (g_render.useSpeedMax - g_render.useSpeedMin + 1e-3f),
                                0.0f, 1.0f);
             int cBucket = (int)(t * (COLOUR_BUCKETS - 1) + 0.5f);
-            colour = WithAlpha(SpeedColour(g_render.speedMin +
-                        (g_render.speedMax - g_render.speedMin) *
+            colour = WithAlpha(SpeedColour(g_render.useSpeedMin +
+                        (g_render.useSpeedMax - g_render.useSpeedMin) *
                         ((float)cBucket / (COLOUR_BUCKETS - 1))), a01);
             bucket = fBucket * COLOUR_BUCKETS + cBucket;
         }
@@ -772,12 +1030,12 @@ static void EmitPath(ImDrawList *dl, const WrPathDraw &d)
             // deliberate too -- a second ramp for a second quantity would be
             // one more thing to learn for no gain.
             float e = WrEnergyOf(pts[i].pos, pts[i].vel);
-            float t = WrClampF((e - g_render.energyMin) /
-                               (g_render.energyMax - g_render.energyMin + 1e-3f),
+            float t = WrClampF((e - g_render.useEnergyMin) /
+                               (g_render.useEnergyMax - g_render.useEnergyMin + 1e-3f),
                                0.0f, 1.0f);
             int cBucket = (int)(t * (COLOUR_BUCKETS - 1) + 0.5f);
-            colour = WithAlpha(SpeedColour(g_render.speedMin +
-                        (g_render.speedMax - g_render.speedMin) *
+            colour = WithAlpha(SpeedColour(g_render.useSpeedMin +
+                        (g_render.useSpeedMax - g_render.useSpeedMin) *
                         ((float)cBucket / (COLOUR_BUCKETS - 1))), a01);
             bucket = fBucket * COLOUR_BUCKETS + cBucket;
         }
@@ -793,12 +1051,12 @@ static void EmitPath(ImDrawList *dl, const WrPathDraw &d)
             // lower than another is not penalised for it -- which is the right
             // question when the answer wanted is "who held onto what they had".
             float e = WrEnergyOf(pts[i].pos, pts[i].vel) - d.startEnergy;
-            float t = WrClampF((e - g_render.energyRelMin) /
-                               (g_render.energyRelMax - g_render.energyRelMin + 1e-3f),
+            float t = WrClampF((e - g_render.useEnergyRelMin) /
+                               (g_render.useEnergyRelMax - g_render.useEnergyRelMin + 1e-3f),
                                0.0f, 1.0f);
             int cBucket = (int)(t * (COLOUR_BUCKETS - 1) + 0.5f);
-            colour = WithAlpha(SpeedColour(g_render.speedMin +
-                        (g_render.speedMax - g_render.speedMin) *
+            colour = WithAlpha(SpeedColour(g_render.useSpeedMin +
+                        (g_render.useSpeedMax - g_render.useSpeedMin) *
                         ((float)cBucket / (COLOUR_BUCKETS - 1))), a01);
             bucket = fBucket * COLOUR_BUCKETS + cBucket;
         }
@@ -2206,10 +2464,12 @@ static void EmitEfficiencyLegend(ImDrawList *dl)
     // it describes.
     if (spdOn || nrgOn || relOn)
     {
-        float lo = relOn ? g_render.energyRelMin
-                         : (nrgOn ? g_render.energyMin : g_render.speedMin);
-        float hi = relOn ? g_render.energyRelMax
-                         : (nrgOn ? g_render.energyMax : g_render.speedMax);
+        // The range the lines are ACTUALLY drawn with, which is not the sliders
+        // when auto-scaling is on. A key describing a range nothing on screen
+        // uses is worse than no key.
+        float lo = 0.0f, hi = 0.0f;
+        bool scaled = false;
+        WrRenderColourRange(&lo, &hi, &scaled);
         const char *unit = relOn ? "from its own start"
                                  : (nrgOn ? "units of height" : "u/s");
         _snprintf_s(sLo, sizeof(sLo), _TRUNCATE, "%.0f %s and below", lo, unit);
@@ -2249,6 +2509,12 @@ static void EmitEfficiencyLegend(ImDrawList *dl)
             foots[nf++] = "the range is yours to set -- fit it to the map and "
                           "the middle becomes readable";
         }
+
+        // Said in the key rather than only in the panel, because this is the one
+        // place a colour can change meaning without anybody touching a setting:
+        // enable another run and the ends move.
+        if (scaled)
+            foots[nf++] = "scaled to the runs currently on screen";
     }
 
     if (effOn)
@@ -3080,6 +3346,11 @@ void WrRenderWorld(void)
     // Feeds the Runs tab's "near you" column, which is how you tell which leg of
     // a staged map a run belongs to.
     WrUpdateNearest(g_cam);
+
+    // AFTER WrUpdateNearest, because that is where a freshly loaded store turns
+    // its first run on -- and the scales are fitted to what is on. Before
+    // anything draws, because every colour below reads what this writes.
+    WrRenderRefreshScales();
 
     // Anchor to where the reference run's RUN starts, once, so that its clock
     // and ours start at the same place -- see wr_timer.h. Only ever taken when

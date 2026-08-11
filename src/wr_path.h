@@ -257,6 +257,21 @@ struct WrRun
     // not yet sorted and any rank would be provisional anyway.
     int rank;                   // 1 is fastest; 0 = not computed yet
     int rankOutOf;
+
+    // The same placing, among the runs currently ENABLED on this leg.
+    //
+    // A second pair rather than rescaling `rank`, because the two answer
+    // different questions and both are wanted. `rank` is a fact about the
+    // leaderboard -- the Runs tab reports it as one, and a number that changed
+    // when you unticked something else would be a lie. `shownRank` is a fact
+    // about the picture: with four lines on screen, colour-by-rank should spend
+    // its whole ramp on those four rather than on the nine thousand runs they
+    // were drawn from.
+    //
+    // Written by WrRenderRefreshScales, read only by WrRunColour, and 0 when
+    // auto-scaling is off -- which reads as "no opinion" and falls back to rank.
+    int shownRank;
+    int shownOutOf;
 };
 
 // Load every .wrpath under wrlines_data\paths\<map>\. Replaces whatever was
@@ -314,6 +329,19 @@ void WrUpdateNearest(const Vec3 &cam);
 // Enable the fastest `count` runs *on the leg you are standing in*, which is
 // almost always what "show me the route" means on a staged map.
 void WrEnableBestNearby(int count, float radius);
+
+// Drop the pending "turn on the best run near you" that a load arms.
+//
+// That behaviour is right when nobody has said what they want and wrong the
+// moment somebody has: WrEnableBestNearby CLEARS every other run, so a store
+// reload after an extraction would wipe a set of ticks and replace it with one
+// run of its own choosing. The quick menu re-applies its ticks when the store
+// changes and calls this in the same breath, because the auto-enable happens
+// LATER in the frame -- it runs from WrUpdateNearest, inside the renderer,
+// which is after WrIdleTick -- and would otherwise win.
+//
+// Idempotent, and does nothing if no load is pending.
+void WrPathCancelAutoEnable(void);
 
 // How many points either side the efficiency figure is differenced over, and a
 // rebuild of every run's eff[] when it changes.

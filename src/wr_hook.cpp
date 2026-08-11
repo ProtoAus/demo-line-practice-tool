@@ -87,6 +87,7 @@ static unsigned int g_framesDrawn = 0;
 static unsigned int g_framesSkipped = 0;
 
 bool WrMenuOpen(void) { return g_menuOpen != 0; }
+bool WrPanelOpen(unsigned int which) { return (g_menuOpen & (LONG)which) != 0; }
 HWND WrGameWindow(void) { return g_window; }
 ID3D11Device *WrDevice(void) { return g_device; }
 ID3D11DeviceContext *WrContext(void) { return g_context; }
@@ -146,25 +147,63 @@ void WrCursorUpdate(void)
 static void SubclassWindow(HWND hwnd);
 static void UnsubclassWindow(void);
 
-void WrSetMenuOpen(bool open)
+// The only place the open set changes, and the only place the window procedure
+// goes in or comes out.
+//
+// THE EDGE IS THE WHOLE POINT. Input ownership belongs to "any panel is up", not
+// to either panel, so it is taken when the set goes from empty to non-empty and
+// given back when it goes the other way. Closing the quick menu while the full
+// one is still open used to be expressible only as "unsubclass", which would
+// have left the panel still on screen and unable to hear a key.
+//
+// InterlockedOr and InterlockedAnd hand back the value BEFORE the change, which
+// is what makes the edge test a comparison of two numbers this thread owns
+// rather than a read-modify-write with a gap in the middle. That gap is not
+// hypothetical here: the hotkey thread opens, the window thread closes on ESC,
+// and the render thread catches up if the window was not known yet. Three
+// writers, one flag, and the last time this file had a race between two of them
+// the game hung unkillably -- see SubclassWindow.
+void WrSetPanelOpen(unsigned int which, bool open)
 {
-    InterlockedExchange(&g_menuOpen, open ? 1 : 0);
+    const LONG bits = (LONG)which;
+    LONG before, after;
     if (open)
+    {
+        before = InterlockedOr(&g_menuOpen, bits);
+        after = before | bits;
+    }
+    else
+    {
+        before = InterlockedAnd(&g_menuOpen, ~bits);
+        after = before & ~bits;
+    }
+
+    if (before == after)
+        return;                     // already in that state; say nothing
+
+    if (before == 0)
     {
         // Start the virtual cursor in the middle rather than wherever the OS
         // cursor happens to have been parked by the game's recentring.
         g_curX = g_bbWidth * 0.5f;
         g_curY = g_bbHeight * 0.5f;
-        // The window procedure goes in only for as long as the panel is up. See
+        // The window procedure goes in only for as long as a panel is up. See
         // SubclassWindow for why.
         SubclassWindow(g_window);
     }
-    else
+    else if (after == 0)
     {
         UnsubclassWindow();
     }
-    WrLogf("menu %s", open ? "opened" : "closed");
+
+    WrLogf("panel %s %s (open now: %s%s)",
+           (which & WR_PANEL_QUICK) ? "quick" : "main",
+           open ? "opened" : "closed",
+           (after & WR_PANEL_MAIN) ? "main " : "",
+           (after & WR_PANEL_QUICK) ? "quick" : (after ? "" : "none"));
 }
+
+void WrSetMenuOpen(bool open) { WrSetPanelOpen(WR_PANEL_MAIN, open); }
 
 // ---------------------------------------------------------------------------
 // Window procedure
@@ -213,11 +252,16 @@ static LRESULT CALLBACK WrWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
 {
     if (WrMenuOpen() && g_renderReady)
     {
-        // ESC closes the panel. Handled before anything else sees it, and not
+        // ESC closes EVERY panel. Handled before anything else sees it, and not
         // forwarded, so it does not also fall through to the game.
+        //
+        // All of them rather than the topmost, because ESC here means "give me
+        // the game back" and the only way to be sure it does is to close the lot.
+        // Closing one and leaving the other would take the key and appear to do
+        // nothing, which is the worst of the three available behaviours.
         if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && wParam == VK_ESCAPE)
         {
-            WrSetMenuOpen(false);
+            WrSetPanelOpen(WR_PANEL_ALL, false);
             return 0;
         }
 

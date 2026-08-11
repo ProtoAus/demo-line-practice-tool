@@ -1458,6 +1458,8 @@ void WrPathTestFindStart(WrRun *run, int stored, bool storedUsable)
 }
 const char *WrPathLoadedMap(void) { return g_loadedMap; }
 
+void WrPathCancelAutoEnable(void) { g_autoEnablePending = false; }
+
 int WrRunEnabledCount(void)
 {
     int n = 0;

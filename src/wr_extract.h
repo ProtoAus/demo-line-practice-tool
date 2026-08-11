@@ -204,13 +204,22 @@ struct WrExtractRequest
     bool progressLines;
 };
 
-// Start a job. No-op if one is already running.
+// Start a job. Returns false, having done nothing, if one is already running.
+//
+// It used to return void, and "already running" was therefore SILENT. That was
+// fine while every caller was a button that had just disabled itself, and it is
+// not fine now that one caller is a state machine: the quick menu advances a
+// chain of jobs across frames and shares this one slot with every button in the
+// full panel, so "did my submit take" is a question it has to be able to ask.
+// Guessing from WrExtractRunning() beforehand cannot answer it -- the slot can
+// go between the test and the call -- and the answer has to come from the latch
+// itself.
 //
 // `ranks` is copied, so the caller can pass a stack array or free its own
 // straight after. There is deliberately no cap: the ticked-places count is
 // bounded only by how big a board is, and the old 64-pick limit existed solely
 // because the selection travelled on a command line.
-void WrExtractSubmit(const WrExtractRequest *req);
+bool WrExtractSubmit(const WrExtractRequest *req);
 
 // The same work, synchronously, on the calling thread: no latch, no thread, no
 // panel, and the exit code as a return value.

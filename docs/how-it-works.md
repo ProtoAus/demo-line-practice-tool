@@ -1176,6 +1176,83 @@ A rate too large to have come from a player is a **booster**, and it is drawn as
 than as zero — zero also means free flight, and drawing those two the same is what made the first
 version of the line colours unreadable.
 
+### Five presses across two tabs
+
+The panel was built to be complete, and it is: nine tabs, every setting anybody could want. What
+completeness cost only showed up in somebody else's hands. The path from *a run on the leaderboard*
+to *a line on the screen* was five presses across two tabs, and the two tabs did not mention each
+other — a fetch finished, the store reloaded, and the demos it had just downloaded were still not
+extracted, because downloading and extracting were different buttons on different pages and nothing
+said so.
+
+So there is a second panel on `DELETE`, and everything it does the other one could already do. What
+it removes is the deciding. One page: the legs of the map you are standing in, the fastest twenty
+runs of whichever leg you are looking at, and a tick box per run that means *put that line on the
+screen*.
+
+Three things made it harder than it looks, and each is a bug that would have been invisible.
+
+**There is one job slot.** Fetching, extracting and board-reading share a single latch, and it is
+also the latch behind every button in the full panel — so a tick cannot call three functions. It
+becomes a want, and a step function advances the chain when the slot is free. `WrExtractSubmit`
+used to return `void` and no-op silently when busy, which is fine for a button that has just
+disabled itself and useless for a state machine; it returns a `bool` now, from the latch itself,
+because testing `WrExtractRunning()` first cannot answer the question — the slot can go between the
+test and the call.
+
+**A store reload turns every line off.** `FinishLoad` disables everything and the auto-enable then
+picks exactly one run. Since every extraction ends in a reload, "tick means set `enabled`" would
+lose every previous tick each time the next one finished — tick five runs and watch four vanish,
+one at a time. So the tick list is the truth and the store is made to agree with it after each
+reload. That is also why `WrPathCancelAutoEnable` exists: the auto-enable runs *later in the frame*,
+from inside the renderer, and would otherwise win. Guessing which run you want is right until
+somebody has said.
+
+**The chain has to stop.** A run that cannot be got has to stop being tried and say why, because a
+row that quietly retries looks exactly like one that is still working — for ever. One fetch attempt
+and one extract attempt per run, and then one of two reasons: *the download did not arrive*, or
+*that demo could not be read*. Those are different failures and the row says which.
+
+The decision itself is a `static inline` in `wr_quick.h` with the rest of the project's pure logic,
+so `tests\test_quick.exe` links **nothing** — no ImGui, no job slot, no run store — and drives the
+whole state machine, including a sweep over all 64 states of a pick asserting that a settled row
+never starts working again.
+
+Two smaller things fell out of it. The legs of a map had no cheap source: the run store knows the
+legs you have extracted, the board cache the legs you have fetched, and the leaderboard API answers
+per leg rather than listing them — so a map you have never touched offered one chip on a map with
+nine stages. The game's own catalogue has the exact answer for all two thousand maps, offline, and
+was simply not being read out; it goes to `wrlines_data\tracks.txt` rather than into `maps.txt`,
+which is byte-compared against the frozen reference and cannot gain a column. And the tick list
+itself cannot live in `settings.cfg`, which promises in writing to hold no names, no run data and
+no record of what was watched — a list of replay hashes you chose to watch is exactly what that
+promise excludes, so it sits under `wrlines_data` with everything else that names other players.
+
+### Two hundred and fifty to three thousand five hundred
+
+The speed ramp ran 250 to 3500 u/s, and the energy ramp 0 to 4000, because those numbers had to be
+*something*. They are about right for the top of a board. On the rest of it they are mostly wasted:
+a run that lives between 400 and 1200 occupies a fifth of the ramp and comes out one colour, so the
+mode that was supposed to show where speed was lost shows nothing at all.
+
+Scaling to the runs actually on screen is therefore less a feature than a connection. `WrRun` has
+carried `speedMin` and `speedMax` since the loader was written, with the comment *for
+colour-by-speed* beside them, and nothing had ever read them. Energy cannot be precomputed the same
+way — it is `z + |v|²/2g` and gravity is a live setting — so that one costs a pass over points, and
+only for the mode that is on.
+
+Two decisions worth naming. The sliders are **not** written back over: a slider that moves on its
+own is a setting you can no longer hold, so the fitted numbers go to a separate `use*` set and
+turning auto-scaling off restores the sliders by doing nothing at all. And rank scales too, into
+`shownRank` rather than over `rank` — with four lines on screen, colour-by-rank should spend its
+whole ramp on those four rather than on the nine thousand runs they were picked from, but the Runs
+tab reports `rank` as a fact about the leaderboard and a number that changed when you unticked
+something else would be a lie.
+
+It is behind a dirty stamp, not recomputed per frame, for the reason written beside `rank` in
+`wr_path.h`: the renderer asks for a run's colour once for the line, again for its name tag, its
+ramp numbers, its checkpoints and its comparison ring.
+
 ### Downloading demos
 
 There was no good way to see what existed. `surf_demise` has **9,104 runs on its main track**;
@@ -2078,7 +2155,7 @@ Everything goes to `wrlines_data\wrlines.log`, flushed on every line.
 ```
 build.bat           vcvars + cl.exe
 injector.cpp        -> wrinject.exe
-dllmain.cpp         entry point, per-frame ordering, INSERT hotkey
+dllmain.cpp         entry point, per-frame ordering, the hotkey thread
 wr_common.h         Vec3 / VMatrix / paths
 wr_log              log file + ring buffer for Diagnostics
 wr_pe               PE section walk -> "is this pointer code in that module"
@@ -2100,6 +2177,8 @@ wr_timer            the run clock
 wr_limit            the frame cap
 wr_extract          counting unextracted demos, and cmd_extract: the demo
                     walk, the work list, the progress lines, the failure record
+wr_peek             which map each demo is for, remembered on (path, size,
+                    mtime) so the work list is not six thousand file opens
 wr_mtv              the .mtv container and Valve-LZMA -- bytes, no floats
 wr_dp               the candidate scan, the dynamic program and the scoring.
                     NO WINDOWS HEADERS: the one place where "does this produce
@@ -2114,13 +2193,16 @@ wr_intogame         copies into the game's replay folder, and the manifest that
                     makes them the only thing removable from the panel
 wr_settings         one registration table, walked by both the reader and the
                     writer -- see "Settings, and where they live"
+wr_quick            the one-page panel on DELETE: legs, the top runs of one,
+                    and the tick -> fetch -> extract -> draw chain
 wr_matrixlife.h     when a chosen matrix has died -- pure logic, tested
 wr_pacing.h         when the next frame may be presented -- pure logic, tested
 wr_budget.h         gross gain/loss without counting noise -- pure logic, tested
 wr_stress.h         the air-strafing ceiling and efficiency -- pure logic, tested
-wr_ui               the panel
+wr_quick.h          the quick page's chain, as a decision -- pure logic, tested
+wr_ui               the full panel on INSERT
 tests\              standalone harnesses -- tests\build.bat builds and runs all
-                    ten. All but two link the real .cpp files, because the
+                    of them. Most link the real .cpp files, because the
                     defects they cover were in those files rather than in the
                     headers. test_live links the timer, the recorder, the zone
                     fit and the save-loc table together, because everything it

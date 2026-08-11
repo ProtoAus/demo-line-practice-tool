@@ -87,6 +87,49 @@ static int __cdecl ByName(const void *a, const void *b)
     return strcmp(((const WrMsmlMap *)a)->name, ((const WrMsmlMap *)b)->name);
 }
 
+// wrlines_data\tracks.txt. See the essay in wr_maps.h for why this is a second
+// file and not two more columns of maps.txt.
+//
+// Maps with neither a stage nor a bonus are LEFT OUT. Most of the catalogue is
+// single-track, so writing them all would triple the file to say "nothing" two
+// thousand times, and a name that is absent already means what an absent name
+// should mean. 2050 maps come to about 8 KB this way.
+static void WriteTracks(const WrMsmlMap *cat, int n)
+{
+    const char *path = WrDataPath("tracks.txt");
+    char tmp[MAX_PATH];
+    _snprintf_s(tmp, sizeof(tmp), _TRUNCATE, "%s.tmp", path);
+
+    FILE *f = NULL;
+    if (fopen_s(&f, tmp, "w") != 0 || !f)
+    {
+        WrLogf("[!] maps: could not write %s", tmp);
+        return;
+    }
+
+    fprintf(f, "# WrLines track index, from the game's own _cache. No network.\n");
+    fprintf(f, "# Maps with no stages and no bonuses are omitted.\n");
+    fprintf(f, "# name\tstages\tbonuses\n");
+    int written = 0;
+    for (int i = 0; i < n; i++)
+    {
+        if (!cat[i].stages && !cat[i].bonuses)
+            continue;
+        fprintf(f, "%s\t%d\t%d\n", cat[i].name, (int)cat[i].stages,
+                (int)cat[i].bonuses);
+        written++;
+    }
+
+    if (fclose(f) != 0 || !MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING))
+    {
+        WrLogf("[!] maps: could not replace %s", path);
+        DeleteFileA(tmp);
+        return;
+    }
+    WrLogf("maps: %d of %d maps have stages or bonuses -> %s", written, n, path);
+    WrMapsTracksReload();
+}
+
 int WrMapsWriteIndex(const char *gameDir, WrMapsEmitFn emit)
 {
     char msg[256];
@@ -162,6 +205,12 @@ int WrMapsWriteIndex(const char *gameDir, WrMapsEmitFn emit)
                 m->approved ? 1 : 0, modes);
     }
     bool wrote = (fclose(f) == 0);
+
+    // The second file, out of the same pass. Silent by design -- it emits
+    // nothing, so `wrextract --index-maps` prints exactly what it printed
+    // before -- and its failure is logged rather than fatal, because a missing
+    // tracks.txt costs the quick menu a guess and costs the map index nothing.
+    WriteTracks(cat, n);
     free(cat);
 
     if (!wrote || !MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING))
@@ -271,6 +320,136 @@ int WrMapsFind(const char *name)
         if (_stricmp(g_maps[i].name, name) == 0)
             return i;
     return -1;
+}
+
+// ---------------------------------------------------------------------------
+// tracks.txt
+// ---------------------------------------------------------------------------
+//
+// Read once, lazily, into a flat array. It is a few thousand rows of two small
+// numbers, so a linear search is a few microseconds and happens when the map
+// changes rather than per frame -- an index would be more code than the whole
+// file for no measurable difference.
+//
+// Its own lock, deliberately not g_cs: this is read from the render thread while
+// the map index's background reader may be holding that one, and one lock across
+// two unrelated tables is how a UI thread ends up waiting on a directory walk.
+
+struct TrackRow { char name[72]; unsigned char stages, bonuses; };
+
+static TrackRow *g_tracks = NULL;
+static int g_trackCount = 0;
+static bool g_tracksRead = false;
+static CRITICAL_SECTION g_trackCs;
+static volatile LONG g_trackCsInit = 0;
+
+static void EnsureTrackCs(void)
+{
+    if (g_trackCsInit == 2)
+        return;
+    if (InterlockedCompareExchange(&g_trackCsInit, 1, 0) == 0)
+    {
+        InitializeCriticalSection(&g_trackCs);
+        InterlockedExchange(&g_trackCsInit, 2);
+        return;
+    }
+    while (g_trackCsInit != 2)
+        Sleep(0);
+}
+
+// Caller holds the lock.
+static void LoadTracksLocked(void)
+{
+    free(g_tracks);
+    g_tracks = NULL;
+    g_trackCount = 0;
+    g_tracksRead = false;
+
+    FILE *f = NULL;
+    if (fopen_s(&f, WrDataPath("tracks.txt"), "r") != 0 || !f)
+        return;
+
+    int cap = 256;
+    TrackRow *rows = (TrackRow *)malloc(sizeof(TrackRow) * (size_t)cap);
+    int n = 0;
+
+    char line[256];
+    while (rows && fgets(line, sizeof(line), f))
+    {
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r')
+            continue;
+        char name[72] = {0};
+        int stages = 0, bonuses = 0;
+        if (sscanf_s(line, "%71[^\t]\t%d\t%d", name, (unsigned)sizeof(name),
+                     &stages, &bonuses) < 3)
+            continue;
+        if (!name[0])
+            continue;
+        if (n == cap)
+        {
+            cap *= 2;
+            TrackRow *bigger = (TrackRow *)realloc(rows, sizeof(TrackRow) * (size_t)cap);
+            if (!bigger)
+                break;
+            rows = bigger;
+        }
+        strcpy_s(rows[n].name, sizeof(rows[n].name), name);
+        rows[n].stages = (unsigned char)(stages < 0 ? 0 : stages > 255 ? 255 : stages);
+        rows[n].bonuses = (unsigned char)(bonuses < 0 ? 0 : bonuses > 255 ? 255 : bonuses);
+        n++;
+    }
+    fclose(f);
+
+    g_tracks = rows;
+    g_trackCount = rows ? n : 0;
+    g_tracksRead = true;
+}
+
+void WrMapsTracksReload(void)
+{
+    EnsureTrackCs();
+    EnterCriticalSection(&g_trackCs);
+    LoadTracksLocked();
+    LeaveCriticalSection(&g_trackCs);
+}
+
+bool WrMapsTracksKnown(void)
+{
+    EnsureTrackCs();
+    EnterCriticalSection(&g_trackCs);
+    if (!g_tracksRead)
+        LoadTracksLocked();
+    bool known = g_tracksRead;
+    LeaveCriticalSection(&g_trackCs);
+    return known;
+}
+
+bool WrMapsTracksFor(const char *map, int *stages, int *bonuses)
+{
+    if (stages)  *stages = 0;
+    if (bonuses) *bonuses = 0;
+    if (!map || !*map)
+        return false;
+
+    EnsureTrackCs();
+    EnterCriticalSection(&g_trackCs);
+    if (!g_tracksRead)
+        LoadTracksLocked();
+
+    bool known = g_tracksRead;
+    for (int i = 0; i < g_trackCount; i++)
+    {
+        if (_stricmp(g_tracks[i].name, map) != 0)
+            continue;
+        if (stages)  *stages = g_tracks[i].stages;
+        if (bonuses) *bonuses = g_tracks[i].bonuses;
+        break;
+    }
+    LeaveCriticalSection(&g_trackCs);
+
+    // True means the FILE was read, not that this map was in it -- a
+    // single-track map is deliberately absent and 0/0 is its correct answer.
+    return known;
 }
 
 void WrMapsShutdown(void) {}

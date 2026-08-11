@@ -17,10 +17,12 @@ void WrUiOnMapChanged(const char *map);
 //   cycle / cycle back   the centre box's mode, Page Down and Page Up
 //   pick toggle          the "whose line is this" plate, Home
 //   overlay toggle       the corner block, End
+//   quick               the one-page panel, Delete
 int WrUiHudCycleKey(void);
 int WrUiHudCycleBackKey(void);
 int WrUiPickToggleKey(void);
 int WrUiOverlayToggleKey(void);
+int WrUiQuickKey(void);
 
 // A printable name for one of those, for the About page. "(unlisted)" if it is
 // not one of the bindable keys -- which a settings file edited by hand can be.

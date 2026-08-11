@@ -67,6 +67,45 @@ int WrMapsFind(const char *name);
 typedef void (*WrMapsEmitFn)(const char *line);
 int WrMapsWriteIndex(const char *gameDir, WrMapsEmitFn emit);
 
+// ---------------------------------------------------------------------------
+// How a map is cut up
+// ---------------------------------------------------------------------------
+//
+// wrlines_data\tracks.txt: one line per map, "name<TAB>stages<TAB>bonuses",
+// written by the same catalogue pass that writes maps.txt and read by the quick
+// menu to know which legs to offer.
+//
+// A SEPARATE FILE, and the reason is a promise maps.txt makes. That file is
+// byte-for-byte what wrpath_extract.py --index-maps wrote, and the reference is
+// frozen, so it cannot gain a column without the two implementations disagreeing
+// about a file they both write. tracks.txt is ours alone and there is nothing to
+// diverge from.
+//
+// WHY THE ANSWER IS NOT AVAILABLE ANYWHERE CHEAPER
+//
+// Nothing else knows which stages a map has until you have already asked for
+// them. The run store knows the legs you have extracted; the board cache knows
+// the legs you have fetched; the leaderboard API answers per leg rather than
+// listing them. So on a map you have never touched, every one of those sources
+// says "main", on a map that has nine stages -- and the quick menu would offer
+// you one chip and no way to find the other nine. The game's own catalogue has
+// the exact answer for all two thousand maps at once, offline, and the only
+// thing it costs is being read.
+//
+// Written silently by WrMapsWriteIndex: no progress line, nothing on stdout.
+
+// False when there is no tracks.txt, which is the ordinary state before the
+// catalogue has been read once. Leaves both counts at 0.
+bool WrMapsTracksFor(const char *map, int *stages, int *bonuses);
+
+// Has the file been read this session? For the one line the quick menu shows
+// when it is working from guesses rather than from the catalogue.
+bool WrMapsTracksKnown(void);
+
+// Re-read tracks.txt. Cheap -- it is a 60 KB fgets loop -- and called when the
+// catalogue pass finishes so the answer is not a restart away.
+void WrMapsTracksReload(void);
+
 void WrMapsShutdown(void);
 
 #endif // WR_MAPS_H

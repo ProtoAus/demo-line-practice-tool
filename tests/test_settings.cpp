@@ -31,6 +31,7 @@
 #include "wr_start.h"
 #include "wr_limit.h"
 #include "wr_profile.h"
+#include "wr_quick.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -68,6 +69,19 @@ void WrRenderDefaults(void)
     g_render.pickHoldSeconds = 0.35f;
     g_render.rankFullBehind = 25.0f;
     g_render.liveColour = 0xFF66FF66u;
+}
+
+// The same arrangement for the quick menu, and for the same reason: wr_quick.cpp
+// is a panel and pulls ImGui in behind it. The struct is real, so the three
+// quick.* registrations in wr_settings.cpp are still checked against the real
+// fields at compile time.
+WrQuickSettings g_quick;
+
+void WrQuickDefaults(void)
+{
+    memset(&g_quick, 0, sizeof(g_quick));
+    g_quick.top = WR_QUICK_TOP_DEFAULT;
+    g_quick.gamemode = 1;
 }
 
 // And the panel's own registration, which lives in wr_ui.cpp for the same

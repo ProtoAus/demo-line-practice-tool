@@ -46,6 +46,21 @@ struct WrRenderSettings
     // the panel. Turning on a second one silently did nothing, which is a poor
     // way for a checkbox to behave.
     int lineColour;             // WrLineColour
+
+    // Take the ends of the ramp from the runs actually on screen.
+    //
+    // The fixed pair below was 250..3500, and on a board's slow end that is
+    // mostly wasted: a learner's run lives between 400 and 1200, which is a
+    // fifth of the ramp, so every line comes out the same colour and the mode
+    // says nothing. Scaled to what is enabled on the leg being looked at, the
+    // ramp covers what those runs did.
+    //
+    // The user's own numbers are NOT overwritten. speedMin/speedMax and the two
+    // energy pairs stay exactly as the sliders left them, the derived values go
+    // in the use* fields below, and turning this off puts the sliders back by
+    // doing nothing at all.
+    bool autoScale;
+
     float speedMin, speedMax;
     float energyMin, energyMax;
     // WR_LINE_ENERGY_REL's own range. A separate pair, because the two modes
@@ -53,6 +68,18 @@ struct WrRenderSettings
     // absolute energy is a map coordinate in the thousands, and a relative one
     // sits either side of zero.
     float energyRelMin, energyRelMax;
+
+    // WHAT THE COLOUR PATH ACTUALLY READS. Not settings: derived, not persisted,
+    // and rewritten by WrRenderRefreshScales. Equal to the three pairs above
+    // whenever autoScale is off.
+    //
+    // A separate set rather than writing the scaled numbers back over the
+    // sliders, because a slider that moves on its own is a setting you can no
+    // longer hold: drag speedMax to 2000, tick another run, and the number you
+    // chose is gone with nothing to put it back.
+    float useSpeedMin, useSpeedMax;
+    float useEnergyMin, useEnergyMax;
+    float useEnergyRelMin, useEnergyRelMax;
 
     // Skip the pre-roll: start each line where the run starts rather than where
     // the recording does. See startIndex in wr_path.h -- there is roughly three
@@ -163,6 +190,23 @@ enum WrRankColour
 // run->colour goes through this, or the line changes colour and its labels do
 // not.
 unsigned int WrRunColour(const WrRun *run);
+
+// Recompute the use* ranges and every run's shownRank. Called once per frame
+// from WrRenderWorld; returns immediately unless something it depends on has
+// changed.
+//
+// A DIRTY STAMP, NOT A PER-FRAME PASS, and the reason is written into
+// wr_path.h: the renderer asks for a run's colour once for the line, again for
+// its name tag, its ramp numbers, its checkpoints and its comparison ring, and
+// a scan of the store per call was a real performance bug at a thousand runs.
+// The energy ranges need a pass over POINTS, which is heavier still. So this
+// watches the store generation, the enabled set, the colour mode and gravity,
+// and does nothing at all when none of them moved.
+void WrRenderRefreshScales(void);
+
+// Which colour range is live, for the on-screen key. Writes the pair the
+// current lineColour mode is actually using.
+void WrRenderColourRange(float *lo, float *hi, bool *scaled);
 
 // What a label on the line may say. Any combination; empty draws nothing.
 #define WR_LABEL_SPEED  (1u << 0)

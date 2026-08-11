@@ -1618,11 +1618,11 @@ static DWORD WINAPI NativeThread(LPVOID)
     return 0;
 }
 
-void WrExtractSubmit(const WrExtractRequest *req)
+bool WrExtractSubmit(const WrExtractRequest *req)
 {
     EnsureCs();
     if (!req || req->kind == WR_JOB_NONE)
-        return;
+        return false;
 
     // The latch is claimed BEFORE any work starts. It was written that way so a
     // ported verb and an unported one could share one slot, one Stop and one
@@ -1630,7 +1630,7 @@ void WrExtractSubmit(const WrExtractRequest *req)
     // shape is still right, because the failure paths below all have to end the
     // run through the same EndRun.
     if (InterlockedCompareExchange(&g_running, 1, 0) != 0)
-        return;
+        return false;
 
     int *ranks = NULL;
     if (req->rankCount > 0 && req->ranks)
@@ -1663,7 +1663,14 @@ void WrExtractSubmit(const WrExtractRequest *req)
     {
         Emit("could not start a worker thread");
         EndRun(1);
+        // True even so, and deliberately: the job was ACCEPTED and then ended,
+        // which is an outcome the caller learns about through the generation
+        // counter like any other. Returning false here would tell a state
+        // machine "the slot was busy, try again", and it would try again for
+        // ever against a machine that cannot make threads.
+        return true;
     }
+    return true;
 }
 
 void WrExtractRun(bool retryFailed)

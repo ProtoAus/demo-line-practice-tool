@@ -53,6 +53,31 @@ struct WrMsmlMap
     char name[72];
     int tier;                   // 0 when unrated, which is also null
     unsigned int modes;         // bit N set = a board exists in gamemode N
+
+    // How many legs the map is cut into: the highest trackNum this map lists a
+    // board for, per track type. 0 means it has none of that kind.
+    //
+    // The one thing here that is NOT in maps.txt, because maps.txt is compared
+    // byte for byte against what the reference wrote and cannot gain a column.
+    // It goes to wrlines_data\tracks.txt instead -- see WrMapsWriteTracks.
+    //
+    // WHY IT IS WORTH READING AT ALL
+    //
+    // "Which stages does this map have" has no cheap answer anywhere else. The
+    // run store only knows the legs you have already extracted, the board cache
+    // only the legs you have already fetched, and the leaderboard API answers
+    // per leg rather than listing them -- so a map you have never touched offers
+    // you the main track and nothing else, on a map with nine stages. The
+    // catalogue the game itself keeps on disk has the exact answer for every map
+    // at once, for free, offline. It was simply not being read out.
+    //
+    // A HIGHEST rather than a set, because Momentum numbers stages 1..N and
+    // bonuses 1..M with no gaps in anything seen. A map that breaks that would
+    // offer a leg with no runs on it, which is a wasted chip and not a wrong
+    // answer.
+    unsigned char stages;       // trackType 1
+    unsigned char bonuses;      // trackType 2
+
     bool approved;              // from the FILENAME, not the map. See below.
 };
 
