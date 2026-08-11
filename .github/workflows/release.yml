@@ -86,11 +86,24 @@ jobs:
                   -property installationPath
           $vc = "$vs\VC\Auxiliary\Build\vcvarsall.bat"
 
+          # -match and -notmatch against an ARRAY are filters, not tests: they
+          # return the elements that did or did not match. dumpbin's output is an
+          # array of lines, so `$lines -notmatch 'x'` is every line without an x
+          # in it -- hundreds of them, and a non-empty array is $true. The
+          # resource check below was written that way and therefore threw on
+          # every run, whatever the DLL contained. That is why nothing has been
+          # released since v0.4.5: this workflow arrived at v0.4.6 and has never
+          # once reached its own Publish step.
+          #
+          # The exports check reads the same way and passes for the opposite
+          # reason -- no line matches, so the filter returns empty, which is
+          # $false. It worked by accident. Both are written as an explicit
+          # "how many lines matched" now, so neither depends on that.
           $exports = cmd /c "call `"$vc`" x64 >nul && dumpbin /nologo /exports wrlines.dll"
-          if ($exports -match 'ordinal hint') { throw "wrlines.dll exports something. It must export nothing." }
+          if (@($exports -match 'ordinal hint').Count -gt 0) { throw "wrlines.dll exports something. It must export nothing." }
 
           $headers = cmd /c "call `"$vc`" x64 >nul && dumpbin /nologo /headers wrlines.dll"
-          if ($headers -notmatch 'Resource Directory') { throw "wrlines.dll has no version resource. See src\wrlines.rc." }
+          if (@($headers -match 'Resource Directory').Count -eq 0) { throw "wrlines.dll has no version resource. See src\wrlines.rc." }
 
           # WINHTTP.dll arrived at v0.6.0 with the leaderboard fetcher, and this
           # list, README.md, HOW TO USE.txt, src\wr_board.h, src\wr_http.h and
