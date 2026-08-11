@@ -1,6 +1,8 @@
 // wr_path.cpp  --  see wr_path.h.
 
 #include "wr_path.h"
+#include "wr_dp.h"
+#include "wr_extract.h"
 #include "wr_profile.h"
 #include "wr_stress.h"
 #include "wr_energy.h"
@@ -12,7 +14,9 @@
 #include <string.h>
 #include <math.h>
 
-// Must match write_wrpath() in wrpath_extract.py exactly.
+// The format, in three numbers. WrPathWrite below and LoadOne further down are
+// the only two things that know them, and they are the only two statements of
+// this format that exist.
 #define WRPATH_HEADER_BYTES 0x100
 #define WRPATH_POINT_BYTES 28
 #define WRPATH_MARKER_BYTES 36
@@ -86,6 +90,263 @@ static unsigned int Crc32(const unsigned char *data, size_t len)
     for (size_t i = 0; i < len; i++)
         c = table[(c ^ data[i]) & 0xFF] ^ (c >> 8);
     return c ^ 0xFFFFFFFFu;
+}
+
+// ---------------------------------------------------------------------------
+// Writing one
+// ---------------------------------------------------------------------------
+//
+// The reader is LoadOne, a couple of hundred lines below, and the offsets both
+// of them use are the three defines at the top of this file. That adjacency is
+// the whole reason the writer is here rather than in the extractor: the
+// reference implementation used to be the second statement of this format and
+// it has stopped shipping, so these two functions are now the only two, and two
+// halves of a format in two files drift.
+
+// The reference's _fixed(): encode to UTF-8, cut to size-1 bytes, NUL-pad.
+//
+// NOT strncpy, and the difference is not academic. The reference reads these
+// fields out of the demo with str.decode("utf-8", "replace") and writes them
+// back with str.encode("utf-8", "replace"), so any byte that is not valid UTF-8
+// has become U+FFFD -- three bytes, EF BF BD -- by the time it reaches the
+// file. That is reachable on real data: the player-name field in a .mtv is 32
+// bytes and the game truncates into it, so a name whose last character is a
+// multi-byte one arrives here cut in half. Copying the raw bytes would produce
+// a file that differs from the reference's in exactly those demos and nowhere
+// else, which is the worst possible shape for a difference to have.
+//
+// The truncation is applied to the ENCODED bytes and can therefore cut a
+// sequence in half itself. That is what the reference's slice does, so it is
+// what this does; the field is a label, not a string anybody parses.
+//
+// The error handling is CPython's, not "one U+FFFD per bad byte": an invalid
+// start byte consumes one, a bad continuation consumes as many as were valid,
+// and a sequence truncated by the end of the field consumes the whole
+// remainder. Emitting per byte would differ on precisely the truncated-emoji
+// case this exists for.
+
+static inline bool Utf8Cont(unsigned char c) { return (c & 0xC0) == 0x80; }
+
+// The length of the valid sequence at s, or minus the number of bytes CPython's
+// decoder would consume before emitting one replacement character.
+static int Utf8SeqLen(const unsigned char *s, size_t avail)
+{
+    const unsigned char c = s[0];
+    if (c < 0x80)
+        return 1;
+    if (c < 0xC2)
+        return -1;                      // continuation byte, or a fake 0000-007F
+    if (c < 0xE0)
+    {
+        if (avail < 2)
+            return -(int)avail;         // unexpected end of data
+        if (!Utf8Cont(s[1]))
+            return -1;
+        return 2;
+    }
+    if (c < 0xF0)
+    {
+        if (avail < 3)
+        {
+            if (avail < 2)
+                return -1;
+            if (!Utf8Cont(s[1]) || (s[1] < 0xA0 ? c == 0xE0 : c == 0xED))
+                return -1;
+            return -2;
+        }
+        if (!Utf8Cont(s[1]))
+            return -1;
+        if (c == 0xE0 && s[1] < 0xA0)
+            return -1;                  // overlong
+        if (c == 0xED && s[1] >= 0xA0)
+            return -1;                  // a surrogate, which is not valid UTF-8
+        if (!Utf8Cont(s[2]))
+            return -2;
+        return 3;
+    }
+    if (c < 0xF5)
+    {
+        if (avail < 4)
+        {
+            if (avail < 2)
+                return -1;
+            if (!Utf8Cont(s[1]) || (s[1] < 0x90 ? c == 0xF0 : c == 0xF4))
+                return -1;
+            if (avail < 3)
+                return -2;
+            if (!Utf8Cont(s[2]))
+                return -2;
+            return -3;
+        }
+        if (!Utf8Cont(s[1]))
+            return -1;
+        if (c == 0xF0 && s[1] < 0x90)
+            return -1;                  // overlong
+        if (c == 0xF4 && s[1] >= 0x90)
+            return -1;                  // past U+10FFFF
+        if (!Utf8Cont(s[2]))
+            return -2;
+        if (!Utf8Cont(s[3]))
+            return -3;
+        return 4;
+    }
+    return -1;                          // F5-FF: no valid sequence starts here
+}
+
+void WrPathFixedField(unsigned char *dst, int size, const char *src)
+{
+    memset(dst, 0, (size_t)size);
+    if (!src || size < 1)
+        return;
+
+    static const unsigned char kReplacement[3] = {0xEF, 0xBF, 0xBD};
+    const unsigned char *s = (const unsigned char *)src;
+    const size_t n = strlen(src);
+    const int cap = size - 1;           // always at least one NUL
+    size_t i = 0;
+    int w = 0;
+
+    // Stopping at `cap` rather than encoding it all and slicing gives the same
+    // bytes: the encoding of a prefix is a prefix of the encoding.
+    while (i < n && w < cap)
+    {
+        int seq = Utf8SeqLen(s + i, n - i);
+        if (seq > 0)
+        {
+            for (int k = 0; k < seq && w < cap; k++)
+                dst[w++] = s[i + (size_t)k];
+            i += (size_t)seq;
+        }
+        else
+        {
+            for (int k = 0; k < 3 && w < cap; k++)
+                dst[w++] = kReplacement[k];
+            i += (size_t)(-seq);
+        }
+    }
+}
+
+static void PutU32(unsigned char *p, unsigned int v) { memcpy(p, &v, 4); }
+static void PutF32(unsigned char *p, float v) { memcpy(p, &v, 4); }
+static void PutF64(unsigned char *p, double v) { memcpy(p, &v, 8); }
+
+long long WrPathWrite(const WrPathWriteArgs *a, char *err, int errCap)
+{
+    const size_t bodyBytes = (size_t)a->pointCount * WRPATH_POINT_BYTES
+                           + (size_t)a->markerCount * WRPATH_MARKER_BYTES;
+    const size_t total = (size_t)WRPATH_HEADER_BYTES + bodyBytes + 4;
+
+    // calloc, because the header is mostly gaps -- 0x20..0x23 between the run
+    // time and the SteamID, and 0xFB -- and those gaps are covered by the CRC.
+    unsigned char *blob = (unsigned char *)calloc(total, 1);
+    if (!blob)
+    {
+        _snprintf_s(err, (size_t)errCap, _TRUNCATE,
+                    "out of memory writing %d points", a->pointCount);
+        return -1;
+    }
+
+    memcpy(blob, "WRPATH\0\0", 8);
+    PutU32(blob + 0x08, 1);                     // WRPATH_VERSION
+    PutU32(blob + 0x0C, a->flags);
+    PutU32(blob + 0x10, (unsigned int)a->pointCount);
+    PutU32(blob + 0x14, (unsigned int)a->markerCount);
+    PutF32(blob + 0x18, a->tickInterval);
+    PutF64(blob + 0x1C, a->runTime);
+    memcpy(blob + 0x24, &a->steamid64, 8);
+    memcpy(blob + 0x2C, &a->dateMs, 8);
+    WrPathFixedField(blob + 0x34, 64, a->map);
+    WrPathFixedField(blob + 0x74, 40, a->mapHash);
+    WrPathFixedField(blob + 0x9C, 40, a->srcSha1);
+    WrPathFixedField(blob + 0xC4, 32, a->player);
+    PutF32(blob + 0xE4, 1.0f);                  // captureTimescale (n/a offline)
+
+    // 0xE8 and 0xEC were minSampleDist and minSampleAngleDeg: written as 0.0
+    // since the format existed and never read by anything. Zero across all 1735
+    // .wrpath files on the development machine, which is what makes claiming
+    // them free -- an older file reads 0 here, and 0 already means "no start
+    // recorded". So this needs no version bump and no branch in LoadOne, whose
+    // version check is a hard reject with no migration path.
+    PutU32(blob + 0xE8, a->startOk ? a->startIndex : 0u);
+    PutU32(blob + 0xEC, a->startOk ? 1u : 0u);  // START_FLAG_FOUND
+    PutF32(blob + 0xF0, 0.0f);                  // eyeHeightOffset: true origin
+    PutU32(blob + 0xF4, (unsigned int)WrNowEpoch());
+    blob[0xF8] = a->gamemode;
+    blob[0xF9] = a->trackType;
+    blob[0xFA] = a->trackNum;
+    PutU32(blob + 0xFC, WR_EXTRACTOR_REVISION);
+
+    unsigned char *p = blob + WRPATH_HEADER_BYTES;
+    const double dt = (double)a->tickInterval;
+    for (int i = 0; i < a->pointCount; i++)
+    {
+        const WrDpPoint *pt = &a->points[i];
+        // t is index * tick_interval in DOUBLE and then rounded once, on the
+        // way into the file. Accumulating a float would drift.
+        float v[7] = {
+            (float)pt->x, (float)pt->y, (float)pt->z,
+            (float)pt->vx, (float)pt->vy, (float)pt->vz,
+            (float)((double)i * dt)
+        };
+        memcpy(p, v, sizeof(v));
+        p += WRPATH_POINT_BYTES;
+    }
+    for (int i = 0; i < a->markerCount; i++)
+    {
+        const WrPathWriteMarker *m = &a->markers[i];
+        memcpy(p + 0, &m->pointIndex, 4);
+        memcpy(p + 4, &m->segment, 2);
+        memcpy(p + 6, &m->minorNum, 2);
+        memcpy(p + 8, &m->timeReached, 8);
+        float mv[4] = {m->vx, m->vy, m->vz, m->maxSpeed};
+        memcpy(p + 16, mv, sizeof(mv));
+        // p + 32 is the four pad bytes, already zero from the calloc.
+        p += WRPATH_MARKER_BYTES;
+    }
+
+    PutU32(blob + total - 4, Crc32(blob, total - 4));
+
+    char tmp[MAX_PATH];
+    _snprintf_s(tmp, sizeof(tmp), _TRUNCATE, "%s.tmp", a->outPath);
+
+    char dir[MAX_PATH];
+    strcpy_s(dir, sizeof(dir), a->outPath);
+    char *slash = strrchr(dir, '\\');
+    if (slash)
+    {
+        *slash = '\0';
+        WrMakeTree(dir);
+    }
+
+    FILE *f = NULL;
+    if (fopen_s(&f, tmp, "wb") != 0 || !f)
+    {
+        _snprintf_s(err, (size_t)errCap, _TRUNCATE, "cannot write %s", tmp);
+        free(blob);
+        return -1;
+    }
+    const size_t put = fwrite(blob, 1, total, f);
+    fclose(f);
+    free(blob);
+    if (put != total)
+    {
+        DeleteFileA(tmp);
+        _snprintf_s(err, (size_t)errCap, _TRUNCATE,
+                    "short write to %s (%zu of %zu bytes)", tmp, put, total);
+        return -1;
+    }
+
+    // os.replace: atomic, so a reader never sees half a file and a Stop never
+    // leaves one behind.
+    if (!MoveFileExA(tmp, a->outPath, MOVEFILE_REPLACE_EXISTING))
+    {
+        DWORD e = GetLastError();
+        DeleteFileA(tmp);
+        _snprintf_s(err, (size_t)errCap, _TRUNCATE,
+                    "cannot replace %s (error %lu)", a->outPath, e);
+        return -1;
+    }
+    return (long long)total;
 }
 
 // ---------------------------------------------------------------------------

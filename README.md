@@ -25,11 +25,10 @@ Step 7 also picks up whatever demos the game had already downloaded by itself, s
 pressing even if you skip step 6. When there is nothing new to do it reads **Re-run extractor**
 instead — same button.
 
-> **Extracting** still needs **Python** (`py.exe`, `python.exe` or `python3.exe` on `PATH`) —
-> step 7 runs through `wrpath_extract.py`, which ships next to the DLL. The panel tells you
-> which interpreter it found, or that it found none. This is being folded into the DLL a piece
-> at a time and the requirement will go away; as of v0.6.1 the map list, the leaderboard and
-> **downloading demos** are all the DLL's own work, so steps 1–6 need no Python at all.
+> **Nothing else to install.** Up to v0.6.1 that last step needed Python, because it ran through a
+> `wrpath_extract.py` that shipped beside the DLL. As of **v0.7.0 it does not** — extraction runs
+> inside `wrlines.dll` on a pool of background threads, the script is gone from the download, and
+> the zip is two binaries and two text files.
 
 ---
 
@@ -110,7 +109,7 @@ built by a public GitHub Actions runner from a tagged commit, with a
 [build provenance attestation](https://github.com/ProtoAus/demo-line-practice-tool/attestations):
 
 ```
-gh attestation verify demo-line-practice-tool-v0.6.1.zip --repo ProtoAus/demo-line-practice-tool
+gh attestation verify demo-line-practice-tool-v0.7.0.zip --repo ProtoAus/demo-line-practice-tool
 ```
 
 VirusTotal for the current release: *(added at tag time)*
@@ -155,10 +154,9 @@ What replaced it is smaller but still checkable in a couple of minutes:
 - **Never on its own.** Nothing here runs on a timer, at startup, or on a map change. Every request
   is downstream of a button press.
 
-From v0.6.1 that is the whole of it. Demos used to be downloaded by `wrpath_extract.py`; they are
-now fetched through the same one file, from the download link the leaderboard reply itself
-contained. Nothing else in the project reaches the network at all — the script that remains does
-extraction, and extraction reads files.
+From v0.6.1 that is the whole of it, and from **v0.7.0 there is nothing else in the project at
+all**: the last thing the Python script did was extraction, extraction reads files off your disk,
+and it now happens inside the DLL. `wrpath_extract.py` is not in the download.
 
 Everything it creates lives in a `wrlines_data` folder next to the DLL. Nothing is written into your
 game install unless you press **send**, **local** or **watch** on a run — those copy one demo into
@@ -184,9 +182,14 @@ files that decide what a run path *contains* rather than fifty that draw a panel
 archive's SHA-256 and what each build option switches off, so you can diff them against upstream
 yourself.
 
-The C++ is in [src/](src/), the harnesses in [tests/](tests/), and everything that talks to the
-network is in [wrpath_extract.py](wrpath_extract.py). Both `.bat` files run from the repo root and
-put their output there.
+The C++ is in [src/](src/) and the harnesses in [tests/](tests/). Both `.bat` files run from the
+repo root and put their output there.
+
+`wrpath_extract.py` is still in the tree, under [tests/reference/](tests/reference/), and it is
+not shipped. It was the whole program once; it is now the oracle the port is checked against,
+the specification for what a `.wrpath` contains, and the way to answer "did the C++ get this
+wrong, or is this demo simply unextractable". [tests/parity.ps1](tests/parity.ps1) runs the two
+against each other over a real library and compares the files byte for byte.
 
 ## How it works
 

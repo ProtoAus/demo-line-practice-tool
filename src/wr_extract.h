@@ -5,6 +5,11 @@
 // you had never processed -- you found out by seeing fewer lines than you
 // expected.
 //
+// Both halves live in the DLL now. There is no wrpath_extract.py in the release
+// zip, no interpreter to find, and no child process: pressing the button starts
+// a worker pool inside the game, which is what wr_jobs.h is about and why it
+// carries a longer essay than its two hundred lines would suggest.
+//
 // Two halves:
 //
 //   COUNTING is done here, in C, and is exact rather than a guess. Two facts
@@ -40,20 +45,38 @@
 //
 // Extraction, the map index, a board fetch and a demo fetch are four different
 // jobs, but to the panel they are one: the same output pane, the same Stop
-// button, the same "something is running" disable. So there is one latch, and it
-// is claimed BEFORE the backend is chosen. That is what lets a job that has been
-// ported to C and a job that is still a python child share this file while the
-// port is in progress -- see NativeHandles() in the .cpp, which is the only
-// place that knows how far the port has got.
+// button, the same "something is running" disable. So there is one latch, and
+// it is claimed BEFORE any work starts. That shape was built so a ported verb
+// and an unported one could share this file while the port was in progress; it
+// is still right, because every failure path has to end the run through the
+// same EndRun or the panel is left with an error and no full stop.
 
 #ifndef WR_EXTRACT_H
 #define WR_EXTRACT_H
 
 #include "wr_common.h"
 
-// Must match EXTRACTOR_REVISION in wrpath_extract.py. A recorded failure from a
-// different revision is ignored here, which reports the demo as unprocessed --
-// the safe direction, since the worst case is offering to redo work.
+// Bumped whenever anything that decides whether a demo can be extracted
+// changes.
+//
+// Failures are recorded per map, in paths\<map>\_failed.txt, so that re-running
+// a map costs seconds instead of minutes -- surf_colin_blaster_69000 has 66
+// demos that all fail, and re-deriving that takes four and a half minutes every
+// time. The record carries this number, and a record written by a different
+// revision is ignored, so improving the extractor automatically retries
+// everything it previously gave up on. Nobody has to remember to delete a file.
+//
+// It is also stamped into every .wrpath at offset 0xFC, which means bumping it
+// does not only retry the recorded failures: it marks everything already
+// written as out of date, so a fix that changes what gets extracted actually
+// reaches the files that were extracted wrongly. Without that, the 75
+// surf_colin_blaster_69000 runs produced under the old +-16384 world limit
+// would have been skipped for ever as "already done", which is exactly what
+// they looked like -- present, and mostly wrong.
+//
+// 3: records where the RUN starts, matched against the demo's own
+//    effectiveStartVelocity. Every file written before this one has a zero
+//    there, which reads as "unknown" and falls back to the DLL's own estimate.
 #define WR_EXTRACTOR_REVISION 3
 
 // ---------------------------------------------------------------------------
@@ -112,13 +135,38 @@ struct WrExtractRequest
 {
     WrJobKind kind;
 
+    // Where the game is installed. "" means WrGameDir(), which is how the DLL
+    // always leaves it: it works the answer out from the path of the running
+    // executable, which inside the game is exactly right.
+    //
+    // It is NOT right for tests\wrextract.exe, whose running executable is
+    // itself -- and finding that out cost a parity run. The port silently
+    // walked a game tree that did not exist, found only the demos under
+    // wrlines_data, and reported a clean extraction of the wrong set. A field
+    // that is empty in the shipped path and filled in by the front end that
+    // needs it is the difference between "the same code" and "the same code
+    // looking somewhere else".
+    char gameDir[MAX_PATH];
+
     char map[72];                   // "" means "the map you are standing in"
     int mapId;
     int gamemode, trackType, trackNum;
 
     // EXTRACT
+    //
+    // The panel only ever sets three of these. The rest exist because
+    // tests\wrextract.exe drives the same function with the reference's own
+    // flag surface, which is what lets tests\parity.ps1 run one argv against
+    // both implementations -- and a request the console front end can express
+    // but the panel cannot is not a second code path, it is the same one with
+    // different numbers in it.
     bool retryFailed;
+    bool skipExisting;              // the panel: always. --file: never.
+    bool verify;                    // compute everything, write nothing
     int timeoutSeconds;             // 0 for no limit
+    int jobs;                       // 0 decides; 1 is serial and comparable
+    int limit;                      // 0 for all of them
+    char file[MAX_PATH];            // one demo, whatever is known about it
 
     // BOARD
     WrBoardFetchMode boardMode;
@@ -139,6 +187,16 @@ struct WrExtractRequest
 // bounded only by how big a board is, and the old 64-pick limit existed solely
 // because the selection travelled on a command line.
 void WrExtractSubmit(const WrExtractRequest *req);
+
+// The same work, synchronously, on the calling thread: no latch, no thread, no
+// panel, and the exit code as a return value.
+//
+// This is the seam that makes the port checkable from outside the game.
+// WrExtractSubmit is this plus the one slot; tests\wrextract.exe is this plus
+// stdout, which is how one argv can be run against both implementations and
+// their output diffed line for line. A console front end with its own copy of
+// the dispatch would agree with itself and say nothing about what ships.
+int WrExtractRunRequest(const WrExtractRequest *req);
 
 // Extraction for the current map -- the two buttons on the Runs tab. retryFailed
 // is the only way to make it reconsider the recorded failures.
@@ -195,26 +253,29 @@ const char *WrExtractLine(int i);
 typedef void (*WrEmitFn)(const char *line);
 void WrExtractSetEmit(WrEmitFn fn);
 
-// What we know about the backend -- which interpreter was found, or why none
-// was. Shown under the buttons when nothing has run yet.
+// One line for under the buttons when nothing has run yet. It used to name the
+// Python interpreter that had been found, or say why none had been; there is
+// nothing left to look for.
 const char *WrExtractStatus(void);
 
-void WrExtractShutdown(void);
+// ---------------------------------------------------------------------------
+// Walking the demos
+// ---------------------------------------------------------------------------
 
-// Build the argv the python backend would be launched with, for
-// tests\test_seam.exe.
+// Every .mtv the extractor would consider, in the reference's iter_demos order:
+// the game's momtv\online tree, then momtv\local, then the demos --fetch put
+// under wrlines_data. Within a directory its FILES come first and its
+// subdirectories after, which is os.walk's order and not the obvious one.
 //
-// Here rather than in the harness because the point is to prove that a typed
-// request produces EXACTLY the command line the call sites used to format by
-// hand. A harness with its own copy of the formatting would agree with itself
-// and say nothing about what ships.
-//
-// Writes only the trailing flags -- the part that used to be the `extraArgs`
-// argument -- because everything before it (interpreter path, script path, game
-// directory) varies per machine and was never in doubt. Returns false if the
-// request cannot be expressed, which after the port is complete will be every
-// request; this function and the backend behind it go at the same time.
-bool WrExtractTestPythonArgs(const WrExtractRequest *req, char *out, int cap,
-                             bool *needsMap);
+// Exposed for tests\wrextract.exe's --dump-info, which selects the same demos
+// by a different rule. One walker, because two would be two chances to disagree
+// about which demos a parity run actually covered.
+typedef void (*WrDemoWalkFn)(void *user, const char *path, long long size);
+void WrExtractWalkDemos(const char *gameDir, WrDemoWalkFn visit, void *user);
+
+// There is no WrExtractShutdown. It was an empty body with no call sites, and
+// the move in-process is exactly when it looked like it should acquire one --
+// see the note in the .cpp for why the answer is still nothing, and why a
+// function with a body and no reachable caller would be worse than its absence.
 
 #endif // WR_EXTRACT_H

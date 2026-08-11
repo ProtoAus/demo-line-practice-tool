@@ -1,6 +1,30 @@
 #!/usr/bin/env python3
 # wrpath_extract.py  --  Momentum Mod ".mtv" run demo  ->  ".wrpath" path cache.
 #
+# FROZEN AT EXTRACTOR_REVISION 3, AND NOT SHIPPED ANY MORE.
+#
+#   Up to v0.6.1 this was the offline half of WrLines and it went out in the
+#   release zip, which is why the tool needed Python on PATH to draw anything.
+#   From v0.7.0 all of it runs inside wrlines.dll -- see src\wr_dp.cpp,
+#   src\wr_demo.cpp, src\wr_jobs.cpp and the writer in src\wr_path.cpp -- and
+#   this file moved here, under tests\, where it is not a dependency of
+#   anything a user runs.
+#
+#   It is kept, rather than deleted, because it is three things the port is
+#   not. It is the ORACLE: tests\parity.ps1 runs both implementations over
+#   every demo on the machine and requires byte-identical output, and a port
+#   with no reference to check against is a port nobody can check. It is the
+#   SPECIFICATION: where the two disagree about what a .wrpath contains, this
+#   file is right by definition. And it is the BISECTION TOOL for the only
+#   question a bug report can ask here -- "did the C++ get this wrong, or is
+#   this demo simply not extractable" -- which no amount of reading the C++
+#   can answer on its own.
+#
+#   So: do not fix bugs in this file. A behaviour changed here is a behaviour
+#   the port no longer matches, and the next parity run reports it as the
+#   port's fault. If something here is wrong, it is wrong in both, and the
+#   place to argue about it is the port.
+#
 # WrLines draws other players' run paths as lines in the world while you play.
 # This script is the offline half: it reads the demos the game already downloaded
 # and writes a small binary path file that wrlines.dll loads and draws. The DLL

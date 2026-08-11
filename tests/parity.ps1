@@ -92,7 +92,7 @@ param(
     [string]$Game,
 
     # Which comparison to run.
-    [ValidateSet("body", "board", "fetch")]
+    [ValidateSet("body", "board", "fetch", "extract", "budget")]
     [string]$Verb = "body",
 
     # Where the two outputs are written and compared. Somewhere with room for
@@ -117,6 +117,12 @@ param(
     # fetching. Lower this on a quiet map.
     [int]$FetchRank = 200,
 
+    # -Verb extract: how many workers each side uses. 1 is the comparable one
+    # -- both implementations then process demos in iteration order and print a
+    # line each, so stdout can be diffed line for line. 0 lets each side decide,
+    # which is faster and compares stdout as a multiset instead.
+    [int]$Jobs = 1,
+
     # -Verb board: fetch the API again even if a recording is already there.
     # Off by default, because a recording is reusable for ever and re-recording
     # is the only part of this that costs somebody else anything.
@@ -134,7 +140,14 @@ param(
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $exe = Join-Path $root "tests\wrextract.exe"
-$ref = Join-Path $root "wrpath_extract.py"
+
+# The reference lives under tests\reference\ from v0.7.0. It sat at the repo
+# root for as long as it was the thing that shipped; it is now the oracle this
+# script drives, so it sits with the harness that drives it. Moving it does not
+# change where it RUNS -- every verb copies it into the staging directory,
+# because DEFAULT_OUT and its third demo tree are derived from the directory the
+# script is in, and both sides have to agree on what is on disk.
+$ref = Join-Path $root "tests\reference\wrpath_extract.py"
 
 foreach ($needed in @($exe, $ref)) {
     if (-not (Test-Path $needed)) {
@@ -729,6 +742,380 @@ if ($Verb -eq "fetch") {
     Write-Host ""
     if ($mismatch -gt 0) { Write-Host "=== PARITY FAILED ==="; exit 1 }
     Write-Host "=== parity holds ==="
+    exit 0
+}
+
+# ---------------------------------------------------------------------------
+# -Verb extract   --   the release gate
+# ---------------------------------------------------------------------------
+#
+# The whole extractor, both implementations, over real demos, compared as
+# files. This is the one that decides whether the port ships, because the
+# cutover is straight: wrpath_extract.py stops being installed in the same tag
+# that turns native extraction on, and there is no switch to put it back.
+#
+# WHY BOTH SIDES RUN FROM A STAGING DIRECTORY
+#
+# The reference derives two of its three paths from the SCRIPT'S OWN directory
+# and not from --out:
+#
+#     DEFAULT_OUT = <script dir>\wrlines_data\paths
+#     iter_demos' third tree = <script dir>\wrlines_data\demos
+#
+# So no value of --out can move the demo tree, and running the reference in
+# place would make it read the working copy of wrlines_data -- while the port,
+# whose WrDataPath is relative to its own .exe, read a different one. The two
+# would then be comparing different sets of demos and agreeing about it.
+#
+# The fix is to give both sides the same home: copy the .py and the .exe into a
+# scratch directory and run them there. Then DEFAULT_OUT and WrDataPath are the
+# same place, --out separates the two outputs, and neither side can see the
+# working tree at all.
+#
+# The demo tree is reached through a DIRECTORY JUNCTION rather than a copy --
+# there are two gigabytes of demos and copying them would be the slowest part of
+# the run by an order of magnitude. Both sides walk it transparently: os.walk
+# only refuses to descend into a link it FINDS, and this one is the root it is
+# handed. The junction is removed before the staging directory is, so nothing
+# can delete through it.
+#
+# WHAT IS COMPARED
+#
+#   every .wrpath      byte for byte, both directions, so a file only one side
+#                      wrote is a failure and not an absence
+#   every _failed.txt  byte for byte, including the reason strings -- a record
+#                      with a different reason reads as a different failure and
+#                      would be re-derived for ever
+#   stdout             at --jobs 1, line for line after the two wall-clock
+#                      fields are blanked. At --jobs 0 the order is whatever the
+#                      pool produced, so it is compared as a sorted multiset
+#                      instead, which still catches a line that differs in
+#                      anything but position -- and with the "[i/n]" completion
+#                      counter blanked as well, because above one worker that
+#                      number is not a property of either implementation. See
+#                      Normalise. The n is still compared.
+#
+# WRLINES_FAKE_NOW is set on both sides. The .wrpath header carries a timestamp
+# at 0xF4 and the CRC covers it, so without pinning the clock two runs of the
+# SAME implementation differ and the comparison needs a tool that knows to skip
+# four bytes and recompute a checksum -- one more thing that can be wrong.
+#
+#     tests\parity.ps1 -Game "..." -Verb extract -Map surf_demise
+#     tests\parity.ps1 -Game "..." -Verb extract -Jobs 0        # the whole library
+
+if ($Verb -eq "extract") {
+    Write-Host ""
+    Write-Host "=== wrlines parity: extraction ==="
+    Write-Host "  reference   $ref"
+    Write-Host "  python      $pyVersion"
+    Write-Host "  port        $exe"
+    Write-Host "  game        $Game"
+    if ($Map) { Write-Host "  map         $Map" } else { Write-Host "  map         (every map)" }
+    Write-Host "  jobs        $Jobs"
+
+    $stage    = Join-Path $Work "stage"
+    $stageDat = Join-Path $stage "wrlines_data"
+    $stageJn  = Join-Path $stageDat "demos"
+    $refOut   = Join-Path $stage "ref"
+    $natOut   = Join-Path $stageDat "paths"
+    $ourDemos = Join-Path $root "wrlines_data\demos"
+
+    # --- put the staging directory back, whatever happened last time ---------
+    if (Test-Path $stageJn) { cmd /c rmdir "$stageJn" | Out-Null }
+    if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+    New-Item -ItemType Directory -Force -Path $stageDat | Out-Null
+
+    Copy-Item -Force $exe (Join-Path $stage "wrextract.exe")
+    Copy-Item -Force $ref (Join-Path $stage "wrpath_extract.py")
+    $stageExe = Join-Path $stage "wrextract.exe"
+    $stagePy  = Join-Path $stage "wrpath_extract.py"
+
+    # The fetched-demo tree, read-only, through a link. Skipped if this machine
+    # has never fetched anything -- and said out loud, because a run that only
+    # covered the game's own tree covered two thirds of the corpus.
+    if (Test-Path $ourDemos) {
+        cmd /c mklink /J "$stageJn" "$ourDemos" | Out-Null
+        if (-not (Test-Path $stageJn)) {
+            Write-Host "[!] could not link $ourDemos into the staging directory"
+            exit 2
+        }
+        $fetched = @(Get-ChildItem -Path $ourDemos -Recurse -Filter *.mtv -File).Count
+        Write-Host "  demos       $fetched fetched (linked, read only)"
+    } else {
+        Write-Host "  demos       none fetched; the game's own tree only"
+    }
+
+    $env:WRLINES_FAKE_NOW = "1700000000"
+
+    $common = @("--game", $Game, "--skip-existing", "--timeout", "0",
+                "--jobs", "$Jobs")
+    if ($Map)   { $common += @("--map", $Map) } else { $common += "--all" }
+    if ($Limit -gt 0) { $common += @("--limit", "$Limit") }
+
+    # --- run the reference ----------------------------------------------------
+    #
+    # Captured with *> rather than raw bytes, which is safe here for a reason
+    # worth writing down: cmd_extract's output is ASCII by construction. It
+    # prints demo file names -- hex, or the game's own ASCII names for local
+    # recordings -- and reason strings, and never a player alias. The board and
+    # fetch verbs, which DO print aliases, compare bytes instead.
+    Write-Host ""
+    Write-Host "  reference running..."
+    $swR = [System.Diagnostics.Stopwatch]::StartNew()
+    $refLog = Join-Path $Work "extract-ref.txt"
+    & $Python -3 $stagePy @common --out $refOut *> $refLog
+    $refCode = $LASTEXITCODE
+    $swR.Stop()
+    Write-Host ("  reference   exit {0}, {1:n0}s" -f $refCode, $swR.Elapsed.TotalSeconds)
+
+    # --- and the port ---------------------------------------------------------
+    Write-Host "  port running..."
+    $swP = [System.Diagnostics.Stopwatch]::StartNew()
+    $natLog = Join-Path $Work "extract-port.txt"
+    & $stageExe @common *> $natLog
+    $natCode = $LASTEXITCODE
+    $swP.Stop()
+    Write-Host ("  port        exit {0}, {1:n0}s" -f $natCode, $swP.Elapsed.TotalSeconds)
+
+    $env:WRLINES_FAKE_NOW = $null
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add("wrlines parity: extraction")
+    $lines.Add("python: $pyVersion")
+    $lines.Add("game:   $Game")
+    $lines.Add("map:    $(if ($Map) { $Map } else { '(all)' })")
+    $lines.Add("jobs:   $Jobs")
+    $lines.Add("")
+
+    $problems = 0
+
+    if ($refCode -ne $natCode) {
+        $problems++
+        $lines.Add("EXITCODE`tref $refCode`tport $natCode")
+    }
+
+    # --- the files ------------------------------------------------------------
+    #
+    # Both directions. A .wrpath only one side wrote is the most interesting
+    # possible difference -- it means the two disagreed about whether a demo is
+    # extractable at all -- so it is a failure and not an absence.
+    function Relative([string]$root, [string]$full) {
+        return $full.Substring($root.Length).TrimStart('\')
+    }
+
+    $refFiles = @{}
+    $natFiles = @{}
+    if (Test-Path $refOut) {
+        foreach ($f in Get-ChildItem -Path $refOut -Recurse -File) {
+            $refFiles[(Relative $refOut $f.FullName)] = $f.FullName
+        }
+    }
+    if (Test-Path $natOut) {
+        foreach ($f in Get-ChildItem -Path $natOut -Recurse -File) {
+            $natFiles[(Relative $natOut $f.FullName)] = $f.FullName
+        }
+    }
+
+    $same = 0; $differ = 0; $onlyRef = 0; $onlyNat = 0
+    foreach ($rel in ($refFiles.Keys | Sort-Object)) {
+        if (-not $natFiles.ContainsKey($rel)) {
+            $onlyRef++
+            $problems++
+            $lines.Add("ONLY-REF`t$rel")
+            continue
+        }
+        $a = (Get-FileHash -Algorithm SHA256 $refFiles[$rel]).Hash
+        $b = (Get-FileHash -Algorithm SHA256 $natFiles[$rel]).Hash
+        if ($a -eq $b) {
+            $same++
+        } else {
+            $differ++
+            $problems++
+            $lines.Add("BYTES`t$rel`tref $a`tport $b")
+        }
+    }
+    foreach ($rel in ($natFiles.Keys | Sort-Object)) {
+        if (-not $refFiles.ContainsKey($rel)) {
+            $onlyNat++
+            $problems++
+            $lines.Add("ONLY-PORT`t$rel")
+        }
+    }
+
+    # --- stdout ---------------------------------------------------------------
+    #
+    # Two wall-clock fields are blanked and nothing else is: the per-demo
+    # "%.1fs" at the end of an OK line, and the "%d processed in %.1fs" of the
+    # summary. Everything else in those lines -- point counts, coverage, the
+    # match error to four decimal places -- is compared as printed.
+    #
+    # The third rule is not a clock. The epilogue names the directory it wrote
+    # to, and the two sides write to DIFFERENT directories on purpose -- that is
+    # what --out is for, and it is the only reason the run can compare anything
+    # at all. Comparing that path would be comparing this script's own argument.
+    # The COUNT in front of it is left alone, and it is the part that means
+    # something: it is the number of files each side believes it wrote.
+    #
+    # AND A FOURTH RULE THAT APPLIES ONLY WHEN THERE IS A POOL.
+    #
+    # The "[i/n]" a progress line opens with is a COMPLETION counter, not the
+    # target's position in the list -- both implementations increment it as
+    # results come back. At --jobs 1 that is iteration order, it is
+    # deterministic, and it is part of what this compares. Above one worker it
+    # is whatever the pool did, so the same demo is [9/6416] in one run and
+    # [10/6416] in the next OF THE SAME BINARY.
+    #
+    # Sorting raw lines therefore made the pooled pass compare two shuffled
+    # numberings and report that every line differed, which says nothing about
+    # either implementation. Measured here: two six-worker runs of one binary
+    # over 6,416 demos produced 6,422 lines whose multisets differ completely
+    # before this rule and are identical after it.
+    #
+    # The DENOMINATOR stays compared. It is the number of targets selected, it
+    # is decided before any work starts, and two sides disagreeing about it is
+    # exactly the kind of divergence this verb exists to catch.
+    function Normalise([string[]]$text, [bool]$pooled) {
+        $out = New-Object System.Collections.Generic.List[string]
+        foreach ($l in $text) {
+            $x = $l -replace '(\s)\d+\.\d(s?)$', '$1<t>$2'
+            $x = $x -replace '^(\d+ processed in )[\d.]+s', '$1<t>s'
+            $x = $x -replace '^(wrote \d+ \.wrpath files under ).*$', '$1<out>'
+            if ($pooled) { $x = $x -replace '^\[\d+/(\d+)\]', '[<i>/$1]' }
+            $out.Add($x)
+        }
+        return $out
+    }
+
+    $refText = Normalise (Get-Content -Path $refLog) ($Jobs -ne 1)
+    $natText = Normalise (Get-Content -Path $natLog) ($Jobs -ne 1)
+
+    $stdoutOk = $true
+    if ($Jobs -eq 1) {
+        # Serial: the reference processes targets in iteration order and prints
+        # a line each, so the ORDER is part of the artefact.
+        if ($refText.Count -ne $natText.Count) {
+            $stdoutOk = $false
+            $lines.Add("STDOUT`tline counts differ: ref $($refText.Count), port $($natText.Count)")
+        }
+        $n = [Math]::Min($refText.Count, $natText.Count)
+        $shown = 0
+        for ($i = 0; $i -lt $n; $i++) {
+            if ($refText[$i] -ne $natText[$i]) {
+                $stdoutOk = $false
+                if ($shown -lt 20) {
+                    $lines.Add("LINE $($i+1)`tref : $($refText[$i])")
+                    $lines.Add("LINE $($i+1)`tport: $($natText[$i])")
+                    $shown++
+                }
+            }
+        }
+    } else {
+        # Parallel: completion order is whatever the pool produced, on both
+        # sides, so position means nothing. Everything else still does.
+        $a = @($refText | Sort-Object)
+        $b = @($natText | Sort-Object)
+        if (($a -join "`n") -ne ($b -join "`n")) {
+            $stdoutOk = $false
+            $lines.Add("STDOUT`tthe two line multisets differ")
+            $onlyA = @(Compare-Object $a $b | Where-Object { $_.SideIndicator -eq "<=" })
+            $onlyB = @(Compare-Object $a $b | Where-Object { $_.SideIndicator -eq "=>" })
+            foreach ($x in ($onlyA | Select-Object -First 20)) { $lines.Add("ONLY-REF-LINE`t$($x.InputObject)") }
+            foreach ($x in ($onlyB | Select-Object -First 20)) { $lines.Add("ONLY-PORT-LINE`t$($x.InputObject)") }
+        }
+    }
+    if (-not $stdoutOk) { $problems++ }
+
+    # --- put the disk back ----------------------------------------------------
+    #
+    # The junction FIRST, so nothing below can walk through it into two
+    # gigabytes of somebody's demos.
+    if (Test-Path $stageJn) { cmd /c rmdir "$stageJn" | Out-Null }
+    if (Test-Path $stageJn) {
+        Write-Host "[!] the demo junction is still there; NOT deleting $stage"
+    } else {
+        Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
+    }
+
+    $lines.Add("")
+    $lines.Add("identical files: $same")
+    $lines.Add("differing:       $differ")
+    $lines.Add("only reference:  $onlyRef")
+    $lines.Add("only port:       $onlyNat")
+    $lines.Add("stdout:          $(if ($stdoutOk) { 'identical' } else { 'DIFFERS' })")
+    $exReport = Join-Path $Work "report-extract.txt"
+    Set-Content -Path $exReport -Value $lines -Encoding UTF8
+
+    Write-Host ""
+    Write-Host ("  identical   {0} files" -f $same)
+    Write-Host ("  DIFFERING   {0}" -f $differ)
+    Write-Host ("  only ref    {0}" -f $onlyRef)
+    Write-Host ("  only port   {0}" -f $onlyNat)
+    Write-Host ("  stdout      {0}" -f $(if ($stdoutOk) { "identical" } else { "DIFFERS" }))
+    Write-Host ("  report      {0}" -f $exReport)
+    Write-Host ("  logs        {0}" -f $refLog)
+    Write-Host ("              {0}" -f $natLog)
+    Write-Host ""
+    if ($problems -gt 0) { Write-Host "=== PARITY FAILED ==="; exit 1 }
+    if ($same -eq 0) {
+        Write-Host "=== NOTHING WAS COMPARED (no demos selected?) ==="
+        exit 1
+    }
+    Write-Host "=== parity holds ==="
+    exit 0
+}
+
+# ---------------------------------------------------------------------------
+# -Verb budget   --   where the numbers in wr_jobs.h came from
+# ---------------------------------------------------------------------------
+#
+# Not a comparison: the port only, over a real library, reporting the
+# distribution of what one demo costs. WR_JOBS_COST_MULT is the one constant in
+# this project that could not be derived from anything, and a guessed memory
+# budget inside somebody else's game is not a thing to guess.
+#
+# The peak is the larger of two moments: the whole file and its decompressed
+# body alive at once, and the body plus the candidate arena plus the points.
+# 70 bytes per candidate is the arena: 16 for the candidate itself and 54 for
+# the eight index arrays, two bitmaps and three scratch buffers the dynamic
+# program needs beside it.
+#
+#     tests\parity.ps1 -Game "..." -Verb budget
+
+if ($Verb -eq "budget") {
+    $tsv = Join-Path $Work "budget.tsv"
+    Write-Host ""
+    Write-Host "=== wrlines memory budget ==="
+    Write-Host "  port        $exe"
+    Write-Host "  game        $Game"
+    Write-Host ""
+
+    $args = @("--game", $Game, "--all", "--dump-info", $tsv)
+    if ($Map) { $args = @("--game", $Game, "--map", $Map, "--dump-info", $tsv) }
+    if ($Limit -gt 0) { $args += @("--limit", "$Limit") }
+    & $exe @args
+
+    $rows = Import-Csv -Path $tsv -Delimiter "`t" | Where-Object { $_.status -eq "ok" }
+    $mult = @()
+    foreach ($r in $rows) {
+        $fb = [double]$r.file_bytes
+        if ($fb -le 0) { continue }
+        $bb = [double]$r.body_bytes
+        $peak = [Math]::Max($fb + $bb, $bb + 70 * [double]$r.candidates + 48 * [double]$r.samples)
+        $mult += ($peak / $fb)
+    }
+    $mult = @($mult | Sort-Object)
+    if ($mult.Count -eq 0) { Write-Host "[!] no rows"; exit 1 }
+
+    function Pct($a, $p) { return $a[[int]([Math]::Floor($p * ($a.Count - 1)))] }
+    Write-Host ""
+    Write-Host ("  demos       {0}" -f $mult.Count)
+    Write-Host ("  peak/file   min {0:n1}  median {1:n1}  p95 {2:n1}  p99 {3:n1}  max {4:n1}" -f `
+        $mult[0], (Pct $mult 0.5), (Pct $mult 0.95), (Pct $mult 0.99), $mult[-1])
+    Write-Host ""
+    Write-Host ("  WR_JOBS_COST_MULT should be at least {0}" -f [int][Math]::Ceiling((Pct $mult 0.99)))
+    Write-Host ("  the largest single demo would want {0:n0} MB" -f `
+        (($rows | ForEach-Object { [double]$_.file_bytes } | Measure-Object -Maximum).Maximum * (Pct $mult 0.99) / 1MB))
+    Write-Host ""
     exit 0
 }
 

@@ -239,6 +239,70 @@ int main(void)
         Check(Refused(n, "tick interval 0.0 out of range"),
               "a tick interval of zero, printed as Python prints it");
 
+        // AND THE ONES 0.5 AND 0.0 CANNOT CATCH, which is why they were the
+        // only two here while PyRepr was wrong.
+        //
+        // repr picks fixed or exponential from where the decimal point falls
+        // -- exponential only when decpt <= -4 or decpt > 16 -- and NOT from
+        // how many digits the shortest round-trip needs. "%.*g" decides it the
+        // other way, so 20.0 came out "2e+01". Every value below round-trips
+        // in fewer digits than it has integer places, which is exactly the set
+        // the old code got wrong, and they are the values a moved OFF_TICKRATE
+        // would actually land on: a ticks-per-SECOND field rather than an
+        // interval.
+        static const struct { float v; const char *repr; } kTicks[] = {
+            { 20.0f,      "20.0" },          // was "2e+01"
+            { 100.0f,     "100.0" },         // was "1e+02"
+            { 1000.0f,    "1000.0" },        // was "1e+03"
+            { 128.0f,     "128.0" },
+            { 0.25f,      "0.25" },          // fixed, and stays fixed
+            // Powers of two, because these two are about the EXPONENTIAL side
+            // and every value here is widened from float32 before it is
+            // printed: 1e-5f is not 1e-5, it is 1.0000000116860974e-05, and a
+            // test written with the decimal literal asserts the wrong string
+            // for the right reason. A power of two is exact in both formats.
+            { 9.5367431640625e-07f, "9.5367431640625e-07" },   // 2^-20, decpt -6
+            { 1152921504606846976.0f, "1.152921504606847e+18" }, // 2^60, decpt 19
+            { -1.0f,      "-1.0" },          // negative, and still gets its .0
+        };
+        for (int i = 0; i < (int)(sizeof(kTicks) / sizeof(kTicks[0])); i++)
+        {
+            char want[64];
+            _snprintf_s(want, sizeof(want), _TRUNCATE,
+                        "tick interval %s out of range", kTicks[i].repr);
+            n = Fresh();
+            memcpy(g_buf + 0x7B, &kTicks[i].v, 4);
+            Check(Refused(n, want), want);
+        }
+
+        // The map name survives a file too short to parse.
+        //
+        // peek_map reads 0x50 bytes, checks the magic and nothing else, and it
+        // is what CHOOSES the targets -- so the reference selects a truncated
+        // demo, names it, and then fails it with a reason that reaches
+        // _failed.txt. Returning before the name was read made such a file
+        // vanish from a --map run entirely.
+        {
+            Fresh();
+            WrMtvHeader h2;
+            char e2[128];
+            bool ok = WrMtvParseFixed(g_buf, 0x50, 0x50, &h2, e2, sizeof(e2));
+            Check(!ok && strcmp(e2, "not an MMTV file") == 0,
+                  "a 0x50-byte file is still refused, with the same words");
+            Check(strcmp(h2.map, kMapName) == 0,
+                  "but its map name came out, the way peek_map's does");
+
+            Fresh();
+            ok = WrMtvParseFixed(g_buf, 0x14, 0x14, &h2, e2, sizeof(e2));
+            Check(!ok && strcmp(h2.map, "surf") == 0,
+                  "and a file that stops mid-name gives the part that was there");
+
+            Fresh();
+            ok = WrMtvParseFixed(g_buf, 4, 4, &h2, e2, sizeof(e2));
+            Check(!ok && h2.map[0] == '\0',
+                  "while four bytes of magic and nothing else names nothing");
+        }
+
         // 0x83 is the low byte of the HIGH word: the field is little-endian at
         // 0x7F, so 0x7F..0x82 carry 0x12345678 and 0x83..0x86 carry 0x01100001.
         n = Fresh();
@@ -396,7 +460,16 @@ int main(void)
         Check(!WrMtvPeek(stub, &h, err, sizeof(err)) &&
               strcmp(err, "not an MMTV file") == 0,
               "a 256-byte file is refused on its length");
-        Check(h.map[0] == '\0', "with nothing read out of it");
+
+        // And it is refused WITH ITS NAME, which is the opposite of what this
+        // asserted for one release. peek_map -- the reference function this
+        // stands in for, and the one that picks the targets -- reads 0x50
+        // bytes and checks only the magic, so the reference selects a
+        // truncated demo, prints a FAIL line for it and records it under its
+        // map. Handing back an empty name made the same file disappear from a
+        // --map run with nothing said anywhere.
+        Check(strcmp(h.map, kMapName) == 0,
+              "and named anyway, so it can be reported rather than vanish");
 
         err[0] = '\0';
         Check(!WrMtvPeek("tests\\_no_such_demo.mtv", &h, err, sizeof(err)) &&

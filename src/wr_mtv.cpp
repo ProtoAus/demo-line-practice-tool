@@ -111,17 +111,70 @@ static void Fail(char *err, int errCap, const char *fmt, ...)
 // and the reading here follow the CRT's locale, so a process that has selected
 // a comma decimal point would produce a comma; nothing in this DLL calls
 // setlocale, and the game has never been observed to.
+// THE SHORTEST DIGITS AND THE PLACE TO PUT THE POINT ARE TWO DECISIONS, AND
+// "%.*g" TIES THEM TOGETHER. That was this function's bug for one release.
+//
+// %g goes exponential when the exponent is >= the precision it was given, and
+// the precision here is the shortest round-tripping digit count -- so 20.0,
+// which round-trips at one digit, came out "2e+01". CPython does not decide it
+// that way. format_float_short (Python/pystrtod.c) finds the shortest digits
+// first and then chooses the layout from where the decimal point falls:
+//
+//     use_exp = (decpt <= -4 || decpt > 16)
+//
+// which is why repr(20.0) is "20.0", repr(1e16) is "1e+16", repr(0.0001) is
+// "0.0001" and repr(0.00001) is "1e-05". Sixteen, not "however many digits it
+// happened to need".
+//
+// So: find the shortest precision with %e, which reports the exponent
+// separately and cannot make this mistake, and only then pick the form.
 static void PyRepr(double v, char *out, int cap)
 {
-    for (int prec = 1; prec <= 17; prec++)
+    // repr's three special cases, spelled Python's way rather than the CRT's
+    // ("-nan(ind)" is not a thing Python prints).
+    if (v != v)
     {
-        _snprintf_s(out, (size_t)cap, _TRUNCATE, "%.*g", prec, v);
-        if (strtod(out, NULL) == v)
+        strcpy_s(out, (size_t)cap, "nan");
+        return;
+    }
+    if (v > 1.7976931348623157e308 || v < -1.7976931348623157e308)
+    {
+        strcpy_s(out, (size_t)cap, v < 0 ? "-inf" : "inf");
+        return;
+    }
+
+    char sci[64];
+    int prec = 0;
+    for (prec = 0; prec <= 16; prec++)
+    {
+        _snprintf_s(sci, sizeof(sci), _TRUNCATE, "%.*e", prec, v);
+        if (strtod(sci, NULL) == v)
             break;
     }
-    // repr always shows a float as a float: repr(3.0) is "3.0", where "%g"
-    // gives "3". The n/i are there to leave "nan" and "inf" alone.
-    if (!strpbrk(out, ".eEni"))
+    if (prec > 16)
+        prec = 16;
+
+    // %e always writes the exponent, always signed, always at least two
+    // digits, so it is there to be read rather than inferred.
+    const char *e = strrchr(sci, 'e');
+    long exp10 = e ? strtol(e + 1, NULL, 10) : 0;
+    long decpt = exp10 + 1;             // digits before the point, CPython's decpt
+
+    if (decpt <= -4 || decpt > 16)
+    {
+        // Already in the right shape, and MSVC's two-digit exponent matches.
+        strcpy_s(out, (size_t)cap, sci);
+        return;
+    }
+
+    // prec + 1 significant digits, decpt of them in front of the point.
+    long places = (long)prec + 1 - decpt;
+    if (places < 0)
+        places = 0;
+    _snprintf_s(out, (size_t)cap, _TRUNCATE, "%.*f", (int)places, v);
+
+    // repr always shows a float as a float: repr(3.0) is "3.0", not "3".
+    if (!strchr(out, '.'))
         strcat_s(out, (size_t)cap, ".0");
 }
 
@@ -138,11 +191,42 @@ bool WrMtvParseFixed(const unsigned char *head, size_t headLen,
         return false;
     memset(out, 0, sizeof(*out));
 
-    // The reference's first line, and its wording. A short file, a file with
-    // the wrong magic, and a file we could not read enough of are all the same
-    // answer: this is not one of these.
-    if (!head || fileSize < WR_MTV_MIN_BYTES || headLen < OFF_END ||
-        memcmp(head, MTV_MAGIC, 4) != 0)
+    if (!head || headLen < 4 || memcmp(head, MTV_MAGIC, 4) != 0)
+    {
+        Fail(err, errCap, "not an MMTV file");
+        return false;
+    }
+
+    // THE NAME COMES OUT BEFORE THE SIZE GATE, and that ordering is the whole
+    // point of these five lines.
+    //
+    // The reference has two readers, not one. parse_mtv_header refuses
+    // anything under 0x200 -- but peek_map, which is what CHOOSES the targets,
+    // reads 0x50 bytes, checks the magic and nothing else, and hands back the
+    // name at 0x10. So a truncated .mtv -- a part-written download, which the
+    // game's own fetcher can leave behind -- is selected by the reference,
+    // named, and then failed by parse_mtv_header with a reason that lands in
+    // paths\<map>\_failed.txt.
+    //
+    // Returning before this ran gave that file an empty map name, which under
+    // --map dropped it from the target list entirely: no line, no failure
+    // record, no sign of it anywhere. A broken demo that reports itself beats
+    // a broken demo that disappears, and it is also what the reference does.
+    //
+    // Bounded by what was actually read rather than by 64, because a file
+    // shorter than 0x50 has fewer than 64 bytes there and Python's slice would
+    // simply be short. CollectVisit and the counter both rely on this: they
+    // ignore the return value and use whatever fields got filled.
+    if (headLen > (size_t)OFF_MAPNAME)
+    {
+        size_t avail = headLen - (size_t)OFF_MAPNAME;
+        CStr(head + OFF_MAPNAME, avail < 64 ? (int)avail : 64,
+             out->map, sizeof(out->map));
+    }
+
+    // The reference's first line, and its wording. A short file and a file we
+    // could not read enough of are the same answer: this is not one of these.
+    if (fileSize < WR_MTV_MIN_BYTES || headLen < OFF_END)
     {
         Fail(err, errCap, "not an MMTV file");
         return false;
@@ -150,7 +234,7 @@ bool WrMtvParseFixed(const unsigned char *head, size_t headLen,
 
     out->version     = Le32(head + OFF_VERSION);
     out->dateMs      = (long long)Le64(head + OFF_DATE_MS);
-    CStr(head + OFF_MAPNAME, 64, out->map, sizeof(out->map));
+    CStr(head + OFF_MAPNAME, 64, out->map, sizeof(out->map));   // again, in full
     CStr(head + OFF_MAPHASH, 41, out->mapHash, sizeof(out->mapHash));
     out->gamemode    = head[OFF_GAMEMODE];
     out->tickInterval = LeF32(head + OFF_TICKRATE);

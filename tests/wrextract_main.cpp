@@ -11,46 +11,62 @@
 // the download explicable, and nothing a user does needs this. It is built by
 // tests\build.bat and it stays in tests\.
 //
-// Its flags are a subset of wrpath_extract.py's, and the same spelling, so the
-// parity driver can hand the same argv to both. The subset grows one verb per
-// phase; anything not yet ported says so and exits non-zero rather than
-// pretending. What is here now:
+// Its flags are wrpath_extract.py's, with the same spelling, so the parity
+// driver can hand the same argv to both:
 //
-//     --index-maps                 the map index          (P1)
-//     --file PATH --dump-body OUT  one demo's run body    (P2)
-//     --board                      a leaderboard window   (P3)
-//     --fetch                      demos onto disk        (P4)
+//     --map / --file / --all       extract
+//     --index-maps                 the map index
+//     --board                      a leaderboard window
+//     --fetch                      demos onto disk
+//     --dump-body / --dump-cands   one layer of one demo, in a file you can diff
+//     --dump-chain / --dump-info
 //     --api-record / --api-replay  a recorded conversation
 //
-// --dump-body is the most valuable of the four dumps and the reason the others
-// can wait. Everything above it in the extractor is arithmetic on floats, where
-// a difference has to be argued about; the body is bytes, so a difference is a
-// difference. Run it over a whole library and the container and the decoder are
-// either right or they are not.
+// THE DUMPS ARE THE REASON ANY OF THIS WORKED. The pipeline is container ->
+// LZMA -> a scan for float triples -> a dynamic program over them -> a scoring
+// pass -> reassembly -> a file. Six layers, and only the last one is visible
+// from outside. Port all six and compare the .wrpath, and a mismatch tells you
+// that a byte differs somewhere in half a million floats. Every layer has an
+// exact oracle available, and none of them is reachable without a flag that
+// prints it:
+//
+//     --dump-body    bytes. No floats are involved yet, so this isolates the
+//                    whole container and LZMA question with no ambiguity at
+//                    all. Run it first, over everything.
+//     --dump-cands   the scan. Pins the bit <-> (phase, q, word) mapping and
+//                    the end bound, which is the subtlest thing in the port.
+//     --dump-chain   the chosen chain and the harvested segments, as bit
+//                    positions. Pins the DP and the origin oracle.
+//     --dump-info    everything a run decided, one TSV row per demo. Also how
+//                    the memory budget in wr_jobs.h was measured across a real
+//                    library rather than guessed at.
+//
+// Floats are %.17g in the chain and info dumps and %.9g in the candidate dump,
+// and the difference is deliberate. A float32 round-trips exactly through
+// %.9g and the candidates ARE float32; the others are doubles, and a divergence
+// in a compensated summation shows up in the tenth digit, which is precisely
+// what %.9g would hide.
 //
 // --board is the same idea one level up. A leaderboard changes under you, so it
 // is not an oracle by itself; --api-replay makes it one, by answering both
 // implementations from the same recorded bytes. See tests\api_tape.h.
 //
-// There is no --map and no --all yet, because demo discovery is a piece of the
-// reference this phase has not ported -- iter_demos walks two named subtrees
-// and sorts, and getting that subtly wrong would quietly change which demos a
-// parity run covered. tests\parity.ps1 does the enumerating instead and hands
-// both sides one --file at a time, which is a comparison with nothing hidden
-// in it.
-//
-// There is no --out either, deliberately. The reference derives the boards
-// directory from it; this one uses WrDataPath, which for an .exe under tests\
-// lands in tests\wrlines_data\ -- covered by .gitignore at any depth, so
-// nothing this writes escapes into the working tree. Accepting --out and
-// ignoring it would be the one thing this file must never do: quietly behave
-// differently from the flag it was handed. parity.ps1 gives --out to the
-// reference only, and compares the two files wherever each of them landed.
+// There is no --out, deliberately, and it is the one flag this refuses rather
+// than accepts. The reference derives its output directory from it; this one
+// uses WrDataPath, which puts everything under wrlines_data\ next to the .exe.
+// Accepting --out and ignoring it would be the single thing this file must
+// never do -- quietly behave differently from the flag it was handed.
+// parity.ps1 gives --out to the reference only, runs this from a scratch
+// directory of its own, and compares the two trees wherever each of them
+// landed.
 //
 // Build:  tests\build.bat
 // Run:    tests\wrextract.exe --game "<install>" --index-maps
 
 #include "wr_api.h"
+#include "wr_demo.h"
+#include "wr_dp.h"
+#include "wr_extract.h"
 #include "wr_fetch.h"
 #include "wr_maps.h"
 #include "wr_msml.h"
@@ -61,6 +77,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+// The one stub, and it is the same short block the harnesses use. The .wrpath
+// writer lives beside its reader in wr_path.cpp, which drags in the run store,
+// which drags in the energy sampler, which asks the engine where the camera is
+// looking. Nothing on this path ever calls it.
+bool WrCameraForward(Vec3 *out) { if (out) *out = WrVec(1, 0, 0); return true; }
 
 // Progress goes to stdout, unbuffered per line. The DLL points the same emit
 // hook at the panel's line ring; this is the other end of that indirection, and
@@ -96,9 +118,22 @@ static void Usage(void)
     printf("wrextract -- the wrlines extractor, without the game.\n"
            "\n"
            "  --game PATH        the Momentum install (required)\n"
+           "\n"
+           "  --map NAME         extract every demo of this map\n"
+           "  --file PATH        ... or exactly this one\n"
+           "  --all              ... or every demo on disk\n"
+           "  --skip-existing    skip demos already done, and recorded failures\n"
+           "  --retry-failed     with --skip-existing, try the failures anyway\n"
+           "  --verify           extract and report, but write nothing\n"
+           "  --jobs N           workers; 0 decides, 1 is serial and comparable\n"
+           "  --timeout N        give up on one demo after N seconds (0: never)\n"
+           "  --limit N          stop after N demos\n"
+           "\n"
            "  --index-maps       rebuild the map index from the game's cache\n"
-           "  --file PATH        the demo to work on\n"
            "  --dump-body PATH   write that demo's decompressed run body\n"
+           "  --dump-cands PATH  ... its coordinate-triple candidates\n"
+           "  --dump-chain PATH  ... its chosen chain and harvested segments\n"
+           "  --dump-info PATH   what each run decided, one TSV row per demo\n"
            "\n"
            "  --board            cache a window of a map's leaderboard\n"
            "  --map NAME         which map\n"
@@ -123,9 +158,10 @@ static void Usage(void)
            "  --api-record DIR   save every leaderboard reply under DIR\n"
            "  --api-replay DIR   answer every request from DIR, never the net\n"
            "\n"
-           "Not shipped. Flags mirror wrpath_extract.py so the two can be\n"
-           "run against each other; verbs not yet ported are refused rather\n"
-           "than quietly skipped.\n");
+           "Not shipped. Flags mirror wrpath_extract.py so the two can be run\n"
+           "against each other. --out is REFUSED rather than ignored: output\n"
+           "goes under wrlines_data next to this .exe, and a flag that is\n"
+           "accepted and then not obeyed is the one thing this must never do.\n");
 }
 
 // wrpath_extract.py --dump-body, including the line it prints and the code it
@@ -192,14 +228,377 @@ static int DumpBody(const char *file, const char *dest)
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// The three dumps above --dump-body
+// ---------------------------------------------------------------------------
+
+// Binary mode on purpose. The reference opens these with newline="\n", so the
+// files are LF even on Windows, and text mode here would make every line differ
+// by one byte.
+static FILE *OpenDump(const char *dest)
+{
+    MakeTree(dest);
+    FILE *f = NULL;
+    if (fopen_s(&f, dest, "wb") != 0 || !f)
+    {
+        printf("[!] could not write %s\n", dest);
+        return NULL;
+    }
+    return f;
+}
+
+// Everything up to the decompressed body, with the reference's own refusals.
+static unsigned char *ReadBody(const char *file, WrMtvHeader *h, size_t *lenOut,
+                               size_t *fileLenOut)
+{
+    char err[256] = "";
+    size_t len = 0;
+    unsigned char *data = WrMtvReadFile(file, &len, err, sizeof(err));
+    if (!data)
+    {
+        printf("[!] %s: %s\n", file, err);
+        return NULL;
+    }
+    if (fileLenOut)
+        *fileLenOut = len;
+
+    if (!WrMtvParseHeader(data, len, h, err, sizeof(err)))
+    {
+        printf("[!] %s: %s\n", file, err);
+        free(data);
+        return NULL;
+    }
+    if (h->codec == WR_MTV_CODEC_ZSTD)
+    {
+        printf("[!] zstd body and no zstandard installed\n");
+        free(data);
+        return NULL;
+    }
+    unsigned char *body = WrMtvBody(data, len, h, lenOut, err, sizeof(err));
+    free(data);
+    if (!body)
+        printf("[!] %s: %s\n", file, err);
+    return body;
+}
+
+static int DumpCands(const char *file, const char *dest)
+{
+    WrMtvHeader h;
+    size_t bodyLen = 0;
+    unsigned char *body = ReadBody(file, &h, &bodyLen, NULL);
+    if (!body)
+        return 1;
+
+    WrDpCand *cands = NULL;
+    int n = 0, stop = 0;
+    char err[256] = "";
+    if (!WrDpScan(body, bodyLen, WR_DP_SCAN_START_BYTE, &cands, &n, &stop,
+                  NULL, NULL, err, sizeof(err)))
+    {
+        printf("[!] %s: %s\n", file, err);
+        free(body);
+        return 1;
+    }
+    free(body);
+
+    FILE *f = OpenDump(dest);
+    if (!f)
+    {
+        free(cands);
+        return 1;
+    }
+    fprintf(f, "# bit\tx\ty\tz\n");
+    fprintf(f, "# count\t%d\n", n);
+    for (int i = 0; i < n; i++)
+        fprintf(f, "%u\t%.9g\t%.9g\t%.9g\n", cands[i].bit, (double)cands[i].x,
+                (double)cands[i].y, (double)cands[i].z);
+    fclose(f);
+    free(cands);
+
+    printf("%d candidates -> %s\n", n, dest);
+    return 0;
+}
+
+// The reference's _dump_val: a bool is 1 or 0, a float is %.17g, None is "-".
+static void DumpReal(char *out, int cap, bool have, double v)
+{
+    if (have)
+        _snprintf_s(out, (size_t)cap, _TRUNCATE, "%.17g", v);
+    else
+        strcpy_s(out, (size_t)cap, "-");
+}
+
+static int DumpChain(const char *file, const char *dest, double timeout)
+{
+    WrMtvHeader h;
+    size_t bodyLen = 0;
+    unsigned char *body = ReadBody(file, &h, &bodyLen, NULL);
+    if (!body)
+        return 1;
+
+    char err[256] = "";
+    WrDemoJson js;
+    // The JSON has to be re-read here because ReadBody freed the file buffer it
+    // lived in; cheaper than keeping a megabyte alive for one number.
+    memset(&js, 0, sizeof(js));
+    {
+        size_t len = 0;
+        unsigned char *data = WrMtvReadFile(file, &len, err, sizeof(err));
+        if (data)
+        {
+            WrDemoParseJson((const char *)data + h.jsonStart, h.jsonLen, &js);
+            free(data);
+        }
+    }
+
+    WrDpArgs a;
+    memset(&a, 0, sizeof(a));
+    a.body = body;
+    a.bodyLen = bodyLen;
+    a.tickInterval = (double)h.tickInterval;
+    a.ticks = h.ticks;
+    a.haveRef = js.haveRef;
+    a.refMaxHoriz = js.refMaxHoriz;
+    a.timeoutSeconds = timeout;
+    a.keepDetail = true;
+
+    WrDpResult r;
+    bool cancelled = false;
+    const bool got = WrDpExtract(&a, &r, &cancelled, err, sizeof(err));
+    WrDemoFreeJson(&js);
+    free(body);
+    if (!got)
+    {
+        printf("[!] %s: %s\n", file, err);
+        return 1;
+    }
+
+    FILE *f = OpenDump(dest);
+    if (!f)
+    {
+        WrDpFree(&r);
+        return 1;
+    }
+
+    char v[64];
+    fprintf(f, "# identified_by\t%s\n",
+            r.info.identifiedBy[0] ? r.info.identifiedBy : "-");
+    fprintf(f, "# rounds\t%d\n", r.info.rounds);
+    DumpReal(v, sizeof(v), r.info.haveDeriv, r.info.derivRate);
+    fprintf(f, "# deriv_rate\t%s\n", v);
+    if (r.info.haveDeriv)
+        fprintf(f, "# deriv_offset\t%d\n", r.info.derivOffset);
+    else
+        fprintf(f, "# deriv_offset\t-\n");
+    fprintf(f, "# chain\t%d\n", r.chainCount);
+    for (int i = 0; i < r.chainCount; i++)
+        fprintf(f, "c\t%u\n", r.chain[i]);
+    fprintf(f, "# segments\t%d\n", r.segCount);
+    for (int i = 0; i < r.segCount; i++)
+    {
+        const unsigned int *seg = r.segBits + r.segOff[i];
+        const int n = r.segLen[i];
+        fprintf(f, "s\t%d\t%d\t%d\t%d\n", i, n, n ? (int)seg[0] : -1,
+                n ? (int)seg[n - 1] : -1);
+        for (int k = 0; k < n; k++)
+            fprintf(f, "b\t%d\t%u\n", i, seg[k]);
+    }
+    fclose(f);
+
+    printf("chain %d, %d segments -> %s\n", r.chainCount, r.segCount, dest);
+    WrDpFree(&r);
+    return 0;
+}
+
+static const char *kInfoKeys =
+    "candidates\tticks\trounds\tconfident\tidentified_by\tderiv_rate\t"
+    "deriv_offset\tsegments\tfirst_segment\tref_max_horiz\tchain_max_horiz\t"
+    "match_error\tsamples\tcoverage\tpath_length\tmarkers\tmarkers_ok\t"
+    "start_index\tstart_ok\tpreroll\tflagged\twhy_flagged";
+
+#define WR_INFO_KEY_COUNT 22
+
+static void InfoRow(FILE *f, const char *name, const WrDemoResult *r)
+{
+    const WrDpInfo *i = &r->dp.info;
+    char rate[64], off[64], ref[64];
+    DumpReal(rate, sizeof(rate), i->haveDeriv, i->derivRate);
+    if (i->haveDeriv)
+        _snprintf_s(off, sizeof(off), _TRUNCATE, "%d", i->derivOffset);
+    else
+        strcpy_s(off, sizeof(off), "-");
+    DumpReal(ref, sizeof(ref), i->haveRef, i->refMaxHoriz);
+
+    fprintf(f, "%s\t%zu\t%zu\tok\t"
+               "%d\t%u\t%d\t%d\t%s\t%s\t%s\t%d\t%d\t%s\t%.17g\t%.17g\t"
+               "%d\t%.17g\t%.17g\t%d\t%d\t%d\t%d\t%.17g\t%d\t%s\n",
+            name, r->fileBytes, r->bodyBytes,
+            i->candidates, i->ticks, i->rounds, i->confident ? 1 : 0,
+            i->identifiedBy[0] ? i->identifiedBy : "-", rate, off,
+            i->segments, i->firstSegment, ref, i->chainMaxHoriz, i->matchError,
+            i->samples, i->coverage, i->pathLength,
+            r->markerCount, r->markersOk ? 1 : 0, r->startIndex,
+            r->startOk ? 1 : 0, r->preroll, r->flagged ? 1 : 0,
+            r->whyFlagged[0] ? r->whyFlagged : "-");
+}
+
+static void InfoErrorRow(FILE *f, const char *name, long long fileBytes,
+                         const char *why)
+{
+    char clean[256];
+    strcpy_s(clean, sizeof(clean), why);
+    for (char *p = clean; *p; p++)
+        if (*p == '\t' || *p == '\n')
+            *p = ' ';
+    fprintf(f, "%s\t%lld\t0\t%s", name, fileBytes, clean);
+    for (int k = 0; k < WR_INFO_KEY_COUNT; k++)
+        fprintf(f, "\t-");
+    fprintf(f, "\n");
+}
+
+// _dump_targets: the same selection cmd_extract makes, WITHOUT the skip rules,
+// and sorted rather than left in walk order. Two different orders on purpose --
+// a dump is a diff of one file per row and wants a stable sort; an extraction
+// is a progress line per demo and wants the order the reference processes them
+// in.
+struct InfoTargets
+{
+    char **v;
+    int n, cap;
+    const char *map;
+};
+
+static void InfoCollect(void *user, const char *path, long long)
+{
+    InfoTargets *t = (InfoTargets *)user;
+    if (t->map && *t->map)
+    {
+        WrMtvHeader hdr;
+        char why[128];
+        WrMtvPeek(path, &hdr, why, sizeof(why));
+        if (_stricmp(hdr.map, t->map) != 0)
+            return;
+    }
+    if (t->n == t->cap)
+    {
+        int grown = t->cap ? t->cap * 2 : 256;
+        char **bigger = (char **)realloc(t->v, sizeof(char *) * (size_t)grown);
+        if (!bigger)
+            return;
+        t->v = bigger;
+        t->cap = grown;
+    }
+    t->v[t->n] = _strdup(path);
+    if (t->v[t->n])
+        t->n++;
+}
+
+static int CompareStr(const void *a, const void *b)
+{
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+static long long SizeOf(const char *path)
+{
+    WIN32_FILE_ATTRIBUTE_DATA ad;
+    if (!GetFileAttributesExA(path, GetFileExInfoStandard, &ad))
+        return -1;
+    return ((long long)ad.nFileSizeHigh << 32) | ad.nFileSizeLow;
+}
+
+static int DumpInfo(const char *game, const char *map, const char *file,
+                    int limit, double timeout, const char *dest)
+{
+    InfoTargets t;
+    memset(&t, 0, sizeof(t));
+    t.map = map;
+
+    if (file)
+        InfoCollect(&t, file, 0);
+    else
+    {
+        // The map filter goes through t.map, not through here.
+        WrExtractWalkDemos(game, InfoCollect, &t);
+        if (t.n > 1)
+            qsort(t.v, (size_t)t.n, sizeof(char *), CompareStr);
+    }
+    if (limit > 0 && t.n > limit)
+        t.n = limit;
+
+    if (t.n == 0)
+    {
+        printf("[!] nothing selected -- pass --file PATH, or --map NAME, or "
+               "--all\n");
+        return 1;
+    }
+
+    FILE *f = OpenDump(dest);
+    if (!f)
+        return 1;
+    fprintf(f, "demo\tfile_bytes\tbody_bytes\tstatus\t%s\n", kInfoKeys);
+
+    int rows = 0;
+    for (int i = 0; i < t.n; i++)
+    {
+        const char *name = t.v[i];
+        for (const char *p = t.v[i]; *p; p++)
+            if (*p == '\\' || *p == '/')
+                name = p + 1;
+
+        WrDemoArgs a;
+        memset(&a, 0, sizeof(a));
+        a.outDir = "";
+        a.verify = true;            // report everything, write nothing
+        a.timeoutSeconds = timeout;
+
+        WrDemoResult r;
+        const WrDemoOutcome oc = WrDemoProcess(t.v[i], &a, &r);
+        if (oc == WR_DEMO_OK)
+        {
+            InfoRow(f, name, &r);
+        }
+        else
+        {
+            // The reference raises MtvError("skip: zstd body") on THIS path
+            // rather than returning a skip, so the status column says that and
+            // not what the extractor's own skip line says.
+            InfoErrorRow(f, name, SizeOf(t.v[i]),
+                         oc == WR_DEMO_SKIP ? "skip: zstd body" : r.message);
+        }
+        WrDemoFree(&r);
+
+        rows++;
+        if (rows % 100 == 0)
+        {
+            printf("[%d/%d]\n", rows, t.n);
+            fflush(stdout);
+        }
+    }
+    fclose(f);
+
+    for (int i = 0; i < t.n; i++)
+        free(t.v[i]);
+    free(t.v);
+
+    printf("%d demos -> %s\n", rows, dest);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     const char *game = NULL;
     const char *file = NULL;
     const char *dumpBody = NULL;
+    const char *dumpCands = NULL;
+    const char *dumpChain = NULL;
+    const char *dumpInfo = NULL;
     const char *apiRecord = NULL;
     const char *apiReplay = NULL;
     bool indexMaps = false;
+
+    bool all = false, verify = false, skipExisting = false, retryFailed = false;
+    int jobs = 0, limit = 0;
+    double timeout = 30.0;      // the reference's default
 
     bool board = false, slowest = false, friends = false, refresh = false;
     bool fetch = false, dryRun = false, intoGame = false;
@@ -217,8 +616,28 @@ int main(int argc, char **argv)
             file = argv[++i];
         else if (strcmp(argv[i], "--dump-body") == 0 && i + 1 < argc)
             dumpBody = argv[++i];
+        else if (strcmp(argv[i], "--dump-cands") == 0 && i + 1 < argc)
+            dumpCands = argv[++i];
+        else if (strcmp(argv[i], "--dump-chain") == 0 && i + 1 < argc)
+            dumpChain = argv[++i];
+        else if (strcmp(argv[i], "--dump-info") == 0 && i + 1 < argc)
+            dumpInfo = argv[++i];
         else if (strcmp(argv[i], "--index-maps") == 0)
             indexMaps = true;
+        else if (strcmp(argv[i], "--all") == 0)
+            all = true;
+        else if (strcmp(argv[i], "--verify") == 0)
+            verify = true;
+        else if (strcmp(argv[i], "--skip-existing") == 0)
+            skipExisting = true;
+        else if (strcmp(argv[i], "--retry-failed") == 0)
+            retryFailed = true;
+        else if (strcmp(argv[i], "--jobs") == 0 && i + 1 < argc)
+            jobs = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--limit") == 0 && i + 1 < argc)
+            limit = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc)
+            timeout = atof(argv[++i]);
         else if (strcmp(argv[i], "--board") == 0)
             board = true;
         else if (strcmp(argv[i], "--map") == 0 && i + 1 < argc)
@@ -301,15 +720,30 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    if (dumpBody)
+    // The reference's own dispatch order: dumps, then the map index, the board,
+    // the fetcher, and extraction last.
+    if (dumpBody || dumpCands || dumpChain || dumpInfo)
     {
+        if (dumpInfo)
+            return DumpInfo(game, map, file, limit, timeout, dumpInfo);
+
+        // The other three take exactly one demo, and the reference says so in
+        // these words rather than picking the first of several.
         if (!file)
         {
-            printf("[!] --dump-body needs --file: this build has no demo "
-                   "discovery yet\n");
-            return 2;
+            const char *which = dumpBody ? "body" : (dumpCands ? "cands" : "chain");
+            if (!map && !all)
+            {
+                printf("[!] nothing selected -- pass --file PATH, or --map "
+                       "NAME, or --all\n");
+                return 1;
+            }
+            printf("[!] --dump-%s takes exactly one demo; use --file.\n", which);
+            return 1;
         }
-        return DumpBody(file, dumpBody);
+        if (dumpBody)  return DumpBody(file, dumpBody);
+        if (dumpCands) return DumpCands(file, dumpCands);
+        return DumpChain(file, dumpChain, timeout);
     }
 
     if (indexMaps)
@@ -393,7 +827,38 @@ int main(int argc, char **argv)
         return rc;
     }
 
-    Usage();
-    printf("\n[!] pick a verb\n");
-    return 1;
+    if (!map && !file && !all)
+    {
+        Usage();
+        printf("\n[!] pick --map NAME, --file PATH, or --all\n");
+        return 1;
+    }
+
+    // A fractional timeout is refused rather than truncated. The panel's slider
+    // is whole seconds and the request struct carries an int; accepting 12.5 and
+    // acting on 12 would be a quiet difference in behaviour from the flag as
+    // handed, which is the thing this front end exists not to do.
+    if (timeout != (double)(int)timeout)
+    {
+        printf("[!] --timeout takes whole seconds here (%g given)\n", timeout);
+        return 2;
+    }
+
+    WrExtractRequest req;
+    memset(&req, 0, sizeof(req));
+    req.kind = WR_JOB_EXTRACT;
+    strcpy_s(req.gameDir, sizeof(req.gameDir), game);
+    if (map)
+        strcpy_s(req.map, sizeof(req.map), map);
+    if (file)
+        strcpy_s(req.file, sizeof(req.file), file);
+    req.skipExisting = skipExisting;
+    req.retryFailed = retryFailed;
+    req.verify = verify;
+    req.jobs = jobs;
+    req.limit = limit;
+    req.timeoutSeconds = (int)timeout;
+
+    WrExtractSetEmit(EmitStdout);
+    return WrExtractRunRequest(&req);
 }

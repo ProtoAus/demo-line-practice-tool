@@ -1,8 +1,18 @@
 // wr_path.h  --  .wrpath loading and the in-memory run store.
 //
-// .wrpath files are produced offline by wrpath_extract.py from the game's own
-// downloaded .mtv demos. This side never parses .mtv: the DLL only ever reads a
-// simple, versioned, CRC-checked array of points.
+// .wrpath files are derived from the game's own downloaded .mtv demos: a
+// simple, versioned, CRC-checked array of points, and nothing that has to be
+// decoded at draw time. Until v0.7.0 they were produced by a Python script that
+// shipped beside the DLL; now they are written by src\wr_dp.cpp and the writer
+// at the bottom of this file's .cpp, on the pool in src\wr_jobs.cpp.
+//
+// The split survives the script that forced it, and it is worth saying why the
+// file format did not just disappear along with the second process. Extraction
+// is seconds of work per demo and drawing is a frame; a run watched today was
+// extracted once, weeks ago, possibly on a build that no longer exists. So the
+// reader below is deliberately not coupled to the extractor above it -- it
+// checks a version and a CRC and otherwise assumes nothing about who wrote the
+// bytes, because in general it does not know.
 //
 // Also holds the live self-recording buffer, which needs no files and no demo
 // at all -- it is the quickest way to prove the whole render path works.
@@ -57,6 +67,12 @@
 #define WR_DIP_MIN_DROP 32.0f
 #define WR_DIP_MIN_GAP 12          // points between successive dips
 
+// Bits 1 and 2 of the format are HAS_ANGLES and IS_EYE_PATH. Nothing has ever
+// written either -- the extractor recovers positions, not view angles, and the
+// positions it recovers are the entity origin rather than the eye -- so they
+// are recorded here and not defined, because a name for a bit nobody sets reads
+// as a feature that exists.
+#define WRPATH_FLAG_HAS_VELOCITY (1u << 0)
 #define WRPATH_FLAG_MARKERS_OK (1u << 3)
 #define WRPATH_FLAG_SELF_RECORDED (1u << 4)
 #define WRPATH_FLAG_FROM_EXTRACTOR (1u << 5)
@@ -335,6 +351,75 @@ void WrScanAvailableMaps(void);
 int WrAvailableMapCount(void);
 const char *WrAvailableMapAt(int i);
 int WrAvailableMapRuns(int i);
+
+// ---------------------------------------------------------------------------
+// Writing one
+// ---------------------------------------------------------------------------
+//
+// The writer lives beside the reader, in wr_path.cpp, and that placement is the
+// point: the offsets at the top of that file are the only statement of this
+// format that exists now that the reference has stopped shipping, and a format
+// with its two halves in different files drifts. tests\test_wrpath.exe writes a
+// file and loads it back through the REAL loader, which is a thing nothing did
+// before the port -- LoadOne had no test at all.
+//
+// THE HEADER IS 0x100 BYTES AND MOSTLY ZEROS. Only the fields the reader reads
+// are written; the gaps (0x20..0x23 between the run time and the SteamID, and
+// 0xFB) stay zero because they are zero in every file ever written and the CRC
+// covers them.
+
+struct WrDpPoint;               // wr_dp.h: x/y/z/vx/vy/vz, all double
+
+// The JSON's split points, already matched onto the path. `pointIndex` is an
+// index into the points array, which is why the two travel together.
+struct WrPathWriteMarker
+{
+    unsigned int pointIndex;
+    unsigned short segment;
+    unsigned short minorNum;
+    double timeReached;
+    float vx, vy, vz;
+    float maxSpeed;
+};
+
+struct WrPathWriteArgs
+{
+    const char *outPath;        // its directory is created if it is missing
+
+    float tickInterval;
+    double runTime;
+    unsigned long long steamid64;
+    long long dateMs;
+
+    // Written into fixed-width NUL-padded fields, one byte of which is always
+    // the terminator. See WrPathFixedField in the .cpp for the one subtlety --
+    // these arrive as raw bytes out of somebody's demo and the reference put
+    // them through a UTF-8 decode first.
+    const char *map;            // 64 bytes at 0x34
+    const char *mapHash;        // 40 at 0x74
+    const char *srcSha1;        // 40 at 0x9C -- the demo's basename, despite the name
+    const char *player;         // 32 at 0xC4
+
+    unsigned int flags;
+    unsigned char gamemode, trackType, trackNum;
+
+    unsigned int startIndex;
+    bool startOk;
+
+    const WrDpPoint *points;
+    int pointCount;
+    const WrPathWriteMarker *markers;
+    int markerCount;
+};
+
+// Bytes written, or -1 having filled in `err`. Temp file plus MoveFileEx, so a
+// reader never sees a partial file and a kill never leaves one.
+long long WrPathWrite(const WrPathWriteArgs *a, char *err, int errCap);
+
+// A fixed-width NUL-padded field, filled the way the reference's _fixed() does.
+// Exposed for tests\test_wrpath.exe; see the definition for why this is not
+// strncpy.
+void WrPathFixedField(unsigned char *dst, int size, const char *src);
 
 void WrPathShutdown(void);
 

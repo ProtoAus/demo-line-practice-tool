@@ -26,7 +26,9 @@
 
 import json
 import lzma
+import math
 import os
+import sys
 import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -240,6 +242,229 @@ def mtv(json_at):
 
 
 # ---------------------------------------------------------------------------
+# A whole demo, with a path in it
+# ---------------------------------------------------------------------------
+#
+# Everything above is one layer of the pipeline. This is all of them at once:
+# a container holding a Valve-LZMA body that really does contain a route, and
+# beside it the .wrpath THE REFERENCE PRODUCES FROM IT, byte for byte.
+#
+# WHY THIS EXISTS WHEN EVERY LAYER IS ALREADY TESTED
+#
+# test_mtv reads the container. test_lzma decodes a stream. test_dp scans and
+# runs the dynamic program over a body it builds itself. test_wrpath writes a
+# file and reads it back. Each of those is a good test and none of them would
+# notice if the four were wired together wrongly -- a body handed over with the
+# header's 17 container bytes still on the front, a tick interval read from the
+# wrong field, markers anchored against the wrong point list. Those are seam
+# bugs, and seams are exactly what a per-layer harness cannot see.
+#
+# The 6,249-demo parity run does see them, and it is the real proof. It also
+# needs a game install, a demo library and a Python interpreter, which means it
+# runs on one machine in the world and never in CI. This is the part of it that
+# fits in 30 KB of committed C: one demo, one expected answer, on every push.
+#
+# WHY THE ANSWER COMES FROM THE REFERENCE AND NOT FROM THIS SCRIPT
+#
+# Because a golden that this file computed would only ever prove that two of my
+# programs agree. The bytes below came out of wrpath_extract.py, which is the
+# thing the port is a port OF, so a difference is a real difference.
+#
+# The path itself is a gentle helix -- the same shape test_dp plants, for the
+# same reasons, and it is worth restating one of them: the filler is 0xFF, and
+# a word of all ones has a biased exponent of 255, outside the [117, 141] the
+# scan admits. So nothing in the filler can be mistaken for a coordinate and
+# every candidate found is one put there on purpose.
+
+E2E_POINTS = 200
+E2E_STRIDE = 32                 # bytes between planted triples
+E2E_BODY = 8192
+E2E_TICKS = 210                 # > points, so coverage is 95.2% and not a round 100
+E2E_DT = 0.015
+E2E_RUN_TIME = 3.0              # E2E_POINTS * E2E_DT exactly
+E2E_START_AT = 20               # which point effectiveStartVelocity fingerprints
+E2E_MARKER_AT = 100             # ... and which one the one split marker does
+
+E2E_MAP = "surf_synthetic"
+E2E_STEM = "e2e"
+E2E_STEAMID = 0x0110000112345678
+E2E_FAKE_NOW = "1700000000"
+
+
+def e2e_points():
+    """The planted trajectory, as float32 widened to double -- which is what
+    the extractor gets back, because struct.unpack('<3f') widens."""
+    import struct
+    pts = []
+    for i in range(E2E_POINTS):
+        t = i * 0.02
+        bump = 30.0 if i >= E2E_POINTS // 2 else 0.0
+        xyz = (2000.0 + 300.0 * math.cos(t) + bump,
+               3000.0 + 300.0 * math.sin(t),
+               1500.0 + 5.0 * i)
+        pts.append(struct.unpack("<3f", struct.pack("<3f", *xyz)))
+    return pts
+
+
+def e2e_velocities(pts):
+    """Central difference inside a segment, one-sided over ONE tick at the ends.
+    Reproduced here rather than asked for, because the JSON has to carry a
+    velocity that matches one of these to within MARKER_TOL before the reference
+    will place a marker at all -- so getting it wrong shows up as markers_ok 0
+    in the assertions below rather than as a fixture nobody checked."""
+    n = len(pts)
+    out = []
+    for i in range(n):
+        if i == 0:
+            a, b, span = pts[0], pts[1], 1
+        elif i == n - 1:
+            a, b, span = pts[n - 2], pts[n - 1], 1
+        else:
+            a, b, span = pts[i - 1], pts[i + 1], 2
+        d = span * E2E_DT
+        out.append(((b[0] - a[0]) / d, (b[1] - a[1]) / d, (b[2] - a[2]) / d))
+    return out
+
+
+def e2e_body():
+    import struct
+    body = bytearray(b"\xFF" * E2E_BODY)
+    for i, p in enumerate(e2e_points()):
+        at = 0x300 + i * E2E_STRIDE
+        body[at:at + 12] = struct.pack("<3f", *p)
+    return bytes(body)
+
+
+def e2e_mtv(js_text):
+    """The same container mtv() builds, at the v2 JSON offset, but carrying a
+    body with a route in it and whatever run-stats JSON it is handed."""
+    import struct
+    json_at = 0xC7
+    head = bytearray(b"\0" * json_at)
+    head[0:4] = b"MMTV"
+    struct.pack_into("<I", head, 0x04, 2)
+    struct.pack_into("<q", head, 0x08, MTV_DATE_MS)
+    head[0x10:0x10 + len(E2E_MAP)] = E2E_MAP.encode()
+    head[0x50:0x50 + len(MTV_HASH)] = MTV_HASH.encode()
+    head[0x79] = 1                                  # gamemode: surf
+    struct.pack_into("<f", head, 0x7B, E2E_DT)
+    struct.pack_into("<Q", head, 0x7F, E2E_STEAMID)
+    head[0x87:0x87 + len(MTV_PLAYER)] = MTV_PLAYER.encode()
+    head[0xA7] = 0                                  # track type: main
+    head[0xA8] = 1                                  # track num
+    struct.pack_into("<d", head, 0xA9, E2E_RUN_TIME)
+    struct.pack_into("<I", head, 0xB1, E2E_TICKS)
+
+    blob = js_text.encode("utf-8")
+    struct.pack_into("<I", head, json_at - 4, len(blob))
+
+    data = e2e_body()
+    props, comp = valve_lzma(data)
+
+    out = bytearray(head)
+    out += blob
+    out += b"LZMA"
+    out += struct.pack("<II", len(data), len(comp))
+    out += props
+    out += comp
+    assert out.index(b"{", 0xB0) == json_at
+    return bytes(out)
+
+
+def run_reference(mtv_bytes, work, extra):
+    """Write the demo where the reference will find it and run it. Returns the
+    parsed --dump-info row, and the .wrpath if one was written."""
+    import subprocess
+    ref = os.path.join(HERE, "reference", "wrpath_extract.py")
+    game = os.path.join(work, "game")
+    demo = os.path.join(game, "momentum", "momtv", "online", "1",
+                        E2E_STEM + ".mtv")
+    os.makedirs(os.path.dirname(demo), exist_ok=True)
+    with open(demo, "wb") as f:
+        f.write(mtv_bytes)
+
+    env = dict(os.environ, WRLINES_FAKE_NOW=E2E_FAKE_NOW)
+    info = os.path.join(work, "info.tsv")
+    subprocess.run([sys.executable, ref, "--game", game, "--file", demo,
+                    "--dump-info", info], check=True, env=env,
+                   stdout=subprocess.DEVNULL)
+    with open(info, "r", encoding="utf-8") as f:
+        head = f.readline().rstrip("\n").split("\t")
+        row = dict(zip(head, f.readline().rstrip("\n").split("\t")))
+
+    written = None
+    if extra:
+        out = os.path.join(work, "out")
+        subprocess.run([sys.executable, ref, "--game", game, "--file", demo,
+                        "--out", out], check=True, env=env,
+                       stdout=subprocess.DEVNULL)
+        p = os.path.join(out, E2E_MAP, E2E_STEM + ".wrpath")
+        with open(p, "rb") as f:
+            written = f.read()
+    os.remove(demo)
+    return row, written
+
+
+def e2e():
+    """Two passes. The first learns what the reference makes of the body with
+    no run stats at all; the second hands those numbers back to it as the JSON,
+    so the fixture asks the speed oracle to confirm a chain rather than skipping
+    it -- which is the single most load-bearing thing extract_path does, and the
+    thing a fixture with no maxHorizontalSpeed would never exercise."""
+    import shutil
+    import tempfile
+
+    work = tempfile.mkdtemp(prefix="wrlines-e2e-")
+    try:
+        first, _ = run_reference(e2e_mtv("{}"), work, extra=False)
+        assert first["status"] == "ok", first
+        speed = float(first["chain_max_horiz"])
+        assert first["identified_by"] == "speed", first
+
+        pts = e2e_points()
+        vel = e2e_velocities(pts)
+        sv = vel[E2E_START_AT]
+        mv = vel[E2E_MARKER_AT]
+
+        js = {
+            "trackStats": {"maxHorizontalSpeed": speed},
+            "segments": [{
+                "effectiveStartVelocity": [sv[0], sv[1], sv[2]],
+                "subsegments": [{
+                    "minorNum": 1,
+                    "timeReached": E2E_MARKER_AT * E2E_DT,
+                    "velocityWhenReached": [mv[0], mv[1], mv[2]],
+                    "stats": {"maxOverallSpeed": speed},
+                }],
+            }],
+        }
+        # repr, not %.6f: the velocity is matched against a central difference
+        # to a relative 8%, but maxHorizontalSpeed is compared to 0.5% and a
+        # rounded one would put the fixture on the edge of its own tolerance.
+        text = json.dumps(js, separators=(",", ":"))
+        blob = e2e_mtv(text)
+
+        row, wrpath = run_reference(blob, work, extra=True)
+
+        # What the fixture is FOR. Every one of these is a distinct arm of the
+        # pipeline, and a golden that matched byte for byte while any of them
+        # had gone quiet would be proving much less than it looks like.
+        assert row["status"] == "ok", row
+        assert row["identified_by"] == "speed", row
+        assert row["confident"] == "1", row
+        assert row["segments"] == "1", row
+        assert int(row["samples"]) == E2E_POINTS, row
+        assert row["markers"] == "1" and row["markers_ok"] == "1", row
+        assert row["start_ok"] == "1", row
+        assert int(row["start_index"]) == E2E_START_AT, row
+        assert float(row["match_error"]) < 1e-9, row
+        assert row["flagged"] == "0", row
+        return blob, wrpath, text, row
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     write_header(
@@ -277,3 +502,32 @@ if __name__ == "__main__":
          '#define WR_FIXTURE_MTV_JSON_LEN %d' % len(MTV_JSON),
          carray("kMtvV1", mtv(0xC6)),
          carray("kMtvV2", mtv(0xC7))])
+
+    blob, wrpath, text, row = e2e()
+    write_header(
+        "fixture_e2e.h", "WR_FIXTURE_E2E_H",
+        "One whole synthetic demo and the .wrpath wrpath_extract.py wrote from\n"
+        "it, with WRLINES_FAKE_NOW pinned at %s so the header stamp the CRC\n"
+        "covers is a constant.\n"
+        "\n"
+        "The body is %d bytes of 0xFF with %d coordinate triples planted every\n"
+        "%d bytes from 0x300 -- a gentle helix, one deliberately doubled step\n"
+        "at the halfway mark. The run stats were then written to MATCH what the\n"
+        "reference made of that body, so the fixture exercises the speed oracle\n"
+        "rather than skipping it:\n"
+        "\n"
+        "%s\n"
+        "\n"
+        "The reference reported: %d candidates, %d points, coverage %s,\n"
+        "identified by %s, match error %s, start at index %s, 1 marker placed."
+        % (E2E_FAKE_NOW, E2E_BODY, E2E_POINTS, E2E_STRIDE,
+           "\n".join("    " + text[i:i + 68] for i in range(0, len(text), 68)),
+           int(row["candidates"]), int(row["samples"]), row["coverage"],
+           row["identified_by"], row["match_error"], row["start_index"]),
+        ["#define WR_FIXTURE_E2E_MAP \"%s\"" % E2E_MAP,
+         "#define WR_FIXTURE_E2E_STEM \"%s\"" % E2E_STEM,
+         "#define WR_FIXTURE_E2E_NOW \"%s\"" % E2E_FAKE_NOW,
+         "#define WR_FIXTURE_E2E_POINTS %d" % E2E_POINTS,
+         "#define WR_FIXTURE_E2E_START %d" % E2E_START_AT,
+         carray("kE2eMtv", blob),
+         carray("kE2eWrpath", wrpath)])

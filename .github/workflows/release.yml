@@ -118,10 +118,12 @@ jobs:
           $v = "${{ github.ref_name }}" -replace '^v',''
           New-Item -ItemType Directory dist | Out-Null
 
-          # wrpath_extract.py drops out of this list when the extractor port
-          # lands. Everything else stays.
+          # Two files and two text files. wrpath_extract.py was here until
+          # v0.7.0 and is not any more -- extraction runs inside the DLL, so
+          # there is nothing to ship beside it and nothing to install to run it.
+          # It survives under tests\reference\ as the parity oracle.
           Compress-Archive -DestinationPath "dist/demo-line-practice-tool-v$v.zip" -Path `
-            wrinject.exe, wrlines.dll, wrpath_extract.py, 'HOW TO USE.txt', LICENSE
+            wrinject.exe, wrlines.dll, 'HOW TO USE.txt', LICENSE
 
           # Symbols are a separate asset. wrlines.pdb alone is 8 MB against a
           # 1.5 MB payload and would be most of what people downloaded.

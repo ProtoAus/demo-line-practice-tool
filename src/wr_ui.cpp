@@ -665,7 +665,7 @@ static void DrawRunsTab(void)
         ImGui::InputTextWithHint("##pickfilter", "filter", pickFilter,
                                  sizeof(pickFilter));
         if (WrAvailableMapCount() == 0)
-            ImGui::TextDisabled("(none yet -- run wrpath_extract.py)");
+            ImGui::TextDisabled("(none yet -- press \"Extract new demos\")");
         int matched = 0;
         for (int i = 0; i < WrAvailableMapCount(); i++)
         {
@@ -804,12 +804,14 @@ static void DrawRunsTab(void)
         if (ImGui::Button(fresh > 0 ? "Extract new demos" : "Re-run extractor"))
             WrExtractRun(false);
         ImGui::SameLine();
-        HelpMarker("Launches wrpath_extract.py in the background, at below-normal "
-                   "priority so it does not fight the game for CPU. It only "
-                   "processes demos that have no .wrpath yet, so pressing it "
+        HelpMarker("Reads the demos and writes the lines, inside the DLL, on a "
+                   "pool of background threads -- below-normal priority and "
+                   "marked as background work, so on a modern CPU they are put "
+                   "on the efficiency cores and leave the game alone. It only "
+                   "processes demos that have no path file yet, so pressing it "
                    "again costs seconds.\n\n"
-                   "This starts a separate python process. It is never run "
-                   "automatically -- only when you press this.");
+                   "Nothing is installed and nothing is launched. It is never "
+                   "run automatically -- only when you press this.");
         if (bad > 0)
         {
             ImGui::SameLine();
@@ -836,10 +838,11 @@ static void DrawRunsTab(void)
                 "Stops whatever is running -- an extraction, a leaderboard "
                 "fetch, a download. There is one slot, so this is it whichever "
                 "tab started it.\n\n"
-                "It takes the worker processes with it, not just the "
-                "interpreter that spawned them: the extractor runs one worker "
-                "per core bar two, and killing only the parent would leave "
-                "them each burning a core until they noticed.\n\n"
+                "It is not instant, and it says so rather than pretending. Each "
+                "worker has to reach its next checkpoint before it can look at "
+                "the flag, which on a large demo can be a second or two. The "
+                "alternative is killing a thread inside the game, which would "
+                "leave a lock held and hang the game on its next allocation.\n\n"
                 "Nothing is lost. Every file already written is complete -- "
                 "they are written to a temporary name and moved into place -- "
                 "and the record of which demos failed is saved as they fail, "
@@ -891,20 +894,13 @@ static void DrawRunsTab(void)
             ImGui::TextDisabled("Load a map, or pick one above.");
             return;
         }
+        // There was a "Copy command" box here, offering a python command line
+        // to run in a terminal instead. There is no script to run any more, and
+        // the button above is now the only way there ever was.
         ImGui::TextWrapped(
-            "No cached paths for this map yet. The button above generates them "
-            "from the demos the game already downloaded. If you would rather do "
-            "it in a terminal:");
-        ImGui::Spacing();
-        char cmd[256];
-        _snprintf_s(cmd, sizeof(cmd), _TRUNCATE,
-                    "python wrpath_extract.py --map %s --skip-existing", map);
-        ImGui::SetNextItemWidth(-1.0f);
-        ImGui::InputText("##cmd", cmd, sizeof(cmd), ImGuiInputTextFlags_ReadOnly);
-        if (ImGui::Button("Copy command"))
-            ImGui::SetClipboardText(cmd);
-        ImGui::SameLine();
-        ImGui::TextDisabled("run it in the wrlines folder, then press Reload");
+            "No cached paths for this map yet. The button above reads them out "
+            "of the demos the game has already downloaded -- and the Board tab "
+            "will fetch more.");
         return;
     }
 

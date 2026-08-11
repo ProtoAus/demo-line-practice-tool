@@ -21,12 +21,10 @@ Step 5 also picks up whatever .mtv demos the game had already downloaded by
 itself, so it is worth pressing even if you skip step 4. When there is nothing
 new to do it reads "Re-run extractor" instead -- same button.
 
-Extracting still needs Python (py.exe, python.exe or python3.exe on PATH):
-step 5 runs through wrpath_extract.py, which is in this folder. The panel says
-which interpreter it found, or that it found none. This is being folded into
-the DLL a piece at a time and the requirement will go away -- as of v0.6.1 the
-map list, the leaderboard and downloading demos are all the DLL's own work, so
-steps 1 to 4 need no Python installed at all.
+There is nothing else to install. Up to v0.6.1 step 5 needed Python, because it
+ran through a wrpath_extract.py that shipped in this folder; as of v0.7.0 it
+does not. All of it happens inside wrlines.dll, on background threads that are
+marked as background work so they stay out of the game's way.
 
 
 KEYS
@@ -83,13 +81,25 @@ IF NOTHING IS DRAWN
   The most common cause is simply that no runs are ticked, or that the ones
   ticked are on a different stage of the map. "Best 3 near me" fixes that.
 
+  One cause it cannot work around, and says so plainly: a game install whose
+  folder path contains non-English characters -- D:\Игры\, or an accented
+  Windows user name. This build reads files through the older Windows calls
+  that cannot name such a path, so it finds no demos at all. Extraction refuses
+  with that reason rather than reporting that it found nothing, and the log
+  names the path. Moving the install, or this folder, somewhere spelled in
+  plain ASCII is the only fix today.
+
 
 IF AN EXTRACTION SEEMS STUCK
 
   It probably is not -- a slow demo used to hold up the progress line for every
-  demo already finished. That is fixed, and there is now a timeout you can set
-  and a Stop button that takes the whole worker pool with it, not just the
-  parent process.
+  demo already finished. That is fixed, and there is a timeout you can set.
+
+  Stop is not instant, and the panel says so rather than pretending. Each
+  worker has to reach its next checkpoint before it can notice, which on a
+  large demo can be a second or two. Nothing is lost either way: every file
+  already written is complete, and the record of which demos failed is saved as
+  they fail.
 
 
 A FEW THINGS WORTH FINDING
@@ -171,10 +181,10 @@ A NOTE ON YOUR DATA
     - It never runs on a timer, at startup, or on a map change. Only from a
       button.
 
-  From v0.6.1 that is all of it. Demos used to be downloaded by the script and
-  are now fetched through that same one file. Nothing else here reaches the
-  network -- what the script still does is extraction, and extraction reads
-  files off your disk.
+  From v0.6.1 that is all of it, and from v0.7.0 there is no script left at
+  all: the last thing it did was extraction, extraction reads files off your
+  disk, and it now happens inside the DLL. wrpath_extract.py is not in this
+  folder any more.
 
 
 Source, full documentation and issues:

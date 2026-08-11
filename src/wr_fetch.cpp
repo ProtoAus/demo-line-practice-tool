@@ -289,6 +289,15 @@ static void WalkTree(WrFetchHeld *h, const char *root)
 
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
         {
+            // _have_hashes walks with os.walk, whose followlinks defaults to
+            // False, and CPython has reported junctions as links since 3.8. So
+            // a junction inside either demo tree contributes nothing to the
+            // reference's held set and must contribute nothing to ours: this
+            // count is printed to the user ("N of M are already here") and
+            // decides what gets downloaded. It is also the same ancestor-cycle
+            // hazard WalkDemos guards against.
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+                continue;
             WalkTree(h, full);
             continue;
         }
@@ -377,22 +386,9 @@ void WrFetchHeldFree(WrFetchHeld *h)
 // Writing a demo down
 // ---------------------------------------------------------------------------
 
-static void MakeTree(const char *dir)
-{
-    char buf[MAX_PATH];
-    strcpy_s(buf, sizeof(buf), dir);
-    for (char *p = buf; *p; p++)
-    {
-        if (*p != '\\' && *p != '/')
-            continue;
-        char was = *p;
-        *p = '\0';
-        if (buf[0] && !(buf[1] == ':' && buf[2] == '\0'))
-            CreateDirectoryA(buf, NULL);
-        *p = was;
-    }
-    CreateDirectoryA(buf, NULL);
-}
+// MakeTree used to be here, and in wr_intogame.cpp, and inside WrDataPath. One
+// copy now, in wr_log.cpp; see WrMakeTree in wr_common.h for why three was one
+// too many even before there were worker threads.
 
 static bool WriteWhole(const char *path, const unsigned char *data, size_t len)
 {
@@ -489,12 +485,12 @@ static int Download(const char *dest, const WrBoardCacheRow *rows, int count,
         return 0;
     }
 
-    MakeTree(dest);
+    WrMakeTree(dest);
 
     char intoGameDir[MAX_PATH] = "";
     if (intoGame && *intoGame)
     {
-        MakeTree(intoGame);
+        WrMakeTree(intoGame);
         DWORD attr = GetFileAttributesA(intoGame);
         if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY))
         {

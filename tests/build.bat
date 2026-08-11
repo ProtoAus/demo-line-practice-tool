@@ -183,36 +183,79 @@ cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Itests /Ithird_party\miniz ^
    /Fe:tests\test_fetch.exe /Fo:tests\ >nul
 if errorlevel 1 ( echo [!] test_fetch FAILED to build & exit /b 1 )
 
-rem test_seam links the real launcher, because the whole claim it checks is that
-rem the request struct turns back into the command line the call sites used to
-rem build by hand. A harness with its own copy of the formatting would agree
-rem with itself and say nothing about what ships.
+rem test_seam lived here. It was written at P0 and its whole subject was that
+rem the typed request produced EXACTLY the command line the nine call sites used
+rem to format by hand -- eleven argv strings, byte for byte. It was temporary by
+rem design and its own header said so; it went with the python backend, because
+rem there is no command line left for it to be about.
+
+rem test_dp is the port's real proof. It links wr_dp.cpp and nothing else,
+rem because wr_dp.cpp includes no Windows header and calls nothing -- the same
+rem property that lets test_json be checked this hard. What it pins is the two
+rem things a .wrpath cannot show you: the exact set of bit positions the scan
+rem admits, and a compensated vector norm transcribed from CPython that has to
+rem agree with it in the last place.
+cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Itests tests\test_dp.cpp ^
+   %S%\wr_dp.cpp ^
+   /Fe:tests\test_dp.exe /Fo:tests\ >nul
+if errorlevel 1 ( echo [!] test_dp FAILED to build & exit /b 1 )
+
+rem test_wrpath writes a file with the real writer and reads it back with the
+rem REAL loader, which nothing did before the port -- LoadOne had no test at
+rem all. That round trip is the only thing standing between the two halves of a
+rem format whose second implementation has stopped shipping.
+cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Itests tests\test_wrpath.cpp ^
+   %S%\wr_path.cpp %S%\wr_profile.cpp %S%\wr_energy.cpp %S%\wr_log.cpp ^
+   /Fe:tests\test_wrpath.exe /Fo:tests\ >nul
+if errorlevel 1 ( echo [!] test_wrpath FAILED to build & exit /b 1 )
+
+rem test_jobs drives the real pool. Most of it is WrJobsWorkerCount as a table,
+rem which needs no threads; the rest genuinely starts them, because "every item
+rem runs exactly once" and "two jobs on different deadlines do not share one"
+rem are properties of the threading and cannot be restated without it.
+cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Itests tests\test_jobs.cpp ^
+   %S%\wr_jobs.cpp %S%\wr_log.cpp ^
+   /Fe:tests\test_jobs.exe /Fo:tests\ >nul
+if errorlevel 1 ( echo [!] test_jobs FAILED to build & exit /b 1 )
+
+rem test_e2e is the only harness here that owns neither end of anything. It
+rem hands WrDemoProcess a whole synthetic .mtv and compares the .wrpath that
+rem comes out against the one wrpath_extract.py wrote from the same bytes,
+rem committed in tests\fixture_e2e.h. Every other harness tests a layer and so
+rem cannot see a seam between two of them; the parity run can, and needs a game
+rem install, a demo library and a specific interpreter to do it. This is the
+rem part of that comparison small enough to run on every push.
 rem
-rem TEMPORARY. It goes with the python backend, once every verb is C.
-rem
-rem The link list grows with the port: wr_extract.cpp is the slot every verb is
-rem dispatched from, so it pulls in whatever has been ported so far. That is the
-rem cost of there being one slot, and it is the right cost.
-cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Ithird_party\miniz /Ithird_party\lzma ^
-   tests\test_seam.cpp ^
-   %S%\wr_extract.cpp %S%\wr_maps.cpp %S%\wr_msml.cpp %S%\wr_json.cpp ^
-   %S%\wr_mtv.cpp %S%\wr_api.cpp %S%\wr_http.cpp %S%\wr_board.cpp ^
-   %S%\wr_fetch.cpp %S%\wr_log.cpp tests\miniz.obj tests\LzmaDec.obj ^
-   winhttp.lib ^
-   /Fe:tests\test_seam.exe /Fo:tests\ >nul
-if errorlevel 1 ( echo [!] test_seam FAILED to build & exit /b 1 )
+rem It links the whole extraction path -- the container, the codec, the JSON
+rem reader, the dynamic program, the writer AND the loader -- because that is
+rem exactly the wiring it exists to check.
+cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Itests /Ithird_party\miniz ^
+   /Ithird_party\lzma tests\test_e2e.cpp ^
+   %S%\wr_demo.cpp %S%\wr_dp.cpp %S%\wr_mtv.cpp %S%\wr_json.cpp ^
+   %S%\wr_path.cpp %S%\wr_profile.cpp %S%\wr_energy.cpp %S%\wr_log.cpp ^
+   tests\LzmaDec.obj ^
+   /Fe:tests\test_e2e.exe /Fo:tests\ >nul
+if errorlevel 1 ( echo [!] test_e2e FAILED to build & exit /b 1 )
 
 rem wrextract.exe is not a harness -- it runs nothing and asserts nothing. It is
 rem the console front end over the same functions the DLL calls, and it is how
 rem the port's output gets diffed against wrpath_extract.py's. Built here so it
 rem cannot rot; never run by this script, and never shipped.
+rem
+rem It links wr_extract.cpp, which is the whole point: the dispatch, the demo
+rem walk, the progress lines and the failure record are the SHIPPED ones. What
+rem this file adds is an argv parser and a stdout emit hook. That drags in most
+rem of src\ behind it, and that is the right cost -- a front end with its own
+rem copy of any of it would agree with itself and say nothing.
 cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Itests /Ithird_party\miniz ^
    /Ithird_party\lzma ^
    tests\wrextract_main.cpp tests\api_tape.cpp ^
-   %S%\wr_maps.cpp %S%\wr_msml.cpp %S%\wr_json.cpp %S%\wr_mtv.cpp ^
-   %S%\wr_api.cpp %S%\wr_http.cpp %S%\wr_board.cpp %S%\wr_fetch.cpp ^
-   %S%\wr_log.cpp tests\miniz.obj tests\LzmaDec.obj winhttp.lib ^
-   /Fe:tests\wrextract.exe /Fo:tests\ >nul
+   %S%\wr_extract.cpp %S%\wr_maps.cpp %S%\wr_msml.cpp %S%\wr_json.cpp ^
+   %S%\wr_mtv.cpp %S%\wr_api.cpp %S%\wr_http.cpp %S%\wr_board.cpp ^
+   %S%\wr_fetch.cpp %S%\wr_dp.cpp %S%\wr_demo.cpp %S%\wr_jobs.cpp ^
+   %S%\wr_path.cpp %S%\wr_profile.cpp %S%\wr_energy.cpp %S%\wr_log.cpp ^
+   tests\miniz.obj tests\LzmaDec.obj winhttp.lib ^
+   /Fe:tests\wrextract.exe /Fo:tests\ 
 if errorlevel 1 ( echo [!] wrextract FAILED to build & exit /b 1 )
 
 del tests\*.obj >nul 2>&1
@@ -234,7 +277,10 @@ tests\test_lzma.exe       || set "RC=1"
 tests\test_mtv.exe        || set "RC=1"
 tests\test_api.exe        || set "RC=1"
 tests\test_fetch.exe      || set "RC=1"
-tests\test_seam.exe       || set "RC=1"
+tests\test_dp.exe         || set "RC=1"
+tests\test_wrpath.exe     || set "RC=1"
+tests\test_jobs.exe       || set "RC=1"
+tests\test_e2e.exe        || set "RC=1"
 
 if "%RC%"=="1" ( echo. & echo [!] SOME HARNESSES FAILED & exit /b 1 )
 echo.

@@ -406,23 +406,9 @@ bool WrIntoGameFindSource(const char *map, int mapId, const char *hash,
 
 // ---------------------------------------------------------------------------
 
-static bool MakeTree(const char *dir)
-{
-    // CreateDirectory one level at a time, which is the whole of mkdir -p here
-    // because the parents all exist in a real install.
-    char tmp[MAX_PATH];
-    strcpy_s(tmp, sizeof(tmp), dir);
-    for (char *p = tmp + 3; *p; p++)
-    {
-        if (*p != '\\')
-            continue;
-        *p = '\0';
-        CreateDirectoryA(tmp, NULL);
-        *p = '\\';
-    }
-    CreateDirectoryA(tmp, NULL);
-    return GetFileAttributesA(tmp) != INVALID_FILE_ATTRIBUTES;
-}
+// MakeTree lived here, and in wr_fetch.cpp, and inside WrDataPath. One copy
+// now, in wr_log.cpp; see WrMakeTree in wr_common.h for why three was one too
+// many even before extraction had worker threads.
 
 // Put an entry in the manifest, if it is not there already. Returns false only
 // when the manifest is full.
@@ -538,7 +524,7 @@ WrIntoGameResult WrIntoGameSendTo(WrIntoGameWhere where, const char *map,
     char *slash = strrchr(dir, '\\');
     if (slash)
         *slash = '\0';
-    if (!MakeTree(dir))
+    if (!WrMakeTree(dir))
     {
         Say(detail, detailLen, "could not create %s", dir);
         return WR_SEND_FAILED;

@@ -79,9 +79,79 @@ const char *WrGameDir(void)
     return g_gameDir;
 }
 
+bool WrPathIsAscii(const char *s)
+{
+    if (!s)
+        return true;
+    // Unsigned, deliberately. A plain char is signed on MSVC, so `*p >= 0x80`
+    // on the raw type is false for every byte that has the high bit set --
+    // which is precisely the set this exists to find.
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++)
+        if (*p >= 0x80)
+            return false;
+    return true;
+}
+
+void WrFileStem(const char *path, char *out, int cap)
+{
+    if (!out || cap <= 0)
+        return;
+    out[0] = '\0';
+    if (!path)
+        return;
+
+    const char *base = path;
+    for (const char *p = path; *p; p++)
+        if (*p == '\\' || *p == '/')
+            base = p + 1;
+    strncpy_s(out, (size_t)cap, base, _TRUNCATE);
+
+    char *dot = strrchr(out, '.');
+    if (!dot)
+        return;
+
+    // Everything before the last dot being itself a dot is Python's "there is
+    // no extension here" -- see the header. The loop, not a `dot != out` test,
+    // because "..mtv" has a dot at index 1 and still must not be split.
+    for (const char *p = out; p < dot; p++)
+        if (*p != '.')
+        {
+            *dot = '\0';
+            return;
+        }
+}
+
+bool WrMakeTree(const char *dir)
+{
+    char buf[MAX_PATH];
+    strcpy_s(buf, sizeof(buf), dir);
+    for (char *p = buf; *p; p++)
+    {
+        if (*p != '\\' && *p != '/')
+            continue;
+        char was = *p;
+        *p = '\0';
+        // Not "C:", which is not a directory anybody can create, and not the
+        // empty string a leading separator would produce.
+        if (buf[0] && !(buf[1] == ':' && buf[2] == '\0'))
+            CreateDirectoryA(buf, NULL);
+        *p = was;
+    }
+    CreateDirectoryA(buf, NULL);
+    return GetFileAttributesA(buf) != INVALID_FILE_ATTRIBUTES;
+}
+
 // Build the path and make sure every directory along it exists. Returns a
 // pointer to a rotating set of static buffers so a couple of calls can be live
 // in one expression without stomping each other.
+//
+// FOUR ROTATING BUFFERS AND NO LOCK, WHICH IS NOW A RULE RATHER THAN A RISK.
+// Two threads calling this can be handed the same buffer. It was safe while
+// only the UI thread and one background counter used it; extraction runs a
+// worker pool. The rule that makes it safe again is in wr_jobs.h and it is
+// structural rather than remembered: this is resolved ONCE PER JOB, on the
+// coordinator, before any worker starts, and workers are handed absolute paths
+// with nothing left to look up.
 const char *WrDataPath(const char *rel)
 {
     static char bufs[4][MAX_PATH];
@@ -96,14 +166,11 @@ const char *WrDataPath(const char *rel)
     // which is assumed to be a file name unless it ends in a separator.
     char tmp[MAX_PATH];
     strcpy_s(tmp, MAX_PATH, out);
-    for (char *p = tmp + 3; *p; p++)
+    char *last = strrchr(tmp, '\\');
+    if (last)
     {
-        if (*p == '\\')
-        {
-            *p = '\0';
-            CreateDirectoryA(tmp, NULL);
-            *p = '\\';
-        }
+        *last = '\0';
+        WrMakeTree(tmp);
     }
     return out;
 }
@@ -136,10 +203,24 @@ long long WrNowEpoch(void)
     DWORD n = GetEnvironmentVariableA("WRLINES_FAKE_NOW", v, sizeof(v));
     if (n > 0 && n < sizeof(v))
     {
+        // int("...") IGNORES SURROUNDING WHITESPACE, and this has to as well.
+        // `set WRLINES_FAKE_NOW=1700000000` in a batch file keeps the trailing
+        // space cmd puts before the newline, and a strict terminator check on
+        // that silently fell through to the live clock -- which shows up as
+        // four differing bytes at 0xF4 and a differing CRC, i.e. as the port
+        // getting the file wrong, in the one variable whose entire job is to
+        // make the two comparable. _strtoi64 already skips leading space; the
+        // trailing end is ours to skip.
         char *end = NULL;
         long long pinned = _strtoi64(v, &end, 10);
-        if (end && end != v && *end == '\0')
-            return pinned;
+        if (end && end != v)
+        {
+            while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n' ||
+                   *end == '\v' || *end == '\f')
+                end++;
+            if (*end == '\0')
+                return pinned;
+        }
     }
 
     // int(time.time()), which truncates toward zero rather than rounds.

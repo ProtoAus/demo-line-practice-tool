@@ -15,24 +15,26 @@ you surf, with
 names and avatars on the lines, speeds at the bottom of every ramp, and a live energy readout
 that tells you where you are wasting momentum.
 
-Two halves:
+Two halves, and **as of v0.7.0 both of them live in `wrlines.dll`**:
 
 | | |
 | --- | --- |
-| `wrpath_extract.py` | offline. Reads the `.mtv` demos on disk and writes small `.wrpath` files. Being folded into the DLL a piece at a time — the map index, the leaderboard and downloading have gone already, and extraction is the last of it. |
-| `wrlines.dll` | in-game. Reads `.wrpath`, draws the lines, and gives you a panel on **INSERT**. |
+| offline | Reads the `.mtv` demos on disk and writes small `.wrpath` files, on a pool of background threads. Started from a button; never automatic. |
+| in-game | Reads `.wrpath`, draws the lines, and gives you a panel on **INSERT**. |
 
-The DLL never parses `.mtv`. It only ever reads a simple, versioned, CRC-checked array of
-points.
+That was two programs until v0.7.0: the offline half was `wrpath_extract.py`, shipped beside the
+DLL and run through whatever Python you had. It went in five releases, one verb at a time — the
+map index at v0.5.0, the container at v0.5.1, the leaderboard at v0.6.0, downloading at v0.6.1
+and extraction at v0.7.0. The script survives in the tree under `tests/reference/` as the
+oracle the port is checked against, and is not in the download.
 
 > **Naming:** the project is *Demo Line Practice Tool*; the binary and the source files kept
 > their working name, `wrlines`. Nothing depends on that — it is just what the files were
 > called while it was being written.
 
-**Requires:** Windows x64, Momentum Mod Playtest (Strata Source), D3D11 or DXVK, and Python 3.8+
-for the one part still in the script — extraction. The Maps tab, the Board tab's leaderboard
-fetch and downloading demos need no interpreter. There is no 32-bit path anywhere in the game, so
-both binaries are x64.
+**Requires:** Windows x64, Momentum Mod Playtest (Strata Source), and D3D11 or DXVK. Nothing
+else — no interpreter, no runtime, no installer. There is no 32-bit path anywhere in the game,
+so both binaries are x64.
 **Linux works, through Proton** — see [Linux](#linux) below for why that is the answer rather
 than a native build.
 
@@ -44,9 +46,6 @@ than a native build.
 git clone --depth 1 --branch v1.91.9b https://github.com/ocornut/imgui imgui
 git clone --depth 1 https://github.com/TsudaKageyu/MinHook minhook
 build.bat
-
-python wrpath_extract.py --list                 # what demos you have
-python wrpath_extract.py --map surf_demise      # extract them
 
 REM launch the game, load the map, then:
 wrinject.exe
@@ -422,13 +421,13 @@ by their arrival. The thing that did change it was `winhttp.lib` at v0.6.0, whic
 not a dependency to vendor; see *Your data* in the README and
 [src/wr_http.h](../src/wr_http.h). The release workflow asserts the exact list either way.
 
-### Python
+### zstd
 
-The extractor needs no packages for most demos. The very largest ones use zstd bodies:
-
-```
-pip install zstandard        # optional; without it those demos are skipped, not failed
-```
+About 3.5% of demos — the very largest — have a zstd body rather than an LZMA one, and reading
+them needs a second decompressor for a format no current demo uses. They are reported as
+**skipped**, never as failed, and that distinction is load-bearing: a skip is not written to the
+failure record, so recording them as failures would put a permanent entry in every user's
+`_failed.txt` that *Retry the failures* would re-fail for ever.
 
 ---
 
@@ -454,13 +453,22 @@ be extracted, so it is now counted as *already known bad* rather than as work wa
 done. Nothing in a 6,249-demo library fails any of them, which is the point: the counter should
 be telling the truth on the day one does.
 
-It runs **only when you press the button** — starting a python process off a map change would
-launch a program behind your back and then compete with the game for CPU while you play. The
-process runs at below-normal priority, and `--skip-existing` means pressing it a second time
-costs seconds rather than minutes.
+It runs **only when you press the button** — starting work off a map change would compete with
+the game for CPU while you play, behind your back. The workers run at below-normal priority and
+are additionally marked as background work through `SetThreadInformation`, which on a hybrid CPU
+asks the scheduler to park them on the efficiency cores and leave the performance cores for the
+game. Skipping what is already done means pressing it a second time costs seconds rather than
+minutes.
 
-Needs `py.exe` or `python.exe` on `PATH`; the panel says which it found, or that it found
-neither.
+It used to launch `python.exe` with a pipe and read its output. From v0.7.0 it is a worker pool
+inside the game's own process, which cost three things that were free before: a worker that
+faults takes the game with it (hence the one `__try` in the project, in
+[src/wr_jobs.cpp](../src/wr_jobs.cpp)); a demo's working set now lives in the game's heap, times
+N (hence the admission budget); and **Stop is no longer instant**, because `TerminateThread` on a
+thread of somebody else's process leaks whatever locks it held — the CRT heap lock among them —
+and the game would deadlock on its next allocation. Cancellation is cooperative, the panel says
+so rather than claiming a clean stop, and nothing is lost either way: every file is written to a
+temp name and renamed.
 
 The panel is there whether or not the map has any paths yet. A map with nothing extracted is
 exactly when you need the button most.
@@ -534,29 +542,53 @@ Three things keep the record from going stale on its own:
 ### Speed
 
 Each demo is completely independent — one file in, one file out — so extraction runs across
-processes. `--jobs` defaults to all cores but two: the in-game button starts the script at
-below-normal priority so it loses any fight with the game, but priority does not help if every
-core is busy. `--jobs 1` forces serial.
+threads. The worker count defaults to all cores but two, and the two are not arbitrary: one of
+the cores we would otherwise take is the game's render thread and the other is its main thread,
+and the whole point of the panel is that you can keep playing while this runs. It is capped at
+sixteen whatever the machine has, because the work is memory-bound long before it is core-bound
+— each worker holds a decompressed body and a candidate arena.
 
-There is also a `--timeout`, 180 s per demo by default. The dynamic program is quadratic in the
-worst case and some demos genuinely take a minute; serially that reads as "it did four quickly
-and then stopped". A demo that hits the limit is recorded as an ordinary failure, so it is not
-paid for twice.
+There is also a **timeout**, 30 s per demo by default, on the slider beside the button. The
+dynamic program is quadratic in the worst case and some demos genuinely take a minute; that
+reads as "it did four quickly and then stopped". A demo that hits the limit is recorded as an
+ordinary failure, so it is not paid for twice.
 
-**1. Generate paths for a map**, if you would rather use a terminal. From this folder:
+Measured against the Python it replaces, on the same demos and the same machine: about **fifty
+times faster**. Most of that is not the language. It is that the reference reads a float at an
+arbitrary bit position by shifting the *entire* decompressed body by each of eight bit phases and
+keeping the copies — roughly ten times the body in allocations, per demo — where the port does
+one unaligned 8-byte load and a shift. See [src/wr_dp.h](../src/wr_dp.h).
 
-```
-python wrpath_extract.py --list                        # what demos you have
-python wrpath_extract.py --map surf_demise             # extract them
-python wrpath_extract.py --map surf_demise --verify    # extract but write nothing
-```
+### The two lines of Python that are not what they look like
 
-Roughly 0.7 s per demo. Files land in `wrlines_data\paths\<map>\`.
+The port has to agree with the reference **to the last bit**, and not out of neatness. Both
+numbers below are compared against a threshold, and a chain that misses a threshold is not
+slightly different — it is *banned*, and the search goes off and finds a different path through
+the demo. So a last-place disagreement does not move a coordinate; it selects another route.
 
-If your game is not at the default `C:\Program Files (x86)\Steam\steamapps\common\Momentum
-Mod Playtest`, pass `--game <path>`.
+Two ordinary-looking expressions do arithmetic nobody would write out:
 
-**2. Launch the game**, then:
+- **`math.dist` and `math.hypot` are not `sqrt(x² + y² + z²)`.** Since 3.8 CPython computes a
+  vector norm with lossless power-of-two scaling, exact squaring via `fma`, Neumaier compensated
+  summation and a differential correction of the square root. On a table of 407 real coordinate
+  pairs, **153 of them disagree with the naive form** — and those are ordinary surf-map
+  distances, not exotica.
+- **`sum()` over floats is Neumaier-compensated too, and only since 3.12.** Not `math.fsum`,
+  which is exactly rounded, but not a running total either. This one was found by the parity
+  run rather than by reading: a plain `+=` over nine thousand step lengths landed 3.6 × 10⁻¹¹
+  away from the reference. That is harmless where it was noticed — a printed diagnostic — and
+  is not harmless in the other place the reference uses it, where the same function averages a
+  segment's coordinates and compares the result against a radius to decide whether that
+  segment is part of the route at all.
+
+  Worth stating plainly: **the port was correct against Python 3.11 and wrong against 3.12.**
+  The version in `wr_dp.h` is not decoration.
+
+Where the reference is *naive*, so is the port. The dynamic program's own step lengths are a
+plain `sqrt` on both sides; "fixing" those would change which edges the DP accepts. `build.bat`
+passes `/fp:precise` for the same reason — reassociating any of this is a correctness change.
+
+**Launch the game**, then:
 
 ```
 wrinject.exe
@@ -620,7 +652,7 @@ arbitrary bytes, and taking the first on faith is what produced `implausible JSO
 1076353433` on two demos. Valve-LZMA is its own thing too — seventeen bytes of header, then a
 raw LZMA1 stream with no end marker, so the decoder has to be told how much to produce.
 
-All of that now exists twice: in `wrpath_extract.py`, and in
+All of that exists twice: in the frozen `tests/reference/wrpath_extract.py`, and in
 [src/wr_mtv.cpp](../src/wr_mtv.cpp) over a committed copy of the LZMA SDK's decoder. It is
 allowed to exist twice because the two are checked against each other:
 [tests/parity.ps1](../tests/parity.ps1) runs both over every demo on this machine and compares
@@ -666,8 +698,32 @@ known-good single-stage demos and testing the stitched points against that geome
 
 ### Known limits
 
-- **zstd bodies are skipped** unless you `pip install zstandard`. That is ~142 of the
-  4035 demos on one test install, all of them the very largest files.
+- **zstd bodies are skipped.** ~310 of the 6,250 demos on this test install, all of them the
+  very largest files. Reported as *skipped*, never as failures — a skip is not written to the
+  failure record, and getting that backwards would poison every user's record with hundreds of
+  permanent entries that `--retry-failed` would re-fail forever.
+- **An install path with non-ASCII characters in it will not work, and v0.7.0 made this
+  worse.** Every path here is `char*` and every file call is the `-A` Windows form, so a byte
+  ≥ 0x80 anywhere in the path — `D:\Игры\`, an accented user name — cannot be named. That was
+  always true of the demo counter. What changed is that extraction used to be a Python script,
+  and Python opens files with *wide* paths, so it read such an install perfectly and the DLL
+  drew the results. Moving extraction in-process took that away.
+
+  It is the **one respect in which the port is a step backwards**, so it is detected and
+  said out loud rather than discovered: the log names both paths at startup, and pressing
+  Extract refuses with the reason instead of reporting a clean run over nothing.
+  `GetShortPathNameA` is not the workaround it appears to be — 8.3 name generation is off by
+  default on modern volumes, so it returns the long path unchanged on exactly the machines
+  that would need it. The real fix is a `-W` conversion of the project, which is a change of
+  a different size and is the obvious follow-up. Bounded, at least: demo file names are hex
+  and map names are ASCII by the game's own rules, so only the install path is exposed.
+- **A junction or symlink inside a demo folder is not followed.** If you keep demos on a second
+  drive and link them into `momtv` or into `wrlines_data\demos`, the linked directory is listed
+  and not descended into, so nothing inside it is found. This matches the reference exactly —
+  `os.walk` defaults to `followlinks=False`, and CPython has reported junctions as links since
+  3.8 — and it is also what stops a link pointing back at one of its own parents from recursing
+  until the stack is gone. The link you hand the extractor as a *root* is fine; it is only links
+  found *during* the walk that are skipped.
 - A small number of runs fail identification outright (2 of 30 in the mixed sweep). They
   are reported as `FAIL`, never silently written.
 - Short stage runs that start near the world origin can be indistinguishable from the
@@ -1733,15 +1789,13 @@ What that means in practice:
   `VirtualAllocEx` and `CreateRemoteThread`, all of which Wine implements; run it through the
   game's own prefix (`protontricks`, or `WINEPREFIX=... proton run wrinject.exe`).
 - The panel's **Diagnostics** tab reports `platform  Wine/Proton` when it detects one, because
-  that changes what several other lines on that tab mean — which `d3d11.dll` is loaded, whether
-  a Python is reachable, and whether a path the game printed is a Windows path or a `Z:` view
-  of a Linux one.
-- **Python has to be reachable from inside the prefix.** A Python installed on the Linux side
-  is not on the prefix's `PATH`, and the extractor is launched as a child process from inside
-  the game. `py.exe`, `python.exe` and `python3.exe` are all searched for; when none is found
-  under Wine the panel says so naming the prefix rather than giving the generic message. The
-  fallback is to run `wrpath_extract.py` yourself on the Linux side — it is pure stdlib, has no
-  Windows dependency, and its default game path is platform-aware.
+  that changes what several other lines on that tab mean — which `d3d11.dll` is loaded, and
+  whether a path the game printed is a Windows path or a `Z:` view of a Linux one.
+- **Nothing has to be installed inside the prefix**, and that is new at v0.7.0. Until then the
+  extractor was a Python script launched as a child process from inside the game, so it needed
+  an interpreter on the *prefix's* `PATH` — and a Python installed on the Linux side is not on
+  it. That was the single most confusing thing about running this under Proton, and it is gone:
+  extraction happens inside the DLL, which is already inside the prefix by definition.
 - Everything else is unchanged. The lines, the panel and the leaderboard have no platform
   surface at all; the whole D3D11 dependency lives in two files.
 
@@ -1975,7 +2029,6 @@ Everything goes to `wrlines_data\wrlines.log`, flushed on every line.
 ## Layout
 
 ```
-wrpath_extract.py   .mtv -> .wrpath, offline
 build.bat           vcvars + cl.exe
 injector.cpp        -> wrinject.exe
 dllmain.cpp         entry point, per-frame ordering, INSERT hotkey
@@ -1998,7 +2051,18 @@ wr_board            a map's leaderboard, as much of it as you asked for
 wr_savelocs         our own times for the game's save-locs
 wr_timer            the run clock
 wr_limit            the frame cap
-wr_extract          counting unextracted demos, running the extractor
+wr_extract          counting unextracted demos, and cmd_extract: the demo
+                    walk, the work list, the progress lines, the failure record
+wr_mtv              the .mtv container and Valve-LZMA -- bytes, no floats
+wr_dp               the candidate scan, the dynamic program and the scoring.
+                    NO WINDOWS HEADERS: the one place where "does this produce
+                    the same numbers as the reference" is the only question
+wr_demo             one .mtv -> one .wrpath: the run's own JSON, the split
+                    markers, where the RUN starts as opposed to the recording
+wr_jobs             the worker pool, the memory budget, cooperative cancel
+wr_json / wr_msml   a hand-written JSON reader, and the game's cache container
+wr_http / wr_api    the only file that reaches the network, and what it asks
+wr_fetch            downloading demos, and the copy that keeps its timestamp
 wr_intogame         copies into the game's replay folder, and the manifest that
                     makes them the only thing removable from the panel
 wr_settings         one registration table, walked by both the reader and the

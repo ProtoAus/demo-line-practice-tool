@@ -11,6 +11,15 @@
 //   the only reason to unload would be to reload a rebuilt DLL -- which a game
 //   restart does more reliably anyway -- there is nothing to gain. The injector
 //   refuses to inject twice for the same reason.
+//
+//   That matters more since extraction became a worker pool inside this
+//   process, so it is worth being explicit: WrExtractShutdown is NOT called
+//   from here. DLL_PROCESS_DETACH on process exit runs after ExitProcess has
+//   already terminated every other thread, so waiting for a worker there would
+//   be waiting, under the loader lock, for a thread that will never run again.
+//   Nothing is lost by not waiting: every file a worker writes goes through a
+//   temp name and a rename, so the worst a killed worker leaves behind is a
+//   stray .tmp.
 
 #include "wr_common.h"
 #include "wr_log.h"
@@ -225,6 +234,21 @@ static DWORD WINAPI InitThread(LPVOID)
     // old settings file load into a new build without resetting the settings the
     // build has added since.
     WrSettingsInit();
+
+    // Said once, at startup, before anything can fail quietly because of it.
+    // See WrPathIsAscii: this build cannot open a path with a byte >= 0x80 in
+    // it, and until v0.7.0 the Python extractor could, so a library on such a
+    // path used to half-work. Two lines in the log now beat a bug report that
+    // says only "the button does nothing".
+    if (!WrPathIsAscii(WrGameDir()) || !WrPathIsAscii(WrModuleDir()))
+    {
+        WrLogf("[!] a path here is not ASCII, and this build reads files with "
+               "the -A Windows calls, which cannot name it:");
+        WrLogf("[!]   game   %s", WrGameDir());
+        WrLogf("[!]   module %s", WrModuleDir());
+        WrLogf("[!] demos will not be found and extraction will refuse. Moving "
+               "the install, or this folder, to an ASCII path is the fix.");
+    }
 
     if (!WrProbeInit())
         WrLogf("[!] probe layer unavailable -- engine access will not be attempted");

@@ -90,7 +90,7 @@ set "IMSRC=%IM%\imgui.cpp %IM%\imgui_draw.cpp %IM%\imgui_tables.cpp %IM%\imgui_w
 set "IMSRC=%IMSRC% %IM%\backends\imgui_impl_dx11.cpp %IM%\backends\imgui_impl_win32.cpp"
 
 rem Our own code lives in src\. The build still runs from the repo root, so the
-rem .obj files, the DLL and wrpath_extract.py all stay where they were.
+rem .obj files and both binaries stay where they were.
 set "S=src"
 set "SRC=%S%\dllmain.cpp %S%\wr_log.cpp %S%\wr_pe.cpp %S%\wr_probe.cpp"
 set "SRC=%SRC% %S%\wr_engine.cpp %S%\wr_scan.cpp %S%\wr_hook.cpp %S%\wr_imgui.cpp"
@@ -101,6 +101,7 @@ set "SRC=%SRC% %S%\wr_profile.cpp %S%\wr_board.cpp %S%\wr_intogame.cpp"
 set "SRC=%SRC% %S%\wr_start.cpp %S%\wr_settings.cpp"
 set "SRC=%SRC% %S%\wr_json.cpp %S%\wr_msml.cpp %S%\wr_mtv.cpp"
 set "SRC=%SRC% %S%\wr_http.cpp %S%\wr_api.cpp %S%\wr_fetch.cpp"
+set "SRC=%SRC% %S%\wr_dp.cpp %S%\wr_demo.cpp %S%\wr_jobs.cpp"
 
 rem IMGUI_USER_CONFIG is resolved by the preprocessor relative to the file that
 rem does the #include -- imgui\imgui.h -- and NOT relative to the working
