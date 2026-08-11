@@ -1264,6 +1264,49 @@ It is pinned in `test_wrpath`, at the end of the round trip through the real wri
 loader, as a fact about the format rather than a bug awaiting a fix: the stem is forty, the field
 is thirty-nine, `strcmp` is false, `WrRunIsFrom` is true.
 
+### Every map on the machine was asked about in surf
+
+The quick page on `DELETE` reads the leaderboard by itself on a map change. On `bhop_hades` it did
+that, correctly, within half a second — and then drew a button offering to do it again.
+
+The log is unambiguous about the sequence. A job was submitted at t=515.438 and finished at
+t=515.969 with exit code 0, and it cannot have been the demo count, because that runs on its own
+latch and never reaches `EndRun`. So the read happened, succeeded, and produced no cache file. That
+is not a contradiction: it is precisely what a successful request for an **empty board** looks like.
+
+`g_quick.gamemode` was initialised to 1 and there was no control anywhere on the page to change it.
+Gamemode 1 is **surf**. The page had asked the surf leaderboard of a bhop map, been told the truth,
+and had no way to say so — an empty result and a wrong question produce the same blank table. On
+every map that is not surf, the front door was useless while looking, from the inside, like
+everything working.
+
+The map index cannot answer this and it is worth saying why, because it is the first place anybody
+would look. `maps.txt` carries a `modes` column and for `bhop_hades` it reads
+`1,2,3,5,6,7,8,9,10,11,12,13`. Momentum gives nearly every map a leaderboard in nearly every mode
+and almost all of them are empty; a list of boards that *might* exist cannot pick the one that
+does.
+
+What can answer it, in order of how much each step actually knows:
+
+1. **A choice made by hand for this map**, remembered in `quickpicks.txt`. First, and it has to be
+   first — most maps worth looking at already have a board cached, so a cache that outranked the
+   picker would be a picker that did nothing on exactly the maps where it mattered.
+2. **A board already cached for this map.** Not a guess at all: the filename is
+   `boards\<map>_g<mode>_t<type><num>.tsv`, so one directory listing with no file opened says which
+   mode somebody already fetched this map in. It is what makes `bhop_telehop_theory` resolve
+   without anything having to know that `bhop_` means anything.
+3. **The map's name.** Momentum prefixes by discipline and the convention is near-universal:
+   `surf_`, `bhop_`, `rj_`, `sj_`, `ahop_`, `conc_`, `defrag_`/`df_`. The climb family is
+   deliberately absent — it has three modes (Momentum, KZT, 16-unit) and a `kz_` prefix cannot tell
+   you which, so it returns nothing rather than being confidently wrong two times in three.
+4. The setting, which is now a fallback rather than the answer.
+
+And the message changed, because "nothing came back for this leg — it may simply have no runs" was
+true of every empty stage board and wrong about the one case that actually happened. It names the
+mode it asked, and when the map's name disagrees it names that too: *nothing on the surf board for
+bhop_hades — it reads like a bhop map, so try bhop above.* Two indistinguishable outcomes, and the
+line now carries the one fact that separates them.
+
 ### Two hundred and fifty to three thousand five hundred
 
 The speed ramp ran 250 to 3500 u/s, and the energy ramp 0 to 4000, because those numbers had to be

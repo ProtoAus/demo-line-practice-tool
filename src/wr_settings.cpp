@@ -107,6 +107,12 @@ static void RegisterRender(void)
     WrSettingsInt("line.pointBudget", &g_render.pointBudget, 1000, 4000000);
     WrSettingsInt("line.colourMode", &g_render.lineColour, 0,
                   WR_LINE_MODE_COUNT - 1);
+    // Missing until v0.8.3, which meant ticking "scale to what is on" bought you
+    // one session of it and no warning that it had gone. The derived use* fields
+    // beside it are NOT here and must not be: they are recomputed from this and
+    // the enabled set, and a persisted copy of a derived value is a stale value
+    // waiting to happen.
+    WrSettingsBool("line.autoScale", &g_render.autoScale);
     WrSettingsBool("line.hidePreRoll", &g_render.hidePreRoll);
 
     WrSettingsBool("markers.draw", &g_render.drawMarkers);

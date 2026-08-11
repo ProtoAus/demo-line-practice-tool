@@ -49,6 +49,16 @@ struct Leg { unsigned char type, num; };
 static char g_map[72] = "";
 static int g_mapId = 0;
 
+// Which leaderboard this map is read on, resolved once per map. See the essay
+// over WrQuickGamemodeGuess in wr_quick.h: this was g_quick.gamemode read
+// directly, which asked the surf board of every map in the game.
+static int g_mode = 1;
+
+// A mode chosen by hand for this map, or 0. Kept apart from g_mode because it is
+// the only part of the resolution worth writing to disk -- the other three steps
+// re-derive themselves for free next time.
+static int g_modePicked = 0;
+
 static Leg g_legs[MAX_LEGS];
 static int g_legCount = 0;
 static int g_leg = 0;               // index into g_legs
@@ -139,6 +149,96 @@ static int __cdecl LegOrder(const void *a, const void *b)
     return (int)x->num - (int)y->num;
 }
 
+// ---------------------------------------------------------------------------
+// Which leaderboard
+// ---------------------------------------------------------------------------
+
+// The gamemode of a board we already hold for this map, or 0.
+//
+// THE STRONGEST SIGNAL THERE IS, and it costs one directory listing with no file
+// opened, because the filename carries it:
+// boards\<map>_g<mode>_t<type><num>.tsv. It is not a guess and not a preference
+// -- it is the mode somebody already fetched this map in, from the Board tab or
+// from this page, and it is right by construction. It is what makes
+// bhop_telehop_theory resolve to bhop without anything having to know that bhop_
+// means anything.
+//
+// The main track wins over a stage when both are cached, since that is the leg
+// this page opens on; a lower mode number breaks any remaining tie, so the answer
+// cannot depend on the order the filesystem happens to enumerate in.
+static int ModeFromCache(void)
+{
+    if (!g_map[0])
+        return 0;
+
+    char pat[MAX_PATH];
+    char rel[224];
+    _snprintf_s(rel, sizeof(rel), _TRUNCATE, "boards\\%s_g*_t*.tsv", g_map);
+    strcpy_s(pat, sizeof(pat), WrDataPath(rel));
+
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE)
+        return 0;
+
+    const size_t skip = strlen(g_map) + 2;   // past "<map>_g"
+    int best = 0;
+    bool bestIsMain = false;
+    do
+    {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            continue;
+        if (strlen(fd.cFileName) <= skip)
+            continue;
+        const char *p = fd.cFileName + skip;
+        if (*p < '0' || *p > '9')
+            continue;
+        const int mode = atoi(p);
+        if (mode < 1 || mode > WR_GAMEMODE_COUNT)
+            continue;
+
+        // "_t0" -- the main track. The rest of the name is the leg and this does
+        // not care which one.
+        const char *t = strstr(p, "_t");
+        const bool isMain = (t && t[2] == '0');
+
+        if (best == 0 || (isMain && !bestIsMain) ||
+            (isMain == bestIsMain && mode < best))
+        {
+            best = mode;
+            bestIsMain = isMain;
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    return best;
+}
+
+// The four steps, in order of how much they know. See the essay over
+// WrQuickGamemodeGuess in wr_quick.h.
+//
+// A HAND-MADE CHOICE COMES FIRST, ahead of the cache, and it has to: most maps
+// worth looking at already have a board cached, so a cache that outranked the
+// picker would be a picker that did nothing on every map where it mattered. The
+// remembered choice IS the correction, and a correction that can be overruled by
+// the thing it is correcting is not one.
+static void ResolveMode(void)
+{
+    int mode = g_modePicked;
+    if (mode < 1)
+        mode = ModeFromCache();
+    if (mode < 1)
+        mode = WrQuickGamemodeGuess(g_map);
+    if (mode < 1 || mode > WR_GAMEMODE_COUNT)
+        mode = g_quick.gamemode;
+    if (mode < 1 || mode > WR_GAMEMODE_COUNT)
+        mode = 1;
+
+    if (mode != g_mode)
+        WrLogf("quick: %s reads as %s (gamemode %d)", g_map,
+               WrGamemodeName(mode), mode);
+    g_mode = mode;
+}
+
 // Every board cache file we already hold for this map and gamemode.
 //
 // The filename IS the answer: boards\<map>_g<mode>_t<type><num>.tsv, so one
@@ -151,7 +251,7 @@ static void LegsFromCache(void)
     char pat[MAX_PATH];
     char rel[224];
     _snprintf_s(rel, sizeof(rel), _TRUNCATE, "boards\\%s_g%d_t*.tsv", g_map,
-                g_quick.gamemode);
+                g_mode);
     strcpy_s(pat, sizeof(pat), WrDataPath(rel));
 
     WIN32_FIND_DATAA fd;
@@ -222,7 +322,7 @@ static void BoardPathForLeg(char *out, int cap, int leg)
 {
     const unsigned char type = (leg >= 0 && leg < g_legCount) ? g_legs[leg].type : 0;
     const unsigned char num = (leg >= 0 && leg < g_legCount) ? g_legs[leg].num : 1;
-    WrBoardCachePath(out, cap, g_map, g_quick.gamemode, type, num);
+    WrBoardCachePath(out, cap, g_map, g_mode, type, num);
 }
 
 static void ReloadRows(void)
@@ -432,9 +532,16 @@ static void SavePicks(void)
         fclose(in);
     }
 
-    if (g_pickCount > 0)
+    if (g_pickCount > 0 || g_modePicked > 0)
     {
         fprintf(out, "[%s]\n", g_map);
+        // Before the rows, so a hand-read file says which leaderboard the hashes
+        // under it came off. An older build drops this line on the floor -- its
+        // reader wants four fields and this has two -- so the file stays
+        // readable in both directions, which is the same promise settings.cfg
+        // makes.
+        if (g_modePicked > 0)
+            fprintf(out, "mode %d\n", g_modePicked);
         for (int i = 0; i < g_pickCount; i++)
             fprintf(out, "%d %d %d %s\n", (int)g_picks[i].trackType,
                     (int)g_picks[i].trackNum, g_picks[i].rank, g_picks[i].hash);
@@ -451,6 +558,7 @@ static void LoadPicks(void)
 {
     g_pickCount = 0;
     g_picksDirty = false;
+    g_modePicked = 0;
     if (!g_map[0])
         return;
 
@@ -471,7 +579,22 @@ static void LoadPicks(void)
             ours = (_stricmp(name, g_map) == 0);
             continue;
         }
-        if (!ours || g_pickCount >= WR_QUICK_MAX_PICKS)
+        if (!ours)
+            continue;
+
+        // The leaderboard this map was corrected to, if it ever was. Read before
+        // the row parse rather than after, because "mode 2" reads as a row with
+        // two fields and the row parse would drop it either way -- but only this
+        // order makes that a fact about the format instead of a coincidence.
+        int picked = 0;
+        if (sscanf_s(line, "mode %d", &picked) == 1)
+        {
+            if (picked >= 1 && picked <= WR_GAMEMODE_COUNT)
+                g_modePicked = picked;
+            continue;
+        }
+
+        if (g_pickCount >= WR_QUICK_MAX_PICKS)
             continue;
 
         int type = 0, num = 1, rank = 0;
@@ -613,7 +736,7 @@ static void SubmitBoard(void)
     WrExtractRequest req = {WR_JOB_BOARD};
     strcpy_s(req.map, sizeof(req.map), g_map);
     req.mapId = g_mapId;
-    req.gamemode = g_quick.gamemode;
+    req.gamemode = g_mode;
     req.trackType = g_wantBoardType;
     req.trackNum = g_wantBoardNum;
     req.boardMode = WR_BOARD_WINDOW;
@@ -655,7 +778,7 @@ static void SubmitFetch(void)
     WrExtractRequest req = {WR_JOB_FETCH};
     strcpy_s(req.map, sizeof(req.map), g_map);
     req.mapId = g_mapId;
-    req.gamemode = g_quick.gamemode;
+    req.gamemode = g_mode;
     req.trackType = type;
     req.trackNum = num;
     req.ranks = ranks;
@@ -768,13 +891,29 @@ void WrQuickTick(void)
     }
 
     // A read that finished and left the table empty. Said out loud, because the
-    // alternative is a page that quietly stays blank and looks broken -- and the
-    // usual cause is not a failure at all: plenty of stage boards have nobody on
-    // them. The full panel's Board tab carries the actual error text if there
-    // was one.
+    // alternative is a page that quietly stays blank and looks broken.
+    //
+    // AND IT NAMES THE MODE, because "it may simply have no runs" was true of
+    // every empty stage board and wrong about the one case that actually
+    // happened: bhop_hades read on the SURF leaderboard, which is empty and
+    // always will be. Both answers look identical from here -- a successful
+    // request that returned nothing -- so the line has to give the user the one
+    // fact that separates them, and the alternative to try.
     if (boardJustRan && g_rowCount == 0)
-        strcpy_s(g_note, sizeof(g_note),
-                 "nothing came back for this leg -- it may simply have no runs");
+    {
+        const int guess = WrQuickGamemodeGuess(g_map);
+        if (guess >= 1 && guess != g_mode)
+            _snprintf_s(g_note, sizeof(g_note), _TRUNCATE,
+                        "nothing on the %s board for %s -- it reads like a %s "
+                        "map, so try %s above",
+                        WrGamemodeName(g_mode), g_map, WrGamemodeName(guess),
+                        WrGamemodeName(guess));
+        else
+            _snprintf_s(g_note, sizeof(g_note), _TRUNCATE,
+                        "nothing on the %s board for this leg -- it may simply "
+                        "have no runs",
+                        WrGamemodeName(g_mode));
+    }
 
     // Fill the page in. Here rather than in the draw path, so it happens on a map
     // change whether or not the panel is open -- by the time you press Delete the
@@ -878,8 +1017,43 @@ void WrQuickOnMapChanged(const char *map)
     g_note[0] = '\0';
     g_nextPollAt = 0;
 
+    // LoadPicks first: it is what recovers a mode chosen for this map before,
+    // and ResolveMode reads that ahead of everything else. RebuildLegs last,
+    // because the legs it lists come partly from the board cache and the board
+    // cache is per gamemode -- rebuilding against the previous map's mode would
+    // list the wrong stages for one frame and re-read the wrong board.
     LoadPicks();
+    ResolveMode();
     RebuildLegs();
+}
+
+// Read this map on a different leaderboard, and remember it.
+//
+// Everything derived from the mode has to go, and the list is longer than it
+// looks: the rows are from one board file, the legs come partly from which board
+// files exist, and the asked-set records questions put to a leaderboard that is
+// no longer the one being asked. Keeping any of them would show surf's stages
+// over bhop's rows.
+static void SetMode(int mode)
+{
+    if (mode < 1 || mode > WR_GAMEMODE_COUNT || mode == g_mode)
+        return;
+
+    g_modePicked = mode;
+    g_mode = mode;
+    g_mapId = 0;                // resolved from a board header; that board is gone
+    g_rowsStale = true;
+    g_rowCount = 0;
+    g_wantBoard = false;
+    g_showTop = g_quick.top;
+    g_askedCount = 0;
+    g_note[0] = '\0';
+    g_nextPollAt = 0;
+
+    RebuildLegs();
+    SavePicks();
+    WrLogf("quick: %s set to %s (gamemode %d) by hand", g_map,
+           WrGamemodeName(mode), mode);
 }
 
 // There is no WrQuickShutdown, and the absence is deliberate -- see the same
@@ -1012,11 +1186,37 @@ void WrQuickDraw(void)
 
     ImGui::Text("%s", g_map);
     ImGui::SameLine();
-    ImGui::TextDisabled("(%s)", WrGamemodeName(g_quick.gamemode));
-    ImGui::SameLine();
     Marker("Everything on this page is about the map you are standing in. The "
            "full panel on Insert can look at any map, and has every setting "
            "this one leaves out.");
+    ImGui::SameLine();
+
+    // The leaderboard, and it is a control rather than a label because the
+    // resolution behind it is partly a guess. See WrQuickGamemodeGuess: a map
+    // name says which discipline it is nearly always and not quite always, and
+    // the climb family it cannot answer at all.
+    {
+        static const char *kModes[WR_GAMEMODE_COUNT];
+        for (int i = 0; i < WR_GAMEMODE_COUNT; i++)
+            kModes[i] = WrGamemodeName(i + 1);
+
+        int idx = g_mode - 1;
+        if (idx < 0 || idx >= WR_GAMEMODE_COUNT)
+            idx = 0;
+        ImGui::SetNextItemWidth(ImGui::CalcTextSize("defrag CPM").x +
+                                ImGui::GetFrameHeight() +
+                                ImGui::GetStyle().FramePadding.x * 4.0f);
+        if (ImGui::Combo("##mode", &idx, kModes, WR_GAMEMODE_COUNT))
+            SetMode(idx + 1);
+    }
+    ImGui::SameLine();
+    Marker("Which leaderboard this map is read on. Momentum keeps a separate one "
+           "per gamemode, and nearly every map has a board in nearly every mode "
+           "with nothing on it -- so asking the wrong one comes back empty and "
+           "looks exactly like a map nobody has run.\n\n"
+           "It is worked out for you: from a board you already fetched for this "
+           "map, then from the map's name, then from the setting. Changing it "
+           "here is remembered for this map.");
 
     // --- consent ------------------------------------------------------------
     if (!g_quick.network)

@@ -89,7 +89,14 @@ struct WrQuickSettings
     bool network;
 
     int top;                    // places listed per leg
-    int gamemode;               // which leaderboard; 1 is the usual one
+
+    // The mode to fall back on when nothing about the map says which.
+    //
+    // A FALLBACK, and no longer the answer. It used to be read directly as "the
+    // leaderboard to ask for", which meant every map on the machine was asked
+    // about in surf -- see WrQuickGamemodeGuess below for what that cost. The
+    // resolution order is there; this is the last step of it.
+    int gamemode;
 };
 
 extern WrQuickSettings g_quick;
@@ -248,6 +255,83 @@ static inline const char *WrQuickGiveUpReason(WrQuickAction a)
     if (a == WQ_GIVE_UP_NO_PATH)
         return "that demo could not be read";
     return "";
+}
+
+// ---------------------------------------------------------------------------
+// Which leaderboard, from the name of the map
+// ---------------------------------------------------------------------------
+//
+// THE BUG THIS EXISTS TO NOT HAVE AGAIN. This page asked gamemode 1 for every
+// map ever loaded, because that is what g_quick.gamemode was initialised to and
+// there was no control to change it. Gamemode 1 is SURF. So on bhop_hades the
+// automatic read fired correctly, half a second after the map change, asked the
+// surf leaderboard of a bhop map, was told -- correctly -- that it is empty, and
+// then drew a button offering to ask the same wrong question again. The log
+// shows the job succeeding with exit code 0 and no cache file appearing, which
+// is exactly what a successful request for an empty board looks like.
+//
+// It made the front door useless on roughly half the game while looking, from
+// the inside, like everything working.
+//
+// WHY THE MAP INDEX CANNOT ANSWER THIS. maps.txt carries a `modes` column and it
+// is no help at all: bhop_hades lists 1,2,3,5,6,7,8,9,10,11,12,13. Momentum
+// gives nearly every map a leaderboard in nearly every mode and almost all of
+// them are empty -- wr_board.h says so about the surf catalogue too. A list of
+// boards that MIGHT exist cannot pick the one that does.
+//
+// So the caller resolves in this order, most certain first:
+//
+//   1. a board already cached for this map -- the filename carries the mode, and
+//      it is the mode you already fetched, not a guess at all;
+//   2. a mode chosen for this map before, remembered in quickpicks.txt;
+//   3. this function;
+//   4. the g_quick.gamemode setting.
+//
+// WHY A PREFIX IS ENOUGH, AND WHERE IT STOPS. Momentum's map names are prefixed
+// by discipline and the convention is near-universal, so the common cases are
+// exact. The climb family is deliberately absent: it has THREE modes (4 Momentum,
+// 5 KZT, 6 16-unit) and a kz_ or climb_ prefix cannot tell you which, so it
+// returns 0 -- "no opinion" -- rather than being confidently wrong two times in
+// three. Same for tricksurf, which has no mode in the enum at all.
+#define WR_QUICK_MODE_UNKNOWN 0
+
+static inline bool WrQuickHasPrefix(const char *s, const char *p)
+{
+    for (; *p; s++, p++)
+    {
+        const char a = (*s >= 'A' && *s <= 'Z') ? (char)(*s - 'A' + 'a') : *s;
+        if (a != *p)
+            return false;
+    }
+    return true;
+}
+
+// The gamemode a map's NAME implies, or WR_QUICK_MODE_UNKNOWN.
+static inline int WrQuickGamemodeGuess(const char *map)
+{
+    if (!map || !*map)
+        return WR_QUICK_MODE_UNKNOWN;
+
+    // Order does not matter here and that is a property worth keeping: no entry
+    // is a prefix of another, so exactly one can ever match and the table can be
+    // read as a set. Adding one that overlaps -- "df" beside "df_", say -- would
+    // quietly make this list order-dependent, which is the kind of thing that is
+    // discovered by a wrong answer rather than by reading.
+    struct { const char *prefix; int mode; } kByName[] = {
+        { "surf_",    1 },
+        { "bhop_",    2 },
+        { "rj_",      7 },
+        { "sj_",      8 },
+        { "ahop_",    9 },
+        { "conc_",   10 },
+        { "defrag_", 11 },
+        { "df_",     11 },
+    };
+    for (int i = 0; i < (int)(sizeof(kByName) / sizeof(kByName[0])); i++)
+        if (WrQuickHasPrefix(map, kByName[i].prefix))
+            return kByName[i].mode;
+
+    return WR_QUICK_MODE_UNKNOWN;
 }
 
 #endif // WR_QUICK_H

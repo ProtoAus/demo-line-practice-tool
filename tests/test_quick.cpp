@@ -396,6 +396,54 @@ int main(void)
     }
     printf("\n");
 
+    // -----------------------------------------------------------------------
+    printf("which leaderboard a map name implies\n");
+    {
+        // The bug this table exists for: every map on the machine was asked
+        // about in gamemode 1, which is surf, so bhop_hades came back empty and
+        // the page offered to ask again. See the essay in wr_quick.h.
+        Check(WrQuickGamemodeGuess("bhop_hades") == 2,
+              "bhop_hades is bhop, which is the whole point of this");
+        Check(WrQuickGamemodeGuess("surf_helloworld") == 1, "surf_ is surf");
+        Check(WrQuickGamemodeGuess("bhop_telehop_theory") == 2,
+              "and a bhop map with underscores later on is still bhop");
+        Check(WrQuickGamemodeGuess("rj_bhop_mix") == 7,
+              "it matches the START and not anywhere, so a rocket-jump map "
+              "named after bhop is not bhop");
+        Check(WrQuickGamemodeGuess("sj_kaizo") == 8, "sj_ is sticky jump");
+        Check(WrQuickGamemodeGuess("ahop_lostworld") == 9, "ahop_ is ahop");
+        Check(WrQuickGamemodeGuess("conc_hops") == 10, "conc_ is conc");
+
+        Check(WrQuickGamemodeGuess("defrag_speed") == 11,
+              "defrag_ is defrag CPM");
+        Check(WrQuickGamemodeGuess("df_speed") == 11,
+              "and so is the df_ spelling of it");
+
+        // The refusals matter more than the answers. A wrong mode is an empty
+        // board, and an empty board on a map somebody has definitely run is the
+        // failure this whole change is about.
+        Check(WrQuickGamemodeGuess("kz_cellblock") == WR_QUICK_MODE_UNKNOWN,
+              "climb has three modes and a kz_ prefix cannot say which");
+        Check(WrQuickGamemodeGuess("climb_frenzy") == WR_QUICK_MODE_UNKNOWN,
+              "nor can climb_, for the same reason");
+        Check(WrQuickGamemodeGuess("tricksurf_arena") == WR_QUICK_MODE_UNKNOWN,
+              "and tricksurf has no mode in the enum at all");
+        Check(WrQuickGamemodeGuess("agtricks") == WR_QUICK_MODE_UNKNOWN,
+              "a map with no prefix says nothing");
+        Check(WrQuickGamemodeGuess("surfing") == WR_QUICK_MODE_UNKNOWN,
+              "and a name that merely STARTS like one is not one -- the "
+              "underscore is part of the prefix");
+
+        Check(WrQuickGamemodeGuess("") == WR_QUICK_MODE_UNKNOWN,
+              "no name, no opinion");
+        Check(WrQuickGamemodeGuess(NULL) == WR_QUICK_MODE_UNKNOWN,
+              "and no map at all is not a crash");
+
+        Check(WrQuickGamemodeGuess("BHOP_Hades") == 2,
+              "the match folds case, because a map name is not a hash");
+    }
+    printf("\n");
+
     printf("\n%s\n\n", g_failures ? "SOME CHECKS FAILED" : "all checks passed");
     return g_failures ? 1 : 0;
 }

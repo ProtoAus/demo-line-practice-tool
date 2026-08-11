@@ -22,6 +22,12 @@ That is the whole of it. Ticking a run downloads the demo, reads it and puts the
 one after the other, in the background — you can close the page and keep playing while it works.
 The ticks are remembered per map, so the lines come back next time you load it.
 
+> **If the list comes back empty**, check the gamemode next to the map name at the top of the page.
+> Momentum keeps a separate leaderboard per mode and gives nearly every map a board in nearly every
+> one of them, almost all empty — so asking the wrong mode looks exactly like a map nobody has run.
+> The page works it out from a board you have already fetched, then from the map's name; correcting
+> it there is remembered for that map.
+
 ### The long way round
 
 `INSERT` opens the full panel, which is the same capability with every decision left to you: nine
