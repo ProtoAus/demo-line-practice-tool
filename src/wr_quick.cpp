@@ -61,7 +61,14 @@ static int g_modePicked = 0;
 
 static Leg g_legs[MAX_LEGS];
 static int g_legCount = 0;
-static int g_leg = 0;               // index into g_legs
+static int g_leg = 0;               // index into g_legs, DERIVED from the pair below
+
+// The leg being looked at, as an identity rather than a position.
+//
+// An index into a list that is rebuilt whenever the store moves is not a
+// selection, it is a guess about a list -- and the list is momentarily empty
+// during every reload. See RebuildLegs.
+static unsigned char g_selType = 0, g_selNum = 1;
 
 // The board rows of the leg being looked at. Re-read when the leg, the map or
 // the cache file changes -- never per frame. Reading the top twenty of a cached
@@ -148,6 +155,15 @@ static unsigned long long g_nextPollAt = 0;
 // What the chain is doing, for the line under the table.
 static char g_note[160] = "";
 
+// How many runs are drawn that this page did not tick.
+//
+// CACHED, for the reason g_rowState is: EnabledNotPicked walks the whole store
+// against the whole pick list, which is sixty-four thousand string compares on
+// a thousand-run map, and the draw path would spend it three hundred times a
+// second to answer a question whose answer changes when a job finishes or a
+// tick moves.
+static int g_extraOn = 0;
+
 static bool SameHash(const char *a, const char *b)
 {
     return _stricmp(a, b) == 0;
@@ -209,27 +225,17 @@ static int ModeFromCache(void)
     if (h == INVALID_HANDLE_VALUE)
         return 0;
 
-    const size_t skip = strlen(g_map) + 2;   // past "<map>_g"
     int best = 0;
     bool bestIsMain = false;
     do
     {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
             continue;
-        if (strlen(fd.cFileName) <= skip)
-            continue;
-        const char *p = fd.cFileName + skip;
-        if (*p < '0' || *p > '9')
-            continue;
-        const int mode = atoi(p);
-        if (mode < 1 || mode > WR_GAMEMODE_COUNT)
+        int mode = 0, type = 0, num = 0;
+        if (!WrQuickParseBoardName(fd.cFileName, g_map, &mode, &type, &num))
             continue;
 
-        // "_t0" -- the main track. The rest of the name is the leg and this does
-        // not care which one.
-        const char *t = strstr(p, "_t");
-        const bool isMain = (t && t[2] == '0');
-
+        const bool isMain = (type == 0);
         if (best == 0 || (isMain && !bestIsMain) ||
             (isMain == bestIsMain && mode < best))
         {
@@ -289,20 +295,20 @@ static void LegsFromCache(void)
     HANDLE h = FindFirstFileA(pat, &fd);
     if (h == INVALID_HANDLE_VALUE)
         return;
+    // WrQuickParseBoardName, shared with ModeFromCache above, and shared rather
+    // than written twice because the version that used to live here was WRONG
+    // for two releases and added nothing at all -- see the essay over it in
+    // wr_quick.h. Two readers of one filename should not be two chances to get
+    // that filename wrong.
     do
     {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
             continue;
-        const char *t = strrchr(fd.cFileName, 't');
-        // The LAST 't' before the extension, which is the one the writer put
-        // there -- a map named "surf_torus" has several others.
-        const char *dot = strrchr(fd.cFileName, '.');
-        if (!t || !dot || t > dot || t[1] < '0' || t[1] > '9')
+        int mode = 0, type = 0, num = 0;
+        if (!WrQuickParseBoardName(fd.cFileName, g_map, &mode, &type, &num))
             continue;
-        int type = t[1] - '0';
-        int num = atoi(t + 2);
-        if (type < 0 || type > 2 || num < 0 || num > 255)
-            continue;
+        if (mode != g_mode)
+            continue;               // the glob is per mode, but say so anyway
         LegAdd((unsigned char)type, (unsigned char)num);
     } while (FindNextFileA(h, &fd));
     FindClose(h);
@@ -310,8 +316,8 @@ static void LegsFromCache(void)
 
 static void RebuildLegs(void)
 {
-    const unsigned char wasType = g_legCount ? g_legs[g_leg].type : 0;
-    const unsigned char wasNum = g_legCount ? g_legs[g_leg].num : 1;
+    const unsigned char wasType = g_selType;
+    const unsigned char wasNum = g_selNum;
 
     g_legCount = 0;
     LegAdd(0, 1);                   // the main track always exists
@@ -336,13 +342,29 @@ static void RebuildLegs(void)
 
     LegsFromCache();
 
+    // The leg being LOOKED AT is kept whether or not anything currently vouches
+    // for it, which is the second half of the bug above.
+    //
+    // WrPathLoadMap bumps the store generation the moment it frees the old runs,
+    // so the first rebuild after a download runs against an EMPTY store. Every
+    // source of legs is empty at that instant, the selected stage is not in the
+    // list, and a selection held as an index into that list has nowhere to go
+    // but back to the main track -- where it then stays, because the next
+    // rebuild has already forgotten what it was. Reported as "ticking a run on a
+    // stage sends me back to main when it downloads".
+    //
+    // So the selection is (type, num) and the index is derived from it. A leg
+    // nothing else knows about is added rather than dropped.
+    LegAdd(wasType, wasNum);
+
     qsort(g_legs, (size_t)g_legCount, sizeof(Leg), LegOrder);
 
-    // Stay on the leg that was selected if it survived the rebuild.
     g_leg = 0;
     for (int i = 0; i < g_legCount; i++)
         if (g_legs[i].type == wasType && g_legs[i].num == wasNum)
             g_leg = i;
+    g_selType = g_legs[g_leg].type;
+    g_selNum = g_legs[g_leg].num;
 }
 
 // ---------------------------------------------------------------------------
@@ -469,15 +491,19 @@ static void WantSlowest(unsigned char type, unsigned char num, int count)
     g_nextPollAt = 0;
 }
 
-// The automatic half: the leg you are looking at, once, when it is empty.
+// The automatic half: the leg you are looking at, at the end you are looking
+// at, once, when it is empty.
 //
-// THE FAST END ONLY. The tail is a second request about the same leg and it is
-// worth having asked for, which makes it a decision rather than a default -- and
-// a page that quietly fetched both ends of every leg you walked past would be
-// twice the traffic for a view most people never open.
+// IT FOLLOWS THE END, and originally it did not -- the tail was a press even
+// after you had chosen to look at it. That was the wrong reading of "one request
+// per leg": having selected the slow end, a leg switch that leaves the table
+// blank until you press a button is the same complaint this page was built to
+// answer, one view along. The traffic argument does not survive either, because
+// the gate is what you are LOOKING at: it is still one request per leg per end
+// per session, and it is still only for an end with nothing cached.
 static void MaybeAutoRead(void)
 {
-    if (!g_quick.network || g_legCount <= 0 || g_wantBoard || g_end != END_FAST)
+    if (!g_quick.network || g_legCount <= 0 || g_wantBoard)
         return;
 
     const unsigned char type = g_legs[g_leg].type;
@@ -495,7 +521,10 @@ static void MaybeAutoRead(void)
     }
 
     MarkAsked(type, num);
-    WantBoard(type, num, 1, g_quick.top);
+    if (g_end == END_SLOW)
+        WantSlowest(type, num, g_quick.top);
+    else
+        WantBoard(type, num, 1, g_quick.top);
 }
 
 // How far along the chain each row is, as a number the status column can be
@@ -561,13 +590,28 @@ enum
 
 static const ImGuiTableSortSpecs *g_specs = NULL;
 
-// The name the table actually draws: the live Steam persona when we have one,
-// and the alias the board was cached with otherwise. Sorting the cached alias
-// while showing the persona would look like a sort that does not work.
+// The name the table draws, and the name it sorts by.
+//
+// THE LEADERBOARD'S OWN ALIAS, not the live Steam persona, and that is a change
+// from the first version of this page. The persona was preferred on the grounds
+// that it is "the name written on the line in the world" -- but it is only
+// available for a player somebody has already ASKED Steam about, and the only
+// thing that asks is a name tag being drawn. So the name in this table changed
+// the moment you ticked the row: alias until the line existed, persona
+// afterwards, and back to alias for anybody Steam had nothing for. Reported as
+// "when I tick some names, the names change".
+//
+// Asking here instead would be worse. WrSteamWant feeds a 96-slot cache that
+// wr_render.cpp's tag code is careful to leave room in -- twelve tags by
+// default, thirty-two at most -- and a hundred rows of leaderboard would take
+// every slot and starve the tags for the rest of the session.
+//
+// So: the alias, which the board cache always carries, which never moves, and
+// which is exactly what the full panel's Board tab shows in the same column.
+// Two pages that show the same row now show the same name.
 static const char *RowName(const WrBoardRow *r)
 {
-    const char *persona = WrSteamPersona(r->steamId);
-    return (persona && *persona) ? persona : r->alias;
+    return r->alias;
 }
 
 static int CompareQuickColumn(int ia, int ib, ImGuiID col)
@@ -827,6 +871,7 @@ static void PickRemove(const char *hash)
         g_picks[k] = g_picks[k + 1];
     g_pickCount--;
     g_picksDirty = true;
+    g_nextPollAt = 0;   // the counts under the table are about to be wrong
 }
 
 // ---------------------------------------------------------------------------
@@ -1009,13 +1054,64 @@ static void ApplyPicks(void)
         r->enabled = true;
         on++;
     }
-    if (on > 0)
+    if (on == 0)
+        return;
+
+    // EXACTLY the picks, which means turning the others OFF as well.
+    //
+    // Turning them on was only half of it, and the missing half was reported as
+    // "ticking a run also loads the first place run". FinishLoad sets
+    // `enabled = (i == 0)` on a store that is sorted by time -- so run 0 IS
+    // first place, and every reload switched it on. This function then added the
+    // ticked run beside it and cancelled the auto-enable, which is the one thing
+    // that would have cleared it. Two lines, one tick, and the Runs tab and this
+    // page reporting different pictures because they were reading different
+    // truths.
+    //
+    // Nothing is lost by being absolute here: a reload has already cleared any
+    // selection made in the Runs tab, so at this instant the enabled set is
+    // entirely machine-chosen. If this page has been told what to show, it is
+    // the only thing that has been told anything.
+    for (int i = 0; i < WrRunCount(); i++)
     {
-        // The auto-enable runs LATER in the frame, from inside the renderer, and
-        // clears every run it did not choose. Somebody has said what they want;
-        // that is exactly when guessing has to stop.
-        WrPathCancelAutoEnable();
+        WrRun *r = WrRunAt(i);
+        if (!r || !r->enabled)
+            continue;
+        bool picked = false;
+        for (int k = 0; k < g_pickCount && !picked; k++)
+            picked = WrRunIsFrom(r, g_picks[k].hash);
+        if (!picked)
+            r->enabled = false;
     }
+
+    // The auto-enable runs LATER in the frame, from inside the renderer, and
+    // clears every run it did not choose. Somebody has said what they want;
+    // that is exactly when guessing has to stop.
+    WrPathCancelAutoEnable();
+}
+
+// Runs drawn that this page did not ask for: the auto-enable's choice on a map
+// load, or anything ticked in the Runs tab.
+//
+// Counted rather than suppressed. With no picks at all, guessing is right --
+// loading a map and seeing the nearest fastest line is the whole of the first
+// impression -- but a line on screen with an empty tick list reads as this page
+// lying about what is on. So it says so, and offers to clear them.
+static int EnabledNotPicked(void)
+{
+    int n = 0;
+    for (int i = 0; i < WrRunCount(); i++)
+    {
+        const WrRun *r = WrRunAt(i);
+        if (!r || !r->enabled)
+            continue;
+        bool picked = false;
+        for (int k = 0; k < g_pickCount && !picked; k++)
+            picked = WrRunIsFrom(r, g_picks[k].hash);
+        if (!picked)
+            n++;
+    }
+    return n;
 }
 
 void WrQuickTick(void)
@@ -1059,6 +1155,8 @@ void WrQuickTick(void)
         ReloadRows();
         RefreshRowState();
     }
+
+    g_extraOn = EnabledNotPicked();
 
     // A read that finished and left the table empty. Said out loud, because the
     // alternative is a page that quietly stays blank and looks broken.
@@ -1129,13 +1227,15 @@ void WrQuickTick(void)
     {
     case WQ_ENABLE:
     {
-        WrRun *r = RunWithHash(g_picks[idx].hash);
-        if (r)
-        {
-            r->enabled = true;
-            WrPathCancelAutoEnable();
-        }
         g_picks[idx].done = true;
+        // ApplyPicks rather than one r->enabled, because this is the path a
+        // run you ALREADY HOLD takes: no download, no extraction, and therefore
+        // no store reload to clean up after. Setting one bool here left
+        // whatever the last reload had enabled -- run 0, which is first place
+        // on a time-sorted store -- switched on beside it, with nothing coming
+        // later to notice. Ticking one run, two lines.
+        ApplyPicks();
+        g_extraOn = 0;
         g_nextPollAt = 0;           // there may be more to enable this frame
         break;
     }
@@ -1178,6 +1278,8 @@ void WrQuickOnMapChanged(const char *map)
     strcpy_s(g_map, sizeof(g_map), map ? map : "");
     g_mapId = 0;
     g_leg = 0;
+    g_selType = 0;              // a new map opens on its main track
+    g_selNum = 1;
     g_legCount = 0;
     g_rowsStale = true;
     g_rowCount = 0;
@@ -1284,6 +1386,8 @@ static void DrawLegChips(void)
         if (ImGui::Button(label))
         {
             g_leg = i;
+            g_selType = g_legs[i].type;     // the selection, not its position
+            g_selNum = g_legs[i].num;
             g_rowsStale = true;
             g_showTop = g_quick.top;    // back to the top of the new leg
             // The tick that fills the page in. MaybeAutoRead does the deciding;
@@ -1558,7 +1662,42 @@ void WrQuickDraw(void)
     // --- the table ----------------------------------------------------------
     if (g_rowCount > 0)
     {
-        const float footer = ImGui::GetFrameHeightWithSpacing() * 5.5f;
+        // How much room to leave BELOW the table, counted rather than guessed.
+        //
+        // It was a flat 5.5 rows, which was right for what sat under the table
+        // when it was written and silently wrong the moment anything was added.
+        // By v0.9.0 there were eight rows down there -- show-more, the buttons,
+        // a wrapped give-up reason, the status note, a separator and three rows
+        // of colour controls -- so the last of them was pushed off the bottom of
+        // the window and "scale to what is on" could not be clicked without
+        // resizing. Reported as "load 20 more pushes the bottom down".
+        //
+        // A count of what is actually about to be drawn cannot drift the same
+        // way: add a row below and this grows with it.
+        const bool willShowMore = (g_showTop < WR_QUICK_TOP_MAX &&
+                                   g_rowCount >= g_showTop &&
+                                   (g_boardTotal <= 0 || g_boardTotal > g_rowCount));
+        int failed = 0;
+        for (int i = 0; i < g_pickCount; i++)
+            if (g_picks[i].failed)
+                failed++;
+
+        float rows = 1.0f;                          // the buttons
+        if (willShowMore)     rows += 1.0f;
+        if (failed)           rows += 2.0f;         // a wrapped sentence
+        if (g_note[0])        rows += 1.0f;
+        if (g_extraOn > 0)    rows += 1.0f;
+        rows += 0.6f;                               // the "Colour" separator
+        rows += 3.0f;                               // two radio rows and the tick
+
+        float footer = ImGui::GetFrameHeightWithSpacing() * rows;
+        // Never more than half the room. A count can still be beaten -- a very
+        // narrow window wraps a sentence further than budgeted -- and the way
+        // that must NOT fail is by leaving no table at all.
+        const float avail = ImGui::GetContentRegionAvail().y;
+        if (footer > avail * 0.5f)
+            footer = avail * 0.5f;
+
         // "quickboard", NOT the "quickrows" this table was called until v0.9.2.
         //
         // ImGui keys a table's saved settings on its ID and its column count,
@@ -1641,13 +1780,8 @@ void WrQuickDraw(void)
                 ImGui::TextUnformatted(t);
 
                 ImGui::TableSetColumnIndex(3);
-                {
-                    // The current Steam persona when we know it, because that is
-                    // the name written on the line in the world -- the alias in
-                    // the cache is whatever it was when the board was fetched.
-                    const char *persona = WrSteamPersona(r->steamId);
-                    ImGui::TextUnformatted((persona && *persona) ? persona : r->alias);
-                }
+                // RowName, so the column is sorted on the string it displays.
+                ImGui::TextUnformatted(RowName(r));
 
                 // ONE WORD, and the sentence on hover and underneath.
                 //
@@ -1782,6 +1916,54 @@ void WrQuickDraw(void)
                     why = g_picks[i].why;
             if (*why)
                 ImGui::TextWrapped("Gave up on %d: %s.", failed, why);
+        }
+    }
+
+    // Lines that are on which this page did not ask for.
+    //
+    // With picks, ApplyPicks makes the store agree exactly and this is zero. It
+    // is reachable when there are none -- loading a map turns on the nearest
+    // fastest run, which is the right first impression and worth keeping -- and
+    // when runs have been ticked in the full panel's Runs tab, which this page
+    // has no business overruling.
+    //
+    // Said out loud either way, because the alternative is what was reported:
+    // two panels describing different pictures, and a line on screen with an
+    // empty tick list here. This page is not the only thing that can draw, and
+    // pretending otherwise is what made the disagreement look like a bug rather
+    // than like two panels.
+    {
+        const int extra = g_extraOn;
+        if (extra > 0)
+        {
+            ImGui::TextDisabled("%d line%s on that you did not tick here", extra,
+                                extra == 1 ? " is" : "s are");
+            ImGui::SameLine();
+            if (ImGui::SmallButton("turn off"))
+            {
+                for (int i = 0; i < WrRunCount(); i++)
+                {
+                    WrRun *r = WrRunAt(i);
+                    if (!r || !r->enabled)
+                        continue;
+                    bool picked = false;
+                    for (int k = 0; k < g_pickCount && !picked; k++)
+                        picked = WrRunIsFrom(r, g_picks[k].hash);
+                    if (!picked)
+                        r->enabled = false;
+                }
+                // Or the next frame's auto-enable puts one straight back.
+                WrPathCancelAutoEnable();
+                g_extraOn = 0;
+                g_nextPollAt = 0;
+            }
+            ImGui::SameLine();
+            Marker("Chosen for you when the map loaded -- the fastest run that "
+                   "passes near where you are standing -- or ticked in the full "
+                   "panel's Runs tab.\n\n"
+                   "Nothing is wrong: this page is not the only thing that can "
+                   "put a line on screen. It is said here so the two panels "
+                   "cannot quietly describe different pictures.");
         }
     }
 

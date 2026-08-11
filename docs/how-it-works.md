@@ -1275,6 +1275,63 @@ not, and a button that quietly ignored both would be the one control on the page
 the table in front of it. At the slow end, sorted by rank, "tick first 5" is the five slowest runs
 on the board — which is the point of having gone there.
 
+### Two panels describing different pictures
+
+Five reports against the quick page, and three of them were one sentence apart from each other.
+
+**Ticking a run also switched on first place.** `FinishLoad` sorts the store by time and sets
+`enabled = (i == 0)` — so run 0 *is* first place, and every store reload switched it on. `ApplyPicks`
+then turned the ticked run on beside it and cancelled the auto-enable, which was the one thing that
+would have cleared it. One tick, two lines. And because the Runs tab reads `enabled` while the quick
+page reads its own tick list, the two panels reported different pictures from different truths.
+
+Turning them on was only half the job; the fix is that the enabled set becomes *exactly* the picks.
+Nothing is lost by being absolute: a reload has already cleared any selection made in the Runs tab,
+so at that instant the enabled set is entirely machine-chosen, and if this page has been told what
+to show it is the only thing that has been told anything. The same call now runs on the
+tick-an-already-extracted-run path too, which is where it was most visible — that path does no
+download, so there is no reload coming later to clean up after it.
+
+With **no** picks, guessing is still right: loading a map and seeing the nearest fastest line is the
+whole first impression. But a line on screen with an empty tick list is exactly what "the two menus
+disagree" looks like, so the page counts them and says so — *2 lines are on that you did not tick
+here* — with a button to clear them. This page is not the only thing that can draw, and pretending
+otherwise is what made two panels look like a bug.
+
+**A stage would jump back to the main track mid-download**, and that took two bugs.
+
+The first: `LegsFromCache` had never added a single leg. It called `strrchr(name, 't')` for "the last
+'t' before the extension" and then rejected any `t` after the dot — and the last `t` in
+`surf_helloworld_g1_t11.tsv` is the one in `.tsv`, which is always after the dot. Every file, every
+time, skipped, in a function whose entire job was to list legs. Nothing noticed because the symptom
+was one step removed: with it dead, a leg was a chip only while runs for it happened to be *loaded*.
+
+The second: `WrPathLoadMap` bumps the store generation the moment it frees the old runs, so the
+first rebuild after a download runs against an **empty** store. Every source of legs is empty at
+that instant, the selected stage is not in the list, and a selection held as an *index into that
+list* has nowhere to go but back to the main track — where it stays, because by the time the store
+refills, the rebuild has already forgotten what it was.
+
+So the selection is `(trackType, trackNum)` and the index is derived from it, and a leg nothing else
+currently vouches for is added rather than dropped. The filename parse moved into `wr_quick.h` as a
+pure function shared by both readers of that name, with a harness case per field — two readers of
+one filename should not be two chances to get it wrong, and this one went two releases without being
+right once.
+
+**The runner names changed as you ticked.** The column preferred the live Steam persona over the
+leaderboard's alias, on the grounds that the persona is the name written on the line in the world.
+But a persona only exists for a player somebody has asked Steam about, and the only thing that asks
+is a name tag being drawn — so the name changed the moment you ticked the row, and changed back for
+anyone Steam had nothing for. Asking here instead would be worse: `WrSteamWant` feeds a 96-slot
+cache that the tag code is careful to leave room in, and a hundred rows of leaderboard would take
+every slot and starve the tags for the session. So the column shows the alias, which the cache
+always carries, which never moves, and which is what the Board tab shows in the same column.
+
+**And the colour controls were being pushed off the bottom.** The table reserved a flat 5.5 rows
+beneath itself, which was right when it was written and silently wrong once anything was added — by
+then there were eight rows down there. It counts what it is about to draw now, and clamps to half
+the window so a sentence that wraps further than budgeted cannot leave no table at all.
+
 ### One byte, and two features that could not work
 
 The quick page shipped saying **"that demo could not be read"** about five runs whose `.wrpath`

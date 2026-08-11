@@ -444,6 +444,78 @@ int main(void)
     }
     printf("\n");
 
+    // -----------------------------------------------------------------------
+    printf("which leg and mode a board cache filename holds\n");
+    {
+        // THE ONE THAT WAS WRONG FOR TWO RELEASES. The old inline version used
+        // strrchr to find "the last 't' before the extension" and then rejected
+        // any 't' after the dot -- which is every filename, because the last 't'
+        // is the one in ".tsv". It listed no legs at all, and the symptom was
+        // one step removed: the stage chips collapsed to the main track during
+        // every store reload, because runs were the only other source of them.
+        int mode = 0, type = 0, num = 0;
+
+        Check(WrQuickParseBoardName("surf_helloworld_g1_t11.tsv",
+                                    "surf_helloworld", &mode, &type, &num),
+              "a stage board parses at all -- which is the whole bug");
+        Check(mode == 1 && type == 1 && num == 1, "surf, stage 1");
+
+        Check(WrQuickParseBoardName("surf_helloworld_g1_t01.tsv",
+                                    "surf_helloworld", &mode, &type, &num) &&
+              mode == 1 && type == 0 && num == 1, "and the main track is type 0");
+
+        Check(WrQuickParseBoardName("surf_hades2_g1_t24.tsv", "surf_hades2",
+                                    &mode, &type, &num) &&
+              type == 2 && num == 4, "bonus 4");
+
+        Check(WrQuickParseBoardName("bhop_telehop_theory_g2_t01.tsv",
+                                    "bhop_telehop_theory", &mode, &type, &num) &&
+              mode == 2, "a two-word map on the bhop board");
+
+        Check(WrQuickParseBoardName("x_g11_t01.tsv", "x", &mode, &type, &num) &&
+              mode == 11, "a two-digit mode is not read as one digit");
+        Check(WrQuickParseBoardName("x_g1_t112.tsv", "x", &mode, &type, &num) &&
+              type == 1 && num == 12, "nor a two-digit stage number");
+
+        // Reading past the map name rather than searching for a separator is
+        // what makes these safe, and they are not hypothetical: the glob that
+        // feeds this is "<map>_g*_t*.tsv" and * matches underscores.
+        Check(WrQuickParseBoardName("surf_t_thing_g1_t01.tsv", "surf_t_thing",
+                                    &mode, &type, &num) &&
+              type == 0 && num == 1,
+              "a map with _t in its own name does not confuse the leg");
+        Check(WrQuickParseBoardName("surf_g_thing_g1_t01.tsv", "surf_g_thing",
+                                    &mode, &type, &num) &&
+              mode == 1, "nor does one with _g confuse the mode");
+        Check(!WrQuickParseBoardName("surf_g_thing_g1_t01.tsv", "surf",
+                                     &mode, &type, &num),
+              "and a longer map's file, caught by a shorter map's glob, is "
+              "refused rather than misread");
+
+        Check(!WrQuickParseBoardName("surf_x_g0_t01.tsv", "surf_x",
+                                     &mode, &type, &num),
+              "gamemode 0 does not exist");
+        Check(!WrQuickParseBoardName("surf_x_g14_t01.tsv", "surf_x",
+                                     &mode, &type, &num),
+              "and neither does 14");
+        Check(!WrQuickParseBoardName("surf_x_g1_t31.tsv", "surf_x",
+                                     &mode, &type, &num),
+              "there is no track type 3");
+        Check(!WrQuickParseBoardName("surf_x_g1_t0.tsv", "surf_x",
+                                     &mode, &type, &num),
+              "a leg with no number is not a leg");
+        Check(!WrQuickParseBoardName("surf_x_g1.tsv", "surf_x",
+                                     &mode, &type, &num),
+              "nor is a name with no leg field at all");
+        Check(!WrQuickParseBoardName("surf_x", "surf_x", &mode, &type, &num),
+              "a name that stops where the map name does holds nothing");
+        Check(!WrQuickParseBoardName(NULL, "surf_x", &mode, &type, &num),
+              "no name is not a crash");
+        Check(!WrQuickParseBoardName("surf_x_g1_t01.tsv", "", &mode, &type, &num),
+              "and neither is no map");
+    }
+    printf("\n");
+
     printf("\n%s\n\n", g_failures ? "SOME CHECKS FAILED" : "all checks passed");
     return g_failures ? 1 : 0;
 }

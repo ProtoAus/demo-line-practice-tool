@@ -54,6 +54,7 @@
 #define WR_QUICK_H
 
 #include "wr_common.h"
+#include "wr_board.h"           // WR_GAMEMODE_COUNT, which bounds a parsed mode
 
 // How many places the list shows. Twenty is what was asked for and it is also
 // about where a leaderboard stops being a list of runs and starts being a
@@ -303,6 +304,88 @@ static inline bool WrQuickHasPrefix(const char *s, const char *p)
         if (a != *p)
             return false;
     }
+    return true;
+}
+
+// Pull the mode and the leg back out of a board cache filename.
+//
+// The filename is boards\<map>_g<mode>_t<type><num>.tsv, and it is the only
+// record of which legs and which gamemodes have ever been fetched for a map --
+// one directory listing answers both with no file opened.
+//
+// IT IS HERE, PURE AND TESTED, BECAUSE THE INLINE VERSION WAS WRONG FOR TWO
+// RELEASES AND NOTHING NOTICED. It looked for the last 't' with strrchr and
+// then rejected any that fell after the dot -- and the last 't' in
+// "surf_helloworld_g1_t11.tsv" is the one in ".tsv", which always falls after
+// the dot. Every file, every time, skipped, in a function whose entire job was
+// to list legs. What it cost was invisible rather than loud: a leg was a chip
+// only while runs for it happened to be LOADED, so the stage list collapsed to
+// the main track during every store reload -- which is one reload per finished
+// download.
+//
+// Reading past the map name rather than searching for a separator is what makes
+// it safe. A map called "surf_t_thing" has a "_t" of its own and a map called
+// "surf_g_thing" has a "_g"; neither is ever looked at, because the length of
+// the name we are asking about says where the fields begin.
+//
+// `name` is the bare filename, not a path. Any out-param may be NULL.
+static inline bool WrQuickParseBoardName(const char *name, const char *map,
+                                         int *mode, int *type, int *num)
+{
+    if (mode) *mode = 0;
+    if (type) *type = 0;
+    if (num)  *num = 0;
+    if (!name || !map || !*map)
+        return false;
+
+    size_t skip = 0;
+    while (map[skip])
+        skip++;
+    skip += 2;                          // past "_g"
+
+    size_t n = 0;
+    while (name[n])
+        n++;
+    if (n <= skip)
+        return false;
+
+    const char *p = name + skip;        // "<mode>_t<type><num>.tsv"
+    if (*p < '0' || *p > '9')
+        return false;                   // a longer map's file caught by the glob
+
+    int m = 0;
+    for (const char *d = p; *d >= '0' && *d <= '9'; d++)
+        m = m * 10 + (*d - '0');
+    if (m < 1 || m > WR_GAMEMODE_COUNT)
+        return false;
+
+    const char *t = NULL;
+    for (const char *c = p; c[0] && c[1]; c++)
+        if (c[0] == '_' && c[1] == 't')
+        {
+            t = c;
+            break;
+        }
+    if (!t || t[2] < '0' || t[2] > '9')
+        return false;
+
+    const int ty = t[2] - '0';
+    if (ty < 0 || ty > 2)
+        return false;
+
+    int nu = 0;
+    bool anyDigit = false;
+    for (const char *d = t + 3; *d >= '0' && *d <= '9'; d++)
+    {
+        nu = nu * 10 + (*d - '0');
+        anyDigit = true;
+    }
+    if (!anyDigit || nu < 0 || nu > 255)
+        return false;
+
+    if (mode) *mode = m;
+    if (type) *type = ty;
+    if (num)  *num = nu;
     return true;
 }
 
