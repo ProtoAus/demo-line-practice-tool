@@ -508,6 +508,53 @@ Completed `.wrpath` files survive any kill — every write is a temp file plus a
 comment claiming otherwise, which was the only cancel-adjacent reasoning in the codebase, was stale
 and has been corrected.
 
+### It was mute again, one layer earlier
+
+Reported after v0.7.0 as "it freezes for 20–30 seconds the first time I hit Extract, then all the
+text appears at once, and every time after that is fast". The same shape as the bug above, in a
+different place, and the "every time after that is fast" is the clue that says which place.
+
+Nothing was slow. Before the extractor can do anything it has to work out *which* of your demos are
+for the map you are on, and a demo's map name is inside the file: the filename is a replay hash,
+and the folder says nothing — `momtv\online\` is keyed by map ID, `momtv\local\` is whatever the
+game called your own recordings, and `wrlines_data\demos\` is ours. So the answer was always found
+the only way it can be found. Open all of them. **6,416 files here**, and not one line printed for
+the whole of it.
+
+Warm, that costs about a quarter of a second. Cold — the first press after the machine booted, or
+after the game had pushed everything else out of the file cache — it is thousands of individual
+seeks, which is exactly the 20 to 30 seconds reported. The second press was fast because Windows
+still had every one of those headers in memory. Two separate walks did it (the demo counter on
+every map change, the extractor on every run), and a finished job started the counter again, so
+pressing Extract shortly after loading a map ran two of them against one cold disk.
+
+Two changes, and they are different kinds of fix:
+
+- **It says so now.** One line before the walk and a count every second during it. That is the
+  honest half: even at its fastest this is work, and a button that does not acknowledge a press is
+  indistinguishable from one that is broken. It is also the half that had to be done carefully —
+  `tests\parity.ps1` compares stdout **character for character** against the frozen Python oracle,
+  which prints nothing here and cannot be changed, so the progress lines are behind a flag that only
+  the in-game path sets. The console front end the oracle is compared against stays silent.
+- **It stops asking.** `wrlines_data\demoindex.txt` remembers which map each demo is for, keyed on
+  the file's path, size and last-write time — all three of which come out of the directory listing
+  already being read, at no extra cost. A row is believed only while all three still match, so a
+  re-downloaded demo is re-read rather than trusted; size catches a truncated download, and the
+  write time catches a replacement that happened to be the same length. Measured over the game tree
+  with the file cache already warm, the walk went from 0.33 s to 0.09 s — and warm is the case where
+  there was least to win. Cold, it replaces several thousand scattered reads with one sequential
+  800 KB one.
+
+It is a **cache**, not a record. A miss is not an error, it is a file being opened the old way;
+a corrupt row is dropped and re-read; deleting the file costs one slow run and nothing else. A
+refusal is remembered too — a file that is not a demo at all is not reopened on every walk to be
+told the same thing.
+
+Like everything else under `wrlines_data\`, it is per-machine and not for sharing: it holds paths to
+files on your disk and the map names of other players' runs, which is why it is not in
+`settings.cfg` — that file promises it contains display settings and nothing else, and it keeps
+that promise.
+
 ### Demos that cannot be extracted
 
 Some demos cannot be read at all — see [Known limits](#known-limits). Failing to read one is

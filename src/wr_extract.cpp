@@ -9,6 +9,7 @@
 #include "wr_maps.h"
 #include "wr_mtv.h"
 #include "wr_path.h"
+#include "wr_peek.h"
 #include "wr_log.h"
 
 #include <math.h>
@@ -403,12 +404,21 @@ static void CountInTree(const char *root, const char *map, const char *pathsDir)
         // rather than vanishing from the total. An empty name is the other
         // case: the file is not an MMTV at all and there is nothing to count
         // it against.
-        char why[128];
-        WrMtvHeader hdr;
-        bool headerOk = WrMtvPeek(full, &hdr, why, sizeof(why));
-        if (!hdr.map[0])
+        // Through the index, for the same reason CollectVisit is: this ran on
+        // every map change, opening four thousand files while the game was
+        // loading one.
+        const long long dsize =
+            ((long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+        const long long dmtime =
+            ((long long)fd.ftLastWriteTime.dwHighDateTime << 32) |
+            fd.ftLastWriteTime.dwLowDateTime;
+
+        char dmap[65];
+        bool headerOk = false;
+        WrPeekMapOf(full, dsize, dmtime, dmap, sizeof(dmap), &headerOk);
+        if (!dmap[0])
             continue;
-        if (_stricmp(hdr.map, map) != 0)
+        if (_stricmp(dmap, map) != 0)
             continue;
 
         g_forThisMap++;
@@ -430,21 +440,31 @@ static void CountInTree(const char *root, const char *map, const char *pathsDir)
             else
                 g_notYetDone++;     // out of date counts as work still to do
         }
-        else if (!headerOk ||
-                 IsKnownBad(&g_failed, base,
-                            ((long long)fd.nFileSizeHigh << 32) |
-                            fd.nFileSizeLow))
+        else if (!headerOk || IsKnownBad(&g_failed, base, dsize))
         {
             g_knownBad++;
             // Nothing in this library has ever failed a header gate, so if one
             // does, the reason is worth having written down somewhere. Capped
             // because a genuinely broken install would otherwise put a line in
             // the log for every demo it owns, every time you change map.
+            //
+            // The index remembers THAT a header did not parse, not why -- the
+            // reason is a sentence, it is only ever printed, and storing it
+            // would put a hundred bytes on every row to serve five lines of log
+            // in the whole history of this library. So the rare bad header is
+            // opened once more to ask. It is the only path here that still
+            // touches a file, and it is unreachable on a healthy install.
             if (!headerOk)
             {
                 g_headerBad++;
                 if (g_headerBad <= 5)
+                {
+                    WrMtvHeader again;
+                    char why[128];
+                    why[0] = '\0';
+                    WrMtvPeek(full, &again, why, sizeof(why));
                     WrLogf("[!] extract: %s -- %s", fd.cFileName, why);
+                }
             }
         }
         else
@@ -487,6 +507,10 @@ static DWORD WINAPI CountThread(LPVOID)
 
         FailFree(&g_failed);
     }
+
+    // Whatever this walk learned, so the next one does not learn it again. A
+    // no-op when every demo was already indexed, which is the steady state.
+    WrPeekSave();
 
     g_haveCounts = true;
     InterlockedExchange(&g_counting, 0);
@@ -911,6 +935,20 @@ struct Collect
 
     MapFails *cache;
     int cacheN, cacheCap;
+
+    // Saying so while it happens. See progressLines in wr_extract.h for why this
+    // is a flag and not simply always on -- the short version is that stdout is
+    // compared character for character against a frozen oracle that prints
+    // nothing here.
+    //
+    // Paced on the CLOCK, not on a count of files. A fixed modulus is wrong in
+    // both directions at once: every 500 files says nothing at all on a library
+    // of 300, and floods a slow disk that is managing 40 a second. A second of
+    // wall clock means the same thing to the person watching whatever the
+    // library looks like.
+    bool progress;
+    int seen;
+    unsigned long long nextAt;
 };
 
 static WrFailSet *CachedFailures(Collect *c, const char *map)
@@ -972,6 +1010,22 @@ static void CollectVisit(void *user, const char *path,
 {
     Collect *c = (Collect *)user;
 
+    // Before any of the early returns below, because this counts FILES LOOKED
+    // AT, not files kept. On a --map run almost everything is discarded a few
+    // lines down, and a counter that only advanced on a keeper would sit at zero
+    // for the entire twenty seconds -- which is the symptom this exists to cure,
+    // reproduced faithfully in the cure.
+    c->seen++;
+    if (c->progress)
+    {
+        const unsigned long long now = GetTickCount64();
+        if (now >= c->nextAt)
+        {
+            Emitf("  %d demos looked at", c->seen);
+            c->nextAt = now + 1000;
+        }
+    }
+
     // peek_map, and deliberately NOT the sanity gates. The reference's peek_map
     // checks the magic and reads the name at 0x10 and nothing else, so a demo
     // whose tick interval is not a tick interval is still SELECTED here and
@@ -979,24 +1033,31 @@ static void CollectVisit(void *user, const char *path,
     // into the failure record and therefore the string that has to match.
     // WrMtvPeek fills in every field it managed to read before the gate that
     // refused it, which is what makes borrowing it for this correct.
-    WrMtvHeader hdr;
-    char why[128];
-    WrMtvPeek(path, &hdr, why, sizeof(why));
-
-    if (c->wantMap[0] && _stricmp(hdr.map, c->wantMap) != 0)
-        return;
-
+    //
+    // Through the index rather than straight at the file: this is the line that
+    // used to open every demo in the library, which is where the twenty seconds
+    // went. Same answer, and the same answer for the same reason -- WrPeekMapOf
+    // calls exactly this function on a miss. See wr_peek.h.
     const long long size = ((long long)fd->nFileSizeHigh << 32) | fd->nFileSizeLow;
+    const long long mtime =
+        ((long long)fd->ftLastWriteTime.dwHighDateTime << 32) |
+        fd->ftLastWriteTime.dwLowDateTime;
+
+    char dmap[65];
+    WrPeekMapOf(path, size, mtime, dmap, sizeof(dmap), NULL);
+
+    if (c->wantMap[0] && _stricmp(dmap, c->wantMap) != 0)
+        return;
 
     char base[128];
     WrFileStem(fd->cFileName, base, sizeof(base));
 
     bool staleOut = false;
-    if (c->skipExisting && hdr.map[0])
+    if (c->skipExisting && dmap[0])
     {
         char out[MAX_PATH];
         _snprintf_s(out, sizeof(out), _TRUNCATE, "%s\\%s\\%s.wrpath",
-                    c->job->outDir, hdr.map, base);
+                    c->job->outDir, dmap, base);
         if (GetFileAttributesA(out) != INVALID_FILE_ATTRIBUTES)
         {
             if (WrpathRevision(out) == WR_EXTRACTOR_REVISION)
@@ -1018,9 +1079,9 @@ static void CollectVisit(void *user, const char *path,
     // under the new one -- and skipping it would leave the old file in place
     // forever, still loaded, still drawn, derived from an assumption we have
     // since established was wrong.
-    if (c->skipExisting && hdr.map[0] && !c->retryFailed && !staleOut)
+    if (c->skipExisting && dmap[0] && !c->retryFailed && !staleOut)
     {
-        const WrFailSet *fs = CachedFailures(c, hdr.map);
+        const WrFailSet *fs = CachedFailures(c, dmap);
         if (fs && IsKnownBad(fs, base, size))
         {
             c->knownBad++;
@@ -1028,7 +1089,7 @@ static void CollectVisit(void *user, const char *path,
         }
     }
 
-    ItemPush(c, path, hdr.map, fd->cFileName, size);
+    ItemPush(c, path, dmap, fd->cFileName, size);
 }
 
 // The same three trees, for a caller that wants the paths and not the filter
@@ -1294,6 +1355,8 @@ static DWORD RunExtract(const WrExtractRequest *req)
     c.wantMap = req->map;
     c.skipExisting = req->skipExisting;
     c.retryFailed = req->retryFailed;
+    c.progress = req->progressLines && !req->file[0];
+    c.nextAt = GetTickCount64() + 1000;
 
     if (req->file[0])
     {
@@ -1318,6 +1381,18 @@ static DWORD RunExtract(const WrExtractRequest *req)
     }
     else
     {
+        // The first thing the panel gets, and it has to arrive before the walk
+        // rather than after it: everything below this line is silent for as long
+        // as the disk takes, and a button that acknowledges the press is the
+        // whole difference between "working" and "hung". It costs one line.
+        if (c.progress)
+        {
+            if (req->map[0])
+                Emitf("looking through your demos for %s", req->map);
+            else
+                Emit("looking through your demos");
+        }
+
         char root[MAX_PATH];
         _snprintf_s(root, sizeof(root), _TRUNCATE, "%s\\momentum\\momtv\\online",
                     gameDir);
@@ -1336,6 +1411,18 @@ static DWORD RunExtract(const WrExtractRequest *req)
     for (int i = 0; i < c.cacheN; i++)
         FailFree(&c.cache[i].set);
     free(c.cache);
+
+    // Before the work starts, not after it: an extraction can take an hour and
+    // be stopped half way, and the index is worth keeping either way. It cost
+    // one file open per demo to learn and it is not tied to whether the run
+    // that learned it finished.
+    WrPeekSave();
+
+    // Closes the pair. Without it the last "N demos looked at" is left hanging
+    // and the run appears to stall a second time, at the moment it actually
+    // started working.
+    if (c.progress)
+        Emitf("%d demos looked at", c.seen);
 
     if (c.already)
         Emitf("%d already extracted, skipping them", c.already);
@@ -1590,6 +1677,12 @@ void WrExtractRun(bool retryFailed)
     // starts this is only drawn in one. An empty map means "every map", which
     // is a thing the console front end can ask for and the panel cannot.
     req.skipExisting = true;
+
+    // The panel's path, and the only caller that sets this. See progressLines in
+    // wr_extract.h: it is off everywhere else so that stdout stays comparable
+    // with the frozen oracle, and on here because here there is a person waiting
+    // on a button they just pressed.
+    req.progressLines = true;
 
     EnterCriticalSection(&g_cs);
     strcpy_s(req.map, sizeof(req.map), g_map);

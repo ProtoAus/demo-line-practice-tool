@@ -178,6 +178,30 @@ struct WrExtractRequest
     int top;                        // fetch the top N (the Maps tab)
     const int *ranks;               // or exactly these places (the Board tab)
     int rankCount;                  // COPIED by WrExtractSubmit; may be a stack array
+
+    // PRESENTATION, and the one field that exists for the PANEL rather than for
+    // the work.
+    //
+    // Building the work list opens every .mtv in three trees, because the map
+    // name lives inside the file and nothing else knows it. Cold, that is twenty
+    // to thirty seconds on a real library, and until this field existed the
+    // extractor printed NOTHING for the whole of it -- so the first press of
+    // Extract in a session looked exactly like a hang, and the second looked
+    // instant because the filesystem cache was warm. It was never slow at the
+    // thing it says it is doing; it was silent at the thing it does first.
+    //
+    // OFF BY DEFAULT, AND THAT IS THE LOAD-BEARING PART. tests\parity.ps1
+    // compares stdout CHARACTER FOR CHARACTER against tests\reference\
+    // wrpath_extract.py, which prints nothing here and cannot be changed -- it is
+    // frozen at revision 3 and is the oracle by definition. An unconditional
+    // progress line would therefore fail the release gate for a reason that has
+    // nothing to do with whether the port is correct.
+    //
+    // So: WrExtractRun sets it, because that is the panel's path and the panel
+    // has a human watching it. tests\wrextract_main.cpp never does, because
+    // `= {0}` leaves it false and the console front end is the one being
+    // compared. Parity is safe by construction rather than by remembering.
+    bool progressLines;
 };
 
 // Start a job. No-op if one is already running.

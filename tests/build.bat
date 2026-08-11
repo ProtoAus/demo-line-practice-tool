@@ -152,6 +152,17 @@ cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Itests /Ithird_party\lzma ^
    /Fe:tests\test_mtv.exe /Fo:tests\ >nul
 if errorlevel 1 ( echo [!] test_mtv FAILED to build & exit /b 1 )
 
+rem test_peek is the one harness here that touches the disk, and it has to: the
+rem thing under test is a claim about file metadata, so a stub that returned
+rem metadata we invented would be a test of the stub. It writes the synthetic
+rem fixture into tests\peekscratch\ and deletes it again. wr_log.cpp comes along
+rem for WrDataPath and WrLogf.
+cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Itests /Ithird_party\lzma ^
+   tests\test_peek.cpp ^
+   %S%\wr_peek.cpp %S%\wr_mtv.cpp %S%\wr_log.cpp tests\LzmaDec.obj ^
+   /Fe:tests\test_peek.exe /Fo:tests\ >nul
+if errorlevel 1 ( echo [!] test_peek FAILED to build & exit /b 1 )
+
 rem test_api links the real API layer AND the real network client, and then
 rem never reaches the network -- api_tape.cpp answers every request from a
 rem checked-in recording, and a URL that is not in it is an error rather than a
@@ -249,7 +260,7 @@ cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Itests /Ithird_party\miniz ^
    /Ithird_party\lzma ^
    tests\wrextract_main.cpp tests\api_tape.cpp ^
    %S%\wr_extract.cpp %S%\wr_maps.cpp %S%\wr_msml.cpp %S%\wr_json.cpp ^
-   %S%\wr_mtv.cpp %S%\wr_api.cpp %S%\wr_http.cpp %S%\wr_board.cpp ^
+   %S%\wr_mtv.cpp %S%\wr_peek.cpp %S%\wr_api.cpp %S%\wr_http.cpp %S%\wr_board.cpp ^
    %S%\wr_fetch.cpp %S%\wr_dp.cpp %S%\wr_demo.cpp %S%\wr_jobs.cpp ^
    %S%\wr_path.cpp %S%\wr_profile.cpp %S%\wr_energy.cpp %S%\wr_log.cpp ^
    tests\miniz.obj tests\LzmaDec.obj winhttp.lib ^
@@ -273,6 +284,7 @@ tests\test_json.exe       || set "RC=1"
 tests\test_maps.exe       || set "RC=1"
 tests\test_lzma.exe       || set "RC=1"
 tests\test_mtv.exe        || set "RC=1"
+tests\test_peek.exe       || set "RC=1"
 tests\test_api.exe        || set "RC=1"
 tests\test_fetch.exe      || set "RC=1"
 tests\test_dp.exe         || set "RC=1"
