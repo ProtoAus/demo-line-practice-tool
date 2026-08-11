@@ -261,9 +261,12 @@ static void ResolveMode(void)
     if (mode < 1 || mode > WR_GAMEMODE_COUNT)
         mode = 1;
 
-    if (mode != g_mode)
-        WrLogf("quick: %s reads as %s (gamemode %d)", g_map,
-               WrGamemodeName(mode), mode);
+    // Every map change, not only when the answer differs from the last map's.
+    // This is the line that would have answered the bhop_hades report in one
+    // run instead of by inference from job timings, and one line per level load
+    // is not a busy log.
+    WrLogf("quick: %s reads as %s (gamemode %d)", g_map, WrGamemodeName(mode),
+           mode);
     g_mode = mode;
 }
 
@@ -1556,7 +1559,17 @@ void WrQuickDraw(void)
     if (g_rowCount > 0)
     {
         const float footer = ImGui::GetFrameHeightWithSpacing() * 5.5f;
-        if (ImGui::BeginTable("quickrows", 5,
+        // "quickboard", NOT the "quickrows" this table was called until v0.9.2.
+        //
+        // ImGui keys a table's saved settings on its ID and its column count,
+        // and imgui.ini files in the wild already carry a "Column 0 Sort=0v"
+        // for the old name -- written while the table was not sortable at all.
+        // Keeping the name would restore that on the first run of the sortable
+        // version: the page would open sorted by the TICK column, descending,
+        // which puts the runs you have not asked for at the top and reads as a
+        // sort that does not work. A new ID starts from the DefaultSort below,
+        // which is rank ascending, which is what a leaderboard looks like.
+        if (ImGui::BeginTable("quickboard", 5,
                               ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                               ImGuiTableFlags_SizingStretchProp |
                               ImGuiTableFlags_Sortable |
