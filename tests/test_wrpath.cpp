@@ -253,6 +253,44 @@ int main(void)
               "the track fields came back");
         Check(r->startIndex == 41 && r->startTrusted,
               "and so did where the RUN starts, as opposed to the recording");
+        // THE FIELD THAT COMES BACK ONE CHARACTER SHORT.
+        //
+        // srcSha1 is the source demo's basename, and for a downloaded run that
+        // is a forty-character replay hash going into a forty-BYTE field --
+        // WrPathFixedField always keeps a byte for the terminator, so exactly one
+        // character is lost, in every file ever written, by the reference too.
+        // The field cannot be widened: player[] begins at 0xC4, immediately
+        // after.
+        //
+        // This is pinned rather than fixed because a lot rests on it and none of
+        // it is visible. Matching a leaderboard row's hash against this with
+        // strcmp is never true for a downloaded run, and the two places that did
+        // it both failed silently: the quick menu called every successful
+        // extraction "that demo could not be read", and the Runs tab's send,
+        // local and watch buttons built "<srcSha1>.mtv" and could not find a file
+        // that was sitting right there.
+        const char *kStem = "fedcba9876543210fedcba9876543210fedcba98";
+        Check(strlen(kStem) == 40, "the source stem is a forty-character hash");
+        Check(strlen(r->srcSha1) == 39,
+              "and the field holds thirty-nine of it -- the format, not a bug");
+        Check(strcmp(r->srcSha1, kStem) != 0,
+              "so comparing it to the real name with strcmp is always false");
+        Check(WrRunIsFrom(r, kStem), "and WrRunIsFrom is what recognises it");
+
+        // The other direction, which is what the length floor is for. A run
+        // recorded by the game itself has a stem far longer than the field, so it
+        // truncates in the MIDDLE and a prefix match with no floor would call two
+        // such runs the same.
+        Check(!WrRunIsFrom(r, "fedcba9876543210fedcba9876543210fedcba98ff"),
+              "a name two characters longer is a different demo");
+        Check(WrRunIsFrom(r, "fedcba9876543210fedcba9876543210fedcba9"),
+              "a name that IS what we stored still matches, truncated or not");
+        Check(!WrRunIsFrom(r, "fedcba9876543210fedcba9876543210fedcba00"),
+              "and one that differs inside the stored part does not");
+        Check(!WrRunIsFrom(r, "fedcba98"), "a bare prefix is not a match either");
+        Check(!WrRunIsFrom(r, ""), "nor is nothing at all");
+        Check(!WrRunIsFrom(NULL, kStem), "and no run matches no name");
+
         Check(r->markerCount == 3, "all three markers came back");
         Check(r->markers[2].pointIndex == 210 &&
               r->markers[2].timeReached == 52.5 &&

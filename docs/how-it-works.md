@@ -1228,6 +1228,42 @@ itself cannot live in `settings.cfg`, which promises in writing to hold no names
 no record of what was watched — a list of replay hashes you chose to watch is exactly what that
 promise excludes, so it sits under `wrlines_data` with everything else that names other players.
 
+### One byte, and two features that could not work
+
+The quick page shipped saying **"that demo could not be read"** about five runs whose `.wrpath`
+files were sitting on disk. The extraction had worked perfectly. The matching had not.
+
+`WrRun::srcSha1` is the source demo's basename, written into a forty-**byte** field at 0x9C by
+`WrPathFixedField` — which always keeps one byte for a terminator. A forty-**character** replay
+hash therefore comes back thirty-nine characters long, in every file ever written, by the
+reference implementation too. It cannot be widened: `player[]` begins at 0xC4, immediately after,
+and the format is frozen and byte-compared. So comparing that field to a leaderboard row's hash
+with `strcmp` is not merely fragile, it is **never true** for a downloaded run, and every
+successful extraction the chain performed was declared a failure.
+
+Verified on the reported map rather than argued: of the top twenty rows of `surf_helloworld`,
+five had a `.wrpath` on disk, the old comparison matched **zero** of them, and the prefix match
+matches all five.
+
+The same fault was older and quieter one file over. The Runs tab builds `"<srcSha1>.mtv"` as a
+filename for its **send**, **local**, **watch** and **take out** buttons — and a name one
+character short is simply not a file. Every one of those had been failing to find its demo for
+every downloaded run, reporting "no demo on disk" about a file right there. The evidence is in
+the manifest: every entry in `into_game.txt` is forty characters, because every entry came from
+the Board tab, which carries the full hash from the leaderboard and hits the exact name first
+try. Nothing the Runs tab sent had ever reached it.
+
+So the reading allows for it, in one place each: `WrRunIsFrom` for comparing a stored stem to a
+known hash, and a one-character wildcard fallback for turning a stored stem back into a filename.
+Thirty-nine hex characters is 156 bits of a SHA-1; the interesting part of the guard is not the
+collision but the **floor**, because a run recorded by the game itself has a stem like
+`104455274-surf_fiellu-1781797367-main-nrm-60.990`, which truncates in the middle — and a prefix
+match with no floor would cheerfully call two of those the same run.
+
+It is pinned in `test_wrpath`, at the end of the round trip through the real writer and the real
+loader, as a fact about the format rather than a bug awaiting a fix: the stem is forty, the field
+is thirty-nine, `strcmp` is false, `WrRunIsFrom` is true.
+
 ### Two hundred and fifty to three thousand five hundred
 
 The speed ramp ran 250 to 3500 u/s, and the energy ramp 0 to 4000, because those numbers had to be

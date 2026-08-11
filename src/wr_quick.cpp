@@ -39,6 +39,10 @@ void WrQuickDefaults(void)
 // ---------------------------------------------------------------------------
 
 #define MAX_LEGS 64
+#define MAX_LEGS_ASKED 64
+
+// How many more places "show more" adds, and asks for.
+#define SHOW_MORE_STEP 20
 
 struct Leg { unsigned char type, num; };
 
@@ -75,9 +79,29 @@ static WrQuickPick g_picks[WR_QUICK_MAX_PICKS];
 static int g_pickCount = 0;
 static bool g_picksDirty = false;   // needs writing to disk
 
-// A board fetch the panel has asked for but the slot was busy for.
+// A board read that is wanted and has not happened yet, either because the job
+// slot was busy or because it has only just been decided.
 static bool g_wantBoard = false;
 static unsigned char g_wantBoardType = 0, g_wantBoardNum = 1;
+static int g_wantBoardFrom = 1;         // 1-based rank to start at
+static int g_wantBoardCount = WR_QUICK_TOP_DEFAULT;
+
+// How many places the table is showing. Starts at the setting and grows by the
+// same step each time "show more" is pressed, up to the row array.
+//
+// Per session and per leg rather than persisted: it is where you have scrolled
+// to, not a preference, and coming back to a map tomorrow wanting the top twenty
+// again is the ordinary case.
+static int g_showTop = WR_QUICK_TOP_DEFAULT;
+
+// Which legs this session has already offered to read, so that switching back
+// and forth across the chips is not one request each way.
+//
+// A leg that came back EMPTY is in here too, and that is the point: a stage with
+// no runs would otherwise be asked about every single time it is selected, for
+// ever, and the answer would be the same every time.
+static unsigned short g_asked[MAX_LEGS_ASKED];
+static int g_askedCount = 0;
 
 static unsigned int g_lastExtractGen = 0;
 static unsigned int g_lastStoreGen = 0;
@@ -211,7 +235,7 @@ static void ReloadRows(void)
     if (!g_map[0] || g_legCount <= 0)
         return;
 
-    int top = g_quick.top;
+    int top = g_showTop;
     if (top < 1) top = 1;
     if (top > WR_QUICK_TOP_MAX) top = WR_QUICK_TOP_MAX;
 
@@ -230,6 +254,82 @@ static void ReloadRows(void)
 
 static WrRun *RunWithHash(const char *hash);
 static bool DemoPath(const char *hash, char *out, int cap);
+
+// ---------------------------------------------------------------------------
+// Asking for a board
+// ---------------------------------------------------------------------------
+
+static unsigned short LegKey(unsigned char type, unsigned char num)
+{
+    return (unsigned short)(((unsigned short)type << 8) | num);
+}
+
+static bool AlreadyAsked(unsigned char type, unsigned char num)
+{
+    const unsigned short k = LegKey(type, num);
+    for (int i = 0; i < g_askedCount; i++)
+        if (g_asked[i] == k)
+            return true;
+    return false;
+}
+
+static void MarkAsked(unsigned char type, unsigned char num)
+{
+    if (AlreadyAsked(type, num) || g_askedCount >= MAX_LEGS_ASKED)
+        return;
+    g_asked[g_askedCount++] = LegKey(type, num);
+}
+
+// Ask for a window of the leg being looked at, if it is worth asking for.
+//
+// THE WHOLE POINT OF THIS PAGE IS THAT IT FILLS ITSELF IN, and until now it did
+// not: it drew a button saying "Read the top 20" and waited to be pressed, which
+// is one press fewer than the panel it was meant to replace and not the same
+// thing at all. Loading a map now reads the main track, and pressing a stage
+// chip reads that stage.
+//
+// Four things keep that from becoming traffic. It needs the persisted consent.
+// It only asks for a leg NOTHING is cached for -- coming back to a map you have
+// looked at before costs nothing at all. It asks once per leg per session, even
+// if the answer was an empty board, so flicking across the chips is not one
+// request each way. And it is one page of twenty, not a leaderboard: surf_demise
+// has nine thousand runs on its main track and this asks for the first twenty of
+// them.
+static void WantBoard(unsigned char type, unsigned char num, int from, int count)
+{
+    if (!g_quick.network)
+        return;
+    g_wantBoard = true;
+    g_wantBoardType = type;
+    g_wantBoardNum = num;
+    g_wantBoardFrom = from < 1 ? 1 : from;
+    g_wantBoardCount = count < 1 ? SHOW_MORE_STEP : count;
+    g_nextPollAt = 0;
+}
+
+// The automatic half: the leg you are looking at, once, when it is empty.
+static void MaybeAutoRead(void)
+{
+    if (!g_quick.network || g_legCount <= 0 || g_wantBoard)
+        return;
+
+    const unsigned char type = g_legs[g_leg].type;
+    const unsigned char num = g_legs[g_leg].num;
+    if (AlreadyAsked(type, num))
+        return;
+
+    if (g_rowsStale)
+        ReloadRows();
+    if (g_rowCount > 0)
+    {
+        // Something is cached. Nothing to ask, and nothing to ask again later.
+        MarkAsked(type, num);
+        return;
+    }
+
+    MarkAsked(type, num);
+    WantBoard(type, num, 1, g_quick.top);
+}
 
 static void RefreshRowState(void)
 {
@@ -427,7 +527,7 @@ static void PickRemove(const char *hash)
     for (int k = 0; k < WrRunCount(); k++)
     {
         WrRun *r = WrRunAt(k);
-        if (r && SameHash(r->srcSha1, hash))
+        if (r && WrRunIsFrom(r, hash))
             r->enabled = false;
     }
 
@@ -441,12 +541,16 @@ static void PickRemove(const char *hash)
 // Facts the decision needs
 // ---------------------------------------------------------------------------
 
+// WrRunIsFrom, not a string compare: see its essay in wr_path.h. A .wrpath
+// stores thirty-nine characters of a forty-character replay hash, so equality
+// here is never true for a downloaded run -- which is exactly the bug that made
+// every successful extraction report "that demo could not be read".
 static WrRun *RunWithHash(const char *hash)
 {
     for (int i = 0; i < WrRunCount(); i++)
     {
         WrRun *r = WrRunAt(i);
-        if (r && SameHash(r->srcSha1, hash))
+        if (r && WrRunIsFrom(r, hash))
             return r;
     }
     return NULL;
@@ -504,23 +608,24 @@ static void RefreshFacts(void)
 // The chain
 // ---------------------------------------------------------------------------
 
-static void SubmitBoard(unsigned char type, unsigned char num)
+static void SubmitBoard(void)
 {
     WrExtractRequest req = {WR_JOB_BOARD};
     strcpy_s(req.map, sizeof(req.map), g_map);
     req.mapId = g_mapId;
     req.gamemode = g_quick.gamemode;
-    req.trackType = type;
-    req.trackNum = num;
+    req.trackType = g_wantBoardType;
+    req.trackNum = g_wantBoardNum;
     req.boardMode = WR_BOARD_WINDOW;
-    req.fromRank = 1;
-    req.count = g_quick.top;
+    req.fromRank = g_wantBoardFrom;
+    req.count = g_wantBoardCount;
 
     if (WrExtractSubmit(&req))
     {
         g_wantBoard = false;
         _snprintf_s(g_note, sizeof(g_note), _TRUNCATE,
-                    "reading the %s leaderboard...", WrTrackNameOf(type, num));
+                    "reading the %s leaderboard...",
+                    WrTrackNameOf(g_wantBoardType, g_wantBoardNum));
     }
 }
 
@@ -629,10 +734,12 @@ void WrQuickTick(void)
     const unsigned int sgen = WrRunStoreGeneration();
     bool poke = false;
 
+    bool boardJustRan = false;
     if (egen != g_lastExtractGen)
     {
         g_lastExtractGen = egen;
         g_rowsStale = true;         // a board or fetch may have rewritten it
+        boardJustRan = (WrExtractLastKind() == WR_JOB_BOARD);
         poke = true;
     }
     if (sgen != g_lastStoreGen)
@@ -660,19 +767,37 @@ void WrQuickTick(void)
         RefreshRowState();
     }
 
+    // A read that finished and left the table empty. Said out loud, because the
+    // alternative is a page that quietly stays blank and looks broken -- and the
+    // usual cause is not a failure at all: plenty of stage boards have nobody on
+    // them. The full panel's Board tab carries the actual error text if there
+    // was one.
+    if (boardJustRan && g_rowCount == 0)
+        strcpy_s(g_note, sizeof(g_note),
+                 "nothing came back for this leg -- it may simply have no runs");
+
+    // Fill the page in. Here rather than in the draw path, so it happens on a map
+    // change whether or not the panel is open -- by the time you press Delete the
+    // board is already there.
+    MaybeAutoRead();
+
     const bool busy = WrExtractRunning();
 
-    // A board the panel asked for. Ahead of the demo chain because there is
+    // A board the page asked for. Ahead of the demo chain because there is
     // nothing to download until the leaderboard says what rank 3 is.
     if (g_wantBoard && !busy)
     {
-        SubmitBoard(g_wantBoardType, g_wantBoardNum);
+        SubmitBoard();
         return;
     }
 
     if (g_pickCount == 0)
     {
-        g_note[0] = '\0';
+        // Not unconditionally: the "nothing came back" line above is set on a
+        // page with no ticks by definition, and clearing it here would wipe it
+        // on the very next tick.
+        if (!boardJustRan)
+            g_note[0] = '\0';
         return;
     }
 
@@ -748,6 +873,8 @@ void WrQuickOnMapChanged(const char *map)
     g_rowsStale = true;
     g_rowCount = 0;
     g_wantBoard = false;
+    g_showTop = g_quick.top;
+    g_askedCount = 0;           // a new map is a new set of legs to ask about
     g_note[0] = '\0';
     g_nextPollAt = 0;
 
@@ -813,6 +940,10 @@ static void DrawLegChips(void)
         {
             g_leg = i;
             g_rowsStale = true;
+            g_showTop = g_quick.top;    // back to the top of the new leg
+            // The tick that fills the page in. MaybeAutoRead does the deciding;
+            // this only has to make the next one happen without waiting out the
+            // poll interval, so a chip press feels like a chip press.
             g_nextPollAt = 0;
         }
         if (selected)
@@ -858,7 +989,7 @@ static void DrawColourRow(void)
 
 void WrQuickDraw(void)
 {
-    ImGui::SetNextWindowSize(ImVec2(560.0f, 480.0f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(640.0f, 520.0f), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImVec2(120.0f, 120.0f), ImGuiCond_FirstUseEver);
 
     bool open = true;
@@ -950,15 +1081,14 @@ void WrQuickDraw(void)
         }
         else
         {
+            // Reachable when the automatic read has already been spent on this
+            // leg and came back with nothing -- an empty stage board, or a
+            // request that failed. Asking again is then a decision rather than a
+            // default, so it is a button.
             char lbl[64];
             _snprintf_s(lbl, sizeof(lbl), _TRUNCATE, "Read the top %d", g_quick.top);
             if (ImGui::Button(lbl))
-            {
-                g_wantBoard = true;
-                g_wantBoardType = legType;
-                g_wantBoardNum = legNum;
-                g_nextPollAt = 0;
-            }
+                WantBoard(legType, legNum, 1, g_quick.top);
         }
     }
     else if (g_boardFetched > 0)
@@ -1025,14 +1155,23 @@ void WrQuickDraw(void)
                     ImGui::TextUnformatted((persona && *persona) ? persona : r->alias);
                 }
 
+                // ONE WORD, and the sentence on hover and underneath.
+                //
+                // It used to print the whole reason here and the column clipped
+                // it -- "that demo could no", with no way to widen the column and
+                // no way to reach the rest. A status column has to fit in a
+                // status column; anything longer belongs somewhere it can wrap.
                 ImGui::TableSetColumnIndex(4);
                 if (pi >= 0 && g_picks[pi].failed)
-                    ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.4f, 1.0f), "%s",
-                                       g_picks[pi].why);
+                {
+                    ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.4f, 1.0f), "gave up");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("%s", g_picks[pi].why);
+                }
                 else if (pi >= 0 && g_picks[pi].done)
                     ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.55f, 1.0f), "drawn");
                 else if (pi >= 0)
-                    ImGui::TextDisabled("working...");
+                    ImGui::TextDisabled("working");
                 else if (g_rowState[i] == ROW_READY)
                     ImGui::TextDisabled("ready");
                 else if (g_rowState[i] == ROW_ON_DISK)
@@ -1041,6 +1180,49 @@ void WrQuickDraw(void)
                 ImGui::PopID();
             }
             ImGui::EndTable();
+        }
+
+        // --- more of the board ----------------------------------------------
+        //
+        // The cache ACCUMULATES, so this is two different things wearing one
+        // button: if the file already holds more places than the table is
+        // showing -- fetched from the Board tab, or from a previous press -- it
+        // costs nothing at all and simply shows them. Only when it does not is a
+        // request made, and then for one page.
+        if (g_showTop < WR_QUICK_TOP_MAX)
+        {
+            const bool haveMore = (g_rowCount > 0 && g_rowCount >= g_showTop);
+            const bool boardHasMore = (g_boardTotal <= 0 || g_boardTotal > g_rowCount);
+            if (haveMore && boardHasMore)
+            {
+                char lbl[64];
+                _snprintf_s(lbl, sizeof(lbl), _TRUNCATE, "Show %d more##more",
+                            SHOW_MORE_STEP);
+                if (ImGui::Button(lbl))
+                {
+                    g_showTop += SHOW_MORE_STEP;
+                    if (g_showTop > WR_QUICK_TOP_MAX)
+                        g_showTop = WR_QUICK_TOP_MAX;
+                    g_rowsStale = true;
+                    ReloadRows();
+                    RefreshRowState();
+                    // Still short after re-reading, so the places are genuinely
+                    // not cached and this is where a request is owed.
+                    if (g_rowCount < g_showTop)
+                        WantBoard(legType, legNum, g_rowCount + 1,
+                                  g_showTop - g_rowCount);
+                }
+                ImGui::SameLine();
+                ImGui::TextDisabled("showing %d", g_rowCount);
+                ImGui::SameLine();
+                Marker("Adds the next twenty places. If they are already cached "
+                       "-- from the Board tab, or from pressing this before -- "
+                       "it costs no request at all.\n\n"
+                       "The full panel is the place to go past a hundred, or to "
+                       "reach the slow end of a board, which is often the more "
+                       "useful end: a 37-second world record is not a line a "
+                       "learner can trace and the run at rank 9,000 is.");
+            }
         }
     }
 
@@ -1074,9 +1256,25 @@ void WrQuickDraw(void)
         else
             ImGui::TextDisabled("%d drawn", done);
 
-        if (g_note[0])
-            ImGui::TextDisabled("%s", g_note);
+        // The reason, in full, where there is room for it to wrap. The cell in
+        // the table has one word and a tooltip; a tooltip you have to find is not
+        // where the only copy of an error message should live.
+        if (failed)
+        {
+            const char *why = "";
+            for (int i = 0; i < g_pickCount; i++)
+                if (g_picks[i].failed && g_picks[i].why[0])
+                    why = g_picks[i].why;
+            if (*why)
+                ImGui::TextWrapped("Gave up on %d: %s.", failed, why);
+        }
     }
+
+    // OUTSIDE the row test. What the page is doing is most worth saying when
+    // there is nothing in the table, which is exactly the state the old
+    // placement could not reach.
+    if (g_note[0])
+        ImGui::TextDisabled("%s", g_note);
 
     DrawColourRow();
 

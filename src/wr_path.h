@@ -295,6 +295,33 @@ unsigned int WrRunStoreGeneration(void);
 const char *WrPathLoadedMap(void);
 int WrRunEnabledCount(void);
 
+// Was this run extracted from the demo whose basename is `stem`?
+//
+// NOT strcmp, AND THE REASON IS IN THE FORMAT. srcSha1 is written into a
+// forty-BYTE field at 0x9C by WrPathFixedField, which always reserves one byte
+// for a terminator -- so a forty-CHARACTER replay hash is stored as thirty-nine
+// characters and reads back one short, for every downloaded run in every file
+// ever written. The reference does the same thing and tests\parity.ps1 holds the
+// port to it byte for byte, so this is the format rather than a bug in the
+// writer, and it cannot be widened: player[] begins at 0xC4, immediately after.
+//
+// It cost a real defect to find. The quick menu matched a leaderboard row's hash
+// against this field with _stricmp, which can never be true for a downloaded
+// run, so every successful extraction was declared a failure -- the .wrpath was
+// on disk and the row said "that demo could not be read". The Runs tab's send,
+// local and watch buttons had the same fault for longer and quieter: they build
+// "<srcSha1>.mtv" as a filename, and a name one character short simply is not
+// there.
+//
+// So the comparison is a prefix, with a floor. Thirty-nine hex characters is 156
+// bits of a SHA-1; two demos colliding on that and differing in the last
+// character is not a thing that has to be reasoned about. The floor exists
+// because a run recorded by the game itself has a stem like
+// "104455274-surf_fiellu-1781797367-main-nrm-60.990", which is far longer than
+// the field and truncates in the middle -- and a prefix match with no floor
+// would happily call two of those the same run.
+bool WrRunIsFrom(const WrRun *run, const char *stem);
+
 // "main", "stage 3", "bonus 1".
 //
 // Both return a pointer into ONE shared static buffer, so two calls in a single

@@ -183,6 +183,71 @@ static bool FileThere(const char *path)
     return path && *path && GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
 }
 
+// The demo whose basename is `stem`, or the one whose basename is `stem` plus
+// one more character.
+//
+// THAT SECOND CASE IS NOT A CONVENIENCE. A run reached from the Runs tab is
+// named by WrRun::srcSha1, and a .wrpath stores that in a forty-BYTE field which
+// always keeps a byte for the terminator -- so a forty-CHARACTER replay hash
+// comes back thirty-nine long, and "<srcSha1>.mtv" is a file that does not
+// exist. Every send, local, watch and take-out reached from that tab has
+// therefore failed to find its demo, quietly, for every downloaded run: the
+// panel reported "no demo on disk" about a file sitting right there. See the
+// essay on WrRunIsFrom in wr_path.h -- the field is the reference's format and
+// is frozen, so the reading has to allow for it.
+//
+// Rows reached from the BOARD tab carry the full hash from the leaderboard and
+// hit the exact name on the first test, which is why the manifest is full of
+// forty-character entries and none of them came from the other tab.
+static bool DemoAt(const char *path, char *out, int outLen)
+{
+    if (!path || !*path)
+        return false;
+    if (FileThere(path))
+    {
+        if (out) strncpy_s(out, (size_t)outLen, path, _TRUNCATE);
+        return true;
+    }
+
+    // Take the path apart: <dir>\<stem>.mtv.
+    const size_t n = strlen(path);
+    if (n < 5 || _stricmp(path + n - 4, ".mtv") != 0)
+        return false;
+    const char *slash = strrchr(path, '\\');
+    const size_t dirLen = slash ? (size_t)(slash - path + 1) : 0;
+    const size_t stemLen = n - 4 - dirLen;
+    if (stemLen < 8 || n + 2 >= MAX_PATH)
+        return false;
+
+    char pattern[MAX_PATH];
+    _snprintf_s(pattern, sizeof(pattern), _TRUNCATE, "%.*s?.mtv", (int)(n - 4),
+                path);
+
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE)
+        return false;
+
+    bool found = false;
+    do
+    {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            continue;
+        // '?' is documented as matching one character OR NOTHING at the end of a
+        // name. The exact-length case was already tested above and was not
+        // there, so insist on the longer one rather than trusting the wildcard.
+        if (strlen(fd.cFileName) != stemLen + 1 + 4)
+            continue;
+        if (out)
+            _snprintf_s(out, (size_t)outLen, _TRUNCATE, "%.*s%s", (int)dirLen,
+                        path, fd.cFileName);
+        found = true;
+        break;
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    return found;
+}
+
 static bool Stat(const char *path, WIN32_FILE_ATTRIBUTE_DATA *fad)
 {
     return path && *path &&
@@ -363,12 +428,8 @@ WrIntoGameSource WrIntoGameSourceOf(const char *map, int mapId, const char *hash
     // Ours first. It is the copy we know the provenance of, and on a machine
     // where the game has also downloaded the same run the two are identical
     // anyway -- the hash is the filename because the hash is the content.
-    const char *ours = OursPath(map, hash);
-    if (FileThere(ours))
-    {
-        if (out) strncpy_s(out, (size_t)outLen, ours, _TRUNCATE);
+    if (DemoAt(OursPath(map, hash), out, outLen))
         return WR_DEMO_OURS;
-    }
 
     const char *game = WrGameDir();
     if (!game || !*game)
@@ -379,21 +440,15 @@ WrIntoGameSource WrIntoGameSourceOf(const char *map, int mapId, const char *hash
     {
         _snprintf_s(path, sizeof(path), _TRUNCATE,
                     "%s\\momentum\\momtv\\online\\%d\\%s.mtv", game, mapId, hash);
-        if (FileThere(path))
-        {
-            if (out) strncpy_s(out, (size_t)outLen, path, _TRUNCATE);
+        if (DemoAt(path, out, outLen))
             return WR_DEMO_GAME_ONLINE;
-        }
     }
     if (map && *map)
     {
         _snprintf_s(path, sizeof(path), _TRUNCATE,
                     "%s\\momentum\\momtv\\local\\%s\\%s.mtv", game, map, hash);
-        if (FileThere(path))
-        {
-            if (out) strncpy_s(out, (size_t)outLen, path, _TRUNCATE);
+        if (DemoAt(path, out, outLen))
             return WR_DEMO_GAME_LOCAL;
-        }
     }
     return WR_DEMO_NONE;
 }

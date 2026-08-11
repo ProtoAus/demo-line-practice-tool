@@ -1460,6 +1460,32 @@ const char *WrPathLoadedMap(void) { return g_loadedMap; }
 
 void WrPathCancelAutoEnable(void) { g_autoEnablePending = false; }
 
+bool WrRunIsFrom(const WrRun *run, const char *stem)
+{
+    if (!run || !stem || !*stem || !run->srcSha1[0])
+        return false;
+
+    const size_t stored = strlen(run->srcSha1);
+    const size_t want = strlen(stem);
+
+    // The stored field is the prefix, never the other way round: it is what got
+    // cut. A stem SHORTER than what we hold cannot be the same demo.
+    if (stored > want)
+        return false;
+
+    // Eight characters, which is the same floor WrIntoGame's hash guard uses.
+    // Below that a prefix match is not evidence of anything.
+    if (stored < 8)
+        return _stricmp(run->srcSha1, stem) == 0;
+
+    // One character is all that is ever lost, so anything shorter than that is
+    // a different name rather than a truncation of this one.
+    if (want - stored > 1)
+        return false;
+
+    return _strnicmp(run->srcSha1, stem, stored) == 0;
+}
+
 int WrRunEnabledCount(void)
 {
     int n = 0;
