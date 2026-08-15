@@ -162,9 +162,21 @@ struct WrQuickPick
     bool fetched;
     bool extracted;
 
+    // ...with exactly one exception, and it is a press rather than a retry.
+    //
+    // "One extract attempt and then a reason" is right when the reason is a
+    // property of the file, and wrong for the one reason that is a property of
+    // the ATTEMPT: running out of time. Those are most of the failures there
+    // are -- 403 of 415 on the machine this was measured on -- so the page
+    // offers a second go with no limit on it, once, when the extractor says
+    // that is what happened. Set by the button, never by the state machine, so
+    // nothing here can loop.
+    bool canRetry;              // the last attempt timed out
+    bool retried;               // and the user asked for the unlimited one
+
     bool done;
     bool failed;
-    char why[80];
+    char why[144];              // the extractor's own sentence, which is long
 };
 
 // What to do next, and which pick it is about.

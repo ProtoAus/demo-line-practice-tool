@@ -586,6 +586,63 @@ WrJobKind WrExtractLastKind(void)
     return k;
 }
 
+// The single-demo outcome; see the header. Written on the job thread from
+// ExtractDone and read from the render thread, so it takes the same lock the
+// rest of this file's cross-thread state does.
+static char g_fileBase[64];
+static char g_fileWhy[192];
+static bool g_fileFailed = false;
+
+static void SetLastFileFailure(const char *base, const char *why)
+{
+    // Belt as well as braces. Every caller reaches here behind an EnsureCs, but
+    // this function is one line from being called somewhere that does not, and
+    // the failure mode is not a wrong answer -- EnterCriticalSection on an
+    // uninitialised section is an access violation inside somebody's game.
+    if (!g_csReady)
+        return;
+    EnterCriticalSection(&g_cs);
+    if (base && why)
+    {
+        strcpy_s(g_fileBase, sizeof(g_fileBase), base);
+        strcpy_s(g_fileWhy, sizeof(g_fileWhy), why);
+        g_fileFailed = true;
+    }
+    else
+    {
+        g_fileBase[0] = '\0';
+        g_fileWhy[0] = '\0';
+        g_fileFailed = false;
+    }
+    LeaveCriticalSection(&g_cs);
+}
+
+bool WrExtractLastFileFailure(char *base, int baseCap, char *why, int whyCap,
+                              bool *timedOut)
+{
+    if (base && baseCap > 0) base[0] = '\0';
+    if (why && whyCap > 0)   why[0] = '\0';
+    if (timedOut)            *timedOut = false;
+    if (!g_csReady)
+        return false;
+
+    EnterCriticalSection(&g_cs);
+    const bool have = g_fileFailed;
+    if (have)
+    {
+        if (base && baseCap > 0)
+            strcpy_s(base, (size_t)baseCap, g_fileBase);
+        if (why && whyCap > 0)
+            strcpy_s(why, (size_t)whyCap, g_fileWhy);
+        // The one coupling, and it is to a literal rather than to a format:
+        // Timeout() in wr_dp.cpp writes "gave up after %.0f s in ...".
+        if (timedOut)
+            *timedOut = (strncmp(g_fileWhy, "gave up after ", 14) == 0);
+    }
+    LeaveCriticalSection(&g_cs);
+    return have;
+}
+
 // The single exit. Every way a run can end -- clean, stopped, or failed before
 // it ever started -- comes through here.
 //
@@ -650,6 +707,7 @@ void WrExtractStop(void)
 static int g_timeout = WR_EXTRACT_TIMEOUT_DEFAULT;
 
 void WrExtractSetTimeout(int seconds) { g_timeout = seconds < 0 ? 0 : seconds; }
+int *WrExtractTimeoutPtr(void) { return &g_timeout; }
 int WrExtractTimeout(void) { return g_timeout; }
 
 // ---------------------------------------------------------------------------
@@ -751,6 +809,10 @@ struct ExtractJob
     char outDir[MAX_PATH];
     bool verify;
     int timeout;
+
+    // --file, so ExtractDone knows this outcome is the one a caller is waiting
+    // on rather than one row of thousands. See WrExtractLastFileFailure.
+    bool singleFile;
 
     // Coordinator only.
     int done, ok, skipped, failed, lowconf, removed;
@@ -1226,6 +1288,12 @@ static void ExtractDone(void *user, int index)
     if (it->outcome == WR_DEMO_ERROR)
     {
         j->failed++;
+        // Before the record and before the line, because this is the only place
+        // that holds the demo and its reason together and a caller waiting on
+        // one demo needs both. Only for --file: a whole-map run would leave the
+        // last of a thousand failures here, which is not an answer to anything.
+        if (j->singleFile)
+            SetLastFileFailure(it->base, it->message);
         if (ms)
         {
             FailPut(&ms->nowFailed, it->base, it->size, it->message);
@@ -1363,6 +1431,14 @@ static DWORD RunExtract(const WrExtractRequest *req)
         // --file takes the demo as given: no skip rules, no failure record, no
         // revision check. It is the "do this one, now, whatever you think you
         // know about it" path.
+        //
+        // Cleared here rather than in EndRun so that a caller reading it after
+        // the job cannot be handed the PREVIOUS demo's reason when this one
+        // succeeded -- which is the shape of bug that makes a working tick
+        // report somebody else's failure.
+        j.singleFile = true;
+        SetLastFileFailure(NULL, NULL);
+
         WrMtvHeader hdr;
         char why[128];
         WrMtvPeek(req->file, &hdr, why, sizeof(why));
@@ -1537,6 +1613,18 @@ static DWORD RunExtract(const WrExtractRequest *req)
 // user comparing two runs should not be able to tell which one they got.
 int WrExtractRunRequest(const WrExtractRequest *reqIn)
 {
+    // The one entry point here that does NOT come through WrExtractSubmit, and
+    // therefore the one that has to initialise the lock itself. Everything else
+    // does it on the way in; this is the seam tests\wrextract.exe enters
+    // through, with no panel and no job slot ahead of it.
+    //
+    // It was missing, and the missing-ness only became reachable in v0.9.4 when
+    // ExtractDone started recording the single-demo outcome behind that lock:
+    // wrextract.exe crashed outright on the first demo, before printing a line.
+    // Safe here where it would not be inside the pool -- this runs before any
+    // worker exists, so the check-then-initialise cannot race.
+    EnsureCs();
+
     const WrExtractRequest req = *reqIn;
     DWORD code = 1;
     switch (req.kind)

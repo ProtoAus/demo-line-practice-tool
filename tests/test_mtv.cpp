@@ -400,13 +400,19 @@ int main(void)
     }
 
     // -----------------------------------------------------------------------
-    printf("\nzstd is recognised, and that is all\n");
+    printf("\nzstd is a codec the locator recognises\n");
     {
-        // It must never become an error. The reference does not write skips to
-        // _failed.txt, and recording these would put a permanent entry in every
-        // user's failure record that --retry-failed would re-fail forever. So
-        // the codec is reported and the caller decides; WrMtvBody refusing it
-        // is the backstop, not the mechanism.
+        // This section used to end "asking for the body anyway is refused by
+        // name", and it passed for two releases while the refusal was the whole
+        // behaviour. It is kept pointed at the LOCATOR, which is this file's
+        // subject: that the magic four bytes past the JSON select the codec and
+        // put bodyOff at the frame rather than past a container that is not
+        // there.
+        //
+        // What comes out of that frame is tests\test_zstd.exe's business, and
+        // it drives a real one -- these four bytes are a magic number with no
+        // frame behind them, which is exactly the input the size call has to
+        // refuse rather than trust.
         size_t n = Fresh();
         g_buf[kBodyOff + 0] = 0x28;
         g_buf[kBodyOff + 1] = 0xB5;
@@ -420,11 +426,14 @@ int main(void)
         Check(ok && h.codec == WR_MTV_CODEC_ZSTD, "and reports its codec");
         Check(ok && h.bodyOff == kBodyOff, "at the same offset an LZMA body would be");
 
+        // A truncated frame header, not a body. It must fail, and it must fail
+        // WITHOUT the words the LZMA arm uses -- "LZMA block runs past EOF" on
+        // a zstd demo would send somebody reading the wrong half of the file.
         size_t bodyLen = 1;
         err[0] = '\0';
         Check(WrMtvBody(g_buf, n, &h, &bodyLen, err, sizeof(err)) == NULL &&
-              bodyLen == 0 && strstr(err, "zstd") != NULL,
-              "asking for the body anyway is refused by name");
+              bodyLen == 0 && strstr(err, "LZMA") == NULL,
+              "and a frame with nothing behind it is refused in zstd's terms");
     }
 
     // -----------------------------------------------------------------------

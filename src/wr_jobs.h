@@ -133,8 +133,35 @@ int WrJobsWorkerCount(int requested, int logicalCores, int itemCount);
 // Worth knowing what the absolute numbers turned out to be, because they say
 // the two constants below are not close to binding: the median demo peaks at
 // about 1 MB, the p99 at 27 MB, and the largest single peak in the library is
-// 42 MB. The very biggest files -- the 48 MB ones -- are all zstd and are
-// skipped before any of this is allocated.
+// 42 MB.
+//
+// ZSTD USED TO BE EXCLUDED FROM ALL OF THIS AND IS NOT ANY MORE. Until v0.9.4
+// the biggest files in the library -- the 48 MB ones, every one of them zstd --
+// were refused before a byte was allocated, so the distribution above was
+// measured over a population that left them out. Now they extract, so the
+// question had to be re-asked rather than assumed, and the answer is the
+// opposite of what it looked like from here.
+//
+// Body bytes per file byte, read out of the headers of every demo on this
+// machine -- the LZMA container states it as a u32 and a zstd frame declares it
+// in its own header, so neither number needed decompressing to get:
+//
+//     lzma  n=6204   min 1.07  median 1.55  p95 1.69  p99 1.91  max 9.76
+//     zstd  n=316    min 1.36  median 1.48  p95 1.68  p99 1.78  max 1.85
+//
+// zstd sits INSIDE the envelope this constant was fitted to, and its tail is
+// far shorter. The intuition that said otherwise -- "zstd compresses harder, so
+// a byte of file buys more body" -- is simply wrong about this data: LZMA is the
+// stronger of the two here, which is why the same run makes a bigger file and a
+// smaller ratio when Momentum stores it as zstd. So there is no per-codec cost
+// function, and that is a measurement rather than an omission.
+//
+// What DID change is the absolute size. The largest zstd body is 67.4 MB from a
+// 46.6 MB file, which costs 885 MB at the multiplier below and is therefore
+// bigger than the whole in-flight budget. That is not a hang and not a refusal:
+// Admit's `inFlightCount == 0` guard runs it on its own, and 885 MB is well
+// under WR_JOBS_MAX_ONE. Both constants below already cover it, which is the
+// only reason this section is a comment and not a patch.
 #define WR_JOBS_COST_MULT 19
 
 // Total bytes of demo allowed in flight across all workers at once. Reaching it
@@ -145,18 +172,25 @@ int WrJobsWorkerCount(int requested, int logicalCores, int itemCount);
 // measured anywhere in this library is 42 MB, so the budget is set to let every
 // worker hold a worst case at once and still not queue. In practice the median
 // demo peaks at about 1 MB and this is never reached.
+//
+// One demo on this machine now exceeds it on its own: the 46.6 MB zstd file
+// costs 885 MB. That is the case Admit's `inFlightCount == 0` guard exists for
+// -- it runs alone rather than waiting for room that can never appear -- and it
+// is why that guard is load-bearing now rather than theoretical.
 #define WR_JOBS_BUDGET_BYTES (768ull * 1024ull * 1024ull)
 
 // Above this, one demo is refused outright and becomes an ordinary recorded
 // failure with a reason naming its size. At the cost multiplier above it works
 // out to an 81 MB demo.
 //
-// Nothing in this library comes near it, and the reason is worth stating
-// because the obvious counter-example is not one: the biggest files here are
-// 46.6 MB, and every single one of them is a zstd body, which is refused before
-// a byte is decompressed and never reaches this test at all. The largest demo
-// that actually gets extracted is 2.1 MB. So this refuses the absurd rather
-// than the merely large, by a factor of forty.
+// Nothing in this library comes near it, and the margin got a great deal
+// smaller in v0.9.4 without this number moving. The biggest files here are
+// 46.6 MB and every one of them is zstd; until that release they were refused
+// before a byte was decompressed and never reached this test, which left the
+// largest demo that actually extracted at 2.1 MB and this limit forty times
+// clear of it. Now they extract, 46.6 MB costs 885 MB, and the margin is under
+// twice. Still the absurd rather than the merely large, but say the real number
+// rather than the comfortable one.
 //
 // A deliberate improvement on the reference, which raises MemoryError out of
 // fut.result() and aborts cmd_extract entirely -- losing the epilogue and every

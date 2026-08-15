@@ -151,23 +151,54 @@ cl /nologo /c /O2 /W3 /Ithird_party\lzma third_party\lzma\LzmaDec.c ^
    /Fo:tests\ >nul
 if errorlevel 1 ( echo [!] LzmaDec FAILED to build for the harnesses & exit /b 1 )
 
+rem zstd, the same way and for the same reason: wr_mtv.cpp now calls it, so
+rem every harness that links wr_mtv.cpp links these too. Ten objects rather than
+rem one because that is the decompression half of the real library -- see
+rem third_party\VERSION.txt for why the one-file decoder in zstd's doc\ tree is
+rem not what is here. The options are build.bat's, verbatim; ZSTD_DISABLE_ASM is
+rem the one that matters, because huf_decompress_amd64.S is not vendored.
+set "ZS=third_party\zstd"
+set "ZSDEFS=/DZSTD_DISABLE_ASM=1 /DZSTD_LEGACY_SUPPORT=0 /DZSTD_MULTITHREAD=0"
+set "ZSDEFS=%ZSDEFS% /DZSTD_NO_TRACE=1"
+cl /nologo /c /O2 /W3 %ZSDEFS% /I%ZS% ^
+   %ZS%\common\debug.c %ZS%\common\entropy_common.c %ZS%\common\error_private.c ^
+   %ZS%\common\fse_decompress.c %ZS%\common\xxhash.c %ZS%\common\zstd_common.c ^
+   %ZS%\decompress\huf_decompress.c %ZS%\decompress\zstd_ddict.c ^
+   %ZS%\decompress\zstd_decompress.c %ZS%\decompress\zstd_decompress_block.c ^
+   /Fo:tests\ >nul
+if errorlevel 1 ( echo [!] zstd FAILED to build for the harnesses & exit /b 1 )
+set "ZSOBJ=tests\debug.obj tests\entropy_common.obj tests\error_private.obj"
+set "ZSOBJ=%ZSOBJ% tests\fse_decompress.obj tests\xxhash.obj tests\zstd_common.obj"
+set "ZSOBJ=%ZSOBJ% tests\huf_decompress.obj tests\zstd_ddict.obj"
+set "ZSOBJ=%ZSOBJ% tests\zstd_decompress.obj tests\zstd_decompress_block.obj"
+
 rem test_lzma checks how wr_mtv.cpp CALLS the decoder, not the decoder. See its
 rem header: LZMA_FINISH_ANY, the property bytes passed straight through, and a
 rem dictionary size that is not something to clamp are three decisions that
 rem could each have gone the other way, and each has a section.
-cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Itests /Ithird_party\lzma ^
+cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Itests /Ithird_party\lzma /I%ZS% ^
    tests\test_lzma.cpp ^
-   %S%\wr_mtv.cpp tests\LzmaDec.obj ^
+   %S%\wr_mtv.cpp tests\LzmaDec.obj %ZSOBJ% ^
    /Fe:tests\test_lzma.exe /Fo:tests\ >nul
 if errorlevel 1 ( echo [!] test_lzma FAILED to build & exit /b 1 )
+
+rem test_zstd is test_lzma's sibling and arrived with the decoder in v0.9.4. It
+rem drives a real frame, and it is the only harness that checks the seam a zstd
+rem demo has and an LZMA one does not: no Valve header, so bodyOff points AT the
+rem frame magic and the size comes out of the frame instead of a container.
+cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Itests /Ithird_party\lzma /I%ZS% ^
+   tests\test_zstd.cpp ^
+   %S%\wr_mtv.cpp tests\LzmaDec.obj %ZSOBJ% ^
+   /Fe:tests\test_zstd.exe /Fo:tests\ >nul
+if errorlevel 1 ( echo [!] test_zstd FAILED to build & exit /b 1 )
 
 rem test_mtv is mostly about refusal, and about the exact words used to refuse.
 rem Those words end up in _failed.txt, which both implementations read back to
 rem decide whether a demo is worth trying again -- so a reason string that
 rem differs from the reference's is a record that reads as a different failure.
-cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Itests /Ithird_party\lzma ^
+cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Itests /Ithird_party\lzma /I%ZS% ^
    tests\test_mtv.cpp ^
-   %S%\wr_mtv.cpp tests\LzmaDec.obj ^
+   %S%\wr_mtv.cpp tests\LzmaDec.obj %ZSOBJ% ^
    /Fe:tests\test_mtv.exe /Fo:tests\ >nul
 if errorlevel 1 ( echo [!] test_mtv FAILED to build & exit /b 1 )
 
@@ -176,9 +207,9 @@ rem thing under test is a claim about file metadata, so a stub that returned
 rem metadata we invented would be a test of the stub. It writes the synthetic
 rem fixture into tests\peekscratch\ and deletes it again. wr_log.cpp comes along
 rem for WrDataPath and WrLogf.
-cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Itests /Ithird_party\lzma ^
+cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Itests /Ithird_party\lzma /I%ZS% ^
    tests\test_peek.cpp ^
-   %S%\wr_peek.cpp %S%\wr_mtv.cpp %S%\wr_log.cpp tests\LzmaDec.obj ^
+   %S%\wr_peek.cpp %S%\wr_mtv.cpp %S%\wr_log.cpp tests\LzmaDec.obj %ZSOBJ% ^
    /Fe:tests\test_peek.exe /Fo:tests\ >nul
 if errorlevel 1 ( echo [!] test_peek FAILED to build & exit /b 1 )
 
@@ -258,10 +289,10 @@ rem It links the whole extraction path -- the container, the codec, the JSON
 rem reader, the dynamic program, the writer AND the loader -- because that is
 rem exactly the wiring it exists to check.
 cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Itests /Ithird_party\miniz ^
-   /Ithird_party\lzma tests\test_e2e.cpp ^
+   /Ithird_party\lzma /I%ZS% tests\test_e2e.cpp ^
    %S%\wr_demo.cpp %S%\wr_dp.cpp %S%\wr_mtv.cpp %S%\wr_json.cpp ^
    %S%\wr_path.cpp %S%\wr_profile.cpp %S%\wr_energy.cpp %S%\wr_log.cpp ^
-   tests\LzmaDec.obj ^
+   tests\LzmaDec.obj %ZSOBJ% ^
    /Fe:tests\test_e2e.exe /Fo:tests\ >nul
 if errorlevel 1 ( echo [!] test_e2e FAILED to build & exit /b 1 )
 
@@ -276,13 +307,13 @@ rem this file adds is an argv parser and a stdout emit hook. That drags in most
 rem of src\ behind it, and that is the right cost -- a front end with its own
 rem copy of any of it would agree with itself and say nothing.
 cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Itests /Ithird_party\miniz ^
-   /Ithird_party\lzma ^
+   /Ithird_party\lzma /I%ZS% ^
    tests\wrextract_main.cpp tests\api_tape.cpp ^
    %S%\wr_extract.cpp %S%\wr_maps.cpp %S%\wr_msml.cpp %S%\wr_json.cpp ^
    %S%\wr_mtv.cpp %S%\wr_peek.cpp %S%\wr_api.cpp %S%\wr_http.cpp %S%\wr_board.cpp ^
    %S%\wr_fetch.cpp %S%\wr_dp.cpp %S%\wr_demo.cpp %S%\wr_jobs.cpp ^
    %S%\wr_path.cpp %S%\wr_profile.cpp %S%\wr_energy.cpp %S%\wr_log.cpp ^
-   tests\miniz.obj tests\LzmaDec.obj winhttp.lib ^
+   tests\miniz.obj tests\LzmaDec.obj %ZSOBJ% winhttp.lib ^
    /Fe:tests\wrextract.exe /Fo:tests\ 
 if errorlevel 1 ( echo [!] wrextract FAILED to build & exit /b 1 )
 
@@ -304,6 +335,7 @@ tests\test_scale.exe      || set "RC=1"
 tests\test_json.exe       || set "RC=1"
 tests\test_maps.exe       || set "RC=1"
 tests\test_lzma.exe       || set "RC=1"
+tests\test_zstd.exe       || set "RC=1"
 tests\test_mtv.exe        || set "RC=1"
 tests\test_peek.exe       || set "RC=1"
 tests\test_api.exe        || set "RC=1"

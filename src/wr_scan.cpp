@@ -148,12 +148,34 @@ static volatile LONG g_phase = 0;
 static volatile LONG64 g_bytes = 0;
 static volatile LONG g_restartPending = 0;
 
+// Ask the next sweep to walk the heap as well as module data. See the essay at
+// the phase 2 gate in ScanThread: without this, one false positive in
+// engine.dll's writable data hides the heap forever.
+//
+// Volatile and Interlocked because it is set from the render thread and read on
+// the scan thread, which is the same rule everything else here follows.
+static volatile LONG g_deepScan = 0;
+static volatile LONG g_deepPending = 0;     // what the NEXT started scan gets
+
 static int g_frames = 0;
 static int g_chosen = -1;
 static int g_staleFrames = 0;
 static int g_restarts = 0;
 static int g_idleFrames = 0;
 static bool g_everStarted = false;
+
+// One forced re-sweep, on the first map load after injection, and never again.
+//
+// A sweep run at the main menu looked at memory that a level load frees and
+// reallocates, and any candidate that won there won against no player camera to
+// confirm it. Between maps the opposite is true and the pick must be KEPT --
+// see the essay on WrScanOnMapChanged -- so this is deliberately a one-shot
+// rather than a rule about map changes.
+//
+// Somebody who injects while already standing in a map never gets a map change,
+// never trips this, and does not need to: their first sweep already read the
+// memory of a loaded level.
+static bool g_reswept = false;
 
 // If the scan has finished and nothing usable turned up, try again rather than
 // sitting there forever. The common case is injecting at the main menu, where
@@ -239,6 +261,11 @@ static inline long long Now(void)
 }
 
 static bool AcceptForFrame(const VMatrix &m);
+
+// Restart the sweep, optionally walking the heap as well as module data. The
+// ladder of who asks for which is at the definition; WrScanOnMapChanged is
+// above it and is the one caller that wants the shallow form.
+static void RestartWith(bool deep);
 
 static char g_status[192] = "not started";
 static char g_note[128] = {0};
@@ -639,12 +666,34 @@ static DWORD WINAPI ScanThread(LPVOID)
 
     // ---- Phase 2: the rest of the writable address space -------------------
     //
-    // Only if module data came up empty. If phase 1 found anything at all, one
-    // of those is the matrix and there is no reason to walk a gigabyte of heap.
-    if (found == 0)
+    // "Only if module data came up empty" was the rule until v0.9.4, and it was
+    // a bug rather than a saving. Reread it as what it actually says: if phase 1
+    // found ANY sixteen floats that pass the oracle -- a baked projection matrix
+    // in engine.dll's .data, a run of zeros, anything -- the heap is never
+    // walked. And since a rescan empties the list and re-runs the same phase 1
+    // over the same module data, it finds the same false positive and skips
+    // phase 2 again, every time, for all five of MAX_AUTO_RESCANS.
+    //
+    // So on any machine where the live matrix is heap-resident AND module data
+    // holds one false positive, this code could never find it, and would spend
+    // the whole session confidently not looking. That is the mechanism behind
+    // "sometimes it doesn't get the right one" -- there was nothing to get.
+    //
+    // The condition is now about PROOF rather than presence. Phase 1 alone is
+    // still what a first scan does, because it is a few MB against a gigabyte
+    // and it is usually right. But when a previous pass's candidates have been
+    // watched and none of them could prove itself -- which is the only reason
+    // anything asks for a deep scan -- the heap is where the answer has to be.
+    const bool deep = (InterlockedCompareExchange(&g_deepScan, 0, 0) != 0);
+    if (found == 0 || deep)
     {
         InterlockedExchange(&g_phase, 2);
-        WrLogf("scan: nothing in module data, sweeping process memory");
+        if (found == 0)
+            WrLogf("scan: nothing in module data, sweeping process memory");
+        else
+            WrLogf("scan: %d module-data candidate%s could not prove itself, "
+                   "sweeping process memory as well", found,
+                   found == 1 ? "" : "s");
 
         LONG64 startBytes = InterlockedCompareExchange64(&g_bytes, 0, 0);
         const unsigned char *p = (const unsigned char *)0x10000;
@@ -796,6 +845,31 @@ void WrScanOnMapChanged(void)
     // what the log showed happening, three times in 1.5 seconds.
     g_restarts = 0;
 
+    // THE FIRST MAP LOAD AFTER INJECTION IS NOT LIKE THE ONES AFTER IT.
+    //
+    // Everything below this block is about keeping what was picked, and it is
+    // right -- between two maps the address does not move and rescanning only
+    // re-rolls the choice. But it rests on the pick having been made in a
+    // loaded level, and the most common way to run this tool is to inject at
+    // the main menu. That sweep read memory the level load has just freed and
+    // reallocated, and anything it picked, it picked with no player camera to
+    // be confirmed against.
+    //
+    // So exactly once, on the first map change we ever see, throw the list away
+    // and look again -- and shallow, because the memory has only just changed
+    // and module data is the cheap place where the answer usually is. If it is
+    // not there either, the idle path escalates to a deep sweep on its own.
+    if (!g_reswept)
+    {
+        g_reswept = true;
+        WrLogf("scan: first map load since injection -- the candidate list was "
+               "built %s, so it is being rebuilt against a loaded level",
+               g_chosen >= 0 ? "before this level existed" : "with nothing to "
+                               "confirm against");
+        RestartWith(false);
+        return;
+    }
+
     if (g_chosen >= 0)
     {
         // Keeping it is right when it is the matrix -- the address does not move
@@ -820,9 +894,23 @@ void WrScanOnMapChanged(void)
 
 // Asks for a restart and returns immediately. WrScanTick starts the new thread
 // once the old one has actually exited.
-void WrScanRestart(void)
+//
+// `deep` decides whether the new sweep walks the heap as well as module data,
+// and the ladder is worth stating in one place because the three callers each
+// sit on a different rung:
+//
+//   a first scan          shallow  -- a few MB against a gigabyte, usually right
+//   the first map load    shallow  -- the memory just changed; try the cheap
+//                                     place again before the expensive one
+//   nothing proved out    DEEP     -- phase 1 has now been watched and found
+//                                     wanting, so repeating it is the one thing
+//                                     guaranteed not to help
+//   the user pressed it   DEEP     -- they are pressing it because the
+//                                     automatic answer is wrong
+static void RestartWith(bool deep)
 {
     EnsureCs();
+    InterlockedExchange(&g_deepPending, deep ? 1 : 0);
     InterlockedExchange(&g_stop, 1);
     InterlockedExchange(&g_restartPending, 1);
 
@@ -841,7 +929,16 @@ void WrScanRestart(void)
     WrMatrixLifeReset(&g_life);
     g_note[0] = '\0';
     strcpy_s(g_status, sizeof(g_status), "restarting the scan...");
-    WrLogf("scan: restart requested");
+    WrLogf("scan: restart requested (%s)",
+           deep ? "module data and the heap" : "module data");
+}
+
+void WrScanRestart(void)
+{
+    // The public one, and it is the deep one. Every caller of it is either the
+    // button somebody pressed because the lines are wrong, or a path that has
+    // already watched phase 1's candidates fail.
+    RestartWith(true);
 }
 
 // Called at the top of every tick. Does nothing until the old scan thread has
@@ -874,6 +971,13 @@ static void ServiceRestart(void)
     InterlockedExchange(&g_phase, 0);
     InterlockedExchange(&g_restartPending, 0);
     InterlockedExchange(&g_stop, 0);
+
+    // Hand the pending depth to the scan that is about to start. It is moved
+    // here rather than read directly by ScanThread so that a restart requested
+    // WHILE a thread is winding down cannot have its depth overwritten by the
+    // next request before the thread it was meant for ever starts.
+    InterlockedExchange(&g_deepScan,
+                        InterlockedExchange(&g_deepPending, 0));
     WrScanStart();
 }
 
@@ -1032,8 +1136,14 @@ void WrScanTick(void)
         {
             g_restarts++;
             g_idleFrames = 0;
-            WrLogf("scan: nothing usable after %d frames, re-scanning (%d/%d)",
-                   IDLE_RESCAN_FRAMES, g_restarts, MAX_AUTO_RESCANS);
+            // Deep, via WrScanRestart. This is the rung of the ladder where
+            // phase 1's candidates have been watched for thirty seconds and
+            // none could prove itself, so re-running phase 1 alone is the one
+            // outcome known in advance not to help -- which is exactly what it
+            // did for all five attempts before v0.9.4.
+            WrLogf("scan: nothing usable after %d frames, re-scanning including "
+                   "the heap (%d/%d)", IDLE_RESCAN_FRAMES, g_restarts,
+                   MAX_AUTO_RESCANS);
             WrScanRestart();
             return;
         }

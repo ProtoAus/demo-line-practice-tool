@@ -54,7 +54,17 @@ rem VERSION.txt argues that properly and records the upstream tag, the archive's
 rem sha256 and what each option below switches off.
 set "TP=third_party"
 set "TPSRC=%TP%\miniz\miniz.c %TP%\lzma\LzmaDec.c"
-set "TPINC=/I%TP%\miniz /I%TP%\lzma"
+rem zstd, decompression only. Ten .c files where LZMA needs one, which
+rem VERSION.txt argues; the short single-file decoder in zstd's own doc\ tree
+rem calls exit(1) on malformed input and would close the game.
+set "ZS=%TP%\zstd"
+set "TPSRC=%TPSRC% %ZS%\common\debug.c %ZS%\common\entropy_common.c"
+set "TPSRC=%TPSRC% %ZS%\common\error_private.c %ZS%\common\fse_decompress.c"
+set "TPSRC=%TPSRC% %ZS%\common\xxhash.c %ZS%\common\zstd_common.c"
+set "TPSRC=%TPSRC% %ZS%\decompress\huf_decompress.c %ZS%\decompress\zstd_ddict.c"
+set "TPSRC=%TPSRC% %ZS%\decompress\zstd_decompress.c"
+set "TPSRC=%TPSRC% %ZS%\decompress\zstd_decompress_block.c"
+set "TPINC=/I%TP%\miniz /I%TP%\lzma /I%ZS%"
 rem NO_ARCHIVE_WRITING_APIS is not here: miniz.h defines it itself the moment
 rem NO_ARCHIVE_APIS is set, and setting both is a C4005 redefinition warning.
 rem LzmaDec.c wants no options at all -- VERSION.txt says why the obvious
@@ -62,6 +72,11 @@ rem _7ZIP_ST is not among them.
 set "TPDEFS=/DMINIZ_NO_ARCHIVE_APIS /DMINIZ_NO_DEFLATE_APIS"
 set "TPDEFS=%TPDEFS% /DMINIZ_NO_STDIO /DMINIZ_NO_TIME"
 set "TPDEFS=%TPDEFS% /DMINIZ_NO_ZLIB_COMPATIBLE_NAMES"
+rem zstd's options, all four switching something OFF. VERSION.txt says what each
+rem one costs. ZSTD_DISABLE_ASM is the load-bearing one: without it the build
+rem wants huf_decompress_amd64.S assembled, and that file is not vendored.
+set "TPDEFS=%TPDEFS% /DZSTD_DISABLE_ASM=1 /DZSTD_LEGACY_SUPPORT=0"
+set "TPDEFS=%TPDEFS% /DZSTD_MULTITHREAD=0 /DZSTD_NO_TRACE=1"
 
 set "IM=imgui"
 set "IMSRC=%IM%\imgui.cpp %IM%\imgui_draw.cpp %IM%\imgui_tables.cpp %IM%\imgui_widgets.cpp"

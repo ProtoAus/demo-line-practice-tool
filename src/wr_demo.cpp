@@ -506,16 +506,16 @@ WrDemoOutcome WrDemoProcess(const char *path, const WrDemoArgs *a,
         return WR_DEMO_ERROR;
     }
 
-    // A SKIP, never an error. cmd_extract does not write skips to _failed.txt,
-    // and recording these would put ~142 permanent entries in every user's
-    // failure record that --retry-failed would re-fail forever.
-    if (out->h.codec == WR_MTV_CODEC_ZSTD)
-    {
-        strcpy_s(out->message, sizeof(out->message),
-                 "zstd body (pip install zstandard)");
-        free(data);
-        return WR_DEMO_SKIP;
-    }
+    // A zstd body used to become a SKIP here, with a message telling the user to
+    // pip install a Python package -- the reference's own wording, kept for
+    // parity, in a program that has had no Python in it since v0.7.0. It was the
+    // most visible thing left of the port. Both the branch and the sentence went
+    // in v0.9.4, when WrMtvBody learned to decode the format: a zstd demo is now
+    // an ordinary demo and takes the path below.
+    //
+    // WR_DEMO_SKIP itself stays. It is still the outcome for anything the
+    // extractor declines without blaming the file, and cmd_extract's skip
+    // accounting is unchanged.
 
     // Read before the body is decompressed, because it lives in the same buffer
     // and this is the last thing that needs it.

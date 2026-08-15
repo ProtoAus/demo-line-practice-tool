@@ -172,6 +172,40 @@ def valve_lzma(data, lc=3, lp=0, pb=2, dict_size=1 << 16):
     return props, comp
 
 
+def valve_zstd(data):
+    """One zstd frame, as a .mtv carries them -- which is NOT as it carries an
+    LZMA body. There is no seventeen-byte Valve header on this one: the frame
+    magic sits where the LZMA container's "LZMA" tag would be, and the frame
+    declares its own content size, which is the only reason a one-shot decoder
+    can be used at all on either side.
+
+    Needs the `zstandard` package, which is the same dependency the reference
+    implementation has and states at wrpath_extract.py's import. Everything else
+    in this file runs on the standard library alone."""
+    try:
+        import zstandard
+    except ImportError:
+        raise SystemExit(
+            "the zstd fixture needs the 'zstandard' package (pip install "
+            "zstandard). It is the same package tests\\reference\\"
+            "wrpath_extract.py imports.")
+
+    # write_content_size, explicitly, because the ENTIRE zstd path on both sides
+    # depends on it: ZstdDecompressor().decompress() raises without a declared
+    # size, and WrMtvZstdSize refuses with "zstd frame does not declare its
+    # size". It is the default here, and a fixture must not rest on a default
+    # that decides whether the thing under test can run.
+    frame = zstandard.ZstdCompressor(level=3,
+                                     write_content_size=True).compress(data)
+
+    # The reference's own call, so a fixture it cannot read never reaches the
+    # repository -- the same guard valve_lzma has.
+    back = zstandard.ZstdDecompressor().decompress(frame)
+    assert back == data, "fixture does not round-trip through the reference"
+    assert frame[:4] == b"\x28\xb5\x2f\xfd", frame[:4].hex()
+    return frame
+
+
 # ---------------------------------------------------------------------------
 # A demo
 # ---------------------------------------------------------------------------
@@ -200,7 +234,7 @@ MTV_JSON = ('{"maxHorizontalSpeed":2500.5,"effectiveStartVelocity":320.25,'
             '"jumps":41,"strafes":812,"note":"synthetic, see make_fixture.py"}')
 
 
-def mtv(json_at):
+def mtv(json_at, codec="lzma"):
     import struct
     head = bytearray(b"\0" * json_at)
     head[0:4] = b"MMTV"
@@ -221,14 +255,20 @@ def mtv(json_at):
     struct.pack_into("<I", head, json_at - 4, len(blob))
 
     data = payload(MTV_BODY_BYTES)
-    props, comp = valve_lzma(data)
 
     out = bytearray(head)
     out += blob
-    out += b"LZMA"
-    out += struct.pack("<II", len(data), len(comp))
-    out += props
-    out += comp
+    if codec == "zstd":
+        # Everything the LZMA arm needs a container for, the frame carries. So
+        # this really is the whole of the difference: the tag and the twenty-two
+        # bytes behind it are gone, and the body starts at bodyOff.
+        out += valve_zstd(data)
+    else:
+        props, comp = valve_lzma(data)
+        out += b"LZMA"
+        out += struct.pack("<II", len(data), len(comp))
+        out += props
+        out += comp
 
     # The promises the harness is written against. Note what is NOT promised:
     # that there is only one '{' in the window. The compressed body starts well
@@ -493,15 +533,38 @@ if __name__ == "__main__":
 
     write_header(
         "fixture_mtv.h", "WR_FIXTURE_MTV_H",
-        "Two synthetic demos, identical but for where the run-stats JSON\n"
-        "starts: 0xC6 as the v1 container puts it, 0xC7 as v2 does. Both carry\n"
-        "%d bytes of Payload() as a Valve-LZMA body." % MTV_BODY_BYTES,
+        "Three synthetic demos of the same run. Two differ only in where the\n"
+        "run-stats JSON starts -- 0xC6 as the v1 container puts it, 0xC7 as v2\n"
+        "does -- and carry %d bytes of Payload() as a Valve-LZMA body.\n"
+        "\n"
+        "The third is that same run with a zstd body, and it is not the same\n"
+        "container with one field changed: a zstd demo has no Valve header at\n"
+        "all, so the frame magic sits exactly where \"LZMA\" would and the\n"
+        "twenty-two bytes of lengths and properties behind it are absent. Its\n"
+        "size therefore differs from the other two, which is why the harness\n"
+        "cannot share one length constant." % MTV_BODY_BYTES,
         ["#define WR_FIXTURE_MTV_BODY %d" % MTV_BODY_BYTES,
          "#define WR_FIXTURE_MTV_JSON_V1 0xC6",
          "#define WR_FIXTURE_MTV_JSON_V2 0xC7",
          '#define WR_FIXTURE_MTV_JSON_LEN %d' % len(MTV_JSON),
          carray("kMtvV1", mtv(0xC6)),
-         carray("kMtvV2", mtv(0xC7))])
+         carray("kMtvV2", mtv(0xC7)),
+         carray("kMtvZstd", mtv(0xC6, codec="zstd"))])
+
+    zbody = payload(16384)
+    write_header(
+        "fixture_zstd.h", "WR_FIXTURE_ZSTD_H",
+        "One zstd frame of %d bytes of Payload(), written with an explicit\n"
+        "content size -- which is not decoration. A frame that declines to say\n"
+        "how big it is cannot be decoded one-shot by either implementation:\n"
+        "python-zstandard raises and WrMtvZstdSize refuses by name. Every demo\n"
+        "in the wild carries one.\n"
+        "\n"
+        "The same Payload() as fixture_lzma.h, deliberately, so the two\n"
+        "harnesses compare their decoders against one set of expected bytes\n"
+        "derived by formula rather than against each other." % len(zbody),
+        ["#define WR_FIXTURE_ZSTD_RAW %d" % len(zbody),
+         carray("kZstdFrame", valve_zstd(zbody))])
 
     blob, wrpath, text, row = e2e()
     write_header(

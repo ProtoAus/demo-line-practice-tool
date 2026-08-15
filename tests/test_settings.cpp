@@ -51,6 +51,18 @@
 // exercises the real names and the real clamps.
 WrRenderSettings g_render;
 
+// The extractor's per-demo timeout, for the same reason and with the same
+// trade. wr_extract.cpp is the job slot: it drags in wr_jobs, wr_demo, wr_dp,
+// wr_mtv, wr_fetch, wr_api and WinHTTP behind it, which is most of the program
+// to check one integer.
+//
+// Only the STORAGE is stubbed, and the name, the range and the round-trip below
+// are the real ones -- which is the whole of what this harness is for. It exists
+// because "extract.timeout" was missing from the table until v0.9.4, so the
+// slider in the Runs tab reset to 30 on every launch.
+static int g_stubTimeout = 30;
+int *WrExtractTimeoutPtr(void) { return &g_stubTimeout; }
+
 void WrRenderDefaults(void)
 {
     memset(&g_render, 0, sizeof(g_render));

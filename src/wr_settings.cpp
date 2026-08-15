@@ -8,6 +8,8 @@
 #include "wr_profile.h"
 #include "wr_quick.h"
 #include "wr_board.h"           // WR_GAMEMODE_COUNT, for the quick menu's range
+#include "wr_extract.h"         // the per-demo timeout, which had a slider and
+                                // no line in this table until v0.9.4
 #include "wr_log.h"
 
 #include <stdio.h>
@@ -229,6 +231,16 @@ static void RegisterQuick(void)
     WrSettingsBool("quick.network", &g_quick.network);
     WrSettingsInt("quick.top", &g_quick.top, 1, WR_QUICK_TOP_MAX);
     WrSettingsInt("quick.gamemode", &g_quick.gamemode, 1, WR_GAMEMODE_COUNT);
+
+    // Not the quick menu's, strictly -- the slider is in the full panel's Runs
+    // tab -- but it is here because it is the quick menu that made the omission
+    // matter. It had a slider and no line in this table, so anybody who raised
+    // it got it back at 30 on the next launch, which is exactly the shape of
+    // the line.autoScale bug and was found the same way: by looking.
+    //
+    // 0 is "no limit" and has to stay reachable, so the range starts there
+    // rather than at 1. The upper end matches the slider.
+    WrSettingsInt("extract.timeout", WrExtractTimeoutPtr(), 0, 300);
 }
 
 static void RegisterProfile(void)

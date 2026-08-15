@@ -863,6 +863,9 @@ static void DrawRunsTab(void)
             WrExtractSetTimeout(tmo);
         ImGui::SameLine();
         HelpMarker(
+            "This is the budget for a BATCH -- the two buttons above, which do "
+            "every demo of a map. A single run ticked on the quick menu gets "
+            "120 seconds instead, or this, whichever is longer.\n\n"
             "Measured across 4388 demos here: the median is 58 KB and extracts "
             "in about a second, and the slowest normal one took seven. But the "
             "tail is enormous -- the 99th percentile is 5.8 MB and the largest "
@@ -873,7 +876,14 @@ static void DrawRunsTab(void)
             "into half a minute. A demo that runs out is recorded as an "
             "ordinary failure and skipped next time, so it is never paid for "
             "twice.\n\n"
-            "0 means no limit, and then only Stop will end a bad one.");
+            "That reasoning is about YOUR demos, and it does not carry to "
+            "downloaded ones: those are complete runs off a leaderboard and "
+            "run six to fifty times larger, which is why the quick menu does "
+            "not use this number as-is. Of the failures recorded on this "
+            "machine, 403 of 415 were this clock rather than anything wrong "
+            "with the demo.\n\n"
+            "0 means no limit, and then only Stop will end a bad one. Remem"
+            "bered between sessions since v0.9.4 -- before that it was not.");
 
         int nLines = WrExtractLineCount();
         if (nLines > 0)

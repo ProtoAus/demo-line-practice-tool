@@ -188,15 +188,16 @@ static int DumpBody(const char *file, const char *dest)
         return 1;
     }
 
-    if (h.codec == WR_MTV_CODEC_ZSTD)
-    {
-        // The reference's own line, verbatim. It is the one place a skip is
-        // printed on this path, and a parity run over a real library meets it
-        // on about one demo in thirty.
-        printf("[!] zstd body and no zstandard installed\n");
-        free(data);
-        return 1;
-    }
+    // A "[!] zstd body and no zstandard installed" refusal used to sit here --
+    // the reference's own line, verbatim -- and a parity run over a real
+    // library met it on about one demo in thirty. It went in v0.9.4 with the
+    // decoder. The branch is unreachable now, and a message that cannot be
+    // produced is worse than no message at all.
+    //
+    // Worth knowing which way this moved parity: the reference decodes zstd
+    // too, whenever its `zstandard` package is installed. So the two sides used
+    // to agree only on the machines where it was NOT, and now they agree
+    // either way.
 
     size_t bodyLen = 0;
     unsigned char *body = WrMtvBody(data, len, &h, &bodyLen, err, sizeof(err));
@@ -268,12 +269,8 @@ static unsigned char *ReadBody(const char *file, WrMtvHeader *h, size_t *lenOut,
         free(data);
         return NULL;
     }
-    if (h->codec == WR_MTV_CODEC_ZSTD)
-    {
-        printf("[!] zstd body and no zstandard installed\n");
-        free(data);
-        return NULL;
-    }
+    // The zstd refusal that used to be here went with the decoder in v0.9.4;
+    // see the longer note on the --dump-body path above.
     unsigned char *body = WrMtvBody(data, len, h, lenOut, err, sizeof(err));
     free(data);
     if (!body)
@@ -559,11 +556,13 @@ static int DumpInfo(const char *game, const char *map, const char *file,
         }
         else
         {
-            // The reference raises MtvError("skip: zstd body") on THIS path
-            // rather than returning a skip, so the status column says that and
-            // not what the extractor's own skip line says.
-            InfoErrorRow(f, name, SizeOf(t.v[i]),
-                         oc == WR_DEMO_SKIP ? "skip: zstd body" : r.message);
+            // This used to special-case a zstd skip, because the reference
+            // raises MtvError("skip: zstd body") on THIS path rather than
+            // returning a skip. Nothing produces WR_DEMO_SKIP here any more --
+            // zstd was the only thing that did -- so the demo's own message is
+            // the whole of it, and a branch kept for a value that cannot arrive
+            // would be a claim about behaviour that no longer exists.
+            InfoErrorRow(f, name, SizeOf(t.v[i]), r.message);
         }
         WrDemoFree(&r);
 

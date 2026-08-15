@@ -8,6 +8,7 @@
 #include "wr_maps.h"
 #include "wr_path.h"
 #include "wr_render.h"
+#include "wr_scan.h"            // the rescan button; see DrawScanRow
 #include "wr_settings.h"
 #include "wr_steam.h"
 
@@ -1002,16 +1003,40 @@ static void SubmitFetch(void)
     if (!WrExtractSubmit(&req))
         return;                     // somebody took the slot; try next tick
 
+    // `p->rank <= 0` again, and the omission was a real one: the loop above
+    // skips a pick with no rank -- there is nothing to ask a leaderboard for --
+    // while this one used to mark it fetched anyway. A pick recorded as having
+    // had its one attempt without one being made goes straight to
+    // WQ_GIVE_UP_NO_DEMO and reports "the download did not arrive", about a
+    // download nobody ever asked for.
     for (int i = 0; i < g_pickCount; i++)
     {
         WrQuickPick *p = &g_picks[i];
-        if (p->done || p->failed || p->inStore || p->fetched)
+        if (p->done || p->failed || p->inStore || p->fetched || p->rank <= 0)
             continue;
         if (p->trackType == type && p->trackNum == num)
             p->fetched = true;
     }
     _snprintf_s(g_note, sizeof(g_note), _TRUNCATE,
                 "downloading %d run%s...", n, n == 1 ? "" : "s");
+}
+
+// How long ONE ticked demo may take. See WR_EXTRACT_TIMEOUT_TICK: the global
+// default is fitted to a batch of thousands and is four times too tight for a
+// single run off a leaderboard, which is where 403 of this machine's 415
+// recorded failures came from.
+//
+// It takes the LARGER of the two, so somebody who has already raised the slider
+// in the full panel is not quietly lowered to 120 -- and 0 there means "no
+// limit", which has to win rather than lose a max().
+static int TickTimeout(bool retrying)
+{
+    if (retrying)
+        return 0;                   // the second press is the deliberate one
+    const int global = WrExtractTimeout();
+    if (global == 0)
+        return 0;
+    return global > WR_EXTRACT_TIMEOUT_TICK ? global : WR_EXTRACT_TIMEOUT_TICK;
 }
 
 static void SubmitExtract(int index)
@@ -1028,14 +1053,18 @@ static void SubmitExtract(int index)
     // map as well, which is minutes of work nobody asked for.
     WrExtractRequest req = {WR_JOB_EXTRACT};
     strcpy_s(req.file, sizeof(req.file), file);
-    req.timeoutSeconds = WrExtractTimeout();
+    req.timeoutSeconds = TickTimeout(p->retried);
     req.jobs = 1;                   // one demo; a pool would be four idle threads
 
     if (!WrExtractSubmit(&req))
         return;
 
     p->extracted = true;
-    _snprintf_s(g_note, sizeof(g_note), _TRUNCATE, "reading a demo...");
+    if (req.timeoutSeconds == 0)
+        _snprintf_s(g_note, sizeof(g_note), _TRUNCATE,
+                    "reading a demo, with no time limit this time...");
+    else
+        _snprintf_s(g_note, sizeof(g_note), _TRUNCATE, "reading a demo...");
 }
 
 // Make the store agree with the ticks.
@@ -1247,13 +1276,38 @@ void WrQuickTick(void)
         break;
     case WQ_GIVE_UP_NO_DEMO:
     case WQ_GIVE_UP_NO_PATH:
-        g_picks[idx].failed = true;
-        strcpy_s(g_picks[idx].why, sizeof(g_picks[idx].why),
-                 WrQuickGiveUpReason(act));
-        WrLogf("quick: giving up on %s -- %s", g_picks[idx].hash,
-               g_picks[idx].why);
+    {
+        WrQuickPick *p = &g_picks[idx];
+        p->failed = true;
+        strcpy_s(p->why, sizeof(p->why), WrQuickGiveUpReason(act));
+
+        // "That demo could not be read" was true of three different things and
+        // useful about none of them. The extractor knows which, so ask it --
+        // and when the answer is the clock rather than the file, say so and
+        // offer the second press. See WrExtractLastFileFailure.
+        if (act == WQ_GIVE_UP_NO_PATH && !p->retried)
+        {
+            char base[64], why[192];
+            bool timedOut = false;
+            // SameHash and not WrRunIsFrom: both of these are FULL forty-
+            // character hashes. The truncation WrRunIsFrom exists for is a
+            // property of a .wrpath, and neither of these came out of one --
+            // `base` is the .mtv's own basename, which the fetcher wrote from
+            // the same leaderboard row this pick came from.
+            if (WrExtractLastFileFailure(base, sizeof(base), why, sizeof(why),
+                                         &timedOut) &&
+                SameHash(base, p->hash))
+            {
+                strcpy_s(p->why, sizeof(p->why), why);
+                p->canRetry = timedOut;
+            }
+        }
+
+        WrLogf("quick: giving up on %s -- %s%s", p->hash, p->why,
+               p->canRetry ? " (offering a second go with no time limit)" : "");
         g_nextPollAt = 0;
         break;
+    }
     case WQ_NOTHING:
     default:
         if (working == 0)
@@ -1473,6 +1527,52 @@ static void DrawColourRow(void)
            "Turning it off puts your own sliders back exactly as they were.");
 }
 
+// The one recovery this page offers for a thing that is not about runs at all.
+//
+// It is here rather than only in the Diagnostics tab because the symptom is
+// visual and the person seeing it is a beginner: lines welded to the screen,
+// lines in the wrong place, lines drifting further out towards the edges. All
+// three are the same cause -- the wrong sixteen floats -- and all three are one
+// press from fixed. Somebody who has to be told to open the other panel, find
+// the ninth tab and scroll to a button called "Rescan" does not get told.
+//
+// Deliberately at the bottom, under the colour rows: it is the least likely
+// thing to be needed and the most alarming to read, so it should not be the
+// first thing the page says.
+static void DrawScanRow(void)
+{
+    const bool busy = WrScanBusy();
+    ImGui::BeginDisabled(busy);
+    if (ImGui::Button("Lines in the wrong place?"))
+        WrScanRestart();
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    Marker("Looks for the game's camera again, from scratch.\n\n"
+           "This tool finds where the game keeps its world-to-screen matrix by "
+           "reading its own memory -- it never calls into the game, which is "
+           "what makes it safe -- and on a bad day it can settle on the wrong "
+           "one. Two symptoms: lines that are right at the crosshair and drift "
+           "further out towards the edges of the screen, which is a matrix "
+           "belonging to a different field of view; and lines that stick to the "
+           "screen while you move, which is one belonging to a different render "
+           "pass.\n\n"
+           "It is worth pressing after injecting at the main menu rather than "
+           "in a map, which is the usual way to end up with a poor choice. "
+           "Walking around for a couple of seconds afterwards is what lets it "
+           "tell the candidates apart.\n\n"
+           "The full panel's Diagnostics tab has the same button, plus the list "
+           "of what it found and a way to pin one for good.");
+
+    ImGui::SameLine();
+    if (busy)
+        ImGui::TextDisabled("looking...");
+    else if (WrScanResolved())
+        ImGui::TextDisabled("camera found");
+    else
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f),
+                           "no camera yet -- walk around for a second");
+}
+
 void WrQuickDraw(void)
 {
     ImGui::SetNextWindowSize(ImVec2(640.0f, 520.0f), ImGuiCond_FirstUseEver);
@@ -1689,6 +1789,12 @@ void WrQuickDraw(void)
         if (g_extraOn > 0)    rows += 1.0f;
         rows += 0.6f;                               // the "Colour" separator
         rows += 3.0f;                               // two radio rows and the tick
+        rows += 1.0f;                               // and DrawScanRow's button
+
+        // Count every widget below the table, without exception. The last
+        // report was "'load 20 more' pushes the bottom of the window down so
+        // 'scale to what is on' is hard to click", and it was one uncounted
+        // row doing it.
 
         float footer = ImGui::GetFrameHeightWithSpacing() * rows;
         // Never more than half the room. A count can still be beaten -- a very
@@ -1792,9 +1898,45 @@ void WrQuickDraw(void)
                 ImGui::TableSetColumnIndex(4);
                 if (pi >= 0 && g_picks[pi].failed)
                 {
-                    ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.4f, 1.0f), "gave up");
-                    if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("%s", g_picks[pi].why);
+                    // The one failure worth a button. Everything else here is a
+                    // property of the file and pressing again would put the same
+                    // question to the same bytes; running out of time is a
+                    // property of the attempt, and it is most of the failures
+                    // there are. See WrQuickPick::canRetry.
+                    if (g_picks[pi].canRetry)
+                    {
+                        if (ImGui::SmallButton("more time"))
+                        {
+                            WrQuickPick *p = &g_picks[pi];
+                            p->failed = false;
+                            p->extracted = false;
+                            p->canRetry = false;
+                            p->retried = true;
+                            p->why[0] = '\0';
+                            g_nextPollAt = 0;
+                        }
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip(
+                                "%s\n\n"
+                                "That is the clock, not the demo -- it would "
+                                "read given longer. Pressing this reads it with "
+                                "no time limit at all.\n\n"
+                                "It can be a long wait. Most are seconds; a "
+                                "forty-minute marathon run took an hour on this "
+                                "machine, and it holds the one job slot while "
+                                "it works, so the other panel's buttons wait "
+                                "too. Stop, in the full panel, ends it.",
+                                g_picks[pi].why);
+                    }
+                    else
+                    {
+                        ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.4f, 1.0f),
+                                           "gave up");
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("%s", g_picks[pi].why[0]
+                                              ? g_picks[pi].why
+                                              : "no reason was recorded");
+                    }
                 }
                 else if (pi >= 0 && g_picks[pi].done)
                     ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.55f, 1.0f), "drawn");
@@ -1974,6 +2116,7 @@ void WrQuickDraw(void)
         ImGui::TextDisabled("%s", g_note);
 
     DrawColourRow();
+    DrawScanRow();
 
     ImGui::End();
 

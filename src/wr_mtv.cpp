@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "LzmaDec.h"
+#include "zstd.h"
 
 #define MTV_MAGIC "MMTV"
 static const unsigned char kZstdMagic[4] = {0x28, 0xB5, 0x2F, 0xFD};
@@ -484,6 +485,112 @@ bool WrMtvLzmaDecode(const unsigned char *src, size_t srcLen,
 }
 
 // ---------------------------------------------------------------------------
+// zstd
+// ---------------------------------------------------------------------------
+//
+// WHY THIS IS THE REAL LIBRARY AND NOT THE SHORT ONE
+//
+// zstd ships a second decoder -- doc\educational_decoder, one file, fifteen
+// hundred lines, and by far the more attractive thing to vendor next to five
+// files of LZMA. It is not usable here, and the reason is in its own comments:
+// it calls exit(1) on every corruption path. That is correct for a program that
+// reads one file and stops, and inside momentum.exe it is the game closing with
+// no message because somebody's demo was truncated in transit. The bodies this
+// decodes arrive over the network from a CDN, so the input is not ours and
+// "malformed" is a case that has to return rather than terminate.
+//
+// So: lib\decompress and the part of lib\common it needs, which is what every
+// program that ships zstd links. It returns error codes, it is what OSS-Fuzz
+// runs continuously, and it is roughly a hundred times faster -- which matters
+// less than it sounds, but the demos this reads are the big ones.
+//
+// The cost is honest and is stated in third_party\VERSION.txt: thirty files
+// where LZMA needs five.
+
+size_t WrMtvZstdSize(const unsigned char *src, size_t srcLen,
+                     char *err, int errCap)
+{
+    if (err && errCap > 0)
+        err[0] = '\0';
+    if (!src || srcLen < 4)
+    {
+        Fail(err, errCap, "zstd frame runs past EOF");
+        return 0;
+    }
+
+    const unsigned long long n = ZSTD_getFrameContentSize(src, srcLen);
+
+    // Two different unknowns with two different meanings, and both are refusals
+    // here. ZSTD_CONTENTSIZE_ERROR is "that is not a zstd frame". _UNKNOWN is a
+    // frame that legitimately declined to say, which a streaming decoder handles
+    // and a one-shot cannot -- and the reference is in exactly the same
+    // position, since ZstdDecompressor().decompress() raises without a declared
+    // size. Every demo in this library carries one.
+    if (n == ZSTD_CONTENTSIZE_ERROR)
+    {
+        Fail(err, errCap, "not a zstd frame");
+        return 0;
+    }
+    if (n == ZSTD_CONTENTSIZE_UNKNOWN)
+    {
+        Fail(err, errCap, "zstd frame does not declare its size");
+        return 0;
+    }
+    if (n == 0)
+    {
+        Fail(err, errCap, "zstd frame declares an empty body");
+        return 0;
+    }
+
+    // The same limit and the same wording as the LZMA path, because it is the
+    // same fact about the scan downstream: a u32 bit position stops being able
+    // to address a body past this.
+    if (n > (unsigned long long)WR_MTV_MAX_BODY)
+    {
+        Fail(err, errCap, "body claims %llu bytes, over the %u byte limit",
+             n, (unsigned int)WR_MTV_MAX_BODY);
+        return 0;
+    }
+    return (size_t)n;
+}
+
+bool WrMtvZstdDecode(const unsigned char *src, size_t srcLen,
+                     unsigned char *dst, size_t dstLen, char *err, int errCap)
+{
+    if (err && errCap > 0)
+        err[0] = '\0';
+    if (!src || !dst || dstLen == 0)
+    {
+        Fail(err, errCap, "Corrupt input data");
+        return false;
+    }
+
+    const size_t got = ZSTD_decompress(dst, dstLen, src, srcLen);
+
+    if (ZSTD_isError(got))
+    {
+        // The library's own wording. Unlike the LZMA path there is no reference
+        // string to match: the reference raises whatever python-zstandard
+        // raises, which is a different sentence again, and a zstd failure has
+        // never been able to reach a _failed.txt written by the reference
+        // because until now the reference was the only side that decoded these.
+        Fail(err, errCap, "zstd: %s", ZSTD_getErrorName(got));
+        return false;
+    }
+
+    // The frame said one number in its header and produced another. Not a short
+    // read to be tolerated -- the size was a claim the file made about itself,
+    // and the caller allocated on the strength of it.
+    if (got != dstLen)
+    {
+        Fail(err, errCap, "zstd short read: %llu of %llu",
+             (unsigned long long)got, (unsigned long long)dstLen);
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // The body
 // ---------------------------------------------------------------------------
 
@@ -503,12 +610,49 @@ unsigned char *WrMtvBody(const unsigned char *data, size_t len,
 
     if (h->codec == WR_MTV_CODEC_ZSTD)
     {
-        // Ours, not the reference's. Its message names a pip package, which is
-        // no longer advice anyone can act on. Callers that care about the
-        // difference between a skip and a failure test h->codec instead of
-        // reading this -- see the header.
-        Fail(err, errCap, "zstd body (this build has no zstd decoder)");
-        return NULL;
+        // A DIFFERENT CONTAINER, NOT THE SAME ONE WITH ANOTHER CODEC IN IT.
+        //
+        // The LZMA arm below reads a seventeen-byte Valve header first -- two
+        // u32 lengths and five property bytes -- and none of that is here. The
+        // frame magic sits AT bodyOff and the body is everything from there to
+        // the end of the file, which is exactly what the reference does:
+        // decompress_body slices data[off:] and hands the whole tail over.
+        //
+        // Everything the LZMA arm gets from that header, a zstd frame carries
+        // in its own: the output size is read back out of it, and there are no
+        // properties to pass.
+        if (h->bodyOff >= len)
+        {
+            Fail(err, errCap, "zstd frame runs past EOF");
+            return NULL;
+        }
+
+        const unsigned char *src = data + h->bodyOff;
+        const size_t srcLen = len - h->bodyOff;
+
+        const size_t actual = WrMtvZstdSize(src, srcLen, err, errCap);
+        if (actual == 0)
+            return NULL;            // WrMtvZstdSize said why
+
+        // The spare byte is the LZMA arm's, for the same reason: a caller that
+        // never has to special-case the allocation.
+        unsigned char *out = (unsigned char *)malloc(actual + 1);
+        if (!out)
+        {
+            Fail(err, errCap, "Cannot allocate memory");
+            return NULL;
+        }
+        out[actual] = 0;
+
+        if (!WrMtvZstdDecode(src, srcLen, out, actual, err, errCap))
+        {
+            free(out);
+            return NULL;
+        }
+
+        if (lenOut)
+            *lenOut = actual;
+        return out;
     }
     if (h->codec != WR_MTV_CODEC_LZMA)
     {

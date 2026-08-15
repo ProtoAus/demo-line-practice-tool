@@ -44,7 +44,7 @@ jobs:
 
       # Everything that went into the binary, in one file. The two clones need
       # their commit recorded because they are not in our history; miniz and the
-      # LZMA decoder are committed under third_party\, so the wrlines sha above
+      # LZMA and zstd decoders are committed under third_party\, so the sha above
       # already pins them exactly -- they are named anyway, because "what is in
       # this DLL" should have one complete answer and not one that stops at the
       # things that happen to be fetched.
@@ -57,6 +57,7 @@ jobs:
             "minhook  v1.3.3    $(git -C minhook rev-parse HEAD)  (cloned)"
             "miniz    3.1.2     third_party\miniz  (committed; see third_party\VERSION.txt)"
             "lzma sdk 23.01     third_party\lzma   (committed; see third_party\VERSION.txt)"
+            "zstd     1.5.7     third_party\zstd   (committed; see third_party\VERSION.txt)"
             "built by ${{ github.workflow }} run ${{ github.run_id }} on $(hostname)"
           ) | Set-Content PROVENANCE.txt -Encoding ascii
           Get-Content PROVENANCE.txt

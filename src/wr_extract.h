@@ -258,6 +258,29 @@ WrJobKind WrExtractLastKind(void);
 // clears it.
 bool WrExtractTakeFinished(void);
 
+// What became of the most recent SINGLE-DEMO extraction -- the --file path, and
+// the one the quick menu uses for every ticked run.
+//
+// It exists because "that demo could not be read" is three different sentences
+// wearing one coat, and only one of them is worth a second press. A demo whose
+// coordinate stream cannot be found will never be readable; a demo that ran out
+// of time in the chain search will be readable given more of it, and 403 of the
+// 415 recorded failures on this machine are that second kind. A page that
+// cannot tell them apart has to give the same dead end to both.
+//
+// `base` is the demo's basename without the extension, which is the replay hash
+// and therefore what the caller ticked. Returns false when nothing single-demo
+// has run yet, or when the last one succeeded -- a success needs no reason.
+//
+// `timedOut` is derived from the message rather than carried as a flag, and
+// the coupling is deliberate but narrow: the one place that sentence is written
+// is Timeout() in wr_dp.cpp, which spells it that way because _failed.txt
+// records written by the REFERENCE spell it that way. Threading a bool up
+// through WrDpExtract and WrDemoProcess would have touched the parity path to
+// learn something the parity path already states.
+bool WrExtractLastFileFailure(char *base, int baseCap, char *why, int whyCap,
+                              bool *timedOut);
+
 // Seconds to allow one demo before giving up on it, or 0 for no limit.
 //
 // 30 rather than the extractor's old 180: measured across 4388 demos, the
@@ -265,8 +288,39 @@ bool WrExtractTakeFinished(void);
 // are what actually hit the limit. Three minutes of silence per bad demo read
 // as a hang.
 #define WR_EXTRACT_TIMEOUT_DEFAULT 30
+
+// ...and a different number for ONE demo somebody asked for by name.
+//
+// The 30 above is a good number for a batch and a bad one for a tick, and the
+// failure records say so out loud. Of the 415 recorded failures on this
+// machine, 403 are this timeout -- not corrupt demos, not unreadable ones,
+// demos that ran out of time. Their median size is 1.1 MB and only 12 of the
+// 403 are under the 700 KB the 30 was reasoned about.
+//
+// The reason the two populations differ is not subtle. The library that 58 KB
+// median came from is mostly your own local demos. The quick menu on Delete
+// downloads from a LEADERBOARD, and a leaderboard is nothing but complete runs
+// of whole maps: median 186 KB where the body is LZMA and 3,082 KB where it is
+// zstd. The old number was never wrong about the library. It was wrong about
+// downloads, and downloads are what the front door does.
+//
+// So a tick gets four times as long, and the difference is justified by what
+// the two jobs are rather than by taste. A tick is one demo, explicitly asked
+// for, on a background thread, with a Stop button and a page that says what it
+// is doing. A whole-map extraction is thousands of demos with a human watching,
+// where four times as long to fail is four times the wait for every bad one.
+#define WR_EXTRACT_TIMEOUT_TICK 120
 void WrExtractSetTimeout(int seconds);
 int WrExtractTimeout(void);
+
+// The same number, addressable, so wr_settings.cpp can put it in settings.cfg
+// beside everything else the panel remembers. It had a slider and no entry in
+// that table, so raising it lasted until you quit -- the same defect
+// line.autoScale had, found the same way.
+//
+// A pointer rather than another setter, which is what WrScanFrozenLimit does
+// for the same reason: the settings table binds to storage.
+int *WrExtractTimeoutPtr(void);
 
 // ---------------------------------------------------------------------------
 // Output

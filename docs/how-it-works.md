@@ -423,11 +423,30 @@ not a dependency to vendor; see *Your data* in the README and
 
 ### zstd
 
-About 3.5% of demos — the very largest — have a zstd body rather than an LZMA one, and reading
-them needs a second decompressor for a format no current demo uses. They are reported as
-**skipped**, never as failed, and that distinction is load-bearing: a skip is not written to the
-failure record, so recording them as failures would put a permanent entry in every user's
-`_failed.txt` that *Retry the failures* would re-fail for ever.
+Some demos — the very largest — carry a zstd body rather than an LZMA one. Until **v0.9.4** they
+were recognised and refused, on the reasoning that a second decompressor was a lot of code for a
+format only a few percent of demos used. Both halves of that were wrong about the population that
+matters, and the numbers say how wrong:
+
+| population | zstd share |
+|---|---|
+| every demo in this install (6,520) | **4.8 %** |
+| demos **downloaded from the leaderboard** (2,220) | **7.7 %** |
+| downloaded for `surf_tropic` | **50 of 100** |
+
+The second row is the one the quick menu lives in, because leaderboard runs are complete runs of
+whole maps and zstd is what the long ones use — the median zstd demo here is 3,082 KB against
+186 KB for LZMA. So on some maps every second tick on the front door was a dead end.
+
+And *skipped* is only a kindness while the thing skipped is rare. A skip is deliberately not
+written to `_failed.txt`, so 172 demos on this machine had no `.wrpath` and no record saying why;
+they looked exactly like runs nobody had got round to extracting, permanently. That is worse
+than a failure, not better, once the count stops being small.
+
+They decode now. See [third_party/VERSION.txt](../third_party/VERSION.txt) for why the decoder is
+thirty files of zstd's real library rather than the single-file one in zstd's own `doc/` tree —
+short version: that one calls `exit(1)` on malformed input, and these bodies arrive over the
+network.
 
 ---
 
@@ -745,10 +764,9 @@ known-good single-stage demos and testing the stitched points against that geome
 
 ### Known limits
 
-- **zstd bodies are skipped.** ~310 of the 6,250 demos on this test install, all of them the
-  very largest files. Reported as *skipped*, never as failures — a skip is not written to the
-  failure record, and getting that backwards would poison every user's record with hundreds of
-  permanent entries that `--retry-failed` would re-fail forever.
+- ~~**zstd bodies are skipped.**~~ **Fixed in v0.9.4** — 316 of the 6,520 demos on this test
+  install, all of them the very largest files, and 7.7 % of everything the quick menu downloads.
+  They decode now; see *zstd* above.
 - **An install path with non-ASCII characters in it will not work, and v0.7.0 made this
   worse.** Every path here is `char*` and every file call is the `-A` Windows form, so a byte
   ≥ 0x80 anywhere in the path — `D:\Игры\`, an accented user name — cannot be named. That was
@@ -1331,6 +1349,63 @@ always carries, which never moves, and which is what the Board tab shows in the 
 beneath itself, which was right when it was written and silently wrong once anything was added — by
 then there were eight rows down there. It counts what it is about to draw now, and clamps to half
 the window so a sentence that wraps further than budgeted cannot leave no table at all.
+
+### The tick that could not work, and the two reasons why
+
+The next report was that the front door "errors a lot" for people using it for the first time, with
+one error quoted: `skip <hash> zstd body (pip install zstandard)` — a Python instruction, in a
+program that has had no Python in it since v0.7.0.
+
+That message was not the bug. It was the visible end of one, and counting the disk said how large:
+
+| on this machine's `wrlines_data\` | |
+|---|---|
+| demos downloaded from the leaderboard | **2,220** |
+| of those, with a `.wrpath` beside them | 1,546 (**69.6 %**) |
+| **zstd bodies** — refused, never decoded | **172 (7.7 %)** |
+| recorded extraction failures | 415 |
+| — of which **the 30-second timeout** | **403** |
+| — of which genuine content failures | 12 |
+
+403 + 172 + 12 accounts for 587 of the 674 missing. **Two causes covered essentially every failed
+tick, and neither was a property of the run anybody asked for.** zstd is [its own
+section](#zstd). The other is a number that was right about the wrong population.
+
+`WR_EXTRACT_TIMEOUT_DEFAULT` is 30 seconds, and it was chosen carefully — measured across 4,388
+demos whose median is 58 KB and extracts in about a second, where the 6.5 % over 700 KB are what
+actually hits a limit. Every word of that is still true, and it is true about **your own local
+demos**. The quick page downloads from a *leaderboard*, and a leaderboard is nothing but complete
+runs of whole maps: median 186 KB where the body is LZMA and 3,082 KB where it is zstd. Of the 403
+timeouts, the median is 1.1 MB and only **12** are under the 700 KB the number was reasoned about.
+
+So a tick gets `WR_EXTRACT_TIMEOUT_TICK`, 120 seconds, or the slider's value if somebody has raised
+it higher — and a batch keeps 30. The difference is justified by what the two jobs are rather than
+by taste: a tick is one demo, explicitly asked for, in the background, behind a Stop button; a
+whole-map extraction is thousands with a human watching, where four times as long to fail is four
+times the wait for every bad one.
+
+**And "that demo could not be read" was three sentences wearing one coat.** A demo whose coordinate
+stream cannot be found will never be readable. A demo that ran out of time will be, given more of
+it — and that is most of the failures there are. So the extractor's own reason is carried up to the
+row now (`WrExtractLastFileFailure`), and when the reason is the clock the cell becomes a **more
+time** button that reads that one demo with no limit at all. It is a press, never a retry loop:
+one flag, set by the button and never by the state machine.
+
+The honesty that costs is worth stating. Some of these are genuinely enormous — the biggest zstd
+demos here are 25-to-42-minute marathon runs of 60,000 points, and the reference implementation
+spent **3,610 seconds** in the dynamic program on one of them. 120 seconds will not extract that,
+the button will, and it will hold the one job slot for an hour doing it. The tooltip says so.
+
+**One smaller thing found while reading the same function.** `SubmitFetch` builds its request from
+picks with a real rank — there is nothing to ask a leaderboard for otherwise — and then marked
+*every* pick on the leg as fetched, including the ones it had just skipped. A pick recorded as
+having had its one attempt without one being made goes straight to `WQ_GIVE_UP_NO_DEMO` and reports
+"the download did not arrive", about a download nobody ever requested. The two loops test the same
+condition now.
+
+**And the timeout slider had no line in `settings.cfg`.** Raising it lasted until you quit — the
+same defect `line.autoScale` had two releases earlier, found the same way: by looking at the table
+instead of at the panel.
 
 ### One byte, and two features that could not work
 
@@ -2403,6 +2478,44 @@ All of this is visible live in the **Diagnostics** tab: the address the matrix w
 at, what the oracle saw, how many candidates are still alive, how much memory was scanned,
 and the log tail.
 
+### The half of memory that was never being searched
+
+Two phases, cheapest first: the writable data of the game's own modules, then — *only if that
+came up empty* — the rest of the writable address space. Read that condition again, because it is
+not the saving it looks like.
+
+"Came up empty" means **zero candidates**, not zero good ones. Any sixteen floats in `engine.dll`'s
+`.data` that pass the structural oracle count: a baked projection matrix, a run of zeros (a zero
+word is plausible and decodes to 0.0, which is inside the world limit). One of those is enough to
+skip the heap entirely. And a rescan empties the candidate list and runs *the same phase 1 over the
+same module data*, finds the same false positive, and skips phase 2 again — for all five of
+`MAX_AUTO_RESCANS`.
+
+So on a machine where the live matrix is heap-resident and module data holds one false positive,
+the scan could never find it and would spend the whole session confidently not looking. Nothing in
+the log said so; it read as "watching 3 candidates", forever.
+
+Fixed in **v0.9.4** by making the condition about *proof* rather than presence, as a ladder:
+
+| when | what it sweeps | why |
+|---|---|---|
+| the first scan | module data | a few MB against a gigabyte, and usually right |
+| the first map load after injection | module data | the memory has only just changed; try the cheap place again |
+| nothing has proved itself | **and the heap** | phase 1 has now been watched and found wanting, so repeating it alone is the one outcome known in advance not to help |
+| you pressed the button | **and the heap** | you are pressing it because the automatic answer is wrong |
+
+The second row is its own fix. `WrScanOnMapChanged` keeps the existing pick across a level change,
+deliberately — the address does not move and rescanning only re-rolls a choice between several
+equally valid matrices. But that rests on the pick having been made *in a loaded level*, and the
+most common way to run this tool is to inject at the main menu, where the sweep reads memory the
+level load is about to free and any winner won against no player camera. So the first map change
+after injection, and only the first, throws the list away and looks again. Injecting while already
+in a map produces no map change, trips none of this, and needs none of it.
+
+The button is now on the quick page too, under the colour rows, spelled *Lines in the wrong
+place?* — the symptom is visual and the person seeing it is a beginner, and somebody who has to be
+told to open the other panel and find the ninth tab does not get told.
+
 ---
 
 ## If it breaks
@@ -2413,7 +2526,8 @@ Everything goes to `wrlines_data\wrlines.log`, flushed on every line.
   are a jump, something else (Steam overlay, RTSS) hooked DXGI first.
 - **No lines, and Diagnostics says the scan found nothing** — load into a map first; the
   oracle needs a real view to confirm against, and there is no world→screen matrix at the
-  main menu. Then **Re-scan**. If it still finds nothing, the fallback is Diagnostics →
+  main menu. Then **Re-scan** (or *Lines in the wrong place?* on the quick page, which is
+  the same button). If it still finds nothing, the fallback is Diagnostics →
   *Enable vtable probing* → type an index → *Try this index*. Best estimate is **69**
   (observed `GetScreenSize` 38, minus SDK 5, plus SDK 36).
 - **Lines lag the camera by a frame** — the scan picked a stale copy. Hit **Re-scan**;
@@ -2453,7 +2567,7 @@ wr_extract          counting unextracted demos, and cmd_extract: the demo
                     walk, the work list, the progress lines, the failure record
 wr_peek             which map each demo is for, remembered on (path, size,
                     mtime) so the work list is not six thousand file opens
-wr_mtv              the .mtv container and Valve-LZMA -- bytes, no floats
+wr_mtv              the .mtv container, Valve-LZMA and zstd -- bytes, no floats
 wr_dp               the candidate scan, the dynamic program and the scoring.
                     NO WINDOWS HEADERS: the one place where "does this produce
                     the same numbers as the reference" is the only question

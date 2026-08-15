@@ -18,35 +18,14 @@ See the route, see where they carried speed and where you don't.
 5. **Press `DELETE`** in game.
 6. Press **Allow it to look**, pick a **stage** if the map has any, and **tick a run**.
 
-That is the whole of it. Ticking a run downloads the demo, reads it and puts the line on screen,
-one after the other, in the background — you can close the page and keep playing while it works.
-The ticks are remembered per map, so the lines come back next time you load it.
+> **If a ticked run says *gave up***, hover it — the reason is the extractor's own. When it ran out
+> of time the cell becomes a **more time** button instead, which reads that one demo with no limit.
+> Long marathon runs genuinely take a while.
 
-> **If the list comes back empty**, check the gamemode next to the map name at the top of the page.
-> Momentum keeps a separate leaderboard per mode and gives nearly every map a board in nearly every
-> one of them, almost all empty — so asking the wrong mode looks exactly like a map nobody has run.
-> The page works it out from a board you have already fetched, then from the map's name; correcting
-> it there is remembered for that map.
-
-### The long way round
-
-`INSERT` opens the full panel, which is the same capability with every decision left to you: nine
-tabs, any map rather than the one you are standing in, whole leaderboards rather than the top
-twenty, and every setting the quick page leaves out.
-
-6. **Board** tab → tick **Allow downloading** → press **Fastest 50** → tick the rows you want →
-   **Download**. That is the map's real leaderboard, and it is where the demos come from.
-   Nothing reaches the network until that checkbox is on.
-7. **Runs** tab → **Extract new demos**. Wait for it. The lines appear when it finishes.
-
-Step 7 also picks up whatever demos the game had already downloaded by itself, so it is worth
-pressing even if you skip step 6. When there is nothing new to do it reads **Re-run extractor**
-instead — same button.
-
-> **Nothing else to install.** Up to v0.6.1 that last step needed Python, because it ran through a
-> `wrpath_extract.py` that shipped beside the DLL. As of **v0.7.0 it does not** — extraction runs
-> inside `wrlines.dll` on a pool of background threads, the script is gone from the download, and
-> the zip is two binaries and two text files.
+> **If the lines are in the wrong place** — drifting further out towards the edges of the screen, or
+> stuck to the screen while you move — press **Lines in the wrong place?** at the bottom of the
+> page and walk around for a couple of seconds. That is the tool looking for the game's camera
+> again, and it is most often needed when you injected at the main menu rather than in a map.
 
 ---
 
@@ -61,40 +40,7 @@ instead — same button.
 | `Home` | *whose line am I looking at* — off by default |
 | `End` | the corner block — off by default |
 
-Both pages can be open at once. All but `INSERT` are rebindable, and the **About** tab lists them
-as they are currently bound.
-
-> **Nothing is drawn on your screen until you ask for it.** As of v0.9.0 the energy readout beside
-> the crosshair is off by default, alongside the corner block that already was — a fresh install
-> draws lines in the world and leaves the screen alone. Both are in **Energy** in the full panel,
-> and turning either on is remembered. If you had one on already, it stays on.
-They are **read, not swallowed**, so if one collides with something you have bound, the game still
-acts on it too.
-
----
-
-## What you get
-
-**Colour the lines by whatever you are chasing** — strafing efficiency, raw speed, energy, or where
-each run placed. Numbers at every top and bottom say what a line carried *through* a ramp and what
-it bought with it. Aim at a line (`Home`) and it tells you whose it is and how you compare at that
-exact point.
-
-**Energy across a whole run, plotted.** A line that sags gently was leaking everywhere; a line with
-one cliff in it lost the lot at one ramp — and only one of those is worth practising the same way.
-Your own last attempt is on there too, and it survives failing, so you can look at what went wrong
-*after* it went wrong.
-
-Also worth finding:
-
-- **Save-loc times.** The game has a `time` field for save-locs and never fills it in, so this keeps
-  its own. Load a save-loc and your run clock goes back with it.
-- **A live strafe gauge** — `Page Down` to it. Green to red on how close you are to the most energy
-  air strafing could physically add.
-- **Watch any demo you have.** Press **watch** on a run and paste the command it copies into the
-  console. Don't hunt for it in the Downloaded tab; that tab is built from leaderboard rows, not
-  from the folder, so a demo you dropped in only shows up if the game had already listed it.
-- **Your settings stay put**, in `wrlines_data\settings.cfg`, panel position included.
+All but `INSERT` are rebindable, and the **About** tab lists them as they are currently bound.
 
 ---
 
@@ -107,103 +53,64 @@ it.**
 
 ## Why your antivirus may flag this
 
-`wrinject.exe` does classic remote-thread injection — `OpenProcess`, `VirtualAllocEx`,
-`WriteProcessMemory`, `GetProcAddress(LoadLibraryA)`, `CreateRemoteThread`. That is about sixty
-lines of [src/injector.cpp](src/injector.cpp), and it is also, precisely, how a lot of malware
-loads itself. Defender cannot tell the two apart from the bytes alone, and it is not being stupid.
+`wrinject.exe` loads the DLL into the game with `OpenProcess` / `VirtualAllocEx` /
+`WriteProcessMemory` / `CreateRemoteThread`. That is also how a lot of malware loads itself, and
+neither file is code-signed, so Defender cannot tell the two apart from the bytes alone.
 
-Inside the game, `wrlines.dll` installs inline detours on D3D11 `Present` and `ResizeBuffers` with
-MinHook — which allocates executable memory for its trampolines — walks its own process's memory
-with `VirtualQuery` looking for the world-to-screen matrix, and polls `GetAsyncKeyState` on a timer
-for the hotkeys. All three are ordinary for a game overlay. All three are also on every heuristic's
-list.
+What it does **not** do: no registry access at all — `ADVAPI32` is not even in the import list — no
+persistence, no packing or obfuscation, no anti-debug, no hidden API names, no cross-process writes
+from the DLL, no driver and no elevation.
 
-What it does **not** do, which is most of what actually separates the two:
+**On VirusTotal at v0.9.3.** Every hit is a machine-learning or heuristic verdict; not one is a
+match against known malware:
 
-- no registry access at all — `ADVAPI32` is not even in the import list
-- no persistence: no autostart, no service, no scheduled task, no self-copy
-- no packing, no obfuscation, no encrypted strings, no UPX
-- no anti-debug and no anti-VM
-- no dynamically resolved API names — every import is declared and visible
-- no cross-process writes from the DLL; the only one in the project is the injector writing its
-  own path into the target so that `LoadLibraryA` has something to read
-- no `SetWindowsHookEx`, no driver, no elevation — the loader is manifested `asInvoker`
+| file | | engine | verdict |
+|---|---|---|---|
+| [`wrinject.exe`](https://www.virustotal.com/gui/file/42c3734aa9b12bbe7a64972409e1e34a3d62501db06c4d0ae63b31d83ffc8d61) | **2/70** | Microsoft | `Program:Win32/Wacapew.C!ml` |
+| | | Trapmine | `Suspicious.low.ml.score` |
+| [`wrlines.dll`](https://www.virustotal.com/gui/file/5d3b4cdc2eeb9b7cfe517d3423b25a6ee0c4cfe1d8809121e353ffffed2d2186) | **5/70** | Microsoft | `Trojan:Win32/Wacatac.B!ml` |
+| | | ESET-NOD32 | `Win64/GameHack_AGen.CCQ` — *potentially unsafe* |
+| | | Symantec | `ML.Attribute.HighConfidence` |
+| | | Cynet | `Malicious (score: 100)` |
+| | | Bkav Pro | `W32.Malware.CA0BE60C` |
+
+The `!ml` suffix on both Microsoft verdicts means a classifier decided, not a rule. ESET's is the
+only specific one, and it files this as a *potentially unsafe application* rather than as malware —
+a fair description of an overlay injected into a game.
 
 **Check the file you downloaded.** Every release publishes `SHA256SUMS.txt`, and both binaries are
 built by a public GitHub Actions runner from a tagged commit, with a
 [build provenance attestation](https://github.com/ProtoAus/demo-line-practice-tool/attestations):
 
 ```
-gh attestation verify demo-line-practice-tool-v0.7.0.zip --repo ProtoAus/demo-line-practice-tool
+gh attestation verify demo-line-practice-tool-v0.9.4.zip --repo ProtoAus/demo-line-practice-tool
 ```
 
-VirusTotal for the current release: *(added at tag time)*
-
-**If Defender quarantines it, please report the false positive.** It is the only thing that
-actually fixes this, and it fixes it for everyone:
+**If Defender quarantines it, please report the false positive.** It is the only thing that actually
+fixes this, and it fixes it for everyone:
 [microsoft.com/en-us/wdsi/filesubmission](https://www.microsoft.com/en-us/wdsi/filesubmission) →
-*Software developer* → *Incorrectly detected as malware*. Attach the file and paste this page's URL
-and the SHA256. I submit every release myself, but a report from an affected machine carries more
-weight than mine.
+*Software developer* → *Incorrectly detected as malware*. I submit every release myself, but a
+report from an affected machine carries more weight than mine. ESET has
+[its own form](https://www.eset.com/int/support/report-a-false-positive/).
 
 There is **no code-signing certificate**, so SmartScreen will show "Windows protected your PC" the
-first time you run the loader. That message is about reputation, not about the file — an unsigned
-binary from a small project never accumulates any. **More info → Run anyway**, once you have
-checked the hash.
+first time you run the loader. That message is about reputation, not about the file. **More info →
+Run anyway**, once you have checked the hash.
 
 ## Your data
 
 Nothing leaves your machine unless you press a button that says it will. No telemetry, no analytics,
 no phone-home of any kind.
 
-Until v0.5.1 that came with a stronger claim: the DLL linked no HTTP client at all, and
-`dumpbin /dependents` proved it in one line. **From v0.6.0 that is no longer true.** Leaderboards
-are now fetched by the DLL rather than by the script, so the import list is six names and
-`WINHTTP.dll` is one of them. There is no way to have both, and pretending otherwise would be
-worse than losing it.
+The DLL fetches leaderboards itself, so `WINHTTP.dll` is one of its six imports. That comes to about
+120 lines in [src/wr_http.cpp](src/wr_http.cpp) which do GET and nothing else, one host —
+`api.momentum-mod.org`, plus the download link its own reply contained — no identifier of any kind
+sent, and no request that is not downstream of something you pressed. Demos are only ever downloaded
+because you ticked a run.
 
-What replaced it is smaller but still checkable in a couple of minutes:
-
-- **One file.** `WinHttp` — the prefix every function in that API carries — appears in
-  [src/](src/) in exactly two files, [src/wr_http.cpp](src/wr_http.cpp) and its header, and
-  `grep` will confirm that faster than reading either. It is about 120 lines and it does GET.
-  There is no arm that does anything else: no POST, no cookies, no credentials, no redirect to a
-  scheme it did not start with.
-- **One host.** Every URL is built in [src/wr_api.cpp](src/wr_api.cpp) from one constant,
-  `https://api.momentum-mod.org/v1`, plus the absolute download link Momentum's own reply
-  contained. Nothing else in the project constructs a URL.
-- **No identifier of any kind.** No machine id, no account, no installation guid, no counter. The
-  User-Agent says `WrLines/<version>` and links here, and that is everything it sends that it did
-  not have to. The one request that names SteamID64s names your *friends'*, because you pressed a
-  button that says it will look them up — and it is the same list the Steam client already has.
-- **Never on its own.** Nothing here runs on a timer or at startup. Every request is downstream of
-  something you pressed.
-
-From v0.6.1 that is the whole of it, and from **v0.7.0 there is nothing else in the project at
-all**: the last thing the Python script did was extraction, extraction reads files off your disk,
-and it now happens inside the DLL. `wrpath_extract.py` is not in the download.
-
-### What v0.8.0 changed, and it is worth reading
-
-The quick page on `DELETE` fills itself in, and filling itself in means reading a leaderboard
-without you pressing a button each time. So the fence moved, and it is a real change rather than a
-detail:
-
-- **The full panel is unchanged.** *Allow downloading* still defaults to off and still resets every
-  launch, so nothing in the Board or Maps tabs reaches the network without a press in that session.
-- **The quick page asks once, and remembers.** *Allow it to look* is a persisted setting, off until
-  you turn it on. After that the page reads a leaderboard by itself — **one** board, for the leg you
-  are actually looking at, and only when nothing is cached for it. Switching to a stage you have
-  never opened is one request; going back to it is none.
-- **Demos are still never downloaded on their own.** A demo body only ever comes down because you
-  ticked a run.
-
-If you would rather it never asked, leave that setting off: the page still works from whatever is
-already cached, and the button to fetch a board by hand is the one that was always there.
-
-Everything it creates lives in a `wrlines_data` folder next to the DLL. Nothing is written into your
-game install unless you press **send**, **local** or **watch** on a run — those copy one demo into
-Momentum's replay folder so the game can play it, and **take out** removes it again.
+Everything it creates lives in a `wrlines_data` folder next to the DLL, and nothing is written into
+your game install unless you press **send**, **local** or **watch** on a run — those copy one demo
+into Momentum's replay folder, and **take out** removes it again.
 
 ---
 
@@ -216,40 +123,32 @@ build.bat
 ```
 
 Needs MSVC Build Tools and the Windows SDK. Close the game first — the DLL never unloads.
-`tests\build.bat` builds and runs the test harnesses.
+`tests\build.bat` builds and runs the test harnesses. Both `.bat` files run from the repo root.
 
-Those are the only two clones. The other two dependencies — zlib inflate and an LZMA decoder —
-are committed under [third_party/](third_party/) instead, because they are a handful of frozen
-files that decide what a run path *contains* rather than fifty that draw a panel.
-[third_party/VERSION.txt](third_party/VERSION.txt) records the upstream tag, the release
-archive's SHA-256 and what each build option switches off, so you can diff them against upstream
-yourself.
+Those are the only two clones. The decompressors — zlib inflate, LZMA and zstd — are committed under
+[third_party/](third_party/) instead, and [VERSION.txt](third_party/VERSION.txt) records the
+upstream tag, the release archive's SHA-256 and what each build option switches off, so you can diff
+them against upstream yourself.
 
-The C++ is in [src/](src/) and the harnesses in [tests/](tests/). Both `.bat` files run from the
-repo root and put their output there.
-
-`wrpath_extract.py` is still in the tree, under [tests/reference/](tests/reference/), and it is
-not shipped. It was the whole program once; it is now the oracle the port is checked against,
-the specification for what a `.wrpath` contains, and the way to answer "did the C++ get this
-wrong, or is this demo simply unextractable". [tests/parity.ps1](tests/parity.ps1) runs the two
-against each other over a real library and compares the files byte for byte.
+The C++ is in [src/](src/) and the harnesses in [tests/](tests/). `wrpath_extract.py`, the Python
+program this was ported from, is not shipped but survives under
+[tests/reference/](tests/reference/) as the oracle the port is checked against;
+[tests/parity.ps1](tests/parity.ps1) runs the two over a real library and compares the files byte
+for byte.
 
 ## How it works
 
 There is no entity access here and no game API: it finds the camera by scanning memory for the
 world-to-screen matrix, reads run paths out of the game's own `.mtv` demos, and projects the lines
-itself. If you want the long version — what is measured, what is approximate, and the things that
-were tried and thrown away — it is all in **[docs/how-it-works.md](docs/how-it-works.md)**.
+itself. The long version is in **[docs/how-it-works.md](docs/how-it-works.md)**.
 
 ## Licence
 
 MIT — see [LICENSE](LICENSE).
 
-Dear ImGui is MIT (Omar Cornut and contributors). MinHook is BSD-2-Clause (Tsuda Kageyu).
-Neither is redistributed here; both are cloned at build time.
-
-Two are redistributed, under [third_party/](third_party/), each with its own licence file beside
-it: **miniz** 3.1.2, MIT (Rich Geldreich and contributors), and the **LZMA SDK** 23.01, placed in
-the public domain by Igor Pavlov.
+Dear ImGui (MIT, Omar Cornut and contributors) and MinHook (BSD-2-Clause, Tsuda Kageyu) are cloned
+at build time, not redistributed here. Redistributed under [third_party/](third_party/), each with
+its own licence file beside it: **miniz** 3.1.2 (MIT, Rich Geldreich and contributors), the
+**LZMA SDK** 23.01 (public domain, Igor Pavlov) and **zstd** 1.5.7 (BSD-3-Clause, Meta Platforms).
 
 Not affiliated with or endorsed by Momentum Mod or Strata Source.

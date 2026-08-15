@@ -72,13 +72,28 @@
 // is not there. (The reference implementation needs one: Python's
 // LZMADecompressor takes dict_size as an allocation.)
 //
-// ZSTD IS RECOGNISED AND NOT DECODED
+// ZSTD IS DECODED, AND WAS NOT UNTIL v0.9.4
 //
-// About 3.5% of the demos here have a zstd body, and reading them needs a
-// second decompressor for a format that no current demo uses. They are a SKIP
-// and never an error, which is not a detail: the reference does not write skips
-// to _failed.txt, and recording them as failures would put a permanent entry in
-// every user's failure record that --retry-failed would re-fail forever.
+// It used to be recognised and refused -- a SKIP, never an error -- on the
+// grounds that it was a second decompressor for a format only a few percent of
+// demos used. Both halves of that turned out to be wrong about the population
+// that matters.
+//
+// The share is not a few percent where it counts. Across a whole install it is
+// about 5%, and 3.5% was the number this file carried for two releases. Across
+// the 2,220 demos DOWNLOADED FROM THE LEADERBOARD on this machine it is 7.7%,
+// and on surf_tropic it is 50 of 100 -- because zstd is what the long runs use
+// and a leaderboard is nothing but long runs. The quick menu on Delete downloads
+// exactly that population, so every second tick on that map reached a dead end.
+//
+// And "skip" is only kind when the thing skipped is rare. 172 demos on this
+// machine had no .wrpath for this reason and no failure record explaining it,
+// because skips are deliberately not written to _failed.txt. They looked like
+// runs nobody had extracted yet, forever.
+//
+// WR_MTV_CODEC_ZSTD survives as a codec, not as a refusal: the container shape
+// genuinely differs -- no Valve header, the frame carries its own size -- and
+// WrMtvBody branches on it.
 
 #ifndef WR_MTV_H
 #define WR_MTV_H
@@ -114,7 +129,7 @@ enum WrMtvCodec
 {
     WR_MTV_CODEC_NONE = 0,
     WR_MTV_CODEC_LZMA,
-    WR_MTV_CODEC_ZSTD           // recognised, deliberately not decoded
+    WR_MTV_CODEC_ZSTD           // a different container shape; see WrMtvBody
 };
 
 // Everything the container says. Sized from the reference's field widths: the
@@ -186,14 +201,11 @@ bool WrMtvPeek(const char *path, WrMtvHeader *out, char *err, int errCap);
 
 // Decompress it. malloc'd, and the caller free()s it.
 //
-// A zstd body is refused rather than decoded, and this is the ONE message in
-// this file that is not the reference's wording: its version names a pip
-// package, which is no longer advice anyone can act on. The difference is safe
-// because that message cannot reach a failure record -- the reference turns a
-// zstd body into a SKIP before it ever calls its own decompress_body, and skips
-// are not written to _failed.txt. Callers that need to make the same
-// distinction test h->codec instead of reading this; the refusal is the
-// backstop, not the mechanism.
+// Two containers behind one function, and the difference is not a flag on the
+// same layout: LZMA is a seventeen-byte Valve header (two u32 lengths and five
+// property bytes) and then the stream, while a zstd frame begins AT bodyOff and
+// carries its own output size. Both arms end the same way -- an allocation of
+// exactly the declared size, plus a spare byte, or a named refusal.
 unsigned char *WrMtvBody(const unsigned char *data, size_t len,
                          const WrMtvHeader *h, size_t *lenOut,
                          char *err, int errCap);
@@ -209,6 +221,28 @@ unsigned char *WrMtvBody(const unsigned char *data, size_t len,
 bool WrMtvLzmaDecode(const unsigned char *src, size_t srcLen,
                      unsigned char *dst, size_t dstLen,
                      const unsigned char props[5], char *err, int errCap);
+
+// The other codec, the same way, and note what it does NOT take: no property
+// bytes and no separate output size. A zstd frame carries both in its own
+// header, which is the whole structural difference between the two containers
+// -- see WrMtvBody.
+//
+// `dstLen` is what the frame said it would produce, read back out with
+// WrMtvZstdSize. Producing anything else is a failure rather than a short read:
+// the frame declared a number and a stream that disagrees with its own header
+// is not a stream we should be deriving a route from.
+bool WrMtvZstdDecode(const unsigned char *src, size_t srcLen,
+                     unsigned char *dst, size_t dstLen, char *err, int errCap);
+
+// How big the body will be, from the frame header alone, or 0 having said why.
+//
+// Separate from the decode because the caller has to allocate before it can
+// decode, and because "the frame does not say" is a refusal with its own
+// wording -- the reference hits the same wall from the other side, since
+// ZstdDecompressor().decompress() requires a declared content size and raises
+// without one.
+size_t WrMtvZstdSize(const unsigned char *src, size_t srcLen,
+                     char *err, int errCap);
 
 // ---------------------------------------------------------------------------
 // Files
