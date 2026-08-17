@@ -139,19 +139,51 @@ jobs:
           Compress-Archive -DestinationPath "dist/demo-line-practice-tool-v$v.zip" -Path `
             wrinject.exe, wrlines.dll, 'HOW TO USE.txt', LICENSE
 
-          # Symbols are a separate asset. wrlines.pdb alone is 8 MB against a
-          # 1.5 MB payload and would be most of what people downloaded.
-          Compress-Archive -DestinationPath "dist/demo-line-practice-tool-v$v-symbols.zip" -Path `
-            wrlines.pdb, wrinject.pdb, PROVENANCE.txt
+          # No symbols asset any more. wrlines.pdb alone is 8 MB against a
+          # 1.5 MB payload, so it was the largest thing on the release page,
+          # and nothing in this project reads it: there is no crash handler
+          # and no minidump writer, so its only consumer was a debugger
+          # attached by hand -- and anyone doing that can build the tag.
+          #
+          # PROVENANCE.txt travelled inside that zip and is not build noise,
+          # so it is published on its own. It names the two clones by commit,
+          # which is the half of "what went into this DLL" that this
+          # repository cannot answer by itself.
+          Copy-Item PROVENANCE.txt dist/
 
-          Get-FileHash dist/*.zip, wrinject.exe, wrlines.dll -Algorithm SHA256 |
+          # The two binaries LOOSE as well as zipped, and this is load-bearing
+          # rather than a convenience. The in-game updater downloads exactly
+          # these two names plus SHA256SUMS.txt; it cannot open the zip,
+          # because third_party\VERSION.txt compiles miniz's archive reader out
+          # on purpose -- "it is the part of miniz with a CVE history" -- and
+          # switching that back on to parse bytes off the network is the wrong
+          # direction. See src\wr_update.h.
+          Copy-Item wrinject.exe, wrlines.dll dist/
+
+          Get-FileHash dist/*.zip, wrinject.exe, wrlines.dll, PROVENANCE.txt -Algorithm SHA256 |
             ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } |
             Set-Content dist/SHA256SUMS.txt -Encoding ascii
           Get-Content dist/SHA256SUMS.txt
 
+          # If these ever stop being published nothing else here fails: the
+          # updater would quietly fall back to "open the release page" for
+          # every release from then on, for ever, and nobody would find out.
+          # Break the release instead.
+          foreach ($n in 'wrlines.dll','wrinject.exe','SHA256SUMS.txt') {
+            if (-not (Test-Path "dist/$n")) {
+              throw "dist\$n is missing. The in-game updater downloads it by that exact name; see src\wr_update.h."
+            }
+          }
+
+      # The loose binaries are attested too, not just the zips. They are what
+      # the in-game updater actually installs, so an attestation covering only
+      # the archive would cover the path fewest people take.
       - uses: actions/attest-build-provenance@v2
         with:
-          subject-path: 'dist/*.zip'
+          subject-path: |
+            dist/*.zip
+            dist/wrlines.dll
+            dist/wrinject.exe
 
       # The gh CLI rather than a third-party release action: one less thing in
       # the supply chain of a project that argues about supply chains.
@@ -178,4 +210,11 @@ jobs:
                is the only step that actually changes a Defender verdict.
 
           Do both BEFORE announcing the release.
+
+          More so since v0.9.5 than before it: the in-game updater downloads
+          these binaries and writes them next to the DLL, so a verdict against
+          this build is not just a scary prompt at install time -- it is
+          somebody's update failing halfway on a machine they are not watching.
+          The updater rolls that back and says what happened, but the report is
+          what stops it.
           '@ | Write-Host

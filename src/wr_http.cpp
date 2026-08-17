@@ -1,6 +1,7 @@
 // wr_http.cpp  --  see wr_http.h. One GET, and nothing else.
 
 #include "wr_http.h"
+#include "wr_log.h"     // one line, for the proxy downgrade in WrHttpGet
 
 #include <winhttp.h>
 
@@ -92,8 +93,26 @@ bool WrHttpGet(const char *url, const char *userAgent,
                           WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!session)
     {
-        Fail(err, errCap, "could not start WinHTTP (error %lu)", GetLastError());
-        return false;
+        // WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY is Windows 8.1 and newer, and
+        // Wine has not always accepted it -- it returns ERROR_INVALID_PARAMETER
+        // on the versions that do not. There is no reason for that to take down
+        // every network feature in the program at once behind one unhelpful
+        // line, which is what it used to do: the leaderboard, the demo fetch
+        // and the updater all arrive here.
+        //
+        // DEFAULT_PROXY rather than NO_PROXY, so a machine that really is
+        // behind a configured proxy still works; it reads the registry
+        // configuration instead of discovering one.
+        DWORD first = GetLastError();
+        session = WinHttpOpen(wua, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                              WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!session)
+        {
+            Fail(err, errCap, "could not start WinHTTP (error %lu)", first);
+            return false;
+        }
+        WrLogf("[i] http: automatic proxy detection was refused (error %lu); "
+               "using the configured proxy setting instead.", first);
     }
 
     {

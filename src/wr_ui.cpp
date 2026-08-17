@@ -24,9 +24,16 @@
 #include "wr_stress.h"
 #include "wr_hook.h"
 #include "wr_settings.h"
+#include "wr_update.h"
 #include "wr_log.h"
 
 #include "imgui.h"
+
+#include <shellapi.h>           // ShellExecuteA, for the release page button.
+                                // SHELL32.dll is already one of the six
+                                // imports, so this adds a function and not a
+                                // dependency -- see .github\workflows
+                                // \release.yml's $expected list.
 
 #include <float.h>
 #include <math.h>
@@ -4981,6 +4988,30 @@ static void DrawDiagnosticsTab(void)
                            "this on Linux");
     else
         ImGui::Text("platform    Windows");
+
+    // The cursor's source, spelled out. This exists because the one bug
+    // reported from Linux -- the panel opening with no usable pointer -- cannot
+    // be reproduced on Windows, so the only way to tell which half of
+    // WrCursorUpdate is misbehaving is to make the machine that has the problem
+    // say so. Four numbers, one screenshot, no round trip per guess.
+    {
+        bool followsOs = false, showing = false;
+        int stale = 0;
+        double rawAge = -1.0;
+        WrCursorDiag(&followsOs, &showing, &stale, &rawAge);
+
+        ImGui::Text("cursor      %s", followsOs ? "following the OS pointer"
+                                                : "virtual (raw mouse deltas)");
+        ImGui::Text("            CURSOR_SHOWING %s, stale %d/%d frames",
+                    showing ? "yes" : "no", stale, WR_OS_CURSOR_STALE_FRAMES);
+        if (rawAge < 0.0)
+            ImGui::Text("            raw input never arrived");
+        else
+            ImGui::Text("            raw input %.1f s ago", rawAge);
+        if (!WrWndProcInstalled())
+            ImGui::TextDisabled("            (window procedure not installed -- "
+                                "no panel is open)");
+    }
     ImGui::Text("emit        %d segments from %d points in %.2f ms", segs, pts, ms);
     ImGui::Text("batches     %d AddPolyline calls", batches);
     {
@@ -5147,6 +5178,159 @@ static void DrawDiagnosticsTab(void)
     ImGui::EndChild();
 }
 
+// The updater, which is three buttons and never more than one at a time.
+//
+// Everything about how this looks follows from wr_update.h: nothing has
+// happened before the first press, each press does one thing and stops, and the
+// panel says what is on disk afterwards rather than implying a process is under
+// way. There is no automatic check and no setting to make it automatic --
+// that is the design, not an omission, and the help marker says so where
+// somebody looking for the missing checkbox will find it.
+static void DrawUpdateBlock(void)
+{
+    WrUpdateInfo u;
+    WrUpdateGet(&u);
+    const bool busy = WrUpdateBusy();
+
+    ImGui::SeparatorText("Update");
+
+    ImGui::BeginDisabled(busy);
+    if (ImGui::Button("Check for updates"))
+        WrUpdateCheck();
+    ImGui::EndDisabled();
+
+    ImGui::SameLine();
+    HelpMarker(
+        "Asks api.github.com for this project's newest release and compares "
+        "the version number against the one running. That is the whole of the "
+        "check: no identifier is sent, nothing is downloaded, and nothing in "
+        "your install changes.\n\n"
+        "It happens when you press this and at no other time. Nothing here "
+        "runs at startup, on a timer or on a map change, and there is "
+        "deliberately no setting to make it automatic -- a program that "
+        "reaches out on its own and replaces its own files is the shape "
+        "antivirus software is looking for, and this one has enough of that "
+        "problem already.\n\n"
+        "Downloading is a second press and installing is a third. Nothing "
+        "outside wrlines_data changes until you press the third one.");
+
+    if (busy)
+    {
+        ImGui::SameLine();
+        ImGui::TextDisabled("working...");
+    }
+
+    // The status line. Coloured only where the colour means something: a
+    // failure, and the one case where there is a newer version to be had.
+    if (u.stage == WR_UPDATE_FAILED)
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.4f, 1.0f), "%s", u.status);
+    else if (u.stage == WR_UPDATE_AVAILABLE || u.stage == WR_UPDATE_STAGED ||
+             u.stage == WR_UPDATE_INSTALLED)
+        ImGui::TextColored(ImVec4(0.6f, 0.9f, 1.0f, 1.0f), "%s", u.status);
+    else
+        ImGui::TextDisabled("%s", u.status);
+
+    if (u.detail[0])
+        ImGui::TextWrapped("%s", u.detail);
+
+    // The release page, wherever there is one to open. Also the whole of the
+    // answer for a release this cannot download.
+    //
+    // The return value is checked, and it is checked because of Proton: inside
+    // the pressure-vessel container the http association goes to winebrowser,
+    // which shells out to xdg-open on a host session it may not be able to
+    // reach. This is the ONLY route offered for a release with no loose assets,
+    // so a button that quietly does nothing there would be the end of the road.
+    // ShellExecute's success values are >32; anything else is an error code.
+    static bool s_browserFailed = false;
+    if (u.htmlUrl[0])
+    {
+        if (ImGui::Button("Open the release page"))
+        {
+            HINSTANCE rc = ShellExecuteA(NULL, "open", u.htmlUrl, NULL, NULL,
+                                         SW_SHOWNORMAL);
+            s_browserFailed = ((INT_PTR)rc <= 32);
+            if (s_browserFailed)
+                WrLogf("[update] could not open a browser for %s (%lld)",
+                       u.htmlUrl, (long long)(INT_PTR)rc);
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("in your browser");
+
+        if (s_browserFailed)
+        {
+            ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.35f, 1.0f),
+                               "No browser opened. The address is below -- "
+                               "select it and copy it by hand.");
+            // Read-only rather than a label, so it can actually be selected.
+            char url[sizeof(u.htmlUrl)];
+            strcpy_s(url, sizeof(url), u.htmlUrl);
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::InputText("##releaseurl", url, sizeof(url),
+                             ImGuiInputTextFlags_ReadOnly);
+        }
+    }
+
+    if (u.stage == WR_UPDATE_AVAILABLE && u.loose)
+    {
+        ImGui::BeginDisabled(busy);
+        if (ImGui::Button("Download it"))
+            WrUpdateDownload();
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (u.bytes > 0)
+            ImGui::TextDisabled("two files, %.1f MB, into wrlines_data\\update",
+                                (double)u.bytes / (1024.0 * 1024.0));
+        else
+            ImGui::TextDisabled("into wrlines_data\\update");
+    }
+
+    if (u.stage == WR_UPDATE_STAGED)
+    {
+        // The digests, on screen rather than merely compared. They are what a
+        // person can hold against the release page or the readme, and that is
+        // the part of this a hash check is actually good for -- the manifest
+        // came down the same connection as the files, so matching it is not a
+        // signature and the wording below must not suggest it is.
+        ImGui::TextDisabled("%-13s %s", WR_UPDATE_DLL, u.dllHex);
+        ImGui::TextDisabled("%-13s %s", WR_UPDATE_EXE, u.exeHex);
+
+        ImGui::BeginDisabled(busy);
+        if (ImGui::Button("Install it"))
+            WrUpdateInstall();
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        HelpMarker(
+            "Renames the pair beside this DLL to .old and puts the downloaded "
+            "pair at their paths. The new version runs the next time you start "
+            "the game -- this DLL never unloads, so what you are looking at "
+            "now keeps running until then.\n\n"
+            "If anything goes wrong the .old files are put straight back, so a "
+            "press that fails leaves you exactly where you were.\n\n"
+            "The digests above are the ones the release published. They mean "
+            "every byte arrived; they are not a signature, because the list "
+            "they were checked against came from the same place the files "
+            "did.");
+    }
+
+    // A release body is markdown and is shown as the plain text it is. Its own
+    // scrolling box, because some of them are long and this is the bottom of a
+    // tab that already has a lot in it.
+    if (u.notes[0] && (u.stage == WR_UPDATE_AVAILABLE ||
+                       u.stage == WR_UPDATE_STAGED ||
+                       u.stage == WR_UPDATE_INSTALLED))
+    {
+        if (ImGui::TreeNode("What changed"))
+        {
+            ImGui::BeginChild("relnotes", ImVec2(0.0f, 140.0f),
+                              ImGuiChildFlags_Borders);
+            ImGui::TextWrapped("%s", u.notes);
+            ImGui::EndChild();
+            ImGui::TreePop();
+        }
+    }
+}
+
 static void DrawAboutTab(void)
 {
     ImGui::TextWrapped("WrLines " WRLINES_VERSION);
@@ -5170,7 +5354,12 @@ static void DrawAboutTab(void)
         "It sets no cvars, runs no console commands, and never touches "
         "sv_cheats. Its own files all live in wrlines_data next to the DLL.");
     ImGui::TextWrapped(
-        "One exception, and it is opt-in: pressing \"send\", \"local\" or "
+        "Two exceptions, and both are opt-in. Pressing \"install\" under "
+        "Update below replaces wrlines.dll and wrinject.exe in this folder "
+        "with a downloaded pair, keeping the ones it replaced beside them as "
+        ".old until the next time the game starts.");
+    ImGui::TextWrapped(
+        "And: pressing \"send\", \"local\" or "
         "\"watch\" on a run copies that one demo into the game's replay folder "
         "so the game can play it. Every copy is written into "
         "wrlines_data\\into_game.txt first, and nothing outside that list can be "
@@ -5244,6 +5433,8 @@ static void DrawAboutTab(void)
                            "written by a different version, and ignored.",
                            WrSettingsUnknownKeys(),
                            WrSettingsUnknownKeys() == 1 ? "" : "s");
+
+    DrawUpdateBlock();
 
     ImGui::SeparatorText("Files");
     ImGui::TextDisabled("%s", WrDataPath(""));

@@ -16,7 +16,7 @@
 #ifndef WR_VERSION_H
 #define WR_VERSION_H
 
-#define WRLINES_VERSION     "0.9.4"
-#define WRLINES_VERSION_NUM 0, 9, 4, 0
+#define WRLINES_VERSION     "0.9.5"
+#define WRLINES_VERSION_NUM 0, 9, 5, 0
 
 #endif

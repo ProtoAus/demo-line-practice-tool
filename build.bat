@@ -95,6 +95,10 @@ set "SRC=%SRC% %S%\wr_start.cpp %S%\wr_settings.cpp %S%\wr_quick.cpp"
 set "SRC=%SRC% %S%\wr_json.cpp %S%\wr_msml.cpp %S%\wr_mtv.cpp %S%\wr_peek.cpp"
 set "SRC=%SRC% %S%\wr_http.cpp %S%\wr_api.cpp %S%\wr_fetch.cpp"
 set "SRC=%SRC% %S%\wr_dp.cpp %S%\wr_demo.cpp %S%\wr_jobs.cpp"
+rem wr_sha256.cpp is written out rather than linked from BCrypt or ADVAPI32 on
+rem purpose: either of those would add a seventh import and break the claim the
+rem README makes about this list. wr_sha256.h has the argument in full.
+set "SRC=%SRC% %S%\wr_sha256.cpp %S%\wr_update.cpp"
 
 rem IMGUI_USER_CONFIG is resolved by the preprocessor relative to the file that
 rem does the #include -- imgui\imgui.h -- and NOT relative to the working

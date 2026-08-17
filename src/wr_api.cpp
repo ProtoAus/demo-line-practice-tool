@@ -97,6 +97,12 @@ void WrApiFriendsUrl(char *out, int cap, int mapId, int gamemode, int trackType,
     }
 }
 
+void WrApiLatestReleaseUrl(char *out, int cap)
+{
+    _snprintf_s(out, (size_t)cap, _TRUNCATE,
+                WR_GITHUB_API "/repos/" WR_GITHUB_REPO "/releases/latest");
+}
+
 // ---------------------------------------------------------------------------
 // _epoch
 // ---------------------------------------------------------------------------

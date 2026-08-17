@@ -122,6 +122,18 @@ cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% tests\test_scale.cpp ^
    /Fe:tests\test_scale.exe /Fo:tests\ >nul
 if errorlevel 1 ( echo [!] test_scale FAILED to build & exit /b 1 )
 
+rem test_args links nothing either, and that is why src\wr_args.h exists as a
+rem header at all: injector.cpp is a translation unit with main() in it, so its
+rem argument parsing could not be driven from here without linking two mains
+rem together. What it pins is a promise -- "wrinject.exe" and "wrinject.exe
+rem path\to\wrlines.dll" must parse as they always did -- and a platform: on
+rem Linux this program runs from a Steam launch option with no console anybody
+rem is watching, so a mistyped argument there is not an error message, it is a
+rem tool that silently never appears.
+cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% tests\test_args.cpp ^
+   /Fe:tests\test_args.exe /Fo:tests\ >nul
+if errorlevel 1 ( echo [!] test_args FAILED to build & exit /b 1 )
+
 rem test_json needs nothing but itself: wr_json.cpp includes no Windows header
 rem and calls nothing, which is the property that lets it be checked this hard.
 cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% tests\test_json.cpp ^
@@ -143,6 +155,18 @@ cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Itests /Ithird_party\miniz ^
    %S%\wr_maps.cpp %S%\wr_msml.cpp %S%\wr_json.cpp %S%\wr_log.cpp tests\miniz.obj ^
    /Fe:tests\test_maps.exe /Fo:tests\ >nul
 if errorlevel 1 ( echo [!] test_maps FAILED to build & exit /b 1 )
+
+rem test_sha256 is the whole of the argument for src\wr_sha256.cpp existing.
+rem That header claims hand-writing a hash is safe where hand-writing a
+rem decompressor would not be, because a wrong hash fails a published vector by
+rem every bit rather than producing slightly different bytes. The claim is only
+rem worth something if the vectors run, so they do -- and so does every chunk
+rem size from 1 to 100, which is the partial-block bookkeeping WrSha256File's
+rem 64 KB reads depend on.
+cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Itests ^
+   tests\test_sha256.cpp %S%\wr_sha256.cpp ^
+   /Fe:tests\test_sha256.exe /Fo:tests\ >nul
+if errorlevel 1 ( echo [!] test_sha256 FAILED to build & exit /b 1 )
 
 rem The LZMA decoder, shared by the three harnesses below and by wrextract, the
 rem same way miniz.obj is. No options: third_party\VERSION.txt says why the
@@ -242,6 +266,19 @@ cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Itests /Ithird_party\miniz ^
    /Fe:tests\test_fetch.exe /Fo:tests\ >nul
 if errorlevel 1 ( echo [!] test_fetch FAILED to build & exit /b 1 )
 
+rem test_update drives the three functions that read somebody else's text and
+rem decide from it whether to replace two binaries: the version compare, the
+rem release parser and the manifest reader. It links wr_http.cpp for the same
+rem reason test_api does -- so that a request escaping the harness would be a
+rem real one -- and makes none: every input here is a string in the file.
+cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Itests /Ithird_party\miniz ^
+   tests\test_update.cpp ^
+   %S%\wr_update.cpp %S%\wr_sha256.cpp %S%\wr_api.cpp %S%\wr_http.cpp ^
+   %S%\wr_board.cpp %S%\wr_msml.cpp %S%\wr_json.cpp %S%\wr_log.cpp ^
+   tests\miniz.obj winhttp.lib ^
+   /Fe:tests\test_update.exe /Fo:tests\ >nul
+if errorlevel 1 ( echo [!] test_update FAILED to build & exit /b 1 )
+
 rem test_seam lived here. It was written at P0 and its whole subject was that
 rem the typed request produced EXACTLY the command line the nine call sites used
 rem to format by hand -- eleven argv strings, byte for byte. It was temporary by
@@ -332,7 +369,9 @@ tests\test_live.exe       || set "RC=1"
 tests\test_settings.exe   || set "RC=1"
 tests\test_quick.exe      || set "RC=1"
 tests\test_scale.exe      || set "RC=1"
+tests\test_args.exe       || set "RC=1"
 tests\test_json.exe       || set "RC=1"
+tests\test_sha256.exe     || set "RC=1"
 tests\test_maps.exe       || set "RC=1"
 tests\test_lzma.exe       || set "RC=1"
 tests\test_zstd.exe       || set "RC=1"
@@ -340,6 +379,7 @@ tests\test_mtv.exe        || set "RC=1"
 tests\test_peek.exe       || set "RC=1"
 tests\test_api.exe        || set "RC=1"
 tests\test_fetch.exe      || set "RC=1"
+tests\test_update.exe     || set "RC=1"
 tests\test_dp.exe         || set "RC=1"
 tests\test_wrpath.exe     || set "RC=1"
 tests\test_jobs.exe       || set "RC=1"

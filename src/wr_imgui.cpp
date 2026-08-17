@@ -13,6 +13,9 @@
 #include "backends/imgui_impl_win32.h"
 #include "backends/imgui_impl_dx11.h"
 
+#include <stdio.h>      // _snprintf_s, for the font search
+#include <string.h>
+
 static ImGuiContext *g_ctx = NULL;
 static bool g_backendsReady = false;
 
@@ -43,42 +46,195 @@ static const float kFontSizes[] = {
 
 static ImFont *g_fonts[WR_FONT_COUNT];
 static int g_fontCount = 0;
-static bool g_monospace = false;
+static bool g_baked = false;        // the ladder above is real, so nothing is scaled
+static bool g_monospace = false;    // and the face is fixed-width, so widths are constant
 
-static void LoadFonts(ImGuiIO &io)
+// TWO flags rather than one, because they used to be the same flag and they are
+// not the same fact. "Every size in the ladder exists" is what stops text being
+// magnified; "the digits are all the same width" is what stops the corner block
+// sliding around. A proportional face baked at the right sizes has the first
+// property without the second, and that combination is worth having -- see
+// LoadFonts.
+
+// Where the faces come from.
+//
+// This used to be one hardcoded string, C:\Windows\Fonts\consola.ttf, and on
+// Windows that is still the first thing tried and still what gets used. But
+// Consolas is a Microsoft font and a Wine prefix does not have one, so every
+// Linux user has been falling all the way through to the 13 px bitmap face that
+// this whole baked ladder exists to get rid of -- and had no way to know it,
+// because blurry is exactly what the tool looked like before the ladder existed.
+//
+// So ask Windows where its font directory is, which inside a prefix is the
+// prefix's own, and work down. The order is deliberate: named monospaced faces
+// first, then anything calling itself mono, and only then a proportional face,
+// because sharp and proportional still beats blurry and proportional and the
+// only thing given up is the fixed-width digits that WrFontIsMonospace() guards.
+static const char *kMonoFonts[] = {
+    "consola.ttf",                  // Consolas -- every Windows since Vista
+    "lucon.ttf",                    // Lucida Console -- older Windows
+    "cour.ttf",                     // Courier New, and Wine's substitute for it
+    "DejaVuSansMono.ttf",
+    "LiberationMono-Regular.ttf",
+    "NotoSansMono-Regular.ttf",
+    "UbuntuMono-R.ttf",
+    "FreeMono.ttf",
+};
+
+static const char *kAnyFonts[] = {
+    "tahoma.ttf",                   // Wine ships this one itself
+    "segoeui.ttf",
+    "arial.ttf",
+    "LiberationSans-Regular.ttf",
+    "DejaVuSans.ttf",
+};
+
+#define WR_ARRAY_LEN(a) (int)(sizeof(a) / sizeof((a)[0]))
+
+static bool FontDir(char *out, size_t cap)
 {
-    // The system face. Present on every Windows since Vista; if it is somehow
-    // missing we fall through to the built-in one rather than fail to start.
-    static const char *kPath = "C:\\Windows\\Fonts\\consola.ttf";
+    char win[MAX_PATH];
+    UINT n = GetWindowsDirectoryA(win, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH)
+        return false;
+    return _snprintf_s(out, cap, _TRUNCATE, "%s\\Fonts", win) >= 0;
+}
 
+static bool FontExists(const char *dir, const char *name, char *out, size_t cap)
+{
+    if (_snprintf_s(out, cap, _TRUNCATE, "%s\\%s", dir, name) < 0)
+        return false;
+    return GetFileAttributesA(out) != INVALID_FILE_ATTRIBUTES;
+}
+
+// Whatever this prefix actually has. `want` is a lowercase substring the name
+// must contain, or NULL for anything at all.
+static bool FontScan(const char *dir, const char *want, char *out, size_t cap)
+{
+    char pattern[MAX_PATH];
+    if (_snprintf_s(pattern, sizeof(pattern), _TRUNCATE, "%s\\*.ttf", dir) < 0)
+        return false;
+
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE)
+        return false;
+
+    bool found = false;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            continue;
+        if (want)
+        {
+            char low[MAX_PATH];
+            strcpy_s(low, sizeof(low), fd.cFileName);
+            _strlwr_s(low, sizeof(low));
+            if (!strstr(low, want))
+                continue;
+        }
+        found = _snprintf_s(out, cap, _TRUNCATE, "%s\\%s", dir, fd.cFileName) >= 0;
+    } while (!found && FindNextFileA(h, &fd));
+
+    FindClose(h);
+    return found;
+}
+
+// One file, every size in the ladder, all or nothing. Partial success is worse
+// than none: WrFontFor picks the NEAREST baked size, so a ladder with holes in
+// it would quietly go back to scaling for the sizes that were missing, which is
+// the exact bug this file exists to have fixed.
+static bool BakeLadder(ImGuiIO &io, const char *path)
+{
     ImFontConfig cfg;
     cfg.OversampleH = 2;        // 1 is what made the default face mushy
     cfg.OversampleV = 1;
     cfg.PixelSnapH = false;
 
+    int n = 0;
     for (int i = 0; i < WR_FONT_COUNT; i++)
     {
-        ImFont *f = io.Fonts->AddFontFromFileTTF(kPath, kFontSizes[i], &cfg);
+        ImFont *f = io.Fonts->AddFontFromFileTTF(path, kFontSizes[i], &cfg);
         if (!f)
             break;
-        g_fonts[g_fontCount++] = f;
+        g_fonts[n++] = f;
     }
-
-    if (g_fontCount == WR_FONT_COUNT)
+    if (n == WR_FONT_COUNT)
     {
-        g_monospace = true;
-        WrLogf("fonts: Consolas baked at %d sizes, %.0f-%.0f px", g_fontCount,
-               kFontSizes[0], kFontSizes[WR_FONT_COUNT - 1]);
-        return;
+        g_fontCount = n;
+        return true;
     }
 
-    // Partial success is worse than none -- the size ladder would have holes.
     io.Fonts->Clear();
     g_fontCount = 0;
+    return false;
+}
+
+static void LoadFonts(ImGuiIO &io)
+{
+    char dir[MAX_PATH] = {0};
+    char path[MAX_PATH];
+
+    g_fontCount = 0;
+    g_baked = false;
+    g_monospace = false;
+
+    if (FontDir(dir, sizeof(dir)))
+    {
+        for (int i = 0; i < WR_ARRAY_LEN(kMonoFonts); i++)
+        {
+            if (!FontExists(dir, kMonoFonts[i], path, sizeof(path)))
+                continue;
+            if (!BakeLadder(io, path))
+                continue;
+            g_baked = g_monospace = true;
+            WrLogf("fonts: %s baked at %d sizes, %.0f-%.0f px (monospaced)",
+                   path, g_fontCount, kFontSizes[0], kFontSizes[WR_FONT_COUNT - 1]);
+            return;
+        }
+
+        if (FontScan(dir, "mono", path, sizeof(path)) && BakeLadder(io, path))
+        {
+            g_baked = g_monospace = true;
+            WrLogf("fonts: %s baked at %d sizes (monospaced, found by name)",
+                   path, g_fontCount);
+            return;
+        }
+
+        // Proportional, but baked, which is the half that matters most: the
+        // readout stops being a magnified bitmap. The corner block will change
+        // width with the digits in it, and that is what WrFontIsMonospace() is
+        // for -- the layout asks, rather than assuming.
+        for (int i = 0; i < WR_ARRAY_LEN(kAnyFonts); i++)
+        {
+            if (!FontExists(dir, kAnyFonts[i], path, sizeof(path)))
+                continue;
+            if (!BakeLadder(io, path))
+                continue;
+            g_baked = true;
+            WrLogf("[i] fonts: no monospaced face here, so %s is baked at %d "
+                   "sizes instead. Text is sharp; the crosshair readout will "
+                   "change width as the numbers do.", path, g_fontCount);
+            return;
+        }
+
+        if (FontScan(dir, NULL, path, sizeof(path)) && BakeLadder(io, path))
+        {
+            g_baked = true;
+            WrLogf("[i] fonts: falling back to %s, baked at %d sizes. Text is "
+                   "sharp; the crosshair readout will change width as the "
+                   "numbers do.", path, g_fontCount);
+            return;
+        }
+    }
+
+    io.Fonts->Clear();
+    g_fontCount = 0;
+    g_baked = false;
     g_monospace = false;
     g_fonts[g_fontCount++] = io.Fonts->AddFontDefault();
-    WrLogf("[!] fonts: could not load %s; falling back to the built-in 13 px "
-           "face. Large text will be scaled and will look soft.", kPath);
+    WrLogf("[!] fonts: no usable TTF in %s; falling back to the built-in 13 px "
+           "face. Large text will be scaled and will look soft.",
+           dir[0] ? dir : "the system font directory");
 }
 
 ImFont *WrFontFor(float wantPixels, float *actual)
@@ -98,8 +254,11 @@ ImFont *WrFontFor(float wantPixels, float *actual)
         if (err < 0.0f) err = -err;
         if (err < bestErr) { bestErr = err; best = i; }
     }
+    // g_baked, not g_monospace: the question here is whether the size on the
+    // ladder is a size that really exists, which is true for any baked face.
+    // Whether it is fixed-width is a separate question, and a different caller's.
     if (actual)
-        *actual = g_monospace ? kFontSizes[best] : wantPixels;
+        *actual = g_baked ? kFontSizes[best] : wantPixels;
     return g_fonts[best];
 }
 

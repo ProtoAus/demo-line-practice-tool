@@ -39,6 +39,7 @@
 #include "wr_intogame.h"
 #include "wr_settings.h"
 #include "wr_quick.h"
+#include "wr_update.h"
 
 #include "imgui.h"
 
@@ -251,6 +252,12 @@ static DWORD WINAPI InitThread(LPVOID)
     // old settings file load into a new build without resetting the settings the
     // build has added since.
     WrSettingsInit();
+
+    // Deletes the pair a previous install renamed aside. It happens here and
+    // not there because the file that would have deleted them was the one still
+    // mapped at that path -- see wr_update.h. This reads two directory entries
+    // and reaches no network: the update CHECK is a button and only a button.
+    WrUpdateSweepOld();
 
     // Said once, at startup, before anything can fail quietly because of it.
     // See WrPathIsAscii: this build cannot open a path with a byte >= 0x80 in

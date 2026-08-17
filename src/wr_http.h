@@ -17,15 +17,31 @@
 //      arm that does anything else. No POST, no PUT, no cookies, no
 //      credentials, no redirect to a scheme it did not start with.
 //   3. The URLs it is ever handed are built in src\wr_api.cpp, all of them from
-//      one constant host, plus -- from v0.6.1 -- the absolute downloadURL that
-//      Momentum's own leaderboard reply contained. Nothing else in the project
-//      constructs a URL.
+//      TWO constant hosts, plus -- from v0.6.1 -- the absolute downloadURL that
+//      Momentum's own leaderboard reply contained, and -- from v0.9.5 -- the
+//      absolute browser_download_url that GitHub's own release reply contained.
+//      Nothing else in the project constructs a URL.
+//
+//      The second host is api.github.com and it arrived with the updater. It is
+//      asked one question, "what is the newest release", and the answer is a
+//      version number that gets compared against this build's own. See
+//      wr_update.h. GitHub redirects an asset download to
+//      objects.githubusercontent.com, which WinHTTP follows without being asked
+//      to, so that name will show up in a packet capture and is named here so
+//      that seeing it is not a surprise.
 //   4. It sends no identifier of any kind. No machine id, no SteamID, no
 //      installation guid, no counter. The one leaderboard call that names
 //      SteamIDs names your FRIENDS', because you pressed a button that says it
 //      will look them up, and it is the same list the Steam client already has.
+//      GitHub is sent the User-Agent below and nothing else at all.
 //   5. It is never called except from a job started by a button press. Nothing
 //      here runs on a timer, at startup, or on a map change.
+//
+//      This one did not change when the updater arrived, and that is the point
+//      of the updater's design rather than an accident of it: checking for a
+//      new version is a button like every other caller here, there is no
+//      setting to make it automatic, and nothing consults the network because
+//      time passed or because the game did something.
 //
 // The honest cost of the port is that "no HTTP client is linked" was a stronger
 // statement than any of that, because it needed no trust at all. What replaced
@@ -41,7 +57,13 @@
 // be tens of thousands of lines of third-party code on the network path, which
 // is the exact opposite of what the rest of this project is arranged around.
 //
-// Wine implements WinHTTP, so this works under Proton as the rest does.
+// Wine implements WinHTTP, so this works under Proton as the rest does. One
+// Wine-shaped detail: the session asks for automatic proxy DISCOVERY, which is
+// a Windows 8.1 access type that older Wine refuses outright. Being refused
+// used to take down the leaderboard, the demo fetch and the updater together
+// behind a single unhelpful line, so it now falls back to the configured proxy
+// setting and says so in the log. Neither mode sends anything a plain GET does
+// not; claim 4 is unaffected either way.
 //
 // WHY A NEW SESSION PER REQUEST
 //

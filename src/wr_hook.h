@@ -58,12 +58,34 @@ void WrBackbufferSize(int *w, int *h);
 //   * The game has hidden and captured it (normal play) -> we integrate raw
 //     input deltas ourselves, because the OS cursor is pinned to screen centre
 //     and useless.
+// Choosing between them is NOT "is the OS cursor visible" -- that answer is not
+// reliable under Wine, where a game holding mouselook can still be reported as
+// showing a pointer. It is "does the reported position move when the mouse
+// does". See WrCursorUpdate.
 void WrVirtualCursor(float *x, float *y);
 void WrCursorUpdate(void);
 bool WrCursorFollowsOS(void);
 
-// True when the loaded d3d11.dll is DXVK rather than the system one. Shown in
-// Diagnostics; nothing in the hook path depends on it.
+// How many consecutive frames the OS pointer may sit still while the mouse is
+// demonstrably moving before WrCursorUpdate stops believing it. A tenth of a
+// second at 60 fps: long enough not to trip on a slow hand, short enough that
+// the handover is not noticeable. Here rather than in the .cpp only because
+// Diagnostics shows the count against it.
+#define WR_OS_CURSOR_STALE_FRAMES 8
+
+// What that decision looked like this frame, for the Diagnostics tab. The
+// Linux cursor bug cannot be reproduced from Windows, so the panel has to be
+// able to answer the question from the machine where it happens: which source
+// is live, what GetCursorInfo claims, how many frames the OS pointer has sat
+// still while the mouse moved, and how long since raw input last arrived
+// (negative meaning it never has).
+void WrCursorDiag(bool *followsOs, bool *cursorShowing, int *staleFrames,
+                  double *rawAgeSeconds);
+
+// True when the loaded d3d11.dll is DXVK rather than the system one -- which
+// includes every Proton install, where DXVK's d3d11.dll lives in the prefix's
+// own system32 and so cannot be told apart by its path. Shown in Diagnostics;
+// nothing in the hook path depends on it.
 bool WrIsDxvk(void);
 const char *WrD3D11Path(void);
 

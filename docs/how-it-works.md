@@ -35,8 +35,8 @@ oracle the port is checked against, and is not in the download.
 **Requires:** Windows x64, Momentum Mod Playtest (Strata Source), and D3D11 or DXVK. Nothing
 else — no interpreter, no runtime, no installer. There is no 32-bit path anywhere in the game,
 so both binaries are x64.
-**Linux works, through Proton** — see [Linux](#linux) below for why that is the answer rather
-than a native build.
+**Linux works, through Proton, and it is one line in Steam's launch options** — see
+[Linux](#linux) below for that line, and for why it is the answer rather than a native build.
 
 ---
 
@@ -356,6 +356,50 @@ is a bare `imgui.ini` relative to the working directory, which for an injected D
 belongs to the game's own devui — so that was set to `NULL`, and the cost was the panel forgetting
 where it was every session. An absolute path under our folder keeps the promise and fixes the
 forgetting.
+
+## Updating itself
+
+Arrived in 0.9.5, and the shape of it is the interesting part rather than the mechanism.
+
+The mechanism is small. `WINHTTP.dll` was already an import and `wr_json.cpp` was already walking a
+paginated API, so asking `api.github.com` what the newest release is costs about eighty lines and no
+new dependency. Replacing the files is possible because **a mapped image can be renamed even while
+it is executing**: the loader's own handle was opened allowing `FILE_SHARE_DELETE`, and a rename
+inside one directory changes a name rather than the bytes behind the section. So `wrlines.dll` moves
+itself aside to `wrlines.dll.old` and the new one takes its path, and the code doing the moving goes
+on running out of the file it just renamed.
+
+**Three presses, and no fourth thing that happens by itself.** Check, download, install. Nothing
+runs at startup, on a timer or on a map change; there is no setting to enable an automatic check,
+and the absence is the feature. An unsigned program that reaches out unprompted and rewrites its own
+executables is, behaviour for behaviour, what a dropper is — and this project already carries
+`Trojan:Win32/Wacatac.B!ml` and `Program:Win32/Wacapew.C!ml` for its injector alone. Everything
+unattended is something that has to be argued away in a false-positive report, so there is nothing
+unattended. `src\wr_http.h`'s claim 5 — *"never called except from a job started by a button press"*
+— is unchanged by this feature, which is the test the design was written to pass.
+
+**What the hash check is worth, stated exactly.** Both binaries are checked against the release's
+own `SHA256SUMS.txt`, in memory, before a byte reaches the disk. That manifest arrives over the same
+connection as the files, so it is **not** a signature and the panel does not call it one: TLS to
+github.com is the trust anchor. What the check does buy is real — a truncated transfer cannot be
+installed, and the digest goes on screen so it can be compared by eye against the release page. The
+attestation is the stronger path and the README points at it.
+
+`SHA256` is written out in `src\wr_sha256.cpp` rather than taken from `BCrypt` or `ADVAPI32`,
+because either of those adds a seventh name to the import list the README makes a claim about. That
+is safe to hand-write for the same reason a decompressor is not: a wrong hash fails the first
+published test vector by every bit, where a wrong inflate produces slightly different bytes and
+bends a line with nothing to notice it. `tests\test_sha256.cpp` runs the FIPS 180-2 vectors, both
+sides of every block boundary, and every chunk size from 1 to 100.
+
+**The one dangerous moment is the install, and three things guard it.** Between the rename and the
+copy there is an instant with no `wrlines.dll` at its path, and a scanner that eats the replacement
+in that instant would leave somebody with neither version. So the module directory is probed for
+writability *before* anything moves — which is also how a `Program Files` install is caught and
+reported instead of half-done — the copy is re-hashed **where it landed** rather than where it came
+from, and any failure renames the `.old` files back. A press that goes wrong ends with exactly what
+it started with. The `.old` pair is swept on the next DLL load, because the file that would have
+deleted it was the one still mapped.
 
 ## Build
 
@@ -1616,12 +1660,15 @@ What replaced it is narrower but still checkable in a couple of minutes, and
 - `WinHttp` — the prefix every function in that API carries — appears in [src/](../src/) in
   exactly two files, `wr_http.cpp` and its header. 120 lines, one function, GET and nothing else.
   No POST, no cookies, no credentials, no scheme it did not start with.
-- Every URL is built in one place from one constant host, plus the absolute `downloadURL` the
-  server's own reply contained.
+- Every URL is built in one place from two constant hosts, plus the absolute `downloadURL` and
+  `browser_download_url` those servers' own replies contained. The second host is
+  `api.github.com` and it arrived with the updater in 0.9.5; it is asked what the newest release
+  is, and nothing else.
 - It sends no identifier of any kind. The User-Agent names the tool and this repo and that is
   all. The one request that carries SteamID64s carries your *friends'*, because you pressed a
-  button that says so.
-- Nothing runs on a timer, at startup, or on a map change.
+  button that says so. GitHub is sent the User-Agent and nothing else at all.
+- Nothing runs on a timer, at startup, or on a map change. The updater did not change this and
+  was designed not to — see [Updating itself](#updating-itself).
 
 One consequence worth stating: downloaded demos carry other players' names and SteamID64s, the
 same as the ones the game downloads. That is why `wrlines_data\` is gitignored.
@@ -2249,26 +2296,102 @@ the same machinery would be far less reliable while looking equally confident.
 
 ## Linux
 
-**It works, through Proton, and that is the answer rather than a shortcoming.**
+**It works, through Proton, and it is one line in Steam's launch options.**
 
-There is no native Linux build to make. The Momentum install ships `bin\win64` and **zero
-`.so` files** — checked on this machine — so there is no native Linux game for a native Linux
-tool to attach to. Proton runs the Windows game, which is why the Windows DLL loaded into it
-and worked. A `.so` would have nothing to hook.
+There is no native Linux build of *this* to make. `wrinject.exe` is a Win32 process injector,
+the overlay is a D3D11 Present hook, and both are Windows by nature — a `.so` would have
+nothing to attach to. So the Windows build runs in the same Wine prefix as the Windows game,
+which is what it was already doing on the machines where this worked.
 
-What that means in practice:
+### Set-up
 
-- Inject **inside the same Wine prefix** as the game. `wrinject.exe` uses Toolhelp32,
-  `VirtualAllocEx` and `CreateRemoteThread`, all of which Wine implements; run it through the
-  game's own prefix (`protontricks`, or `WINEPREFIX=... proton run wrinject.exe`).
-- The panel's **Diagnostics** tab reports `platform  Wine/Proton` when it detects one, because
-  that changes what several other lines on that tab mean — which `d3d11.dll` is loaded, and
-  whether a path the game printed is a Windows path or a `Z:` view of a Linux one.
-- **Nothing has to be installed inside the prefix**, and that is new at v0.7.0. Until then the
-  extractor was a Python script launched as a child process from inside the game, so it needed
-  an interpreter on the *prefix's* `PATH` — and a Python installed on the Linux side is not on
-  it. That was the single most confusing thing about running this under Proton, and it is gone:
-  extraction happens inside the DLL, which is already inside the prefix by definition.
+**1. Force a Proton version** in the game's Properties → Compatibility. Momentum has a native
+Linux build now, and a Windows DLL cannot be injected into a native Linux process. If this step
+is skipped, everything below fails with the injector never finding the game.
+
+**2. Put the WrLines folder inside the game's own directory**, e.g.
+`steamapps/common/Momentum Mod Playtest/wrlines/`. Nothing forces this, but it makes the path
+short, ASCII and definitely writable — which sidesteps the `Z:` mapping, the `MAX_PATH` buffers
+and the non-ASCII warning `dllmain.cpp` prints, all at once.
+
+**3. One launch option:**
+
+```
+PROTON_REMOTE_DEBUG_CMD="/full/path/to/wrlines/wrinject.exe --wait" %command%
+```
+
+That is the whole of it. Start the game from Steam as normal; the panel is on INSERT as ever.
+
+### Why that line works and the obvious ones do not
+
+Proton's own launch script reads `PROTON_REMOTE_DEBUG_CMD`, runs it as `wine <cmd>` with the
+game's complete environment, and kills it when the game exits. That puts the injector **inside
+the container, in the game's prefix, under the game's wineserver** — which is the only place it
+can see `momentum.exe` at all.
+
+`protontricks-launch`, or `WINEPREFIX=... proton run wrinject.exe`, cannot do this, and earlier
+versions of this document wrongly said they could. Steam's pressure-vessel container gets a
+private `/run`, so `XDG_RUNTIME_DIR` differs, so a second launch over the *same* `WINEPREFIX`
+starts a **second wineserver**. `CreateToolhelp32Snapshot` is answered by that second
+wineserver, which has never heard of the game — the symptom is the injector reporting that
+momentum.exe is not running while it plainly is. protontricks will not grow a fix for this; the
+request to reuse a running game's container was closed as not planned.
+
+Two details of the mechanism that the injector had to be changed for:
+
+- **Proton starts the debug command *before* the game.** That is why `--wait` exists. Without
+  it the injector looked exactly once, found nothing, and exited seconds before the process it
+  was waiting for came into existence.
+- **Its stdout goes to the Proton log**, which is off unless `PROTON_LOG=1`. So in `--wait`
+  mode the injector also writes `wrlines_data\wrinject.log` beside the DLL. If the panel does
+  not appear, that file is the first thing to read — and if it does not exist either, the
+  launch option is not running at all.
+
+`--wait` also waits for `d3d11.dll` to show up in the game's module list rather than injecting
+the instant the process exists, because the instant it exists it is still inside loader
+initialisation. If the module list cannot be read at all it injects anyway after twenty seconds
+and says so in the log, since that check only improves the timing and must never be the thing
+that stops the tool working.
+
+### If it does not work
+
+`PROTON_REMOTE_DEBUG_CMD` is read by Proton's launch script and has been for several major
+versions, but Valve documents no promise about it. The documented route is more typing and
+needs a terminal, so it is the fallback rather than the headline:
+
+```
+# launch option:
+STEAM_COMPAT_LAUNCHER_SERVICE=proton %command%
+
+# then, while the game is running:
+SLR=~/.steam/steam/steamapps/common/SteamLinuxRuntime_sniper/pressure-vessel/bin
+$SLR/steam-runtime-launch-client --list            # prints the right bus name
+$SLR/steam-runtime-launch-client --bus-name=com.steampowered.App<ID> -- \
+    wine /full/path/to/wrlines/wrinject.exe
+```
+
+`wine` has to be spelled out: the launcher service runs *Linux* commands in the game's
+environment, so a Windows executable needs Wine naming explicitly. Here the game is already
+running, so `--wait` is unnecessary.
+
+### What else is different under Proton
+
+- The **Diagnostics** tab reports `platform  Wine/Proton`, which changes what several other
+  lines there mean — which `d3d11.dll` is loaded, and whether a path the game printed is a
+  Windows path or a `Z:` view of a Linux one. It also reports the cursor's source and how
+  recently raw input arrived, which is the fastest way to describe an input problem that cannot
+  be reproduced on Windows.
+- **Fonts.** The panel bakes its text at fixed sizes out of a monospaced face, and on Windows
+  that face is Consolas. A Wine prefix has no Consolas, so it looks through the prefix's font
+  directory for the next best thing and, failing that, for anything monospaced at all. The
+  `fonts:` line in `wrlines.log` says which file it settled on. If it says the built-in 13 px
+  face, the prefix has no usable TTF and the panel's larger text will be soft.
+- **Nothing has to be installed inside the prefix**, and that is true since v0.7.0. Until then
+  the extractor was a Python script launched as a child process, so it needed an interpreter on
+  the *prefix's* `PATH` — and a Python installed on the Linux side is not on it. That was the
+  single most confusing thing about running this under Proton, and it is gone: extraction
+  happens inside the DLL, which is already inside the prefix by definition. **No release since
+  v0.7.0 ships a `.py` file, and nothing in the program looks for an interpreter.**
 - Everything else is unchanged. The lines, the panel and the leaderboard have no platform
   surface at all; the whole D3D11 dependency lives in two files.
 
@@ -2543,6 +2666,7 @@ Everything goes to `wrlines_data\wrlines.log`, flushed on every line.
 ```
 build.bat           vcvars + cl.exe
 injector.cpp        -> wrinject.exe
+wr_args.h           its command line, in a header so a harness can drive it
 dllmain.cpp         entry point, per-frame ordering, the hotkey thread
 wr_common.h         Vec3 / VMatrix / paths
 wr_log              log file + ring buffer for Diagnostics
@@ -2577,6 +2701,8 @@ wr_jobs             the worker pool, the memory budget, cooperative cancel
 wr_json / wr_msml   a hand-written JSON reader, and the game's cache container
 wr_http / wr_api    the only file that reaches the network, and what it asks
 wr_fetch            downloading demos, and the copy that keeps its timestamp
+wr_sha256           SHA-256, written out so the import list stays at six
+wr_update           check, download, stage, swap -- three presses and no timer
 wr_intogame         copies into the game's replay folder, and the manifest that
                     makes them the only thing removable from the panel
 wr_settings         one registration table, walked by both the reader and the

@@ -27,6 +27,35 @@ does not. All of it happens inside wrlines.dll, on background threads that are
 marked as background work so they stay out of the game's way.
 
 
+ON LINUX (AND THE STEAM DECK)
+
+It runs under Proton. Three things to do once, and then you start the game
+normally and never think about it again.
+
+  1. Force a Proton version in the game's Properties -> Compatibility. Momentum
+     has a native Linux build now, and a Windows DLL cannot go into a native
+     Linux process, so this one is not optional.
+  2. Unzip this folder INSIDE the game's own folder, e.g.
+     steamapps/common/Momentum Mod Playtest/wrlines/
+  3. Set one launch option:
+
+       PROTON_REMOTE_DEBUG_CMD="/full/path/to/wrlines/wrinject.exe --wait" %command%
+
+Then launch from Steam as usual and press INSERT in game. Do NOT run
+wrinject.exe yourself -- Proton starts it for you, before the game, and --wait
+is what makes it sit there until the game is up.
+
+If no panel appears, read wrlines_data/wrinject.log beside the DLL. The
+injector writes it because on Linux its console output goes into the Proton
+log, where nobody is looking. If that file is not there at all, the launch
+option is not running.
+
+Running wrinject.exe through protontricks or "proton run" does NOT work: Steam
+runs the game inside a container, so a second launch gets its own wineserver
+and cannot see the game's processes. docs/how-it-works.md explains it properly
+and gives a fallback route.
+
+
 KEYS
 
   INSERT      show / hide the panel
@@ -54,6 +83,29 @@ WHERE YOUR FILES GO
   replay folder so the game can play it. Every copy is recorded first, and
   "take out" is only ever allowed to delete things on that list -- the demos the
   game downloaded itself cannot be reached from here.
+
+  The one other thing that writes outside wrlines_data is "Install it" under
+  Update in the About tab, which replaces wrlines.dll and wrinject.exe in this
+  folder. It keeps the pair it replaced beside them as .old until the next time
+  the game starts, so there is always a way back.
+
+
+KEEPING IT UP TO DATE
+
+  About tab -> "Check for updates". Three presses, each of which stops:
+
+    1. Check      asks GitHub what the newest release is. Writes nothing.
+    2. Download   fetches the two files, checks them against the release's own
+                  SHA256SUMS.txt BEFORE anything reaches your disk, and puts
+                  them in wrlines_data\update.
+    3. Install    swaps them in. Restart the game to run the new version --
+                  the DLL never unloads. Anything that fails puts the old pair
+                  straight back.
+
+  There is no automatic check and no setting to turn one on. A program that
+  reaches out on its own and replaces its own files is exactly the shape
+  antivirus software looks for, and this one has enough of that problem
+  already -- see the section below.
 
 
 WATCHING A DEMO YOU HAVE FETCHED
@@ -180,13 +232,17 @@ A NOTE ON YOUR DATA
     - It is called from ONE file, src\wr_http.cpp, which is about a hundred and
       twenty lines and does GET and nothing else. Search the source for
       "WinHttp" and that file and its header are the only two that have it.
-    - The only addresses it is ever given are api.momentum-mod.org and the
-      download link that Momentum's own reply contained.
+    - The only addresses it is ever given are api.momentum-mod.org,
+      api.github.com, and the download links that their own replies contained.
+      GitHub is asked one question -- what the newest release is -- and only
+      when you press "Check for updates".
     - It sends no identifier. No machine id, no account, no counter. The one
       request that names SteamIDs names your friends', because you pressed a
-      button that says it will look them up.
+      button that says it will look them up. GitHub is sent nothing but the
+      user agent, which is the version number and this project's address.
     - It never runs on a timer, at startup, or on a map change. Only from a
-      button.
+      button. That did not change when the updater arrived in v0.9.5, and
+      there is deliberately no setting to make the check automatic.
 
   From v0.6.1 that is all of it, and from v0.7.0 there is no script left at
   all: the last thing it did was extraction, extraction reads files off your

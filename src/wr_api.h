@@ -58,6 +58,16 @@
 
 #define WR_API_BASE "https://api.momentum-mod.org/v1"
 
+// The second host, and the only other one. It is here rather than in
+// wr_update.cpp so that wr_http.h's claim 3 -- "nothing else in the project
+// constructs a URL" -- stays a sentence a reader can check with one grep.
+//
+// Nothing is sent to it but the User-Agent below, which is the same one the
+// leaderboard sees and names only the version and this repo. GitHub answers 403
+// to a request with no User-Agent, so it is required rather than volunteered.
+#define WR_GITHUB_API  "https://api.github.com"
+#define WR_GITHUB_REPO "ProtoAus/demo-line-practice-tool"
+
 // The API's own maximum page. Not a preference: take=101 is a 400.
 #define WR_API_PAGE 100
 
@@ -197,6 +207,10 @@ void WrApiLeaderboardUrl(char *out, int cap, int mapId, int gamemode,
                          int trackType, int trackNum, int take, int skip);
 void WrApiFriendsUrl(char *out, int cap, int mapId, int gamemode, int trackType,
                      int trackNum, const unsigned long long *ids, int n);
+
+// The newest published release. /latest excludes prereleases and drafts on the
+// server, which is one fewer thing this has to decide for itself.
+void WrApiLatestReleaseUrl(char *out, int cap);
 
 // "2026-03-16T09:40:41.194Z" -> unix seconds. 0 if it will not parse.
 //

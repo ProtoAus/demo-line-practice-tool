@@ -77,7 +77,23 @@ static int g_bbWidth = 0, g_bbHeight = 0;
 static volatile LONG g_menuOpen = 0;
 static float g_curX = 0.0f, g_curY = 0.0f;
 static bool g_cursorFollowsOS = false;
-static bool g_sawRawInput = false;
+
+// The OS pointer is only a source of truth while it MOVES when the mouse moves.
+// Under Wine that is not the same thing as GetCursorInfo reporting CURSOR_SHOWING
+// -- see WrCursorUpdate -- so these three track whether it is actually keeping up.
+static ULONGLONG g_rawMotionTick = 0;   // when raw mouse motion last arrived
+static unsigned long g_rawMotionSeq = 0; // bumped by every raw motion packet
+static unsigned long g_rawMotionSeen = 0; // the value at the previous frame's check
+static long g_osLastX = -1, g_osLastY = -1;
+static int g_osStaleFrames = 0;
+static bool g_cursorShowing = false;     // what the last GetCursorInfo said
+
+// WR_OS_CURSOR_STALE_FRAMES lives in wr_hook.h, because Diagnostics shows the
+// running count against it and two copies of the number would drift.
+
+// Raw input counts as the live source only if it arrived recently. It used to
+// count for ever -- see the WM_MOUSEMOVE case in WrWndProc.
+#define WR_RAW_INPUT_FRESH_MS 1000
 static bool g_renderReady = false;
 static bool g_isDxvk = false;
 static char g_d3d11Path[MAX_PATH] = {0};
@@ -120,6 +136,25 @@ bool WrCursorFollowsOS(void) { return g_cursorFollowsOS; }
 // Decide once per frame where our cursor should come from. Doing this here
 // rather than in the message handler means the answer is consistent for the
 // whole frame, which is what stops the pointer jittering between two sources.
+//
+// THE RULE IS "DOES IT MOVE", NOT "DOES WINDOWS SAY IT IS VISIBLE".
+//
+// It used to be the second one, and on Windows the two agree: a game holding
+// mouselook hides the pointer, GetCursorInfo says so, and we integrate raw
+// deltas into a cursor of our own. Under Wine they can disagree -- the pointer
+// is reported as showing while the game has it grabbed and yanked back to the
+// screen centre every frame. The old code believed the report, set
+// g_cursorFollowsOS, and WrImGuiFrame then turned OFF the drawn cursor because
+// the real one was supposedly right there. The result was a panel with no
+// pointer at all, pinned at the centre, which is exactly what was reported from
+// Linux: "insert doesn't bring cursor on its own, so you need to go to any menu
+// with cursor available before using insert". Opening a game menu stops the
+// recentring, so the two sources agree again and it starts working.
+//
+// So the OS pointer has to earn it: if the mouse is demonstrably moving (raw
+// packets are arriving) and the reported position does not change, it is not a
+// cursor, it is a number stuck at 960,540. This never fires on Windows, because
+// there the report is already false in that state.
 void WrCursorUpdate(void)
 {
     g_cursorFollowsOS = false;
@@ -130,18 +165,66 @@ void WrCursorUpdate(void)
     if (!WrMenuOpen())
         return;
 
+    // Did the mouse move since the last time we looked?
+    unsigned long seq = g_rawMotionSeq;
+    bool moved = (seq != g_rawMotionSeen);
+    g_rawMotionSeen = seq;
+
     CURSORINFO ci;
     ci.cbSize = sizeof(ci);
     if (!GetCursorInfo(&ci) || !(ci.flags & CURSOR_SHOWING))
-        return;     // hidden: the game has mouselook, integrate raw deltas
+    {
+        // Hidden: the game has mouselook, integrate raw deltas. Nothing to be
+        // stale about, so the count starts again from here.
+        g_cursorShowing = false;
+        g_osStaleFrames = 0;
+        g_osLastX = g_osLastY = -1;
+        return;
+    }
+    g_cursorShowing = true;
 
     POINT p = ci.ptScreenPos;
     if (!ScreenToClient(g_window, &p))
         return;
 
+    if (moved && p.x == g_osLastX && p.y == g_osLastY)
+    {
+        if (g_osStaleFrames < WR_OS_CURSOR_STALE_FRAMES)
+            g_osStaleFrames++;
+    }
+    else
+    {
+        g_osStaleFrames = 0;
+    }
+    g_osLastX = p.x;
+    g_osLastY = p.y;
+
+    // Self-correcting in both directions: the moment the reported position
+    // starts tracking again -- a game menu opening, mouselook released -- the
+    // count resets and the OS pointer is trusted again on the next frame.
+    if (g_osStaleFrames >= WR_OS_CURSOR_STALE_FRAMES)
+        return;
+
     g_curX = WrClampF((float)p.x, 0.0f, (float)g_bbWidth);
     g_curY = WrClampF((float)p.y, 0.0f, (float)g_bbHeight);
     g_cursorFollowsOS = true;
+}
+
+// For the Diagnostics tab. This cannot be reproduced from Windows, so the panel
+// has to be able to answer it from the machine where it happens -- one
+// screenshot instead of a round trip per guess.
+void WrCursorDiag(bool *followsOs, bool *cursorShowing, int *staleFrames,
+                  double *rawAgeSeconds)
+{
+    if (followsOs)     *followsOs = g_cursorFollowsOS;
+    if (cursorShowing) *cursorShowing = g_cursorShowing;
+    if (staleFrames)   *staleFrames = g_osStaleFrames;
+    if (rawAgeSeconds)
+    {
+        *rawAgeSeconds = g_rawMotionTick
+            ? (double)(GetTickCount64() - g_rawMotionTick) / 1000.0
+            : -1.0;     // never seen at all, which is itself the answer
+    }
 }
 
 static void SubclassWindow(HWND hwnd);
@@ -187,6 +270,12 @@ void WrSetPanelOpen(unsigned int which, bool open)
         // cursor happens to have been parked by the game's recentring.
         g_curX = g_bbWidth * 0.5f;
         g_curY = g_bbHeight * 0.5f;
+        // And start the "is the OS pointer keeping up" test from scratch, so a
+        // verdict reached during the last time the panel was open cannot carry
+        // into this one -- the game may have been in a menu then and not now.
+        g_osStaleFrames = 0;
+        g_osLastX = g_osLastY = -1;
+        g_rawMotionSeen = g_rawMotionSeq;
         // The window procedure goes in only for as long as a panel is up. See
         // SubclassWindow for why.
         SubclassWindow(g_window);
@@ -236,7 +325,13 @@ static void AccumulateRawMouse(LPARAM lParam)
     if (ri->data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)
         return;     // absolute devices (tablets) are not worth handling here
 
-    g_sawRawInput = true;
+    // A sequence number and a timestamp rather than the one-way "we have seen
+    // raw input at some point" flag this used to set. The flag was never
+    // cleared, so a single packet at any time in the session permanently
+    // disabled the WM_MOUSEMOVE fallback below -- the only thing keeping the
+    // panel usable when raw input stops arriving.
+    g_rawMotionSeq++;
+    g_rawMotionTick = GetTickCount64();
 
     // Only integrate deltas when we are not already tracking the OS cursor;
     // otherwise the two sources would add together and the pointer would run
@@ -285,10 +380,17 @@ static LRESULT CALLBACK WrWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
         switch (msg)
         {
         case WM_MOUSEMOVE:
-            // If raw input never arrives (some setups run without it) fall back
-            // to using the message's own client coordinates, so the panel is
-            // still usable rather than having no pointer at all.
-            if (!g_sawRawInput && !g_cursorFollowsOS)
+            // If raw input is not arriving (some setups run without it, and
+            // some only deliver it while the pointer is grabbed) fall back to
+            // the message's own client coordinates, so the panel is still
+            // usable rather than having no pointer at all.
+            //
+            // "Recently", not "ever". This used to test a flag that was set by
+            // the first raw packet of the session and never cleared, which
+            // turned the fallback off permanently the moment it was needed
+            // least.
+            if ((GetTickCount64() - g_rawMotionTick) >= WR_RAW_INPUT_FRESH_MS &&
+                !g_cursorFollowsOS)
             {
                 g_curX = WrClampF((float)WR_LPARAM_X(lParam), 0.0f, (float)g_bbWidth);
                 g_curY = WrClampF((float)WR_LPARAM_Y(lParam), 0.0f, (float)g_bbHeight);
@@ -760,11 +862,19 @@ bool WrHookInit(void)
     if (GetModuleFileNameA(d3d11, g_d3d11Path, MAX_PATH))
     {
         // DXVK ships its own d3d11.dll; the game folder path is the tell.
+        //
+        // Except under Proton, where the path test gets it exactly backwards:
+        // Proton installs DXVK's d3d11.dll INTO the prefix's system32, so the
+        // path contains \windows\ precisely in the case where DXVK is most
+        // certain. Diagnostics has been reporting "DXVK  no" on every Proton
+        // install since the line was written. This is display-only -- nothing
+        // in the hook path branches on it (see wr_hook.h) -- but a diagnostic
+        // that is always wrong on one platform is worse than no diagnostic.
         const char *lower = g_d3d11Path;
         char low[MAX_PATH];
         strcpy_s(low, MAX_PATH, lower);
         _strlwr_s(low, MAX_PATH);
-        g_isDxvk = (strstr(low, "\\windows\\") == NULL);
+        g_isDxvk = (strstr(low, "\\windows\\") == NULL) || WrIsWine();
         WrLogf("d3d11.dll: %s%s", g_d3d11Path, g_isDxvk ? "   (not system -- DXVK?)" : "");
     }
 
