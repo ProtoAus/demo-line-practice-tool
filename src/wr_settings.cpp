@@ -171,6 +171,7 @@ static void RegisterEnergy(void)
     WrSettingsFloat("phys.maxSpeed", &g_energy.maxSpeed, 100.0f, 500.0f);
     WrSettingsFloat("phys.eyeHeight", &g_energy.eyeHeight, 0.0f, 96.0f);
 
+    WrSettingsBool("phase.show", &g_energy.showPhase);
     WrSettingsBool("hud.show", &g_energy.showHud);
     WrSettingsFloat("hud.offsetX", &g_energy.hudOffsetX, -2000.0f, 2000.0f);
     WrSettingsFloat("hud.offsetY", &g_energy.hudOffsetY, -2000.0f, 2000.0f);

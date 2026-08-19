@@ -81,6 +81,34 @@ static WrTrendWindow g_trend;
 #define GAUGE_INTERVAL 0.05f
 static WrTrendWindow g_gauge;
 static float g_gaugeClock = 0.0f;
+
+// Vertical velocity per frame, for telling whether you are touching anything.
+//
+// THE ONE LIVE READING THAT SURVIVED THE CAMERA. wr_stress.h records that
+// efficiency did not: differencing the camera gives a velocity good to a few
+// percent, and against a 37 units/s ceiling that agreed with the truth 45% of
+// the time and pointed the WRONG WAY 26%. Contact is a different size of signal
+// entirely -- a surface changes the vertical acceleration by hundreds of units
+// per second squared, where air strafing changes it by nothing at all.
+//
+// Measured the same way, by resampling 250 real runs at 200 Hz, adding view bob
+// and pushing them through the real wr_smooth.h estimator:
+//
+//     window  tol   agrees   missed a ramp   invented one
+//     0.10    150   90.2%    0.1%            9.6%
+//     0.10    250   92.7%    0.2%            7.0%
+//     0.10    320   93.4%    0.4%            6.2%
+//
+// And view bob does not matter here either: 93.4% with two units of it, 93.5%
+// with none. Same finding as the efficiency work, reached independently.
+//
+// The error is one-sided in the direction that matters. It essentially never
+// misses a ramp; what it does, a few percent of the time, is claim a surface
+// during free flight. A readout that occasionally says "ramp" a moment early is
+// a different kind of wrong from one that stays silent through a whole ramp.
+#define PHASE_LIVE_WINDOW 0.10f
+#define PHASE_LIVE_TOL 250.0f
+static WrTrendWindow g_vzTrend;
 static WrArrow g_arrow;
 static WrSwing g_swing;
 static bool g_spliced = false;
@@ -263,6 +291,7 @@ void WrEnergyDefaults(void)
     g_energy.velTau = VEL_TAU;
     g_energy.speedTau = SPEED_TAU;
     g_energy.powerSeconds = POWER_WINDOW;
+    g_energy.showPhase = true;
     g_energy.gaugeSeconds = 2.0f;
     g_energy.arrowBand = ARROW_BAND;
     g_energy.anchorToRunStart = true;
@@ -315,6 +344,7 @@ void WrEnergyReset(void)
     WrEmaReset(&g_viewTurnEma); WrEmaReset(&g_velTurnEma); WrEmaReset(&g_accelEma);
     WrTrendReset(&g_trend);
     WrTrendReset(&g_gauge);
+    WrTrendReset(&g_vzTrend);
     g_gaugeClock = 0.0f;
     WrArrowReset(&g_arrow);
     WrSwingReset(&g_swing, WR_SWING_HYSTERESIS);
@@ -450,6 +480,7 @@ static void Teleported(const Vec3 &pos)
     WrEmaReset(&g_velTurnEma); WrEmaReset(&g_zEma);
     WrTrendReset(&g_trend);
     WrTrendReset(&g_gauge);
+    WrTrendReset(&g_vzTrend);
     g_gaugeClock = 0.0f;
     WrArrowReset(&g_arrow);
 
@@ -830,6 +861,7 @@ void WrEnergySample(const Vec3 &pos, float dt)
             WrEmaReset(&g_speedEma); WrEmaReset(&g_energyEma); WrEmaReset(&g_zEma);
             WrTrendReset(&g_trend);
             WrTrendReset(&g_gauge);
+    WrTrendReset(&g_vzTrend);
             g_gaugeClock = 0.0f;
             g_swing.have = false;
             // And back to the full hold, because from here this is an ordinary
@@ -887,6 +919,15 @@ void WrEnergySample(const Vec3 &pos, float dt)
         WrTrendPush(&g_gauge, g_nowSmooth, g_gaugeClock);
         g_gaugeClock = 0.0f;
     }
+
+    // Vertical velocity, per frame, for the phase test.
+    //
+    // Unlike the gauge this one WANTS the fast ring: the window is 0.10 s, which
+    // fits in 256 frames at any frame rate anybody plays at, and a longer window
+    // makes it worse rather than better -- measured, agreement peaks around 0.10
+    // and falls away by 0.30. Contact is a short-lived thing and smearing it
+    // over a third of a second smears it across the transition.
+    WrTrendPush(&g_vzTrend, g_vel.z, dt);
 
     // The height alone, through the SAME filter and from the SAME instant --
     // mid.z, not pos.z. Because an EMA is linear, subtracting it from the
@@ -1226,6 +1267,48 @@ float WrEnergyLost(void)
 }
 
 bool WrEnergyBudgetSpliced(void) { return g_spliced; }
+// Are you in the air, on a ramp, or on the ground -- right now?
+//
+// The air/contact half is the vertical acceleration against gravity, exactly as
+// on a stored line, but with the tolerance opened from 60 to 250 because the
+// velocity behind it is differenced from the camera rather than recorded. See
+// the measurements at PHASE_LIVE_TOL.
+//
+// The ramp/ground half composes this with the old |vz| ground test, and the
+// composition is worth stating because it repairs something. That test settles
+// whenever the vertical speed is small for a moment, which wr_energy.h records
+// as firing "at the apex of every arc" -- at g = 800 the vertical speed passes
+// through zero slowly enough to hold the window for a quarter of a second, and
+// that is why it was taken off the anchor logic. It cannot do that here: an apex
+// is free flight, so the contact test rules it out before the ground test is
+// ever asked. Two heuristics, each with a known failure, and the failure of one
+// is exactly what the other is sure about.
+//
+// WR_PHASE_UNKNOWN when there is no camera, or not enough history yet.
+int WrEnergyPhase(void)
+{
+    if (!g_valid || g_held)
+        return WR_PHASE_UNKNOWN;
+
+    float span = 0.0f;
+    float dvz = WrTrendOverSpan(&g_vzTrend, PHASE_LIVE_WINDOW, &span);
+
+    // Refuse a short span rather than dividing by the window that was asked
+    // for. The ring is 256 frames, so this only bites in the first tenth of a
+    // second after a reset -- but reading a rate off a span half the size of the
+    // one it is divided by is the exact defect WrEnergyPower documents.
+    if (span < PHASE_LIVE_WINDOW * 0.75f)
+        return WR_PHASE_UNKNOWN;
+
+    float az = dvz / span;
+    float d = az + g_energy.gravity;
+    if (d < 0.0f) d = -d;
+
+    if (d < PHASE_LIVE_TOL)
+        return WR_PHASE_AIR;
+    return g_onGround ? WR_PHASE_GROUND : WR_PHASE_RAMP;
+}
+
 bool WrEnergyOnGround(void) { return g_onGround; }
 bool WrEnergyHaveRef(void) { return g_haveRef; }
 float WrEnergyRefZ(void) { return g_haveRef ? g_refZ : 0.0f; }

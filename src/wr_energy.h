@@ -92,6 +92,7 @@
 #define WR_ENERGY_H
 
 #include "wr_common.h"
+#include "wr_phase.h"   // WR_PHASE_*, for WrEnergyPhase
 
 struct WrEnergySettings
 {
@@ -131,6 +132,12 @@ struct WrEnergySettings
     // worst of it: its fill is a fraction of the width, so the same energy gap
     // drew a physically longer bar for a player with a longer name.
     float hudWidth;
+
+    // A row on the corner block saying whether you are in the air, on a ramp or
+    // on the ground. See WrEnergyPhase for how well it works and how that was
+    // measured; it is the only live reading derived from the camera that is
+    // accurate enough to state plainly.
+    bool showPhase;
 
     bool showOverlay;       // the corner block; ON by default
     int overlayCorner;      // 0 TL, 1 TR, 2 BL, 3 BR
@@ -483,6 +490,19 @@ float WrEnergySpeedRate(void);      // d|v|/dt, units per second per second
 float WrEnergySinceGround(void);    // vs the last flat ground you jumped from
 float WrEnergySinceStart(void);
 float WrEnergyPeak(void);           // peak relative energy
+// In the air, on a ramp, on the ground, or not known -- one of WR_PHASE_*.
+//
+// The one live reading that survived being derived from a camera. Efficiency
+// did not: see wr_stress.h, 45% agreement and 26% pointing the wrong way.
+// Contact changes the vertical acceleration by hundreds of units per second
+// squared where air strafing changes it by nothing, and simulated against 250
+// real runs through the real estimator this agrees 92.7% of the time, misses a
+// ramp 0.2% of the time and invents one 7.0%.
+//
+// Erring towards inventing a surface rather than missing one is deliberate and
+// is what the tolerance is chosen for.
+int WrEnergyPhase(void);
+
 bool WrEnergyOnGround(void);
 bool WrEnergyHaveRef(void);
 float WrEnergyRefZ(void);

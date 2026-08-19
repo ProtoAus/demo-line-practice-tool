@@ -2909,6 +2909,23 @@ static void EmitEnergyOverlay(ImDrawList *dl)
                 WrEnergySpeed(), WrEnergyHorizontalSpeed());
     cols[n++] = 0xFFCCCCCCu;
 
+    // What you are touching, right now.
+    //
+    // Coloured off PhaseColour so this row and the line mode can never disagree
+    // about what blue means. A grey dash rather than a guess while there is not
+    // enough history: the first tenth of a second after a teleport has no window
+    // behind it, and "unknown" and "airborne" are not the same claim.
+    if (g_energy.showPhase)
+    {
+        int ph = WrEnergyPhase();
+        static const char *kName[4] = { "--", "in the air", "on a ramp", "on ground" };
+        _snprintf_s(lines[n], sizeof(lines[0]), _TRUNCATE, "you are %s",
+                    kName[(ph >= 0 && ph < 4) ? ph : 0]);
+        cols[n++] = (ph == WR_PHASE_UNKNOWN) ? 0xFF808080u
+                                             : PhaseColour((unsigned char)ph,
+                                                           0xFFE0E0E0u);
+    }
+
     // The same three numbers the HUD can show, always visible here since the
     // corner block is the one you read while standing still.
     WrEnergyBudget bud;
@@ -3048,6 +3065,14 @@ static struct
 // wrong in a way that shows: one line running alongside another contributes a
 // hundred samples, and the plate then claims a hundred other lines were just as
 // close. The number is there to admit a coin toss, so it has to be countable.
+// How near the picked point has to be to a board for the plate to report it.
+//
+// In POINTS, which is ticks: 40 is about six tenths of a second at a 0.015
+// interval, so it covers the arrival and the moment either side of it and not
+// the whole ramp. Wider and the plate starts attributing a board to a stretch of
+// line the player was nowhere near when it happened.
+#define WR_PICK_BOARD_POINTS 40
+
 #define WR_PICK_CAND 8
 static struct { int slot; float score; } g_cand[WR_PICK_CAND];
 static int g_candCount = 0;
@@ -3431,13 +3456,16 @@ static void EmitPickPlate(ImDrawList *dl)
         dl->AddCircleFilled(at, 2.5f, col);
     }
 
-    // Eight, and every append below is bounded against it. The worst case is a
-    // name, four rows from BuildLabel (its mask has four bits), the track and
-    // the tie note -- seven. A five-element array was one label bit away from
-    // being written past.
-    char lines[8][96];
-    unsigned int cols[8];
-    const int kMaxLines = 8;
+    // Ten, and every append below is bounded against it. The worst case is a
+    // name, four rows from BuildLabel (its mask has four bits), the track, the
+    // tie note and two board rows -- nine. A five-element array was one label
+    // bit away from being written past, and it was eight until the board rows
+    // were added; the number and the worst case are kept in step here on
+    // purpose, because that is the only thing stopping the next row from
+    // overflowing it silently.
+    char lines[10][96];
+    unsigned int cols[10];
+    const int kMaxLines = 10;
     int n = 0;
 
     // Ask for this runner's name and picture.
@@ -3483,6 +3511,49 @@ static void EmitPickPlate(ImDrawList *dl)
             _snprintf_s(lines[n], sizeof(lines[0]), _TRUNCATE, "%s",
                         WrTrackName(run));
         cols[n++] = col;
+    }
+
+    // The board you are pointing at, if you are pointing near one.
+    //
+    // This is the coaching loop the whole feature is for: aim at the place a
+    // good run arrived on a ramp and read what the arrival actually cost them,
+    // rather than guessing from the shape of the line.
+    //
+    // Only when the picked point is genuinely close to one. A board is an
+    // instant, and attaching its numbers to a point half a ramp away would be
+    // reporting a measurement about somewhere else.
+    if (run->boards && run->boardCount > 0 && n < kMaxLines - 1)
+    {
+        const WrBoard *closest = NULL;
+        int bestGap = WR_PICK_BOARD_POINTS + 1;
+        for (int i = 0; i < run->boardCount; i++)
+        {
+            int gap = run->boards[i].pointIndex - idx;
+            if (gap < 0) gap = -gap;
+            if (gap < bestGap)
+            {
+                bestGap = gap;
+                closest = &run->boards[i];
+            }
+        }
+
+        if (closest)
+        {
+            _snprintf_s(lines[n], sizeof(lines[0]), _TRUNCATE,
+                        "boarded %s  -%.0f u/s (%.1f%%)",
+                        WrPhaseGradeName(closest->s.grade), closest->s.loss,
+                        closest->s.lossPct * 100.0f);
+            cols[n++] = WithAlpha(GradeColour(closest->s.grade), fade);
+
+            if (n < kMaxLines)
+            {
+                _snprintf_s(lines[n], sizeof(lines[0]), _TRUNCATE,
+                            "%.0f deg onto a %.0f deg ramp at %.0f",
+                            closest->s.approachDeg, closest->s.rampDeg,
+                            closest->s.speedIn);
+                cols[n++] = WithAlpha(0xFFDDDDDDu, fade);
+            }
+        }
     }
 
     if (tied > 0 && n < kMaxLines)
