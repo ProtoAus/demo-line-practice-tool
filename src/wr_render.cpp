@@ -59,6 +59,10 @@ WrRenderSettings g_render;
 #define EFF_BUCKETS 17
 #define EFF_NO_DATA_CLASS EFF_BUCKETS       // one more class, for "no reading"
 #define EFF_CLASSES (EFF_BUCKETS + 1)
+
+// WR_LINE_PHASE is categorical rather than a ramp: air, ramp, ground, unknown.
+// Four batch classes, one per value of WR_PHASE_*.
+#define PHASE_CLASSES 4
 #define OFFSCREEN_BREAK 8
 
 static ImVec2 g_batch[MAX_BATCH];
@@ -168,6 +172,16 @@ void WrRenderDefaults(void)
     g_render.maxPeaksPerRun = 24;
     g_render.peakLabel = WR_LABEL_ENERGY;
     g_render.markerLabel = WR_LABEL_TIME;
+
+    // Boards OFF by default. Twelve marks a run is a lot of furniture on a line
+    // somebody enabled to see a ROUTE, and this is a practice tool for one
+    // question at a time -- the same reason the corner block and the pick plate
+    // are off. The Lines tab names it and says what it is.
+    g_render.drawBoards = false;
+    g_render.maxBoardsPerRun = 24;
+    g_render.boardLabels = true;
+    g_render.boardLabelDetail = false;
+
     g_render.drawVelocity = true;
     // Symmetric. Measured p60 of in-band eta is +0.589, and once the loss side
     // stopped being discarded it carries more mass than the gain side, not less.
@@ -872,6 +886,7 @@ static unsigned int RampColour(float t)
 // "no usable speed here" and colour-by-speed falls back to the flat colour.
 // Defined below, with the rest of the energy drawing.
 static unsigned int EfficiencyColour(float eta, unsigned int runColour);
+static unsigned int PhaseColour(unsigned char ph, unsigned int runColour);
 static unsigned int MixColour(unsigned int c, float r, float g, float b, float t);
 
 // A descriptor rather than eleven positional arguments, three of which are
@@ -885,6 +900,7 @@ struct WrPathDraw
     const int *breaks;
     int breakCount;
     const signed char *eff;
+    const unsigned char *phase;     // WR_PHASE_*, or NULL when unknown
     unsigned int baseColour;
     float velScale;
     float thickness;
@@ -911,6 +927,7 @@ static void EmitPath(ImDrawList *dl, const WrPathDraw &d)
     const int *breaks = d.breaks;
     const int breakCount = d.breakCount;
     const signed char *eff = d.eff;
+    const unsigned char *phase = d.phase;
     const float velScale = d.velScale;
     const float thickness = d.thickness;
 
@@ -1096,6 +1113,22 @@ static void EmitPath(ImDrawList *dl, const WrPathDraw &d)
                                      baseColour), a01);
                 bucket = fBucket * EFF_CLASSES + cBucket;
             }
+        }
+        else if (g_render.lineColour == WR_LINE_PHASE && phase)
+        {
+            unsigned char ph = phase[i];
+            if (ph == WR_PHASE_UNKNOWN)
+            {
+                // A teleport join, or a run whose gravity setting made the
+                // question unanswerable. Faded in the run's own colour, the same
+                // way efficiency draws its no-data -- an absence, not a state.
+                colour = WithAlpha(baseColour, a01 * g_render.effNoDataAlpha);
+            }
+            else
+            {
+                colour = WithAlpha(PhaseColour(ph, baseColour), a01);
+            }
+            bucket = fBucket * PHASE_CLASSES + (int)ph;
         }
         else if (g_render.lineColour == WR_LINE_SPEED && velScale > 0.0f)
         {
@@ -1426,6 +1459,94 @@ static void EmitTurns(ImDrawList *dl, const WrRun *run, bool tops)
             continue;
         dl->AddLine(ImVec2(s.x, s.y), ImVec2(s.x, s.y + 7.0f * side),
                     WithAlpha(WrRunColour(run), 0.9f), 1.5f);
+        drawn++;
+    }
+}
+
+// Colours for a board's grade, worst to best.
+//
+// Blue for a clean one and red for a wasteful one, which is the surf
+// community's own convention and the one their server-side tools already use --
+// worth matching, because a player who has seen a board graded before should
+// not have to learn a second scheme to read this one. It runs the opposite way
+// to the efficiency ramp on purpose: there, green is gaining; here, blue is
+// clean. They are never on screen as the same picture.
+static unsigned int GradeColour(unsigned char g)
+{
+    switch (g)
+    {
+        case WR_GRADE_PERFECT:  return 0xFFFFB440u;     // ABGR: blue
+        case WR_GRADE_GOOD:     return 0xFF60FF40u;     // green
+        case WR_GRADE_OKAY:     return 0xFFFFFFFFu;     // white
+        case WR_GRADE_BAD:      return 0xFF20C8FFu;     // yellow
+        default:                return 0xFF4040FFu;     // red
+    }
+}
+
+// Where a run boarded a ramp, and what it cost.
+//
+// A board is the moment a player in the air first touches a ramp. It is the
+// single most consequential event in a surf run -- the measured worst one in
+// this library threw away 211 units of a 3,099 u/s entry in one tick -- and
+// until now nothing on screen said where they happened, let alone how clean
+// they were.
+//
+// Drawn as a tick across the line at the contact point, coloured by grade, with
+// the loss beside it. Deliberately NOT a number per board by default: a surf run
+// boards a dozen times, and twelve labels on one line is a wall of text over the
+// route it is describing.
+static void EmitBoards(ImDrawList *dl, const WrRun *run)
+{
+    if (!g_render.drawBoards || !run->boards || run->boardCount <= 0)
+        return;
+
+    const float maxDistSqr = g_render.maxDrawDistance * g_render.maxDrawDistance;
+    int drawn = 0;
+
+    for (int i = 0; i < run->boardCount && drawn < g_render.maxBoardsPerRun &&
+                    g_statLabels < WR_MAX_LABELS_PER_FRAME; i++)
+    {
+        const WrBoard &b = run->boards[i];
+        int idx = b.pointIndex;
+        if (idx < 0 || idx >= run->pointCount)
+            continue;
+
+        // Nothing from the pre-roll, for the same reason the line does not start
+        // there: walking into a start zone bumps into geometry, and those are
+        // not boards anybody wants graded.
+        if (g_render.hidePreRoll && idx < run->startIndex)
+            continue;
+
+        const WrPoint *p = &run->points[idx];
+        if (WrDistSqr(p->pos, g_cam) > maxDistSqr)
+            continue;
+
+        ImVec2 s;
+        if (!Project(p->pos, &s))
+            continue;
+        if (s.x < 0.0f || s.x > g_sw || s.y < 0.0f || s.y > g_sh)
+            continue;
+
+        unsigned int col = GradeColour(b.s.grade);
+
+        // A short bar ACROSS the line rather than a tick along it, so a board
+        // does not read as one of the turning-point numbers.
+        dl->AddLine(ImVec2(s.x - 6.0f, s.y), ImVec2(s.x + 6.0f, s.y),
+                    WithAlpha(col, 0.95f), 2.0f);
+        dl->AddCircle(s, 3.5f, WithAlpha(col, 0.95f), 0, 1.5f);
+
+        if (g_render.boardLabels)
+        {
+            char label[96];
+            if (g_render.boardLabelDetail)
+                _snprintf_s(label, sizeof(label), _TRUNCATE, "%s  -%.0f  %.0f deg",
+                            WrPhaseGradeName(b.s.grade), b.s.loss, b.s.approachDeg);
+            else
+                _snprintf_s(label, sizeof(label), _TRUNCATE, "-%.0f", b.s.loss);
+
+            if (!DrawLabel(dl, ImVec2(s.x + 9.0f, s.y - 7.0f), label, col))
+                continue;
+        }
         drawn++;
     }
 }
@@ -2286,6 +2407,32 @@ static unsigned int MixColour(unsigned int c, float r, float g, float b, float t
     return 0xFF000000u | (bi << 16) | (gi << 8) | ri;   // ImGui packs ABGR
 }
 
+// The colour of a movement phase.
+//
+// Categorical, not a ramp, so it deliberately does NOT reuse the efficiency
+// gradient: green-to-red there means gaining-to-losing, and a surf ramp is not
+// worse than the air just because it is a different kind of thing.
+//
+// Blue and orange, which is the pair the colourblind mode already switches TO --
+// so this palette needs no variant and is safe for every common form of colour
+// blindness as it stands. Air is the run's own colour pulled towards grey,
+// because it is 68.7% of a surf run and the quiet majority should read as the
+// background state rather than compete with what is being pointed at.
+static unsigned int PhaseColour(unsigned char ph, unsigned int runColour)
+{
+    switch (ph)
+    {
+        case WR_PHASE_RAMP:
+            return MixColour(runColour, 0.20f, 0.75f, 1.00f, 0.92f);
+        case WR_PHASE_GROUND:
+            return MixColour(runColour, 1.00f, 0.65f, 0.15f, 0.92f);
+        case WR_PHASE_AIR:
+            return MixColour(runColour, 0.5f, 0.5f, 0.5f, g_render.effNeutralMix);
+        default:
+            return runColour;       // unknown: the caller fades it
+    }
+}
+
 static unsigned int EfficiencyColour(float eta, unsigned int runColour)
 {
     float band = WrClampF(g_render.effNeutralBand, 0.0f, 0.9f);
@@ -2507,8 +2654,9 @@ static void EmitEfficiencyLegend(ImDrawList *dl)
     bool spdOn = g_render.lineColour == WR_LINE_SPEED && g_render.lineKey;
     bool nrgOn = g_render.lineColour == WR_LINE_ENERGY && g_render.lineKey;
     bool relOn = g_render.lineColour == WR_LINE_ENERGY_REL && g_render.lineKey;
+    bool phsOn = g_render.lineColour == WR_LINE_PHASE && g_render.lineKey;
     bool rankOn = g_render.rankColour != WR_RANK_OFF && g_render.rankLegend;
-    if (!effOn && !spdOn && !nrgOn && !relOn && !rankOn)
+    if (!effOn && !spdOn && !nrgOn && !relOn && !phsOn && !rankOn)
         return;
 
     float size = 0.0f;
@@ -2657,6 +2805,43 @@ static void EmitEfficiencyLegend(ImDrawList *dl)
                       "this finely";
         foots[nf++] = "the velocity arrow is your energy TREND, not this; they "
                       "differ on purpose";
+    }
+
+    if (phsOn)
+    {
+        // The swatches come from PhaseColour itself, at the same grey the other
+        // keys use as a stand-in run colour, so the key cannot drift from the
+        // lines it describes.
+        static const unsigned char kPh[3] = {
+            (unsigned char)WR_PHASE_AIR,
+            (unsigned char)WR_PHASE_RAMP,
+            (unsigned char)WR_PHASE_GROUND,
+        };
+        static const char *kPhText[3] = {
+            "in the air -- nothing is being touched",
+            "on a ramp -- too steep to stand on",
+            "on ground -- a surface you could stand on",
+        };
+        for (int i = 0; i < 3; i++)
+        {
+            rows[n].colour = PhaseColour(kPh[i], 0xFFB0B0B0u);
+            rows[n].dim = (kPh[i] == WR_PHASE_AIR);
+            rows[n++].text = kPhText[i];
+        }
+        rows[n].colour = WithAlpha(0xFFB0B0B0u, g_render.effNoDataAlpha);
+        rows[n].dim = true;
+        rows[n++].text = "no reading -- across a teleport";
+
+        // Where the line between the two surfaces actually falls, because it is
+        // not where anybody guesses. Source will not stand on a normal whose z
+        // is under 0.7, and that is 45.57 degrees -- so a 45 degree slope is a
+        // walkable hill, and a surf ramp is steeper than people think.
+        foots[nf++] = "the split is Source's own: steeper than 45.6 degrees "
+                      "is a ramp";
+        foots[nf++] = "not a judgement -- a ramp is not worse than air, it is "
+                      "a different thing";
+        foots[nf++] = "demo lines only -- your own velocity has not been "
+                      "checked against this";
     }
 
     float w = 0.0f;
@@ -3522,6 +3707,7 @@ void WrRenderWorld(void)
         d.breaks = run->breaks;
         d.breakCount = run->breakCount;
         d.eff = run->eff;
+        d.phase = run->phase;
         d.baseColour = WrRunColour(run);
         d.velScale = 1.0f;
         d.thickness = g_render.thickness;
@@ -3531,6 +3717,7 @@ void WrRenderWorld(void)
         EmitPath(dl, d);
         EmitTurns(dl, run, false);
         EmitTurns(dl, run, true);
+        EmitBoards(dl, run);
         EmitMarkers(dl, run);
         if (g_render.drawTags)
             EmitTag(dl, run);       // which queues the Steam lookup, if it draws
@@ -3552,6 +3739,7 @@ void WrRenderWorld(void)
             d.breaks = run->breaks;
             d.breakCount = run->breakCount;
             d.eff = run->eff;
+            d.phase = run->phase;
             d.baseColour = WrRunColour(run);
             d.velScale = 1.0f;
             d.thickness = g_render.thickness * g_render.pickThickBoost;
@@ -3561,6 +3749,7 @@ void WrRenderWorld(void)
             EmitPath(dl, d);
             EmitTurns(dl, run, false);
             EmitTurns(dl, run, true);
+            EmitBoards(dl, run);
             EmitMarkers(dl, run);
             // No name tag for this one: the plate already carries the name, and
             // suppressing it frees a rectangle for something else.
@@ -3594,6 +3783,12 @@ void WrRenderWorld(void)
             d.breaks = NULL;
             d.breakCount = 0;
             d.eff = NULL;
+            // Your own line has no phase either. Contact is a far larger signal
+            // than the efficiency that kept the live line uncoloured, so this is
+            // likely to survive the trip -- but it has not been measured against
+            // a camera-differenced velocity yet, and until it has, drawing it
+            // would be a claim rather than a reading.
+            d.phase = NULL;
             d.baseColour = g_render.liveColour;
             d.velScale = 1.0f;
             d.thickness = g_render.thickness;

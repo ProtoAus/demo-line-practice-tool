@@ -110,6 +110,18 @@ struct WrRenderSettings
     unsigned int peakLabel;     // WR_LABEL_* mask
     unsigned int markerLabel;   // WR_LABEL_* mask
 
+    // Where a run boarded a ramp, and how cleanly.
+    //
+    // Separate from the dip and peak labels above even though all three mark
+    // points on a line, because they answer different questions: a dip is where
+    // a ramp bottomed out, and a board is where the player ARRIVED on one. The
+    // budget is per run for the same reason theirs is -- a surf run boards about
+    // a dozen times, so eight runs enabled is a hundred marks.
+    bool drawBoards;
+    int maxBoardsPerRun;
+    bool boardLabels;           // the loss beside each mark
+    bool boardLabelDetail;      // grade and approach angle as well
+
     // Where you will be in a quarter of a second, drawn from your midsection.
     bool drawVelocity;
 
@@ -158,6 +170,7 @@ enum WrLineColour
     WR_LINE_ENERGY,         // energyMin..energyMax, z + |v|^2/2g, absolute
     WR_LINE_ENERGY_REL,     // the same, less each run's own energy at its start
     WR_LINE_EFFICIENCY,     // dE/dt against what air accel could have added
+    WR_LINE_PHASE,          // in the air, on a ramp, or on the ground
     WR_LINE_MODE_COUNT
 };
 

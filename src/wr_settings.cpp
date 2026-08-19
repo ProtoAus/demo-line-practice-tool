@@ -136,6 +136,11 @@ static void RegisterRender(void)
     WrSettingsInt("peaks.perRun", &g_render.maxPeaksPerRun, 0, 64);
     WrSettingsUInt("peaks.label", &g_render.peakLabel);
 
+    WrSettingsBool("boards.draw", &g_render.drawBoards);
+    WrSettingsInt("boards.perRun", &g_render.maxBoardsPerRun, 0, 64);
+    WrSettingsBool("boards.labels", &g_render.boardLabels);
+    WrSettingsBool("boards.detail", &g_render.boardLabelDetail);
+
     WrSettingsBool("velocity.draw", &g_render.drawVelocity);
 
     WrSettingsFloat("eff.saturation", &g_render.effSaturation, 0.2f, 1.0f);

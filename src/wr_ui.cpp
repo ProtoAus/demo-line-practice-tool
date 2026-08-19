@@ -2021,10 +2021,19 @@ static void DrawDisplayTab(void)
         "middle of it means anything.\n\n"
         "EFFICIENCY is how much of the energy air strafing could physically "
         "have added was actually added. It needs the per-point data the "
-        "extractor writes, so it works on demo lines and not on your own.");
+        "extractor writes, so it works on demo lines and not on your own.\n\n"
+        "PHASE is what the player was touching: blue on a ramp, orange on "
+        "ground they could stand on, and the run's own colour, greyed, while "
+        "airborne. It is not a judgement and there is no good or bad end to it "
+        "-- it is a fact about the trajectory. In free flight the vertical "
+        "acceleration is exactly gravity, and a stored run's velocity reads "
+        "that back to a tenth of a percent, so this is measured rather than "
+        "guessed. Demo lines only, for now: your own velocity comes from "
+        "differencing the camera and has not been checked against this yet.");
     const char *kLine[WR_LINE_MODE_COUNT] = {
         "nothing -- one colour per run", "speed", "energy (absolute height)",
-        "energy above its own start", "strafing efficiency"
+        "energy above its own start", "strafing efficiency",
+        "air / ramp / ground"
     };
     if (g_render.lineColour < 0 || g_render.lineColour >= WR_LINE_MODE_COUNT)
         g_render.lineColour = WR_LINE_FLAT;
@@ -2055,8 +2064,13 @@ static void DrawDisplayTab(void)
             float lo = 0.0f, hi = 0.0f;
             bool scaled = false;
             WrRenderColourRange(&lo, &hi, &scaled);
+            // Only the modes that HAVE a numeric range. Efficiency is scaled
+            // against a physical ceiling and phase is four categories; printing
+            // a speed range under either says the picture is fitted to numbers
+            // it does not use.
             if (g_render.lineColour != WR_LINE_FLAT &&
-                g_render.lineColour != WR_LINE_EFFICIENCY)
+                g_render.lineColour != WR_LINE_EFFICIENCY &&
+                g_render.lineColour != WR_LINE_PHASE)
                 ImGui::TextDisabled("currently %.0f to %.0f", lo, hi);
         }
     }
@@ -2257,6 +2271,50 @@ static void DrawDisplayTab(void)
     ImGui::TextDisabled("Exact on stored lines. Your own line has no marks yet --");
     ImGui::TextDisabled("that needs a second derivative of a camera-differenced");
     ImGui::TextDisabled("velocity and is not measured well enough to draw.");
+    ImGui::Spacing();
+    ImGui::Checkbox("Mark boards", &g_render.drawBoards);
+    ImGui::SameLine();
+    HelpMarker("Where a run ARRIVED on a ramp, and what the arrival cost.\n\n"
+               "A board is the moment a player in the air first touches a ramp. "
+               "It is the most expensive single event in a surf run -- the worst "
+               "one measured across this machine's library threw away 211 units "
+               "of a 3,099 u/s entry in one tick -- and it is the thing a surfer "
+               "can most directly practise.\n\n"
+               "Found as a TRANSITION rather than a threshold: three clear "
+               "airborne ticks, then contact that sticks. That distinction "
+               "matters. The usual server-side rule takes the first velocity "
+               "clip whose component into the ramp clears 25 u/s, which also "
+               "fires while you are simply riding one -- reproduced against this "
+               "library it graded 84% of its own events perfect. This finds "
+               "about a dozen a run, which is what a surf run actually has.\n\n"
+               "Colours are the surf convention, best to worst: blue, green, "
+               "white, yellow, red. The grade needs both a small speed loss and "
+               "a near-parallel entry, and the loss threshold is relaxed above "
+               "1500 u/s because the same geometry costs proportionally more the "
+               "faster you arrive.\n\n"
+               "Demo lines only. Your own velocity is differenced from the "
+               "camera and has not been checked against this yet.");
+    if (g_render.drawBoards)
+    {
+        ImGui::SliderInt("Max boards per run", &g_render.maxBoardsPerRun, 1, 64);
+        ImGui::Checkbox("Print the loss", &g_render.boardLabels);
+        if (g_render.boardLabels)
+        {
+            ImGui::SameLine();
+            ImGui::Checkbox("with grade and angle", &g_render.boardLabelDetail);
+            ImGui::SameLine();
+            HelpMarker("The angle is between your velocity and the ramp's "
+                       "surface: 90 degrees is perfectly parallel and loses "
+                       "nothing, and every unit of speed lost is a consequence "
+                       "of falling short of it.\n\n"
+                       "Exactly a consequence, in fact -- the loss is "
+                       "1 - sin(angle), because an airborne clip against a plane "
+                       "is a pure projection. The two numbers are the same fact "
+                       "written twice, which is why the short label prints only "
+                       "one of them.");
+        }
+    }
+
     ImGui::Spacing();
     LabelPicker("At checkpoints", &g_render.markerLabel, &g_render.drawMarkers);
     ImGui::SliderFloat("Marker size", &g_render.markerRadius, 2.0f, 16.0f, "%.1f px");
