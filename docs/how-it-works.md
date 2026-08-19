@@ -1238,6 +1238,103 @@ A rate too large to have come from a player is a **booster**, and it is drawn as
 than as zero — zero also means free flight, and drawing those two the same is what made the first
 version of the line colours unreadable.
 
+### Air, ramp, ground — and the one live reading the camera was good enough for
+
+Asked directly: *can we detect when the player is on a ramp, or in the air?* Nothing here could. The
+only notion of a surface in the whole tool was a `|vz| < 30` ground test kept for one line in the
+Energy tab, and it fires at the apex of every jump — which is why it was taken off the anchor logic.
+There was no airborne flag, no surface normal, no slope, and there is no trace, no entity access and
+no collision data to build one from.
+
+It does not need geometry. **In free flight the only force is gravity, so the vertical acceleration
+is exactly `−sv_gravity`.** Anything else means something is pushing back, and the only thing that
+pushes back is a surface. Measured over the whole library here — 2,239 runs, 8,926,314 ticks:
+
+| | |
+| --- | --- |
+| median `dvz/dt` in free flight | **−800.0 u/s²**, against a theory of −800 |
+| p05 | −801 |
+| the split | **68.7 % air, 31.3 % contact** |
+| teleports rejected | 4,116 |
+
+The stored velocities read gravity back to **0.1 %**, so the test has a noise floor around 1 u/s²
+against a signal of hundreds to thousands.
+
+**The mistake that is easiest to make here is thresholding `|a − g|` instead of its vertical
+component.** Source's air acceleration is purely horizontal, so a player strafing hard has `a − g`
+pointing sideways at up to 2000 u/s² with `a_z` still exactly `−g`. The magnitude test put **36 %**
+of all samples into a phantom "the normal is horizontal" spike — that spike was air-strafing, not
+surfaces.
+
+**The surface normal falls out too, with no tracing at all.** Airborne clips use `overbounce = 1.0`,
+which makes `ClipVelocity` a pure orthogonal projection, so the normal is the direction of the
+velocity change once gravity is removed — and every board statistic collapses onto two speeds:
+
+```
+intoPlane = sqrt(inSpeed² − outSpeed²)
+approach  = asin(outSpeed / inSpeed)      90° = parallel to the ramp = ideal
+lossPct   = 1 − sin(approach)
+```
+
+Checked against the reconstruction, `lossPct == 1 − sin(approach)` to a median error of **0.0056**.
+Sustained contact is fitted with cross products rather than an eigenvector solve: power iteration
+converges at the ratio of the two largest eigenvalues, which on a ramp is the spread *along* it
+against the spread *across* it, and a player turns slowly enough that no fixed iteration count is
+enough — the harder the fit, the slower it converged, which is backwards. Fitted over 38,008
+segments the ramp angles are p10 47.3°, **p50 54.1°**, p90 83.2°, and **94.8 %** are steeper than
+Source's own standable cut. Which is what a surf map is.
+
+That cut is not where anybody guesses, and it is worth saying out loud: Source refuses to stand on a
+plane whose `normal.z` is under 0.7, and **that is 45.57°**. A "45 degree ramp" is a walkable hill.
+
+#### A board is a transition, not a threshold
+
+The surf community's server-side tools grade a board from the arguments of one `ClipVelocity` call,
+picking the first whose into-plane component clears 25 u/s and then latching until a hundred
+clip-free ticks have passed. Reproduced against this library that rule grades **84 % of its own
+events "perfect"** — because sustained surfing clips every single tick too, and most of what it
+catches is somebody riding a ramp perfectly well. Its own author marks the latch `TODO, better
+version of ramp detection`.
+
+What separates a board from riding a ramp is that **a board has air before it**. Three clear airborne
+ticks, then contact that sticks: **27,453 found, 12.3 per run**, graded perfect 31 / good 30 / okay
+18 / bad 20 / terrible 2. That is what a surf run actually has.
+
+#### And it survives the camera, where efficiency did not
+
+The section above explains why efficiency is not drawn on your own line: differenced from camera
+positions it agrees with the truth 45 % of the time and points the **wrong way 26 %**, and view bob
+is not the cause, so no filter was going to fix it.
+
+Contact is a different size of signal entirely. A surface changes the vertical acceleration by
+hundreds of units per second squared; air strafing changes it by nothing at all. So the same
+estimator that cannot resolve a 37 units/s ceiling has plenty of room for this one. Measured the same
+way — 199 real runs resampled at 200 Hz, view bob added, pushed through the real estimator and scored
+against the truth at the window midpoint:
+
+| window | tol | agrees | missed a ramp | invented one |
+| --- | --- | --- | --- | --- |
+| 0.10 s | 150 | 90.6 % | 0.1 % | 9.2 % |
+| 0.10 s | **250** | **92.9 %** | **0.3 %** | **6.8 %** |
+| 0.10 s | 320 | 93.6 % | 0.4 % | 5.9 % |
+
+**The error is one-sided in the direction that matters.** It essentially never misses a ramp; a few
+percent of the time it claims one that is not there. A readout that says *ramp* a moment early is a
+different kind of wrong from one that stays silent through a whole ramp.
+
+View bob does not matter here either — 92.9 % with two units of it against 93.1 % with none, the same
+finding the efficiency work reached, arrived at independently. And a *longer* window makes it worse:
+agreement peaks near 0.10 s and falls away by 0.30, because contact is short-lived and a long window
+smears the transition. So this ring is the fast per-frame one, unlike the strafe gauge, which needs
+two seconds and had to have its own.
+
+Ramp versus ground live composes this with that old `|vz|` ground test, and the composition repairs
+it: the apex where it misfires is free flight, so the contact test rules it out before the ground
+question is ever asked. Two heuristics, each with a known failure, where one is certain about exactly
+what the other gets wrong.
+
+All of it is re-derivable — `tests\phase_sweep.exe` for the corpus, `--live` for the estimator.
+
 ### Five presses across two tabs
 
 The panel was built to be complete, and it is: nine tabs, every setting anybody could want. What
