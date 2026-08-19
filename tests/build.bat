@@ -122,6 +122,17 @@ cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% tests\test_scale.cpp ^
    /Fe:tests\test_scale.exe /Fo:tests\ >nul
 if errorlevel 1 ( echo [!] test_scale FAILED to build & exit /b 1 )
 
+rem test_phase links nothing either. It pins the one claim the ramp and air
+rem detection rests on -- that in free flight the vertical acceleration is
+rem exactly -sv_gravity, so anything else is a surface -- and, more importantly,
+rem that the test is on the VERTICAL component rather than on |a - g|. Source's
+rem air acceleration is purely horizontal, so a magnitude test calls a hard
+rem air-strafe a surface; measured on real demos that put 36% of all samples
+rem into a phantom "the normal is horizontal" spike.
+cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% tests\test_phase.cpp ^
+   /Fe:tests\test_phase.exe /Fo:tests\ >nul
+if errorlevel 1 ( echo [!] test_phase FAILED to build & exit /b 1 )
+
 rem test_args links nothing either, and that is why src\wr_args.h exists as a
 rem header at all: injector.cpp is a translation unit with main() in it, so its
 rem argument parsing could not be driven from here without linking two mains
@@ -369,6 +380,7 @@ tests\test_live.exe       || set "RC=1"
 tests\test_settings.exe   || set "RC=1"
 tests\test_quick.exe      || set "RC=1"
 tests\test_scale.exe      || set "RC=1"
+tests\test_phase.exe      || set "RC=1"
 tests\test_args.exe       || set "RC=1"
 tests\test_json.exe       || set "RC=1"
 tests\test_sha256.exe     || set "RC=1"

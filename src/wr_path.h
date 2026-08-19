@@ -21,6 +21,7 @@
 #define WR_PATH_H
 
 #include "wr_common.h"
+#include "wr_phase.h"
 
 // 1000, and it used to be 256.
 //
@@ -110,6 +111,18 @@ struct WrMarker
     double timeReached;
     Vec3 vel;
     float maxSpeed;
+};
+
+// One board: where on the path it happened, and the statistics from wr_phase.h.
+//
+// The normal is kept as well as the angle because the renderer wants to draw the
+// ramp's facing, and re-deriving it at draw time would mean re-finding the two
+// velocities it came from.
+struct WrBoard
+{
+    int pointIndex;
+    Vec3 normal;
+    WrBoardStats s;
 };
 
 struct WrRun
@@ -205,6 +218,29 @@ struct WrRun
     // renderer only ever does a lookup.
     signed char *eff;
     int effWindow;              // what it was built with; see WrPathRefreshEff
+
+    // Per-point movement phase: WR_PHASE_AIR / RAMP / GROUND / UNKNOWN.
+    //
+    // In free flight the vertical acceleration is exactly -sv_gravity, so
+    // anything else means a surface is pushing back -- and the stored velocities
+    // read gravity back to 0.1%, which makes this a clean split rather than a
+    // statistical one. See wr_phase.h for the derivation and the measurements.
+    //
+    // Derived at load like breaks, dips, peaks and eff. Deliberately NOT stored
+    // in the .wrpath: the format is frozen and byte-compared, and every one of
+    // the files already on disk gains this on the next load with no
+    // re-extraction. There is nothing here a position and a velocity do not
+    // already contain.
+    unsigned char *phase;
+
+    // Where this run boarded a ramp, and what it cost.
+    //
+    // A board is the transition from air to sustained ramp contact, which is a
+    // strictly better signal than the into-plane threshold the surf community's
+    // server-side tools use -- that one catches ordinary surfing too, and
+    // reproducing it against this library graded 84% of its own events perfect.
+    WrBoard *boards;
+    int boardCount;
 
     // Bounds, for aiming at a line. Built once at load; see WrChunk above.
     // boundRadius is 0 when there is nothing to bound, which reads as "cannot

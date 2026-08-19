@@ -367,6 +367,10 @@ static void FreeRuns(void)
             free(g_runs[i].peaks);
         if (g_runs[i].eff)
             free(g_runs[i].eff);
+        if (g_runs[i].phase)
+            free(g_runs[i].phase);
+        if (g_runs[i].boards)
+            free(g_runs[i].boards);
         if (g_runs[i].chunks)
             free(g_runs[i].chunks);
         WrProfileFree(&g_runs[i]);
@@ -601,6 +605,7 @@ static void BuildBounds(WrRun *run)
 static void FindStart(WrRun *run, int stored, bool storedUsable);
 static void CheckTimes(WrRun *run);
 static void FindEfficiency(WrRun *run);
+static void FindPhase(WrRun *run);
 
 static bool LoadOne(const char *path, WrRun *run)
 {
@@ -794,7 +799,18 @@ static bool LoadOne(const char *path, WrRun *run)
     FindPeaks(run);
     CheckTimes(run);        // after breaks and FindStart: a break makes the clock
                             // untrustworthy, and the pre-roll used to dilute it
+    FindPhase(run);         // after breaks: a teleport is not an acceleration
     FindEfficiency(run);    // after breaks: never differences across a teleport
+
+    // NOTE, because it is the obvious next idea and it is wrong. eta means air
+    // strafing efficiency, and wr_stress.h says so, which makes "blank it
+    // wherever the phase is not AIR" look like a free correctness win now that
+    // the phase is known. It is not. The one-sided rejection in FindEfficiency
+    // exists precisely to KEEP ramp entries visible: they are 18.8% of all
+    // samples and carry 94.6% of all the energy lost in this library, and
+    // collapsing them to no-data is the exact defect that made the first version
+    // of the line colours unreadable. The phase is for telling the reader which
+    // samples are which, not for throwing half of them away.
 
     // No energy array. It would only ever be read one element at a time -- the
     // point nearest the camera -- and caching it here would go silently stale
@@ -1078,7 +1094,16 @@ static void FindEfficiency(WrRun *run)
     // same thing and must not draw the same.
     memset(run->eff, WR_ETA_NO_DATA, (size_t)run->pointCount);
 
-    float ceiling = WrAirPowerCeiling(g_energy.gravity, run->tickInterval);
+    // The user's cvar settings, not the built-in defaults.
+    //
+    // This was WrAirPowerCeiling, which hardcodes airaccel 150 and maxspeed 250,
+    // while the live gauge in wr_energy.cpp asks WrAirPowerCeilingEx with
+    // whatever the Energy tab's sliders say. So moving a slider changed the
+    // gauge and left every drawn line coloured against the old ceiling, and the
+    // two quietly disagreed about the same quantity. Same call, same numbers.
+    float ceiling = WrAirPowerCeilingEx(g_energy.gravity, run->tickInterval,
+                                        g_energy.airAccelerate, g_energy.maxSpeed,
+                                        1.0f);
     float dt = run->tickInterval * (float)(win * 2);
     if (!(dt > 1e-5f))
         return;
@@ -1112,6 +1137,211 @@ static void FindEfficiency(WrRun *run)
             continue;
         run->eff[i] = WrEtaToByte(WrEfficiency(power, ceiling));
     }
+}
+
+// Air, ramp, ground -- and the boards.
+//
+// The whole of the classification is in wr_phase.h; this walks the run and
+// applies it. Two things it has to get right that the pure header cannot:
+//
+// TELEPORTS COME FIRST. A fail trigger or a save-loc load moves the player
+// thousands of units between two samples, and differencing across one produces
+// an acceleration of tens of thousands -- which would be graded as the most
+// spectacular board in the library. 4,116 of them across this machine's runs.
+// The interval either side of a break is UNKNOWN rather than air, because a
+// phase that guessed would be indistinguishable from one that measured.
+//
+// A BOARD IS A TRANSITION, NOT A THRESHOLD. The surf community's server-side
+// tools detect one by watching the engine's own ClipVelocity calls and taking
+// the first whose into-plane component clears 25 u/s, then latching until a
+// hundred tickless-of-clips ticks have passed. That rule does not survive being
+// applied to a position trace: reproduced against this library it graded 84% of
+// its own events perfect, because sustained surfing clips every single tick too.
+// What separates a board from riding a ramp is that a board is preceded by AIR.
+// So the test is three clear air intervals, then contact that sticks -- and
+// "sticks" is what rejects a graze that the player bounced straight back out of.
+#define PHASE_BOARD_AIR_BEFORE 3    // clear air intervals required first
+#define PHASE_BOARD_WINDOW     6    // and of the next this many...
+#define PHASE_BOARD_STICK      4    // ...at least this many stay in contact
+
+static void FindPhase(WrRun *run)
+{
+    free(run->phase);
+    free(run->boards);
+    run->phase = NULL;
+    run->boards = NULL;
+    run->boardCount = 0;
+
+    if (run->pointCount < 8)
+        return;
+
+    // Without a real gravity there is no test to make.
+    //
+    // Every classification here is "is the vertical acceleration -g", so a
+    // gravity of zero says free flight is zero acceleration and reclassifies the
+    // entire world as airborne -- confidently, and with no sign anything is
+    // wrong. Leaving the array NULL is the honest answer, and it is the one the
+    // rest of this project gives: WR_ETA_NO_DATA rather than eta 0, "no reading"
+    // rather than a number. Callers already treat a NULL phase as unknown.
+    //
+    // In the DLL this cannot happen -- dllmain runs WrEnergyDefaults() before
+    // anything loads -- but a harness that links wr_path.cpp and not the energy
+    // defaults can, and did.
+    const float g = g_energy.gravity;
+    if (!(g > 1.0f))
+        return;
+
+    run->phase = (unsigned char *)malloc((size_t)run->pointCount);
+    if (!run->phase)
+        return;
+    memset(run->phase, WR_PHASE_UNKNOWN, (size_t)run->pointCount);
+
+    // A break at index k means the step from k to k+1 is a jump. Mark them up
+    // front so the walk below is a lookup rather than a scan per point.
+    unsigned char *broken = (unsigned char *)calloc((size_t)run->pointCount, 1);
+    if (!broken)
+        return;
+    for (int k = 0; k < run->breakCount; k++)
+        if (run->breaks[k] >= 0 && run->breaks[k] < run->pointCount)
+            broken[run->breaks[k]] = 1;
+
+    // Pass one: air or contact, per interval, recorded on its first point.
+    for (int i = 0; i + 1 < run->pointCount; i++)
+    {
+        if (broken[i])
+            continue;                       // stays UNKNOWN
+
+        const WrPoint &a = run->points[i], &b = run->points[i + 1];
+        float h = b.t - a.t;
+        float step = WrDist(a.pos, b.pos);
+        if (WrPhaseIsTeleport(step, WrLength(a.vel), h))
+            continue;
+
+        if (!WrPhaseIsContact(a.vel.z, b.vel.z, h, g))
+        {
+            run->phase[i] = WR_PHASE_AIR;
+            continue;
+        }
+
+        // In contact. Which kind needs the normal, and a single clip is a poor
+        // estimate of it during a sustained ride -- the change over one tick
+        // there is mostly gravity. So the phase is left as a contact of unknown
+        // kind and pass two decides it from the whole segment.
+        run->phase[i] = WR_PHASE_GROUND;
+    }
+
+    // Pass two: fit a plane to each run of contact and reclassify it. While a
+    // player rides a surface every velocity lies IN it, so a segment gives a far
+    // better normal than any one tick of it does.
+    for (int i = 0; i + 1 < run->pointCount; )
+    {
+        if (run->phase[i] != WR_PHASE_GROUND) { i++; continue; }
+
+        int j = i;
+        while (j + 1 < run->pointCount && run->phase[j] == WR_PHASE_GROUND)
+            j++;
+
+        int m = j - i + 1;
+        if (m >= 4 && m <= 4096)
+        {
+            float *vs = (float *)malloc(sizeof(float) * 3 * (size_t)m);
+            if (vs)
+            {
+                for (int k = 0; k < m; k++)
+                {
+                    const Vec3 &v = run->points[i + k].vel;
+                    vs[3 * k + 0] = v.x;
+                    vs[3 * k + 1] = v.y;
+                    vs[3 * k + 2] = v.z;
+                }
+                float nrm[3];
+                if (WrPhaseFitNormal(vs, m, nrm))
+                {
+                    unsigned char ph = (unsigned char)WrPhaseFromNormal(nrm);
+                    for (int k = i; k < j; k++)
+                        run->phase[k] = ph;
+                }
+                free(vs);
+            }
+        }
+        i = j;
+    }
+
+    // Pass three: the boards. Counted first so the array is allocated once --
+    // 27,453 of them across this library, but a single run has tens.
+    int found = 0;
+    for (int pass = 0; pass < 2; pass++)
+    {
+        int count = 0;
+        for (int i = PHASE_BOARD_AIR_BEFORE;
+             i + PHASE_BOARD_WINDOW + 1 < run->pointCount; i++)
+        {
+            if (run->phase[i] != WR_PHASE_RAMP && run->phase[i] != WR_PHASE_GROUND)
+                continue;
+
+            bool airBefore = true;
+            for (int k = 1; k <= PHASE_BOARD_AIR_BEFORE; k++)
+                if (run->phase[i - k] != WR_PHASE_AIR)
+                    airBefore = false;
+            if (!airBefore)
+                continue;
+
+            int stick = 0;
+            for (int k = i; k < i + PHASE_BOARD_WINDOW; k++)
+                if (run->phase[k] == WR_PHASE_RAMP || run->phase[k] == WR_PHASE_GROUND)
+                    stick++;
+            if (stick < PHASE_BOARD_STICK)
+                continue;
+
+            const WrPoint &a = run->points[i], &b = run->points[i + 1];
+            float h = b.t - a.t;
+            float vIn[3] = { a.vel.x, a.vel.y, a.vel.z };
+            float vOut[3] = { b.vel.x, b.vel.y, b.vel.z };
+            float nrm[3];
+            if (!WrPhaseNormal(vIn, vOut, h, g, nrm))
+                continue;
+
+            // Only ramps. A landing on a floor is not a board, and neither is
+            // clipping a wall -- the lower bound is what keeps near-vertical
+            // geometry out of a readout about surfing.
+            float nz = nrm[2] < 0.0f ? -nrm[2] : nrm[2];
+            if (nz < WR_PHASE_MIN_RAMP_NZ || nz > WR_PHASE_STANDABLE)
+                continue;
+
+            WrBoardStats s;
+            if (!WrPhaseBoard(vIn, vOut, nrm, &s))
+                continue;
+            if (!WrPhaseBoardWorthReporting(&s))
+                continue;
+
+            if (pass == 1 && count < found)
+            {
+                run->boards[count].pointIndex = i;
+                run->boards[count].normal = WrVec(nrm[0], nrm[1], nrm[2]);
+                run->boards[count].s = s;
+            }
+            count++;
+        }
+
+        if (pass == 0)
+        {
+            found = count;
+            if (found <= 0)
+                break;
+            run->boards = (WrBoard *)malloc(sizeof(WrBoard) * (size_t)found);
+            if (!run->boards)
+            {
+                found = 0;
+                break;
+            }
+        }
+        else
+        {
+            run->boardCount = count < found ? count : found;
+        }
+    }
+
+    free(broken);
 }
 
 // Distance from the camera to the nearest point of each run.

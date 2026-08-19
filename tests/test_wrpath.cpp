@@ -45,6 +45,7 @@
 #include "wr_dp.h"
 #include "wr_path.h"
 #include "wr_extract.h"
+#include "wr_energy.h"
 #include "wr_log.h"
 
 #include <math.h>
@@ -143,6 +144,14 @@ int main(void)
     // Pinned so the header's timestamp is a constant. Set before anything is
     // written; WrNowEpoch reads the environment on every call.
     SetEnvironmentVariableA("WRLINES_FAKE_NOW", "1700000000");
+
+    // The loader derives per-point quantities that depend on the energy
+    // settings -- efficiency against the air-strafing ceiling, and the movement
+    // phase against gravity. dllmain does this before anything loads; a harness
+    // that links wr_path.cpp has to do it too, and this one was not: gravity sat
+    // at zero, which made the ceiling meaningless and told the phase classifier
+    // that free fall has no acceleration.
+    WrEnergyDefaults();
 
     char dir[MAX_PATH];
     strcpy_s(dir, sizeof(dir), WrDataPath("paths\\" TEST_MAP));
@@ -314,6 +323,34 @@ int main(void)
                 r->points[i].vel.y != (float)pts[i].vy)
                 posExact = false;
         Check(posExact, "every coordinate is the float32 of what went in");
+
+        // The phase array, through the real loader rather than the pure header.
+        //
+        // This fixture climbs at a CONSTANT vz -- 5 units a tick, for all 300 of
+        // them -- so its vertical acceleration is zero where free flight would
+        // be -800. Nothing coasts upward at a fixed rate under gravity alone, so
+        // every interval of it must read as contact and none as air. That is a
+        // fact about the trajectory rather than a tuned expectation, which is
+        // what makes it worth asserting: if the classifier ever starts calling
+        // this air, it has stopped measuring gravity.
+        Check(r->phase != NULL, "a phase array is built at load");
+        if (r->phase)
+        {
+            int air = 0, contact = 0;
+            for (int i = 0; i + 1 < r->pointCount; i++)
+            {
+                if (r->phase[i] == WR_PHASE_AIR) air++;
+                if (r->phase[i] == WR_PHASE_RAMP || r->phase[i] == WR_PHASE_GROUND)
+                    contact++;
+            }
+            Check(air == 0, "a constant climb is never free flight");
+            Check(contact == r->pointCount - 1, "and every interval of it is contact");
+        }
+
+        // And with no airborne phase anywhere there is nothing that can board:
+        // the detector wants three clear air intervals before a contact, which
+        // is the whole reason it does not fire on sustained surfing.
+        Check(r->boardCount == 0, "a run that is never airborne has no boards");
     }
 
     // -----------------------------------------------------------------------
