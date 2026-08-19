@@ -34,6 +34,7 @@
 // Run:    tests\test_phase.exe
 
 #include "wr_phase.h"
+#include "wr_stress.h"   // the air-strafing physics; pure, like this one
 
 #include <stdio.h>
 #include <math.h>
@@ -339,6 +340,50 @@ int main(void)
         float n[3] = { 0.0f, 0.0f, 1.0f };
         Check(!WrPhaseBoard(zero, zero, n, &s), "a stationary player is not a board");
         Check(!WrPhaseBoard(a, b, n, 0), "a null output is refused");
+    }
+
+    // -----------------------------------------------------------------------
+    printf("\nthe perfect strafe angle, and where the other formula breaks\n");
+    {
+        // Surf: airaccel 150, maxspeed 250, 0.015 tick. accelspeed is 562.5, so
+        // the 30 u/s wishspeed cap binds and the gain is 30.
+        Check(WrAirGainPerTick(0.015f, 150.0f, 250.0f) == 30.0f,
+              "at surf settings the wishspeed cap binds, so a tick adds 30");
+
+        // Low air acceleration: 3 * 250 * 0.015 = 11.25, under the cap, so the
+        // acceleration binds instead and the gain is smaller.
+        float low = WrAirGainPerTick(0.015f, 3.0f, 250.0f);
+        Check(low > 11.2f && low < 11.3f,
+              "at airaccel 3 the acceleration binds instead, at 11.25");
+
+        // The ideal turn slows as you speed up -- the same 30 units a tick buys
+        // a smaller angle. This is the property the readout is for.
+        float a1000 = WrPerfectStrafeDegrees(1000.0f, 0.015f, 150.0f, 250.0f);
+        float a3000 = WrPerfectStrafeDegrees(3000.0f, 0.015f, 150.0f, 250.0f);
+        Check(a1000 > a3000, "the ideal angle shrinks as speed rises");
+        Check(a3000 * 3.0f > a1000 * 0.98f && a3000 * 3.0f < a1000 * 1.02f,
+              "and shrinks as 1/speed, since atan is linear this small");
+
+        // atan(30/1000) = 1.718 degrees.
+        Check(a1000 > 1.70f && a1000 < 1.74f, "atan(30/1000) is 1.72 degrees");
+
+        // THE DISAGREEMENT WORTH PINNING. The strafe-analyzer project computes
+        // min(tick * 30 * airaccel, 30), which puts the wishspeed cap where
+        // sv_maxspeed belongs. At surf settings both saturate at 30 and nobody
+        // notices. At CS:GO KZ's airaccelerate 12 on a 64 tick they part
+        // company: Source gives min(12 * 250 / 64, 30) = 30, and theirs gives
+        // 12 * 30 / 64 = 5.6 -- and that is exactly the configuration somebody
+        // would reach for this to check.
+        float kz = WrAirGainPerTick(1.0f / 64.0f, 12.0f, 250.0f);
+        float theirs = 12.0f * 30.0f / 64.0f;
+        Check(kz == 30.0f, "at KZ settings Source still caps the gain at 30");
+        Check(theirs < 6.0f, "the other formula gives 5.6 for the same case");
+
+        // Degenerate input is clamped rather than dividing by zero.
+        Check(WrPerfectStrafeDegrees(0.0f, 0.015f, 150.0f, 250.0f) > 0.0f,
+              "a standing player gets a finite angle, not a divide by zero");
+        Check(WrAirGainPerTick(0.015f, 0.0f, 250.0f) == 0.0f,
+              "no air acceleration means no gain");
     }
 
     printf("\n");

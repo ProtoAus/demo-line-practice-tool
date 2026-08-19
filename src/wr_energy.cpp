@@ -73,6 +73,7 @@ WrEnergySettings g_energy;
 static WrVelWindow g_win;
 static WrEma g_velX, g_velY, g_velZ;
 static WrEma g_speedEma, g_energyEma, g_viewTurnEma, g_velTurnEma, g_accelEma;
+static WrEma g_yawTurnEma;      // yaw alone, for the strafe readout
 static WrEma g_zEma;                // the height alone, so K can be separated
 static WrTrendWindow g_trend;
 
@@ -218,6 +219,7 @@ static Vec3 g_lastVelDir;
 static float g_lastSpeedForRate = 0.0f;
 static bool g_haveLastSpeed = false;
 static float g_viewTurn = 0.0f, g_velTurn = 0.0f, g_speedRate = 0.0f;
+static float g_yawTurn = 0.0f;
 
 // Displayed value, quantised with hysteresis so the last digit stops churning.
 static float g_shown = 0.0f;
@@ -294,6 +296,7 @@ void WrEnergyDefaults(void)
     g_energy.speedTau = SPEED_TAU;
     g_energy.powerSeconds = POWER_WINDOW;
     g_energy.showPhase = true;
+    g_energy.showStrafe = false;
     g_energy.gaugeSeconds = 2.0f;
     g_energy.arrowBand = ARROW_BAND;
     g_energy.anchorToRunStart = true;
@@ -344,6 +347,7 @@ void WrEnergyReset(void)
     WrEmaReset(&g_velX); WrEmaReset(&g_velY); WrEmaReset(&g_velZ);
     WrEmaReset(&g_speedEma); WrEmaReset(&g_energyEma); WrEmaReset(&g_zEma);
     WrEmaReset(&g_viewTurnEma); WrEmaReset(&g_velTurnEma); WrEmaReset(&g_accelEma);
+    WrEmaReset(&g_yawTurnEma);
     WrTrendReset(&g_trend);
     WrTrendReset(&g_gauge);
     WrTrendReset(&g_vzTrend);
@@ -381,6 +385,7 @@ void WrEnergyReset(void)
     g_haveVelDir = false;
     g_haveShown = false;
     g_viewTurn = g_velTurn = g_speedRate = 0.0f;
+    g_yawTurn = 0.0f;
     g_vel = WrVec(0.0f, 0.0f, 0.0f);
 }
 
@@ -528,6 +533,7 @@ static void Teleported(const Vec3 &pos)
     g_stillFor = 0.0f;
     g_held = false;
     g_speedRate = g_viewTurn = g_velTurn = 0.0f;
+    g_yawTurn = 0.0f;
 
     if (!g_haveRef)
         return;
@@ -963,6 +969,24 @@ void WrEnergySample(const Vec3 &pos, float dt)
             d = WrClampF(d, -1.0f, 1.0f);
             float deg = acosf(d) * 57.2957795f;
             g_viewTurn = WrEmaStep(&g_viewTurnEma, deg / dt, dt, TURN_TAU);
+
+            // And the YAW rate on its own, which is the one that strafing is
+            // about. The rate above is the full angle between two forward
+            // vectors, so it counts pitch -- and a surfer moves pitch constantly
+            // while riding a ramp, which would be charged to their strafing.
+            //
+            // Unwrapped through the +-180 seam, because the raw difference
+            // between +179 and -179 is 358 degrees of a two-degree turn, and at
+            // 200 fps that lands in the readout as a 70,000 deg/s spike.
+            float yaw = 0.0f, lastYaw = 0.0f;
+            float lf[3] = { g_lastFwd.x, g_lastFwd.y, g_lastFwd.z };
+            yaw = atan2f(fwd.y, fwd.x) * 57.2957795f;
+            lastYaw = atan2f(lf[1], lf[0]) * 57.2957795f;
+            float dy = yaw - lastYaw;
+            while (dy > 180.0f) dy -= 360.0f;
+            while (dy < -180.0f) dy += 360.0f;
+            if (dy < 0.0f) dy = -dy;
+            g_yawTurn = WrEmaStep(&g_yawTurnEma, dy / dt, dt, TURN_TAU);
         }
         g_lastFwd = fwd;
         g_haveFwd = true;
@@ -1205,6 +1229,7 @@ float WrEnergyGaugeSpan(void)
 }
 
 float WrEnergyViewTurnRate(void) { return g_viewTurn; }
+float WrEnergyYawRate(void) { return g_yawTurn; }
 float WrEnergyVelTurnRate(void) { return g_velTurn; }
 float WrEnergySpeedRate(void) { return g_speedRate; }
 

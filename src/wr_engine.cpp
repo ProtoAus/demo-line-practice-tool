@@ -437,6 +437,38 @@ bool WrCameraForward(Vec3 *out)
     return true;
 }
 
+// Where you are looking, as Source's own angles.
+//
+// The forward vector has been sitting here since the matrix scanner shipped and
+// nothing ever turned it into an angle. It is worth knowing how good it is: the
+// camera basis comes out of the world-to-screen matrix, and WrValidateW2S will
+// not accept a matrix whose extracted basis is not orthonormal, whose aspect
+// disagrees with the backbuffer, or which fails to reproject a point 512 units
+// down the view axis to the screen centre within 1%. So this is not an estimate
+// in the way the velocity is an estimate -- it is the game's own view direction,
+// read rather than derived, and wr_energy.h already says as much about the turn
+// rate built from it: "literally how fast the mouse is moving".
+//
+// Source's convention: yaw is degrees anticlockwise from +X, and pitch is
+// POSITIVE DOWNWARD, which is why the z term is negated.
+bool WrCameraYaw(float *out)
+{
+    if (!g_camValid)
+        return false;
+    *out = (float)(atan2((double)g_camForward.y, (double)g_camForward.x) *
+                   57.29577951308232);
+    return true;
+}
+
+bool WrCameraPitch(float *out)
+{
+    if (!g_camValid)
+        return false;
+    float z = WrClampF(g_camForward.z, -1.0f, 1.0f);
+    *out = (float)(-asin((double)z) * 57.29577951308232);
+    return true;
+}
+
 const char *WrLevelName(void)
 {
     return g_mapOverride[0] ? g_mapOverride : g_levelName;

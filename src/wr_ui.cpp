@@ -4552,6 +4552,31 @@ static void DrawEnergyTab(void)
                "unless a block genuinely would not fit.");
     const char *corners[] = { "top left", "top right", "bottom left", "bottom right" };
     ImGui::Combo("Corner", &g_energy.overlayCorner, corners, 4);
+    ImGui::Checkbox("Strafe rate against the ideal", &g_energy.showStrafe);
+    ImGui::SameLine();
+    HelpMarker("How fast your view is turning, against how fast it should be.\n\n"
+               "Both numbers are trustworthy, for different reasons. The "
+               "measured one is EXACT -- it comes from the camera basis this "
+               "tool already validates every frame, so it is literally how fast "
+               "the mouse is moving, not something differenced. The ideal is not "
+               "a measurement at all: it is a consequence of Source's "
+               "AirAccelerate. Held perpendicular to your velocity, a tick adds "
+               "at most 30 units at a right angle to it, so the velocity turns "
+               "by atan(gain / speed) and your view has to follow by exactly "
+               "that much.\n\n"
+               "Which is why the ideal turn SLOWS as you speed up. The same 30 "
+               "units a tick buys a smaller and smaller angle, and a rate that "
+               "was right at 1000 u/s is far too fast at 3000.\n\n"
+               "Airborne only, and that restriction is the whole reason this can "
+               "be shown at all. On a ramp the surface turns your velocity far "
+               "faster than air acceleration ever could -- measured, that fires "
+               "on a tenth to a quarter of the samples of RECORD-class runs, "
+               "which is why turn rate was rejected as an efficiency metric and "
+               "dE/dt used instead. In the air there is nothing else doing the "
+               "turning.\n\n"
+               "It reads from the gravity, air-accelerate and max-speed settings "
+               "on this tab, because nothing here reads a cvar. If your server "
+               "runs something other than 150 and 250, set them or ignore this.");
     ImGui::Checkbox("Say what you are touching", &g_energy.showPhase);
     ImGui::SameLine();
     HelpMarker("A row on the corner block reading in the air / on a ramp / on "

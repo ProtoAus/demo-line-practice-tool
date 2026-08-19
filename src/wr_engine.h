@@ -57,6 +57,13 @@ bool WrWorldToScreen(VMatrix *out);
 bool WrCameraOrigin(Vec3 *out);
 bool WrCameraForward(Vec3 *out);
 
+// The same direction as Source's own angles: yaw anticlockwise from +X, pitch
+// positive downward. Exact -- the matrix oracle will not accept a basis that is
+// not orthonormal or that fails to reproject, so this is the game's view
+// direction read rather than anything estimated.
+bool WrCameraYaw(float *out);
+bool WrCameraPitch(float *out);
+
 // Bare map name, e.g. "surf_demise" (no "maps/" prefix, no ".bsp").
 //
 // Read out of momentum\demoheader.tmp, which the engine rewrites on every map

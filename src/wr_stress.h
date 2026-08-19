@@ -191,6 +191,56 @@ static inline float WrAirPowerCeiling(float gravity, float tickInterval)
                                WR_MAXSPEED_DEFAULT, 1.0f);
 }
 
+// How much speed one tick of air strafing can actually add, done ideally.
+//
+// Source's AirAccelerate, with the two speeds it uses for two different things:
+//
+//     wishspd    = min(wishspeed, 30)                   AIR_MAX_WISHSPEED
+//     addspeed   = wishspd - dot(velocity, wishdir)
+//     accelspeed = sv_airaccelerate * wishspeed * tick  <- the UNCAPPED one
+//     gain       = min(accelspeed, addspeed)
+//
+// Done ideally, dot(velocity, wishdir) is 0 -- that is what wr_stress.h's
+// derivation above maximises over -- so addspeed is the full 30 and the gain is
+// whichever of the two is smaller.
+static inline float WrAirGainPerTick(float tickInterval, float airAccel,
+                                     float maxSpeed)
+{
+    if (tickInterval < 1e-4f) tickInterval = 0.015f;
+    if (airAccel < 0.0f) airAccel = 0.0f;
+    if (maxSpeed < 0.0f) maxSpeed = 0.0f;
+
+    float a = airAccel * maxSpeed * tickInterval;
+    return (a > WR_AIR_WISHSPEED) ? WR_AIR_WISHSPEED : a;
+}
+
+// How far your view has to turn each tick to keep strafing ideally, in degrees.
+//
+// Held perpendicular to the velocity, each tick adds `gain` at a right angle to
+// it, so the velocity direction rotates by atan(gain / speed) -- and your view
+// has to follow by exactly that much to stay perpendicular to the new one. That
+// is the whole derivation, and it is why the ideal turn SLOWS as you speed up:
+// the same 30 units a tick buys a smaller and smaller angle.
+//
+// NOT the formula the strafe-analyzer project uses. Its version is
+//
+//     accelSpeed = min(tick * 30 * sv_airaccelerate, 30)
+//
+// which puts the wishspeed cap where sv_maxspeed belongs. The two agree at surf
+// settings by coincidence -- both saturate at 30 -- and disagree badly anywhere
+// the cap does not bind: at CS:GO KZ's airaccelerate 12 on a 64 tick, theirs
+// gives 5.4 units and Source gives min(12 * 250 / 64, 30) = 30. Worth writing
+// down, because that is exactly the configuration somebody would reach for this
+// to check.
+static inline float WrPerfectStrafeDegrees(float speed, float tickInterval,
+                                           float airAccel, float maxSpeed)
+{
+    if (speed < 1.0f)
+        speed = 1.0f;
+    float gain = WrAirGainPerTick(tickInterval, airAccel, maxSpeed);
+    return (float)(atan2((double)gain, (double)speed) * 57.29577951308232);
+}
+
 // Past this much of the ceiling on the GAIN side, it was not the player -- it
 // was a booster. There is deliberately no matching limit on the loss side; see
 // the header. Losing at 350x the ceiling is a wall, and a wall is worth drawing.

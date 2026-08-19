@@ -2909,6 +2909,52 @@ static void EmitEnergyOverlay(ImDrawList *dl)
                 WrEnergySpeed(), WrEnergyHorizontalSpeed());
     cols[n++] = 0xFFCCCCCCu;
 
+    // How fast you are turning, against how fast you should be.
+    //
+    // Both halves are honest for different reasons. The measured rate is exact:
+    // it comes from the camera basis the matrix oracle validated, and is
+    // literally how fast the mouse is moving. The ideal is not a measurement at
+    // all but a consequence of Source's AirAccelerate -- held perpendicular to
+    // the velocity, each tick adds at most 30 units at a right angle to it, so
+    // the velocity direction rotates by atan(gain / speed) and the view has to
+    // follow by exactly that. Which is why the ideal turn SLOWS as you speed up.
+    //
+    // Only while airborne, because that is the only time the number means
+    // anything: on a ramp your velocity is being turned by the surface far
+    // faster than air acceleration could manage, which is the whole finding
+    // behind wr_stress.h refusing to use turn rate as an efficiency metric.
+    if (g_energy.showStrafe)
+    {
+        int ph = WrEnergyPhase();
+        if (ph == WR_PHASE_AIR)
+        {
+            // The same rule the Energy tab uses: a compared run's own tick if
+            // there is one, else 0.015. 482 of the 503 demos measured are 0.015
+            // but every bhop_futile run is 0.01, so this is not a constant.
+            const WrRun *tr = WrEnergyReferenceRun();
+            float tick = (tr && tr->tickInterval > 1e-4f) ? tr->tickInterval
+                                                          : 0.015f;
+            float ideal = WrPerfectStrafeDegrees(WrEnergyHorizontalSpeed(), tick,
+                                                 g_energy.airAccelerate,
+                                                 g_energy.maxSpeed) / tick;
+            float got = WrEnergyYawRate();
+            _snprintf_s(lines[n], sizeof(lines[0]), _TRUNCATE,
+                        "strafe  %.0f/s  ideal %.0f/s", got, ideal);
+
+            // Green inside a fifth of the ideal either way. Not tighter: the
+            // rate is smoothed over 0.12 s and a surfer is never meant to sit
+            // exactly on it -- the point is the size of the miss, not a score.
+            float rel = (ideal > 1.0f) ? (got / ideal) : 1.0f;
+            cols[n++] = (rel > 0.8f && rel < 1.2f) ? 0xFF66FF66u : 0xFFCCCCCCu;
+        }
+        else
+        {
+            _snprintf_s(lines[n], sizeof(lines[0]), _TRUNCATE,
+                        "strafe  --  (only in the air)");
+            cols[n++] = 0xFF808080u;
+        }
+    }
+
     // What you are touching, right now.
     //
     // Coloured off PhaseColour so this row and the line mode can never disagree

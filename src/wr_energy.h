@@ -139,6 +139,12 @@ struct WrEnergySettings
     // accurate enough to state plainly.
     bool showPhase;
 
+    // A row comparing how fast you are turning against how fast Source's own
+    // AirAccelerate says you should be. Airborne only -- on a ramp the surface
+    // turns your velocity far faster than air acceleration could, which is the
+    // finding behind wr_stress.h refusing turn rate as an efficiency metric.
+    bool showStrafe;
+
     bool showOverlay;       // the corner block; ON by default
     int overlayCorner;      // 0 TL, 1 TR, 2 BL, 3 BR
 
@@ -501,6 +507,16 @@ float WrEnergyPeak(void);           // peak relative energy
 //
 // Erring towards inventing a surface rather than missing one is deliberate and
 // is what the tolerance is chosen for.
+// How fast your view is turning in YAW alone, degrees a second.
+//
+// Separate from the view turn rate beside it, which is the full angle between
+// two forward vectors and therefore counts pitch -- and a surfer moves pitch
+// constantly while riding a ramp, which would be charged to their strafing.
+//
+// Exact, in the same sense the view rate is: it comes from the camera basis the
+// matrix oracle validated, not from anything differenced.
+float WrEnergyYawRate(void);
+
 int WrEnergyPhase(void);
 
 bool WrEnergyOnGround(void);
