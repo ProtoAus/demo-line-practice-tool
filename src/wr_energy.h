@@ -496,8 +496,8 @@ float WrEnergyPeak(void);           // peak relative energy
 // did not: see wr_stress.h, 45% agreement and 26% pointing the wrong way.
 // Contact changes the vertical acceleration by hundreds of units per second
 // squared where air strafing changes it by nothing, and simulated against 250
-// real runs through the real estimator this agrees 92.7% of the time, misses a
-// ramp 0.2% of the time and invents one 7.0%.
+// real runs through the real estimator this agrees 92.9% of the time, misses a
+// ramp 0.3% of the time and invents one 6.8%.
 //
 // Erring towards inventing a surface rather than missing one is deliberate and
 // is what the tolerance is chosen for.

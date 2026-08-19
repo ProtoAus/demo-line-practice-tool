@@ -133,6 +133,18 @@ cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% tests\test_phase.cpp ^
    /Fe:tests\test_phase.exe /Fo:tests\ >nul
 if errorlevel 1 ( echo [!] test_phase FAILED to build & exit /b 1 )
 
+rem phase_sweep is BUILT but not RUN. It is where every number in wr_phase.h's
+rem header and in WrEnergyPhase's came from, and it needs thousands of real
+rem .wrpath files to say anything -- other people's demos, which are not in this
+rem repository, the same reason parity.ps1 is a separate script. Building it here
+rem means it cannot rot: a change to the classifier that breaks the tool that
+rem measures the classifier fails the build.
+rem   tests\phase_sweep.exe                 the corpus, exact velocities
+rem   tests\phase_sweep.exe --live          through the real camera estimator
+cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% tests\phase_sweep.cpp ^
+   /Fe:tests\phase_sweep.exe /Fo:tests\ >nul
+if errorlevel 1 ( echo [!] phase_sweep FAILED to build & exit /b 1 )
+
 rem test_args links nothing either, and that is why src\wr_args.h exists as a
 rem header at all: injector.cpp is a translation unit with main() in it, so its
 rem argument parsing could not be driven from here without linking two mains

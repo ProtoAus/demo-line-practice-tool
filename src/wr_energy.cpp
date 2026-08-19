@@ -95,12 +95,14 @@ static float g_gaugeClock = 0.0f;
 // and pushing them through the real wr_smooth.h estimator:
 //
 //     window  tol   agrees   missed a ramp   invented one
-//     0.10    150   90.2%    0.1%            9.6%
-//     0.10    250   92.7%    0.2%            7.0%
-//     0.10    320   93.4%    0.4%            6.2%
+//     0.10    150   90.6%    0.1%            9.2%
+//     0.10    250   92.9%    0.3%            6.8%
+//     0.10    320   93.6%    0.4%            5.9%
 //
-// And view bob does not matter here either: 93.4% with two units of it, 93.5%
+// And view bob does not matter here either: 92.9% with two units of it, 93.1%
 // with none. Same finding as the efficiency work, reached independently.
+//
+// Re-derive any of it with tests\phase_sweep.exe --live.
 //
 // The error is one-sided in the direction that matters. It essentially never
 // misses a ramp; what it does, a few percent of the time, is claim a surface
