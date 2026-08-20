@@ -305,6 +305,15 @@ int main(int argc, char **argv)
     float *resident = (float *)malloc(4096 * sizeof(float));
     int residentN = 0;
 
+    // What one call to WrBspLoad costs, end to end: open, decompress, walk,
+    // clip, grid. This is the number the worker thread in wr_bspload.cpp is
+    // sized against, so it is measured per map rather than averaged over the
+    // sweep -- an average would hide the tail, and the tail is what a hitch is.
+    float *loadMs = (float *)malloc(4096 * sizeof(float));
+    int loadN = 0;
+    float worstLoadMs = 0.0f;
+    char worstLoadMap[128] = { 0 };
+
     LARGE_INTEGER freq, t0, t1;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&t0);
@@ -324,7 +333,16 @@ int main(int argc, char **argv)
 
         WrBspRaw r;
         char err[192] = { 0 };
-        if (!WrBspReadRaw(path, &r, err, (int)sizeof(err)))
+        // Read and build only. The explicit walk below and the checks after it
+        // are the sweep's own work and the worker never does them; WrBspBuild
+        // walks the tree itself, so read + build IS the whole of a load.
+        long long loadTicks = 0;
+        LARGE_INTEGER m0, m1;
+        QueryPerformanceCounter(&m0);
+        bool readOk = WrBspReadRaw(path, &r, err, (int)sizeof(err));
+        QueryPerformanceCounter(&m1);
+        loadTicks += m1.QuadPart - m0.QuadPart;
+        if (!readOk)
         {
             refusedRead++;
             NoteReason(err, fd.cFileName);
@@ -387,7 +405,11 @@ int main(int argc, char **argv)
         if (build)
         {
             WrBspMap map;
-            if (!WrBspBuild(&r, &map, err, (int)sizeof(err)))
+            QueryPerformanceCounter(&m0);
+            bool buildOk = WrBspBuild(&r, &map, err, (int)sizeof(err));
+            QueryPerformanceCounter(&m1);
+            loadTicks += m1.QuadPart - m0.QuadPart;
+            if (!buildOk)
             {
                 refusedBuild++;
                 NoteReason(err, fd.cFileName);
@@ -441,6 +463,17 @@ int main(int argc, char **argv)
                     }
 
                 WrBspFreeMap(&map);
+
+                float ms = (float)(1000.0 * (double)loadTicks
+                                   / (double)freq.QuadPart);
+                if (loadN < 4096)
+                    loadMs[loadN++] = ms;
+                if (ms > worstLoadMs)
+                {
+                    worstLoadMs = ms;
+                    _snprintf_s(worstLoadMap, sizeof(worstLoadMap), _TRUNCATE,
+                                "%s", fd.cFileName);
+                }
             }
         }
 
@@ -505,6 +538,16 @@ int main(int argc, char **argv)
                    g_biggestMap);
             printf("    %lld vertices across the library\n", verts);
         }
+
+        if (loadN)
+        {
+            qsort(loadMs, loadN, sizeof(float), CmpF);
+            printf("\n    one load (read + build): p50 %.0f ms  p90 %.0f ms  "
+                   "p99 %.0f ms\n",
+                   Pct(loadMs, loadN, 0.50), Pct(loadMs, loadN, 0.90),
+                   Pct(loadMs, loadN, 0.99));
+            printf("    slowest: %.0f ms  %s\n", worstLoadMs, worstLoadMap);
+        }
     }
 
     if (rays > 0 && g_rayCount)
@@ -557,6 +600,7 @@ int main(int argc, char **argv)
         printf("    %4d  %s\n            first: %s\n",
                g_reasonN[i], g_reason[i], g_reasonMap[i]);
 
+    free(loadMs);
     free(ownedPct);
     free(resident);
 

@@ -95,6 +95,12 @@ set "SRC=%SRC% %S%\wr_start.cpp %S%\wr_settings.cpp %S%\wr_quick.cpp"
 set "SRC=%SRC% %S%\wr_json.cpp %S%\wr_msml.cpp %S%\wr_mtv.cpp %S%\wr_peek.cpp"
 set "SRC=%SRC% %S%\wr_http.cpp %S%\wr_api.cpp %S%\wr_fetch.cpp"
 set "SRC=%SRC% %S%\wr_dp.cpp %S%\wr_demo.cpp %S%\wr_jobs.cpp"
+rem The map reader is two translation units on purpose. wr_bsp.cpp is pure --
+rem a path in, polygons or a refusal out, no threads, no settings, no engine --
+rem which is what lets tests\test_bsp.exe and tests\bsp_sweep.exe link it with
+rem nothing else attached. wr_bspload.cpp is the half that knows a game is
+rem running, and the tests do not build it.
+set "SRC=%SRC% %S%\wr_bsp.cpp %S%\wr_bspload.cpp"
 rem wr_sha256.cpp is written out rather than linked from BCrypt or ADVAPI32 on
 rem purpose: either of those would add a seventh import and break the claim the
 rem README makes about this list. wr_sha256.h has the argument in full.

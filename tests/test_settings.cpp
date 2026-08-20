@@ -32,6 +32,7 @@
 #include "wr_limit.h"
 #include "wr_profile.h"
 #include "wr_quick.h"
+#include "wr_bspload.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -96,6 +97,24 @@ void WrQuickDefaults(void)
     g_quick.gamemode = 1;
 }
 
+// And the map reader's, for a reason that is worth stating rather than lumping
+// in with the two above: wr_bspload.cpp is not a panel and pulls in no ImGui.
+// What it does pull in is wr_bsp.cpp, the LZMA decoder and the engine layer,
+// which is a lot of program to check eight keys -- and it also owns a worker
+// thread, which a settings harness has no business starting. The struct is the
+// real one, so a renamed field still fails to compile here.
+WrBspLoadSettings g_bspLoad;
+
+void WrBspLoadDefaults(void)
+{
+    memset(&g_bspLoad, 0, sizeof(g_bspLoad));
+    g_bspLoad.read = true;
+    g_bspLoad.drawRadius = 1024.0f;
+    g_bspLoad.drawAlpha = 0.55f;
+    g_bspLoad.maxDrawPolys = 96;
+    g_bspLoad.aheadDistance = 2048.0f;
+}
+
 // And the panel's own registration, which lives in wr_ui.cpp for the same
 // reason -- a handful of its settings, restated with the same keys.
 static int g_hudCycleKey = 0, g_pickToggleKey = 0;
@@ -134,6 +153,7 @@ static void Defaults(void)
     WrEnergyDefaults();
     WrStartDefaults();
     WrLimitDefaults();
+    WrBspLoadDefaults();
 }
 
 static void WriteFile_(const char *body)

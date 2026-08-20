@@ -40,6 +40,7 @@
 #include "wr_settings.h"
 #include "wr_quick.h"
 #include "wr_update.h"
+#include "wr_bspload.h"
 
 #include "imgui.h"
 
@@ -79,11 +80,23 @@ void WrIdleTick(void)
         // map index the panel owns, so it happens there.
         WrIntoGameRefresh(NULL, 0);
         WrExtractOnMapChanged(map);
+
+        // Drops the previous level's geometry NOW, and asks for this one's.
+        // The drop has to happen on this thread and at this moment: a load
+        // takes up to 124 ms, and until the replacement lands anything drawn
+        // from the old map is ramps from somewhere else, at plausible angles,
+        // in plausible places. See wr_bspload.h.
+        WrBspLoadOnMapChanged(map);
     }
 
     // Feeds the run store a few files per frame, so a 125-run map does not stall
     // the render thread on load.
     WrPathLoadTick();
+
+    // Picks up a finished map parse and frees the one it replaces. This is the
+    // ONLY place a WrBspMap is freed, which is what lets the draw path hold the
+    // pointer for a frame without a lock or a reference count.
+    WrBspLoadTick();
 
     // Our own frame time. ImGui's io.DeltaTime is not available here: on an idle
     // frame there is no ImGui frame at all, and using it would make the energy
@@ -246,6 +259,7 @@ static DWORD WINAPI InitThread(LPVOID)
     WrStartDefaults();
     WrLimitDefaults();
     WrQuickDefaults();
+    WrBspLoadDefaults();
 
     // AFTER the defaults, never before: the file is read OVER them, so a key it
     // does not carry keeps whatever the default put there. That is what lets an

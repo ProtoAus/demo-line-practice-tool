@@ -7,6 +7,7 @@
 #include "wr_limit.h"
 #include "wr_profile.h"
 #include "wr_quick.h"
+#include "wr_bspload.h"
 #include "wr_board.h"           // WR_GAMEMODE_COUNT, for the quick menu's range
 #include "wr_extract.h"         // the per-demo timeout, which had a slider and
                                 // no line in this table until v0.9.4
@@ -250,6 +251,19 @@ static void RegisterQuick(void)
     WrSettingsInt("extract.timeout", WrExtractTimeoutPtr(), 0, 300);
 }
 
+static void RegisterBsp(void)
+{
+    WrSettingsBool("bsp.read", &g_bspLoad.read);
+    WrSettingsBool("bsp.drawSurf", &g_bspLoad.drawSurf);
+    WrSettingsFloat("bsp.drawRadius", &g_bspLoad.drawRadius, 128.0f, 8192.0f);
+    WrSettingsFloat("bsp.drawAlpha", &g_bspLoad.drawAlpha, 0.05f, 1.0f);
+    WrSettingsInt("bsp.maxDrawPolys", &g_bspLoad.maxDrawPolys, 8, 512);
+    WrSettingsBool("bsp.drawFill", &g_bspLoad.drawFill);
+    WrSettingsBool("bsp.showAhead", &g_bspLoad.showAhead);
+    WrSettingsFloat("bsp.aheadDistance", &g_bspLoad.aheadDistance,
+                    256.0f, 8192.0f);
+}
+
 static void RegisterProfile(void)
 {
     WrSettingsInt("graph.buckets", &g_wrProfileBuckets, 16, WR_PROFILE_BUCKETS);
@@ -477,6 +491,7 @@ void WrSettingsInit(void)
         RegisterLimit();
         RegisterProfile();
         RegisterQuick();
+        RegisterBsp();
         WrUiRegisterSettings();
         g_registered = true;
 
