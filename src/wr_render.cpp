@@ -421,18 +421,25 @@ static void FlushBatch(ImDrawList *dl, unsigned int colour, float thickness)
 }
 
 // The colour of a surfable face read out of the map file, in ImGui's ABGR --
-// rgb(80, 226, 214), a cyan.
+// rgb(150, 195, 215), a pale steel blue.
 //
-// Deliberately the same family as the "on a ramp" line colour, which is a light
-// blue, because both of them mean ramp. They cannot be confused with each other
-// despite that: one is a line following a trajectory and the other is a closed
-// outline lying on a surface, and the shapes say which is which long before the
-// hue does.
+// PICKED BY SATURATION, NOT BY HUE, and that is forced rather than stylistic.
+// No hue is free: kPalette in wr_path.cpp already spends eight of them on run
+// identity -- gold, cyan, green, red, magenta, orange, teal, grey -- so a
+// search for an unused colour has nowhere to land. The first attempt here was
+// rgb(80, 226, 214), which sits directly between that palette's cyan and its
+// teal, which is the worst place on the wheel to have put it.
 //
-// What it must NOT collide with is the field: the speed, energy and efficiency
-// ramps run green through amber to red, first place is violet, and the live
-// trail is green. Cyan is the one region none of those reaches.
-#define WR_BSP_SURF_COLOUR 0xFFD6E250u
+// What IS free is the low-saturation end. Every mark this tool draws is a
+// saturated hue because every one of them is about a run: the palette, the
+// green-amber-red ramps that speed, energy and efficiency all share, the blue
+// and orange of the phase colours, the violet of first place. This is the only
+// thing on screen that is not about a run, so it is the only thing that is not
+// a saturated hue -- and the rule reads the same way round, which is what makes
+// it worth having as a rule.
+//
+// It is also drawn under everything, so looking like background is correct.
+#define WR_BSP_SURF_COLOUR 0xFFD7C396u
 
 static inline unsigned int WithAlpha(unsigned int colour, float a)
 {
