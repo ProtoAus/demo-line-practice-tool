@@ -779,6 +779,8 @@ static bool Grow(void **buf, int *cap, int need, size_t elem, size_t *bytes)
     return true;
 }
 
+static bool BuildGrid(WrBspMap *m, char *err, int errCap);
+
 bool WrBspBuild(const WrBspRaw *r, WrBspMap *out, char *err, int errCap)
 {
     if (err && errCap > 0)
@@ -985,7 +987,326 @@ bool WrBspBuild(const WrBspRaw *r, WrBspMap *out, char *err, int errCap)
         }
     }
 
+    if (!BuildGrid(&m, err, errCap))
+    {
+        WrBspFreeMap(&m);
+        return false;
+    }
+
     *out = m;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// The grid
+// ---------------------------------------------------------------------------
+//
+// A polygon goes in every cell its bounding box touches AND whose box its
+// plane actually passes through. The second half is not an optimisation of the
+// first -- it is the difference between a workable index and one that is
+// mostly wasted. A surf ramp is a thin sheet lying diagonally across a large
+// box, so its AABB can cover a hundred cells while the ramp itself passes
+// through a dozen. Testing the plane against each cell's own box costs eight
+// dot products and removes the rest.
+//
+// It is still conservative: a cell can straddle the plane without containing
+// any of the polygon. That is fine and it is the right direction to be wrong
+// in -- a cell holding a polygon it does not really contain costs one extra
+// test at query time, where a missing one costs a wrong answer.
+
+static bool PlaneCrossesCell(const float p[4], const float lo[3],
+                             const float hi[3])
+{
+    // The two corners furthest along and against the normal bracket every
+    // other corner, so two dot products decide it rather than eight.
+    float near_ = 0.0f, far_ = 0.0f;
+    for (int k = 0; k < 3; k++)
+    {
+        if (p[k] >= 0.0f) { near_ += p[k] * lo[k]; far_ += p[k] * hi[k]; }
+        else              { near_ += p[k] * hi[k]; far_ += p[k] * lo[k]; }
+    }
+    return near_ <= p[3] + WR_BSP_ON_EPSILON &&
+           far_  >= p[3] - WR_BSP_ON_EPSILON;
+}
+
+static bool BuildGrid(WrBspMap *m, char *err, int errCap)
+{
+    WrBspGridFit(m->mins, m->maxs, &m->grid);
+    const int cells = WrBspGridCellCount(&m->grid);
+    if (cells <= 0)
+    {
+        Fail(err, errCap, "the map has no extent to index");
+        return false;
+    }
+
+    int *counts = (int *)calloc((size_t)cells + 1, sizeof(int));
+    if (!counts)
+    {
+        Fail(err, errCap, "out of memory");
+        return false;
+    }
+
+    // Two passes over the same loop, because the exact item count is not
+    // knowable without doing the work: pass 0 counts, pass 1 fills.
+    long long total = 0;
+    for (int pass = 0; pass < 2; pass++)
+    {
+        if (pass == 1)
+        {
+            // Prefix sum turns the counts into starts. cellStart[cells] is the
+            // terminator, so every cell's range is a subtraction.
+            int running = 0;
+            for (int c = 0; c < cells; c++)
+            {
+                const int n = counts[c];
+                counts[c] = running;
+                running += n;
+            }
+            counts[cells] = running;
+
+            m->cellItems = (int *)malloc((size_t)(running ? running : 1)
+                                         * sizeof(int));
+            if (!m->cellItems)
+            {
+                free(counts);
+                Fail(err, errCap, "out of memory");
+                return false;
+            }
+            m->itemCount = running;
+            m->bytes += (size_t)running * sizeof(int)
+                      + (size_t)(cells + 1) * sizeof(int);
+            if (m->bytes > WR_BSP_MAX_RESIDENT)
+            {
+                free(counts);
+                Fail(err, errCap,
+                     "the geometry needs over %u bytes, which is the limit",
+                     (unsigned int)WR_BSP_MAX_RESIDENT);
+                return false;
+            }
+        }
+
+        for (int i = 0; i < m->polyCount; i++)
+        {
+            const WrBspPoly *p = &m->polys[i];
+            const float (*v)[3] = m->verts + p->first;
+
+            float bmin[3], bmax[3];
+            for (int k = 0; k < 3; k++) { bmin[k] = v[0][k]; bmax[k] = v[0][k]; }
+            for (int j = 1; j < p->count; j++)
+                for (int k = 0; k < 3; k++)
+                {
+                    if (v[j][k] < bmin[k]) bmin[k] = v[j][k];
+                    if (v[j][k] > bmax[k]) bmax[k] = v[j][k];
+                }
+
+            int lo[3], hi[3];
+            WrBspGridCell(&m->grid, bmin, lo);
+            WrBspGridCell(&m->grid, bmax, hi);
+
+            for (int z = lo[2]; z <= hi[2]; z++)
+                for (int y = lo[1]; y <= hi[1]; y++)
+                    for (int x = lo[0]; x <= hi[0]; x++)
+                    {
+                        float cl[3], ch[3];
+                        const int cc[3] = { x, y, z };
+                        for (int k = 0; k < 3; k++)
+                        {
+                            cl[k] = m->grid.mins[k] + m->grid.cell[k] * cc[k];
+                            ch[k] = cl[k] + m->grid.cell[k];
+                        }
+                        if (!PlaneCrossesCell(p->plane, cl, ch))
+                            continue;
+
+                        const int c = WrBspGridIndex(&m->grid, x, y, z);
+                        if (pass == 0)
+                        {
+                            counts[c]++;
+                            total++;
+                        }
+                        else
+                        {
+                            m->cellItems[counts[c]++] = i;
+                        }
+                    }
+        }
+
+        if (pass == 0 && total > 40LL * 1000LL * 1000LL)
+        {
+            free(counts);
+            Fail(err, errCap, "the grid would need %lld entries", total);
+            return false;
+        }
+    }
+
+    // counts has been walked forward by the fill, so entry c now holds what
+    // entry c+1 should. Shifting it back is cheaper than keeping two arrays.
+    for (int c = cells; c > 0; c--)
+        counts[c] = counts[c - 1];
+    counts[0] = 0;
+
+    m->cellStart = counts;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// The queries
+// ---------------------------------------------------------------------------
+
+bool WrBspTraceRay(const WrBspMap *m, const float start[3], const float dir[3],
+                   float maxDist, int *polyOut, float *tOut)
+{
+    if (!m || !m->cellStart || m->polyCount <= 0)
+        return false;
+
+    WrBspDda w;
+    if (!WrBspDdaBegin(&m->grid, start, dir, maxDist, &w))
+        return false;
+
+    int best = -1;
+    float bestT = maxDist;
+
+    do
+    {
+        // The walk's cells only ever start further along, so once the nearest
+        // hit is behind where this cell begins, nothing after it can beat it.
+        if (best >= 0 && bestT < w.t)
+            break;
+
+        const int c = WrBspGridIndex(&m->grid, w.c[0], w.c[1], w.c[2]);
+        for (int k = m->cellStart[c]; k < m->cellStart[c + 1]; k++)
+        {
+            const int i = m->cellItems[k];
+            const WrBspPoly *p = &m->polys[i];
+            float t;
+            if (!WrBspRayPoly(start, dir, p->plane, m->verts + p->first,
+                              p->count, &t))
+                continue;
+            if (t < bestT)
+            {
+                bestT = t;
+                best = i;
+            }
+        }
+    } while (WrBspDdaNext(&m->grid, &w));
+
+    if (best < 0)
+        return false;
+    if (polyOut) *polyOut = best;
+    if (tOut) *tOut = bestT;
+    return true;
+}
+
+// The cell range a sphere touches, clamped into the grid.
+static void CellBox(const WrBspMap *m, const float pt[3], float radius,
+                    int lo[3], int hi[3])
+{
+    float a[3], b[3];
+    for (int k = 0; k < 3; k++)
+    {
+        a[k] = pt[k] - radius;
+        b[k] = pt[k] + radius;
+    }
+    WrBspGridCell(&m->grid, a, lo);
+    WrBspGridCell(&m->grid, b, hi);
+}
+
+int WrBspSurfNear(const WrBspMap *m, const float pt[3], float radius,
+                  int *out, int cap)
+{
+    if (!m || !m->cellStart || !out || cap <= 0)
+        return 0;
+
+    int lo[3], hi[3];
+    CellBox(m, pt, radius, lo, hi);
+
+    // Insertion sort into the output, nearest first, with the duplicate check
+    // folded in. A polygon is listed in every cell its plane crosses, so
+    // without the check a ramp lying across nine cells comes back nine times.
+    float dist[64];
+    if (cap > 64)
+        cap = 64;
+    int n = 0;
+
+    for (int z = lo[2]; z <= hi[2]; z++)
+        for (int y = lo[1]; y <= hi[1]; y++)
+            for (int x = lo[0]; x <= hi[0]; x++)
+            {
+                const int c = WrBspGridIndex(&m->grid, x, y, z);
+                for (int k = m->cellStart[c]; k < m->cellStart[c + 1]; k++)
+                {
+                    const int i = m->cellItems[k];
+                    const WrBspPoly *p = &m->polys[i];
+                    if (!WrBspIsSurfBand(p->plane[2]))
+                        continue;
+
+                    bool already = false;
+                    for (int j = 0; j < n && !already; j++)
+                        if (out[j] == i)
+                            already = true;
+                    if (already)
+                        continue;
+
+                    const float d = WrBspPointPolyDist(pt, p->plane,
+                                                       m->verts + p->first,
+                                                       p->count);
+                    if (d > radius)
+                        continue;
+
+                    int at = n < cap ? n : cap - 1;
+                    if (n == cap && d >= dist[cap - 1])
+                        continue;
+                    while (at > 0 && dist[at - 1] > d)
+                    {
+                        dist[at] = dist[at - 1];
+                        out[at] = out[at - 1];
+                        at--;
+                    }
+                    dist[at] = d;
+                    out[at] = i;
+                    if (n < cap)
+                        n++;
+                }
+            }
+
+    return n;
+}
+
+bool WrBspNearestFace(const WrBspMap *m, const float pt[3], float radius,
+                      int *polyOut, float *distOut)
+{
+    if (!m || !m->cellStart)
+        return false;
+
+    int lo[3], hi[3];
+    CellBox(m, pt, radius, lo, hi);
+
+    int best = -1;
+    float bestD = radius;
+
+    for (int z = lo[2]; z <= hi[2]; z++)
+        for (int y = lo[1]; y <= hi[1]; y++)
+            for (int x = lo[0]; x <= hi[0]; x++)
+            {
+                const int c = WrBspGridIndex(&m->grid, x, y, z);
+                for (int k = m->cellStart[c]; k < m->cellStart[c + 1]; k++)
+                {
+                    const int i = m->cellItems[k];
+                    const WrBspPoly *p = &m->polys[i];
+                    const float d = WrBspPointPolyDist(pt, p->plane,
+                                                       m->verts + p->first,
+                                                       p->count);
+                    if (d < bestD)
+                    {
+                        bestD = d;
+                        best = i;
+                    }
+                }
+            }
+
+    if (best < 0)
+        return false;
+    if (polyOut) *polyOut = best;
+    if (distOut) *distOut = bestD;
     return true;
 }
 
@@ -995,5 +1316,7 @@ void WrBspFreeMap(WrBspMap *m)
         return;
     free(m->polys);
     free(m->verts);
+    free(m->cellStart);
+    free(m->cellItems);
     memset(m, 0, sizeof(*m));
 }

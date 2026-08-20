@@ -146,6 +146,20 @@
 // built here -- see wr_bspgeom.h for why a grid and not the file's own tree.
 // So the version-sensitive structs exist for the length of one function call,
 // which is the only window in which Strata changing dnode_t again can hurt.
+//
+// THE GRID IS CHECKED AGAINST THE THING IT ACCELERATES
+//
+// An index that is wrong does not report an error. A ray that should hit
+// returns "nothing ahead", which is byte for byte what a ray that correctly
+// finds nothing returns -- and this feature's whole job is answering "what is
+// ahead of me", where "nothing" is an ordinary answer. So the only way to know
+// is to ask without the grid and require the same result.
+//
+// 260,800 rays over all 1,304 maps, from inside each map's own bounds, in
+// every direction: ZERO disagreements with brute force. 26.7% of them hit
+// something, so the comparison is not vacuous. And it is worth having --
+// 0.3 microseconds a ray against 115.7, which is 401x, and cheap enough that a
+// query every frame is not a thing anybody has to think about.
 
 #ifndef WR_BSP_H
 #define WR_BSP_H
@@ -163,12 +177,12 @@
 // exist because fileofs, filelen and the LZMA container's declared size all
 // come out of somebody else's file and each of them is an allocation.
 
-// WR_BSP_MAX_RESIDENT is what the POLYGONS are allowed to cost, and it is the
-// one of the three with real data behind it. Measured over all 1,304 maps: p50
-// 1.19 MB, p90 2.38 MB, p99 4.75 MB, worst 9.50 MB (bhop_canals, 95,955
-// faces). 64 MB is therefore about seven times the worst map in the library,
-// which is the right kind of margin for a number whose job is to stop rather
-// than to fit.
+// WR_BSP_MAX_RESIDENT is what the polygons AND the grid are allowed to cost
+// together, and it is the one of the three with real data behind it. Measured
+// over all 1,304 maps: p50 2.25 MB, p90 4.05 MB, p99 6.41 MB, worst 10.50 MB
+// (bhop_canals, 95,955 faces). 64 MB is therefore about six times the worst
+// map in the library, which is the right kind of margin for a number whose job
+// is to stop rather than to fit.
 #define WR_BSP_MAX_LUMP        (128u * 1024u * 1024u)
 #define WR_BSP_MAX_LUMPS_TOTAL (256u * 1024u * 1024u)
 #define WR_BSP_MAX_RESIDENT    (64u * 1024u * 1024u)
@@ -348,6 +362,15 @@ struct WrBspMap
     float surfArea;
     float solidArea;
 
+    // The uniform grid, as a bucketed index. cellStart has one entry per cell
+    // plus a terminator, so cell c holds cellItems[cellStart[c]..cellStart[c+1]).
+    // See wr_bspgeom.h for why a grid we build and not the tree the file came
+    // with.
+    WrBspGridDesc grid;
+    int *cellStart;
+    int *cellItems;
+    int  itemCount;
+
     size_t bytes;           // what all of the above cost
 };
 
@@ -361,5 +384,39 @@ static inline const float (*WrBspPolyVerts(const WrBspMap *m, int i))[3]
 {
     return m->verts + m->polys[i].first;
 }
+
+// ---------------------------------------------------------------------------
+// The three questions anybody asks of it
+// ---------------------------------------------------------------------------
+//
+// All three go through the grid, and all three are also implemented brute
+// force in tests\test_bsp.exe and compared -- an accelerator that disagrees
+// with the thing it accelerates is the failure mode here, and it is a quiet
+// one: a ray that misses returns "nothing ahead", which is exactly what a ray
+// that correctly finds nothing returns.
+//
+// None of these calls into the game, and none of them is a trace. They are
+// arithmetic over a list of polygons read off a file.
+
+// WHAT IS AHEAD. The nearest front-facing polygon along a ray. This is the
+// query behind "what angle is that ramp, before I reach it".
+//
+// Front faces only, which does a second job worth naming: it is what stops a
+// ramp's UNDERSIDE being reported as the ramp when the query starts below it.
+bool WrBspTraceRay(const WrBspMap *m, const float start[3], const float dir[3],
+                   float maxDist, int *polyOut, float *tOut);
+
+// WHAT IS AROUND. Surf-band polygons within `radius` of a point, deduplicated,
+// nearest first. This is the query behind drawing the ramp surface itself.
+// Returns how many were written, which may be less than found if cap is small.
+int WrBspSurfNear(const WrBspMap *m, const float pt[3], float radius,
+                  int *out, int cap);
+
+// WHAT DID I TOUCH. The nearest polygon of any facing, for confirming a normal
+// that wr_phase.h recovered from a velocity trace. The contact point for that
+// is a player ORIGIN a few units off the surface rather than a point on it,
+// which is why this measures distance to the polygon and not to its plane.
+bool WrBspNearestFace(const WrBspMap *m, const float pt[3], float radius,
+                      int *polyOut, float *distOut);
 
 #endif // WR_BSP_H

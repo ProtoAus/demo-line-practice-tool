@@ -142,12 +142,121 @@ static double g_angle[91];
 static double g_angleArea = 0.0;
 
 // ---------------------------------------------------------------------------
+// The grid, against the thing it accelerates
+// ---------------------------------------------------------------------------
+//
+// tests\test_bsp.exe already compares them, on a fixture whose grid is three
+// cells by three by one. That is enough to catch an arithmetic mistake and not
+// nearly enough to catch a WALK mistake: a DDA that skips a cell under some
+// direction sign, or stops a step early at a boundary, needs a grid with
+// somewhere to go wrong in. Real maps have grids of thousands of cells, and
+// the answer is still checkable, because brute force does not care how many
+// polygons there are -- only how long it takes.
+
+static unsigned int g_seed = 987654321u;
+static float Rnd(float lo, float hi)
+{
+    g_seed = g_seed * 1664525u + 1013904223u;
+    return lo + (hi - lo) * ((g_seed >> 8) & 0xFFFFFF) / (float)0x1000000;
+}
+
+static bool BruteRay(const WrBspMap *m, const float s[3], const float d[3],
+                     float maxDist, int *polyOut, float *tOut)
+{
+    int best = -1;
+    float bestT = maxDist;
+    for (int i = 0; i < m->polyCount; i++)
+    {
+        float t;
+        if (!WrBspRayPoly(s, d, m->polys[i].plane, m->verts + m->polys[i].first,
+                          m->polys[i].count, &t))
+            continue;
+        if (t < bestT) { bestT = t; best = i; }
+    }
+    if (best < 0)
+        return false;
+    if (polyOut) *polyOut = best;
+    if (tOut) *tOut = bestT;
+    return true;
+}
+
+static long long g_rayGrid = 0, g_rayBrute = 0;      // ticks
+static long long g_rayCount = 0, g_rayHits = 0, g_rayMismatch = 0;
+static char g_mismatchMap[128] = "none";
+
+static void RayCheck(const WrBspMap *m, const char *name, int rays)
+{
+    if (m->polyCount <= 0)
+        return;
+
+    LARGE_INTEGER a, b, c;
+    float (*S)[3] = (float (*)[3])malloc((size_t)rays * sizeof(float) * 3);
+    float (*D)[3] = (float (*)[3])malloc((size_t)rays * sizeof(float) * 3);
+    if (!S || !D) { free(S); free(D); return; }
+
+    // Rays from inside the map's own box, in every direction. Starting inside
+    // is what makes them interesting: a ray from outside enters the grid once
+    // and the slab clip does most of the work, where one from inside exercises
+    // the step.
+    for (int i = 0; i < rays; i++)
+    {
+        for (int k = 0; k < 3; k++)
+            S[i][k] = m->mins[k] + (m->maxs[k] - m->mins[k]) * Rnd(0.0f, 1.0f);
+        float len;
+        do {
+            for (int k = 0; k < 3; k++)
+                D[i][k] = Rnd(-1.0f, 1.0f);
+            len = (float)sqrt(D[i][0]*D[i][0] + D[i][1]*D[i][1] + D[i][2]*D[i][2]);
+        } while (len < 1e-3f);
+        for (int k = 0; k < 3; k++)
+            D[i][k] /= len;
+    }
+
+    const float reach = 4096.0f;
+
+    int *pg = (int *)malloc((size_t)rays * sizeof(int));
+    float *tg = (float *)malloc((size_t)rays * sizeof(float));
+    unsigned char *hg = (unsigned char *)malloc((size_t)rays);
+
+    QueryPerformanceCounter(&a);
+    for (int i = 0; i < rays; i++)
+    {
+        pg[i] = -1; tg[i] = 0.0f;
+        hg[i] = WrBspTraceRay(m, S[i], D[i], reach, &pg[i], &tg[i]) ? 1 : 0;
+    }
+    QueryPerformanceCounter(&b);
+    for (int i = 0; i < rays; i++)
+    {
+        int pb = -1; float tb = 0.0f;
+        bool hb = BruteRay(m, S[i], D[i], reach, &pb, &tb);
+        g_rayCount++;
+        if (hb) g_rayHits++;
+        // The polygon index may legitimately differ where two faces meet at
+        // exactly the same distance -- a floor and a wall sharing an edge --
+        // so the DISTANCE is what has to agree. A skipped cell moves it.
+        if ((hg[i] != 0) != hb || (hb && fabs(tg[i] - tb) > 0.05))
+        {
+            if (g_rayMismatch == 0)
+                _snprintf_s(g_mismatchMap, sizeof(g_mismatchMap), _TRUNCATE,
+                            "%s", name);
+            g_rayMismatch++;
+        }
+    }
+    QueryPerformanceCounter(&c);
+
+    g_rayGrid  += b.QuadPart - a.QuadPart;
+    g_rayBrute += c.QuadPart - b.QuadPart;
+
+    free(S); free(D); free(pg); free(tg); free(hg);
+}
+
+// ---------------------------------------------------------------------------
 
 int main(int argc, char **argv)
 {
     const char *root = "momentum\\maps";
     const char *only = NULL;
-    int limit = 0;
+    int limit = 0, rays = 0;
     bool build = false, angles = false;
 
     for (int i = 1; i < argc; i++)
@@ -155,6 +264,9 @@ int main(int argc, char **argv)
         if (strcmp(argv[i], "--verbose") == 0) g_verbose = true;
         else if (strcmp(argv[i], "--closure") == 0) build = true;
         else if (strcmp(argv[i], "--angles") == 0) { build = true; angles = true; }
+        else if (strcmp(argv[i], "--rays") == 0)
+        { build = true; rays = (i + 1 < argc && argv[i + 1][0] != '-')
+                               ? atoi(argv[++i]) : 200; }
         else if (strcmp(argv[i], "--limit") == 0 && i + 1 < argc)
             limit = atoi(argv[++i]);
         else if (strcmp(argv[i], "--only") == 0 && i + 1 < argc)
@@ -311,6 +423,9 @@ int main(int argc, char **argv)
                     g_unclosedMaps++;
                 }
 
+                if (rays > 0)
+                    RayCheck(&map, fd.cFileName, rays);
+
                 if (angles)
                     for (int i = 0; i < map.polyCount; i++)
                     {
@@ -370,9 +485,10 @@ int main(int argc, char **argv)
         printf("    %lld had a plane that was not a unit normal\n",
                sideDegenerate);
         printf("    %lld had a vertex outside the world\n", sideTooFar);
-        printf("    %lld FAILED THE CLOSURE ASSERTION (%.4f%%), on %d maps\n",
+        printf("    %lld FAILED THE CLOSURE ASSERTION (%.4f%%)\n",
                sideNotClosed,
-               sideTotal ? 100.0 * sideNotClosed / sideTotal : 0.0,
+               sideTotal ? 100.0 * sideNotClosed / sideTotal : 0.0);
+        printf("    %d maps had a side refused for either reason\n",
                g_unclosedMaps);
         printf("    %lld solid brushes were playerclip-only and skipped\n",
                clipOnly);
@@ -389,6 +505,23 @@ int main(int argc, char **argv)
                    g_biggestMap);
             printf("    %lld vertices across the library\n", verts);
         }
+    }
+
+    if (rays > 0 && g_rayCount)
+    {
+        const double f = (double)freq.QuadPart;
+        printf("\nthe grid against brute force\n");
+        printf("    %lld rays, %lld of them hit something (%.1f%%)\n",
+               g_rayCount, g_rayHits, 100.0 * g_rayHits / g_rayCount);
+        printf("    %lld DISAGREED with brute force", g_rayMismatch);
+        if (g_rayMismatch)
+            printf("  (first on %s)", g_mismatchMap);
+        printf("\n");
+        printf("    grid  %.1f us a ray\n",
+               1e6 * (g_rayGrid / f) / (double)g_rayCount);
+        printf("    brute %.1f us a ray  -- %.0fx\n",
+               1e6 * (g_rayBrute / f) / (double)g_rayCount,
+               g_rayGrid ? (double)g_rayBrute / (double)g_rayGrid : 0.0);
     }
 
     if (angles && g_angleArea > 0.0)
@@ -430,7 +563,8 @@ int main(int argc, char **argv)
     // The exit code is the whole assertion. Anything refused is a layout this
     // does not know about, and the point of running it is to find out.
     bool clean = (refusedRead == 0 && refusedWalk == 0 &&
-                  refusedBuild == 0 && sideNotClosed == 0 && g_reasons == 0);
+                  refusedBuild == 0 && sideNotClosed == 0 &&
+                  g_rayMismatch == 0 && g_reasons == 0);
     printf("\n%s\n", clean ? "every map read and walked"
                            : "SOME MAPS WERE REFUSED");
     return clean ? 0 : 1;

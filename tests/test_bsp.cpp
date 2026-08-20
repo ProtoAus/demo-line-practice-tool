@@ -956,6 +956,198 @@ static void TestTriggerCounterfactual(void)
 }
 
 // ---------------------------------------------------------------------------
+// The grid, against the thing it accelerates
+// ---------------------------------------------------------------------------
+//
+// WHY BRUTE FORCE IS IN THE HARNESS
+//
+// An index that is wrong does not report an error. A ray that should hit
+// returns "nothing ahead", which is byte for byte what a ray that correctly
+// finds nothing returns -- and the feature this is for is "show me the ramp
+// before I reach it", where "nothing ahead" is a perfectly ordinary answer. So
+// the only way to know the grid is right is to ask the same question without
+// it and require the same answer, on enough rays that a missed cell has to
+// show up.
+
+static bool BruteRay(const WrBspMap *m, const float start[3],
+                     const float dir[3], float maxDist, int *polyOut,
+                     float *tOut)
+{
+    int best = -1;
+    float bestT = maxDist;
+    for (int i = 0; i < m->polyCount; i++)
+    {
+        float t;
+        if (!WrBspRayPoly(start, dir, m->polys[i].plane,
+                          WrBspPolyVerts(m, i), m->polys[i].count, &t))
+            continue;
+        if (t < bestT) { bestT = t; best = i; }
+    }
+    if (best < 0)
+        return false;
+    if (polyOut) *polyOut = best;
+    if (tOut) *tOut = bestT;
+    return true;
+}
+
+// A tiny deterministic generator. Not rand(): the run has to be identical on
+// every machine, or "it passed here" means nothing.
+static unsigned int g_seed = 12345u;
+static float Rnd(float lo, float hi)
+{
+    g_seed = g_seed * 1664525u + 1013904223u;
+    return lo + (hi - lo) * ((g_seed >> 8) & 0xFFFFFF) / (float)0x1000000;
+}
+
+static void TestGrid(void)
+{
+    printf("\nthe grid\n");
+
+    Bsp a = Copy(kBspV20, sizeof(kBspV20));
+    WrBspRaw raw;
+    if (ReadBack(&a, "v20.bsp", &raw)[0])
+    {
+        Check(false, "the fixture loads");
+        Drop(&a);
+        return;
+    }
+
+    WrBspMap m;
+    char err[192] = { 0 };
+    if (!WrBspBuild(&raw, &m, err, (int)sizeof(err)))
+    {
+        Check(false, "the fixture builds");
+        printf("      %s\n", err);
+        WrBspFreeRaw(&raw);
+        Drop(&a);
+        return;
+    }
+
+    printf("      grid %dx%dx%d, cells of %.0f x %.0f x %.0f, %d entries\n",
+           m.grid.dims[0], m.grid.dims[1], m.grid.dims[2],
+           m.grid.cell[0], m.grid.cell[1], m.grid.cell[2], m.itemCount);
+
+    Check(m.cellStart != NULL && m.itemCount >= m.polyCount,
+          "every polygon is in at least one cell");
+
+    // The buckets have to tile: cell c is cellStart[c]..cellStart[c+1], and if
+    // the prefix sum is off by one anywhere the last cell reads past the end.
+    {
+        const int cells = WrBspGridCellCount(&m.grid);
+        bool tiles = m.cellStart[0] == 0 && m.cellStart[cells] == m.itemCount;
+        for (int c = 0; c < cells && tiles; c++)
+            if (m.cellStart[c] > m.cellStart[c + 1])
+                tiles = false;
+        Check(tiles, "the buckets tile the item list exactly, start to end");
+    }
+
+    // A ray straight down onto the ramp. The slant is 0.8x + 0.6z = 180, so at
+    // x = 112.5 it sits at z = (180 - 90) / 0.6 = 150. From z = 400 that is a
+    // drop of 250, and there is nothing above it to get in the way.
+    {
+        const float start[3] = { 112.5f, 0.0f, 400.0f };
+        const float down[3] = { 0.0f, 0.0f, -1.0f };
+        int poly = -1;
+        float t = 0.0f;
+        bool hit = WrBspTraceRay(&m, start, down, 1000.0f, &poly, &t);
+        Check(hit && fabs(t - 250.0) < 0.05, "a ray down onto the ramp, at 250");
+        Check(hit && WrBspIsSurfBand(m.polys[poly].plane[2]),
+              "and what it hit is the surf-band face, not the floor under it");
+    }
+
+    // The same ray from BELOW. The ramp's slant faces up, so from underneath
+    // it is a back face and must not be reported -- otherwise a query made
+    // from inside the world finds the ceiling of everything.
+    {
+        const float start[3] = { 112.5f, 0.0f, -32.0f };
+        const float up[3] = { 0.0f, 0.0f, 1.0f };
+        int poly = -1;
+        bool hit = WrBspTraceRay(&m, start, up, 1000.0f, &poly, NULL);
+        Check(!hit || !WrBspIsSurfBand(m.polys[poly].plane[2]),
+              "from below, the ramp's underside is not reported as the ramp");
+    }
+
+    // Out over the edge of the slab, pointing away. Nothing to hit.
+    {
+        const float start[3] = { 900.0f, 900.0f, 500.0f };
+        const float away[3] = { 0.7071f, 0.7071f, 0.0f };
+        Check(!WrBspTraceRay(&m, start, away, 4000.0f, NULL, NULL),
+              "a ray into empty space finds nothing");
+    }
+
+    // AND THE REAL CHECK. Two thousand rays from everywhere, in every
+    // direction, both answers required to agree on the polygon AND the
+    // distance. A cell the walk skips shows up here as a disagreement and
+    // nowhere else.
+    {
+        int mismatch = 0, hits = 0;
+        for (int i = 0; i < 2000; i++)
+        {
+            float s[3], d[3];
+            s[0] = Rnd(-800.0f, 800.0f);
+            s[1] = Rnd(-800.0f, 800.0f);
+            s[2] = Rnd(-200.0f, 600.0f);
+            d[0] = Rnd(-1.0f, 1.0f);
+            d[1] = Rnd(-1.0f, 1.0f);
+            d[2] = Rnd(-1.0f, 1.0f);
+            float len = (float)sqrt(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
+            if (len < 1e-4f)
+                continue;
+            d[0] /= len; d[1] /= len; d[2] /= len;
+
+            int pg = -1, pb = -1;
+            float tg = 0.0f, tb = 0.0f;
+            bool hg = WrBspTraceRay(&m, s, d, 4000.0f, &pg, &tg);
+            bool hb = BruteRay(&m, s, d, 4000.0f, &pb, &tb);
+            if (hb)
+                hits++;
+            if (hg != hb || (hb && (pg != pb || fabs(tg - tb) > 0.01)))
+                mismatch++;
+        }
+        // A guard against the comparison being vacuous rather than a target.
+        // The sampling box is much bigger than the two brushes in it, so about
+        // a sixth of random rays finding something is what it should give --
+        // what would be alarming is a handful.
+        printf("      2000 rays, %d of them hit something\n", hits);
+        Check(hits > 200, "the rays are actually hitting things");
+        Check(mismatch == 0, "the grid agrees with brute force on all 2000");
+    }
+
+    // What is around. One surf-band face in the whole map, and it is found
+    // once rather than once per cell it lies across.
+    {
+        const float on[3] = { 112.5f, 0.0f, 150.0f };
+        int out[8];
+        int n = WrBspSurfNear(&m, on, 64.0f, out, 8);
+        Check(n == 1 && WrBspIsSurfBand(m.polys[out[0]].plane[2]),
+              "the ramp is found once, not once per cell it crosses");
+
+        const float far_[3] = { -400.0f, -400.0f, 200.0f };
+        Check(WrBspSurfNear(&m, far_, 64.0f, out, 8) == 0,
+              "and nothing is found where there is no ramp");
+    }
+
+    // What was touched. A player origin sits off the surface, so this has to
+    // measure to the polygon rather than to its plane.
+    {
+        // Straight up 20 from a point on the slant. The plane is tilted, so
+        // the perpendicular distance is 20 * n.z = 12, not 20.
+        const float above[3] = { 112.5f, 0.0f, 150.0f + 20.0f };
+        int poly = -1;
+        float d = 0.0f;
+        bool got = WrBspNearestFace(&m, above, 64.0f, &poly, &d);
+        Check(got && fabs(d - 12.0) < 0.5,
+              "a point 20 units above the ramp along z is 12 off the face");
+        Check(got && WrBspIsSurfBand(m.polys[poly].plane[2]),
+              "and the face it names is the ramp");
+    }
+
+    WrBspFreeMap(&m);
+    WrBspFreeRaw(&raw);
+    Drop(&a);
+}
+
+// ---------------------------------------------------------------------------
 // Nothing is left behind on a refusal
 // ---------------------------------------------------------------------------
 //
@@ -1006,6 +1198,7 @@ int main(void)
     TestWalkRefusals();
     TestBuild();
     TestTriggerCounterfactual();
+    TestGrid();
     TestNoPartialSuccess();
 
     // Tidy up. Leaving these behind would be harmless and would also mean a
