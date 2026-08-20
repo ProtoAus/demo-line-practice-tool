@@ -25,6 +25,7 @@
 #include "wr_hook.h"
 #include "wr_settings.h"
 #include "wr_update.h"
+#include "wr_bspload.h"
 #include "wr_log.h"
 
 #include "imgui.h"
@@ -2432,6 +2433,148 @@ static void DrawDisplayTab(void)
         ImGui::TextDisabled("median eta +0.17, p75 +0.67. 11%% sit inside the dim band.");
     }
 
+    ImGui::SeparatorText("The map's own geometry");
+    ImGui::Checkbox("Read the map file", &g_bspLoad.read);
+    ImGui::SameLine();
+    HelpMarker(
+        "Opens <game>\\momentum\\maps\\<level>.bsp, read-only and shared, and "
+        "pulls the collision brushes out of it.\n\n"
+        "This is the OTHER HALF of the ramp detection. The lines already know "
+        "which surface a run touched -- that falls out of the velocity trace, "
+        "because free flight has vertical acceleration exactly -g and a surface "
+        "changes it by hundreds. What no trace can tell you is the angle of a "
+        "ramp NOBODY HAS HIT YET, because there is no measurement of a "
+        "collision that did not happen. The file is the only place that is "
+        "written down.\n\n"
+        "Ordinary read-only file I/O, of the same kind and from the same "
+        "install directory the demo reader already uses. No call into the game, "
+        "no cvar, no console command.\n\n"
+        "It costs a background thread for a few tens of milliseconds once per "
+        "map -- 16 ms at the median across the 1,304 maps here, 124 ms at the "
+        "very worst -- and about 2 MB resident, 10.5 MB on the largest map "
+        "measured. Turning this off frees that now rather than at the next map "
+        "change.\n\n"
+        "Four BSP versions are read: 19, 20, 21 and Strata's 25. Anything else "
+        "is refused BY NAME rather than guessed at, and the reason is written "
+        "into wr_bsp.h: a wrong struct width does not crash, it produces "
+        "plausible planes at plausible angles in plausible places.");
+
+    if (g_bspLoad.read)
+    {
+        char cover[256];
+        bool have = WrBspLoadCoverage(cover, (int)sizeof(cover));
+        if (!have)
+        {
+            // The refusals and the "not here" cases both land in this string,
+            // and they are not the same news. A missing .bsp is ordinary; a
+            // file that is present and refused names the lump it choked on and
+            // is worth somebody reporting.
+            int st = WrBspLoadStateNow();
+            if (st == WR_BSPLOAD_REFUSED)
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "%s", cover);
+            else
+                ImGui::TextDisabled("%s", cover);
+        }
+        else
+        {
+            ImGui::TextDisabled("%s", cover);
+            ImGui::TextDisabled("%s, read in %.0f ms.", WrBspLoadMapName(),
+                                WrBspLoadMillis());
+
+            // THE LINE THAT STOPS THIS LYING BY OMISSION. On a map built out
+            // of entities -- bhop_slope_v2 gives the world 48 of its 1,351
+            // brushes -- almost nothing is read, and an empty result looks
+            // exactly like "there is no ramp ahead of you".
+            if (WrBspLoadCoverageThin())
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
+                                   "Most of this map is built out of entities, "
+                                   "so most of it is not read.");
+        }
+
+        ImGui::TextDisabled("Brushes only, and only the ones the world owns.");
+        ImGui::SameLine();
+        HelpMarker(
+            "Three things are deliberately left out, and each of them is a real "
+            "hole rather than a rounding error.\n\n"
+            "DISPLACEMENTS. Over half of maps have some, and on 51 of the 1,106 "
+            "surf maps here the ramps ARE displacements -- on those this reads "
+            "almost nothing. Across all of them 95.5% of surfable area at real "
+            "ramp angles is brush-backed and the median map is 100%, so it is "
+            "usually complete and occasionally empty. The coverage line above "
+            "is how you tell which.\n\n"
+            "ENTITY GEOMETRY. Only brushes belonging to worldspawn are read, "
+            "which drops 16% of them: about 7.7% trigger volumes, which is the "
+            "entire point, and 4.7% genuine func_* geometry, which is a loss. A "
+            "ramp built as a func_detail belongs to its own model and will not "
+            "be seen.\n\n"
+            "The walk is not an optimisation. A TRIGGER BRUSH CARRIES SOLID "
+            "CONTENTS, verbatim, exactly as a ramp does -- there is no flag "
+            "anywhere in the file separating a teleport volume from something "
+            "you can ride. On surf_greensway 47% of solid brushes are teleport "
+            "volumes, and a teleport volume on a surf map is characteristically "
+            "a big slanted box under the ramp. Skipping the walk does not "
+            "produce garbage; it produces a second ramp.\n\n"
+            "PLAYERCLIP. 141,841 brushes across the library are clip and not "
+            "solid: invisible geometry a mapper put there to smooth a ramp. "
+            "They are what you collide with, but drawing them would put a "
+            "surface on screen that nobody can see in game.");
+
+        ImGui::Spacing();
+        ImGui::Checkbox("Draw the ramps around you", &g_bspLoad.drawSurf);
+        ImGui::SameLine();
+        HelpMarker(
+            "Outlines every surfable face within the radius below, straight off "
+            "the map file, whether or not anybody's line goes near it.\n\n"
+            "SURFABLE means the surface normal points up but not up enough to "
+            "stand on: between 0.10 and 0.70, which is 45.6 to 84.3 degrees "
+            "from flat. The upper bound is Source's own standable cut and it is "
+            "doing real work. Area-weighted over all 1,106 surf maps here the "
+            "largest non-floor feature is at 45 degrees, by more than double -- "
+            "and 45 degrees has a normal of 0.7071, just above the cut, so it "
+            "is something you walk up rather than slide down. Widening this "
+            "bound by a hundredth would more than double what is drawn, with "
+            "surfaces nobody surfs.\n\n"
+            "Inside the band the angles run from about 46 to 60 degrees and "
+            "peak at 51, which is the shape a surf map has. 6.8% of up-facing "
+            "area is in it: most of a map is floor.");
+        if (g_bspLoad.drawSurf)
+        {
+            ImGui::SliderFloat("Look this far", &g_bspLoad.drawRadius,
+                               128.0f, 8192.0f, "%.0f units");
+            ImGui::SameLine();
+            HelpMarker("1024 units is about a second and a half of travel at "
+                       "surf speed. The query itself is not the cost -- a grid "
+                       "lookup is 0.3 microseconds against 115.7 for the same "
+                       "answer brute force -- the cost is how much ends up on "
+                       "screen at once.");
+            ImGui::SliderInt("At most", &g_bspLoad.maxDrawPolys, 8, 512,
+                             "%d faces");
+            ImGui::SliderFloat("Opacity", &g_bspLoad.drawAlpha, 0.05f, 1.0f,
+                               "%.2f");
+            ImGui::Checkbox("Shade them in", &g_bspLoad.drawFill);
+            ImGui::SameLine();
+            HelpMarker("Off by default: a filled face hides the demo line lying "
+                       "on it, which is the thing this whole tool exists to "
+                       "show.");
+        }
+
+        ImGui::Spacing();
+        ImGui::Checkbox("Say what is ahead", &g_bspLoad.showAhead);
+        ImGui::SameLine();
+        HelpMarker(
+            "A row on the corner block giving the angle of the first surface "
+            "your crosshair is pointing at, and how far off it is. Follows the "
+            "corner block's own toggle, so it appears with the rest of that "
+            "readout.\n\n"
+            "Not a trace through the game. It is a ray against the polygons "
+            "read out of the file, front faces only -- which is also what stops "
+            "the UNDERSIDE of a ramp being reported as the ramp when you are "
+            "below it.");
+        if (g_bspLoad.showAhead)
+            ImGui::SliderFloat("Reach", &g_bspLoad.aheadDistance,
+                               256.0f, 8192.0f, "%.0f units");
+    }
+
     ImGui::SeparatorText("Your own path");
     bool live = WrLiveEnabled();
     if (ImGui::Checkbox("Record my path", &live))
@@ -2461,7 +2604,12 @@ static void DrawDisplayTab(void)
 
     ImGui::Spacing();
     if (ImGui::Button("Reset to defaults"))
+    {
         WrRenderDefaults();
+        // The map reader's settings live on this tab, so they belong to this
+        // button. It puts "read the map file" back ON, which is its default.
+        WrBspLoadDefaults();
+    }
 }
 
 static void DrawFrameCapTab(void)

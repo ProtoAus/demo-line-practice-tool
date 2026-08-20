@@ -35,6 +35,7 @@
 #include "wr_stress.h"
 #include "wr_hook.h"
 #include "wr_log.h"
+#include "wr_bspload.h"
 
 #include "imgui.h"
 
@@ -295,6 +296,14 @@ bool WrHasAnythingToDraw(void)
         return true;
     if (g_render.drawLive && WrLiveEnabled())
         return true;
+
+    // The map's ramps do not need a run, a demo or a recording -- they are read
+    // off a file. Without this line the outlines only appeared on maps that
+    // happened to have a line enabled, which is exactly backwards: the whole
+    // point of reading the .bsp is that it works where nothing has been flown.
+    if (g_bspLoad.drawSurf && WrBspLoadCurrent())
+        return true;
+
     for (int i = 0; i < WrRunCount(); i++)
     {
         const WrRun *r = WrRunAt(i);
@@ -410,6 +419,20 @@ static void FlushBatch(ImDrawList *dl, unsigned int colour, float thickness)
     }
     g_batchCount = 0;
 }
+
+// The colour of a surfable face read out of the map file, in ImGui's ABGR --
+// rgb(80, 226, 214), a cyan.
+//
+// Deliberately the same family as the "on a ramp" line colour, which is a light
+// blue, because both of them mean ramp. They cannot be confused with each other
+// despite that: one is a line following a trajectory and the other is a closed
+// outline lying on a surface, and the shapes say which is which long before the
+// hue does.
+//
+// What it must NOT collide with is the field: the speed, energy and efficiency
+// ramps run green through amber to red, first place is violet, and the live
+// trail is green. Cyan is the one region none of those reaches.
+#define WR_BSP_SURF_COLOUR 0xFFD6E250u
 
 static inline unsigned int WithAlpha(unsigned int colour, float a)
 {
@@ -2631,6 +2654,124 @@ static void EmitVelocityVector(ImDrawList *dl)
     }
 }
 
+// The surfable faces read out of the map file, outlined where they are.
+//
+// THIS IS THE ONE THING ON SCREEN THAT IS NOT ABOUT ANYBODY'S RUN. Every other
+// mark this tool draws is derived from a trajectory somebody actually flew. A
+// ramp nobody has hit has no trajectory, so the only place its angle is written
+// down is the .bsp -- see wr_bsp.h for what is read and, more to the point,
+// what is not.
+//
+// Drawn BEFORE the lines, deliberately. The lines are what the tool is for and
+// they have to sit on top of this; an outline that crossed over a demo line
+// would be reading as part of it.
+//
+// It is a cheap query and the numbers say so: WrBspSurfNear walks a uniform
+// grid rather than the file's own tree, and a ray through the same structure
+// costs 0.3 microseconds against 115.7 brute force. What costs is what ends up
+// on screen, which is why there is a face cap and not just a radius.
+static void EmitMapSurfaces(ImDrawList *dl)
+{
+    if (!g_bspLoad.drawSurf)
+        return;
+    const WrBspMap *map = WrBspLoadCurrent();
+    if (!map || map->polyCount <= 0)
+        return;
+
+    int cap = g_bspLoad.maxDrawPolys;
+    if (cap > 512) cap = 512;       // the size of `found`, below
+    if (cap <= 0)
+        return;
+
+    static int found[512];
+    const float at[3] = { g_cam.x, g_cam.y, g_cam.z };
+    const float radius = g_bspLoad.drawRadius;
+    int n = WrBspSurfNear(map, at, radius, found, cap);
+    if (n <= 0)
+        return;
+
+    for (int k = 0; k < n; k++)
+    {
+        const int pi = found[k];
+        if (pi < 0 || pi >= map->polyCount)
+            continue;
+        const WrBspPoly *poly = &map->polys[pi];
+        if (poly->count < 3 || poly->count > WR_BSP_MAX_POLY_VERTS)
+            continue;
+        const float (*v)[3] = WrBspPolyVerts(map, pi);
+
+        // Its centre, for the distance fade and for the one label. The
+        // polygon's own average rather than its nearest vertex: a long ramp
+        // face reaching past the radius should fade as one object rather than
+        // brighten at the end that happens to point at you.
+        Vec3 mid = WrVec(0.0f, 0.0f, 0.0f);
+        for (int j = 0; j < poly->count; j++)
+            mid = WrAdd(mid, WrVec(v[j][0], v[j][1], v[j][2]));
+        mid = WrScale(mid, 1.0f / (float)poly->count);
+
+        float d = WrLength(WrSub(mid, g_cam));
+        float fade = (radius > 1.0f) ? 1.0f - (d / radius) : 1.0f;
+        if (fade < 0.0f) fade = 0.0f;
+        if (fade > 1.0f) fade = 1.0f;
+        // A floor under the fade. Without it the far half of the set is drawn
+        // at an alpha nothing can be seen at, which costs the same as drawing
+        // it properly and tells nobody anything.
+        fade = 0.25f + 0.75f * fade;
+
+        unsigned int col = WithAlpha(WR_BSP_SURF_COLOUR,
+                                     g_bspLoad.drawAlpha * fade);
+
+        // The fill wants every vertex in front of the near plane, because a
+        // convex polygon clipped against it is no longer the polygon ImGui was
+        // handed. The outline has no such problem -- each edge is clipped on
+        // its own -- so a face that is half behind you still gets its edges.
+        ImVec2 sp[WR_BSP_MAX_POLY_VERTS];
+        bool whole = g_bspLoad.drawFill;
+        if (whole)
+        {
+            for (int j = 0; j < poly->count && whole; j++)
+                if (!Project(WrVec(v[j][0], v[j][1], v[j][2]), &sp[j]))
+                    whole = false;
+            if (whole)
+                dl->AddConvexPolyFilled(sp, poly->count,
+                                        WithAlpha(WR_BSP_SURF_COLOUR,
+                                                  g_bspLoad.drawAlpha * fade
+                                                  * 0.22f));
+        }
+
+        for (int j = 0; j < poly->count; j++)
+        {
+            Vec3 a = WrVec(v[j][0], v[j][1], v[j][2]);
+            const int j2 = (j + 1 == poly->count) ? 0 : j + 1;
+            Vec3 b = WrVec(v[j2][0], v[j2][1], v[j2][2]);
+            ImVec2 pa, pb;
+            if (!ClipToNear(&a, &b) || !Project(a, &pa) || !Project(b, &pb))
+                continue;
+            dl->AddLine(pa, pb, col, g_render.thickness * 0.7f);
+            g_statSegments++;
+        }
+
+        // The angle, on the nearest one only.
+        //
+        // One label rather than one per face, and that is a judgement about
+        // clutter with a number behind it: WrBspSurfNear is happy to return a
+        // hundred faces and every label competes for the same reservation pool
+        // the name tags use. The nearest face is the one the question is
+        // usually about.
+        if (k == 0)
+        {
+            ImVec2 c;
+            if (Project(mid, &c))
+            {
+                char lab[32];
+                _snprintf_s(lab, sizeof(lab), _TRUNCATE, "%.0f deg",
+                            WrBspSurfaceAngle(poly->plane));
+                DrawLabel(dl, c, lab, WithAlpha(WR_BSP_SURF_COLOUR, 0.95f));
+            }
+        }
+    }
+}
+
 // The key for the efficiency colours.
 //
 // There was none, anywhere, for any colour scheme in this tool -- and the
@@ -2656,7 +2797,14 @@ static void EmitEfficiencyLegend(ImDrawList *dl)
     bool relOn = g_render.lineColour == WR_LINE_ENERGY_REL && g_render.lineKey;
     bool phsOn = g_render.lineColour == WR_LINE_PHASE && g_render.lineKey;
     bool rankOn = g_render.rankColour != WR_RANK_OFF && g_render.rankLegend;
-    if (!effOn && !spdOn && !nrgOn && !relOn && !phsOn && !rankOn)
+
+    // The map's outlines get a row for the same reason everything else here
+    // does: cyan appeared on screen and nothing said what it was. It is NOT a
+    // line colour mode, so it is gated on the outlines being drawn rather than
+    // on which mode is selected -- and it can be the only thing in the box.
+    bool bspOn = g_bspLoad.drawSurf && g_render.lineKey && WrBspLoadCurrent();
+
+    if (!effOn && !spdOn && !nrgOn && !relOn && !phsOn && !rankOn && !bspOn)
         return;
 
     float size = 0.0f;
@@ -2844,6 +2992,21 @@ static void EmitEfficiencyLegend(ImDrawList *dl)
                       "checked against this";
     }
 
+    if (bspOn)
+    {
+        rows[n].colour = WR_BSP_SURF_COLOUR;
+        rows[n].dim = false;
+        rows[n++].text = "outlined surface -- a surfable face in the map file";
+
+        // The two things somebody will otherwise work out by being confused. It
+        // is not somebody's line, and where it is absent that is not the same
+        // as there being no ramp.
+        foots[nf++] = "read from the .bsp, not from anybody's run -- it is "
+                      "there whether or not a line is";
+        foots[nf++] = "brush geometry only: displacement ramps and func_* "
+                      "geometry are not drawn";
+    }
+
     float w = 0.0f;
     for (int i = 0; i < nf; i++)
     {
@@ -2897,8 +3060,12 @@ static void EmitEnergyOverlay(ImDrawList *dl)
     if (!g_energy.showOverlay || !WrEnergyValid())
         return;
 
-    char lines[10][96];
-    unsigned int cols[10];
+    // Twelve, not ten. Every row below is optional but they are not mutually
+    // exclusive, and with all of them on the old ten were exactly full -- so
+    // adding the map reader's row would have written off the end of the array
+    // for anybody who had turned the other two on.
+    char lines[12][96];
+    unsigned int cols[12];
     int n = 0;
 
     _snprintf_s(lines[n], sizeof(lines[0]), _TRUNCATE, "energy  %.0f  (%.0f u/s)",
@@ -2970,6 +3137,45 @@ static void EmitEnergyOverlay(ImDrawList *dl)
         cols[n++] = (ph == WR_PHASE_UNKNOWN) ? 0xFF808080u
                                              : PhaseColour((unsigned char)ph,
                                                            0xFFE0E0E0u);
+    }
+
+    // What you are LOOKING at, which is the other half of the row above.
+    //
+    // "You are on a ramp" comes from your own velocity and is about a surface
+    // you have already met. This comes from the map file and is about one you
+    // have not -- the only source for that, since there is no measurement of a
+    // collision that has not happened.
+    //
+    // Front faces only, which quietly does a second job: it is what stops a
+    // ramp's UNDERSIDE being reported when you are looking up at it from below.
+    if (g_bspLoad.showAhead)
+    {
+        Vec3 fwd;
+        float deg = 0.0f, dist = 0.0f;
+        bool band = false;
+        if (WrBspLoadStateNow() != WR_BSPLOAD_READY)
+        {
+            _snprintf_s(lines[n], sizeof(lines[0]), _TRUNCATE,
+                        "ahead   --  (map not read)");
+            cols[n++] = 0xFF808080u;
+        }
+        else if (WrCameraForward(&fwd) &&
+                 WrBspLoadAhead(g_cam, fwd, g_bspLoad.aheadDistance,
+                                &deg, &dist, &band))
+        {
+            _snprintf_s(lines[n], sizeof(lines[0]), _TRUNCATE,
+                        "ahead   %.0f deg  at %.0f%s", deg, dist,
+                        band ? "  surf" : "");
+            // The band colour is the same one the drawn faces use, so a face
+            // you can see outlined and the number describing it agree.
+            cols[n++] = band ? WR_BSP_SURF_COLOUR : 0xFFCCCCCCu;
+        }
+        else
+        {
+            _snprintf_s(lines[n], sizeof(lines[0]), _TRUNCATE,
+                        "ahead   nothing within %.0f", g_bspLoad.aheadDistance);
+            cols[n++] = 0xFF808080u;
+        }
     }
 
     // The same three numbers the HUD can show, always visible here since the
@@ -3802,6 +4008,11 @@ void WrRenderWorld(void)
         if (WrPickedRun(&pi, NULL, NULL))
             pickSlot = g_pick.slot;
     }
+
+    // The map's own ramps, FIRST, so every line drawn below sits on top of
+    // them. This is the only thing on screen that is not derived from somebody
+    // having flown a trajectory, and it is not what the tool is for.
+    EmitMapSurfaces(dl);
 
     int drawn = 0;
     for (int i = 0; i < WrRunCount() && drawn < WR_MAX_RUNS_DRAWN; i++)
