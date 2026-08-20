@@ -259,6 +259,25 @@ cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Itests /Ithird_party\lzma /I%ZS% ^
    /Fe:tests\test_mtv.exe /Fo:tests\ >nul
 if errorlevel 1 ( echo [!] test_mtv FAILED to build & exit /b 1 )
 
+rem test_bsp is mostly about refusal, the same way test_mtv is, and for a
+rem sharper reason. A .mtv that will not parse produces no lines and everybody
+rem notices; a .bsp read at the wrong struct stride produces GEOMETRY, and
+rem nothing downstream of it can tell. So the reader refuses every layout it has
+rem not measured and this pins the words it refuses with -- including the two
+rem that are easiest to get wrong later, a real lump version on the wrong BSP
+rem version, and a lump whose length does not tile at its stride.
+rem
+rem It also reads tests\fixture_bsp.h, which holds the same little map twice:
+rem v20 raw and v25 LZMA-compressed. Those two disagree about the size of four
+rem of the seven structs, so requiring them to produce identical counts is a
+rem check on the v25 half of the stride table that no v20 map could give.
+cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Itests /Ithird_party\lzma /I%ZS% ^
+   tests\test_bsp.cpp ^
+   %S%\wr_bsp.cpp %S%\wr_mtv.cpp tests\LzmaDec.obj %ZSOBJ% ^
+   /Fe:tests\test_bsp.exe /Fo:tests\ >nul
+if errorlevel 1 ( echo [!] test_bsp FAILED to build & exit /b 1 )
+
+
 rem test_peek is the one harness here that touches the disk, and it has to: the
 rem thing under test is a claim about file metadata, so a stub that returned
 rem metadata we invented would be a test of the stub. It writes the synthetic
@@ -411,6 +430,7 @@ tests\test_maps.exe       || set "RC=1"
 tests\test_lzma.exe       || set "RC=1"
 tests\test_zstd.exe       || set "RC=1"
 tests\test_mtv.exe        || set "RC=1"
+tests\test_bsp.exe        || set "RC=1"
 tests\test_peek.exe       || set "RC=1"
 tests\test_api.exe        || set "RC=1"
 tests\test_fetch.exe      || set "RC=1"
