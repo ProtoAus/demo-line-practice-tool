@@ -726,3 +726,274 @@ bool WrBspWorldBrushes(const WrBspRaw *r, unsigned char *owned, int *ownedOut,
         *ownedOut = found;
     return true;
 }
+
+// ---------------------------------------------------------------------------
+// Brushes into polygons
+// ---------------------------------------------------------------------------
+//
+// The pipeline itself is in wr_bspgeom.h, hand-checked there against shapes
+// whose answers are known. What is here is the bookkeeping around it: which
+// brushes to feed it, where to put the results, and what to do when a side
+// comes back wrong.
+//
+// FOUR WAYS A SIDE IS DROPPED, AND ONLY TWO OF THEM ARE ERRORS
+//
+//   Clipped to nothing. That is a BEVEL, and half to two thirds of all
+//   brushsides are one. A bevel is tangent to an edge of the brush rather than
+//   bounding a face of it, so clipping it against the real sides leaves a
+//   sliver or leaves nothing. Nothing in the file has to mark them -- Strata
+//   has a bevel byte and stock Source has a bevel short, and neither is
+//   trusted here, because a correct clip already knows.
+//
+//   A plane that is not a unit normal. 807 planes across four v25 maps in the
+//   library are exactly (0, 0, 0) with distance 0. They are referenced by no
+//   brushside and no node, so they are harmless -- to a reader that checks.
+//
+//   Failing the closure assertion. THIS one is an error, and it is the only
+//   check anywhere in this file that can catch a struct stride wrong in a way
+//   every index check passed. A brush is the intersection of its half-spaces,
+//   so no face of it can stick out through another of its sides; if one does,
+//   the sides were not the sides of that brush.
+//
+//   A vertex outside the world. Also an error, and a narrower one: it means
+//   the clip never actually closed and the assertion above was satisfied by
+//   too few sides, leaving part of the 65536-unit starting quad in the result.
+
+// Grow a packed array, doubling. The first guess is deliberately small
+// because the count that would size it exactly -- how many sides survive the
+// clip -- is not knowable without doing the clip.
+static bool Grow(void **buf, int *cap, int need, size_t elem, size_t *bytes)
+{
+    if (need <= *cap)
+        return true;
+    int want = *cap ? *cap * 2 : 1024;
+    while (want < need)
+        want *= 2;
+
+    void *p = realloc(*buf, (size_t)want * elem);
+    if (!p)
+        return false;
+    *bytes += (size_t)(want - *cap) * elem;
+    *buf = p;
+    *cap = want;
+    return true;
+}
+
+bool WrBspBuild(const WrBspRaw *r, WrBspMap *out, char *err, int errCap)
+{
+    if (err && errCap > 0)
+        err[0] = '\0';
+    if (!out)
+        return false;
+    memset(out, 0, sizeof(*out));
+    if (!r || !r->data[WR_BSP_L_PLANES])
+    {
+        Fail(err, errCap, "nothing to build from");
+        return false;
+    }
+
+    const int numBrush = r->count[WR_BSP_L_BRUSHES];
+
+    unsigned char *owned = (unsigned char *)malloc((size_t)numBrush);
+    if (!owned)
+    {
+        Fail(err, errCap, "out of memory");
+        return false;
+    }
+    int worldCount = 0;
+    if (!WrBspWorldBrushes(r, owned, &worldCount, err, errCap))
+    {
+        free(owned);
+        return false;
+    }
+
+    WrBspMap m;
+    memset(&m, 0, sizeof(m));
+    m.version = r->version;
+    m.compressed = r->compressed;
+    m.brushTotal = numBrush;
+    m.brushWorld = worldCount;
+    for (int k = 0; k < 3; k++)
+    {
+        m.mins[k] = 1e30f;
+        m.maxs[k] = -1e30f;
+    }
+
+    int vertCap = 0, polyCap = 0;
+    bool ok = true;
+
+    // Two ping-ponged working buffers and the brush's own side planes. All on
+    // the stack and all fixed: a brush cannot have more sides than
+    // WR_BSP_MAX_BRUSH_SIDES, and the walk already refused any that claimed a
+    // side range outside the lump.
+    static float bufA[WR_BSP_MAX_POLY_VERTS][3];
+    static float bufB[WR_BSP_MAX_POLY_VERTS][3];
+    float sides[WR_BSP_MAX_BRUSH_SIDES][4];
+
+    for (int b = 0; b < numBrush && ok; b++)
+    {
+        if (!owned[b])
+            continue;
+
+        int firstSide = 0, sideCount = 0, contents = 0;
+        if (!WrBspBrush(r, b, &firstSide, &sideCount, &contents))
+            continue;
+
+        if (!(contents & WR_BSP_CONTENTS_SOLID))
+        {
+            if (contents & WR_BSP_CONTENTS_PLAYERCLIP)
+                m.brushClipOnly++;
+            continue;
+        }
+        m.brushSolid++;
+
+        if (sideCount < 4 || sideCount > WR_BSP_MAX_BRUSH_SIDES)
+            continue;       // fewer than four half-spaces is not a volume
+
+        // Gather the planes once. Reading them inside the clip loop would
+        // fetch the same twenty bytes sideCount times for every side.
+        bool haveAll = true;
+        for (int s = 0; s < sideCount; s++)
+        {
+            const int pn = WrBspBrushSidePlane(r, firstSide + s);
+            if (pn < 0 || !WrBspPlane(r, pn, sides[s]))
+            {
+                haveAll = false;
+                break;
+            }
+        }
+        if (!haveAll)
+        {
+            Fail(err, errCap, "brush %d has a side with no plane", b);
+            ok = false;
+            break;
+        }
+
+        m.sideTotal += sideCount;
+
+        for (int s = 0; s < sideCount; s++)
+        {
+            int n = WrBspStartQuad(sides[s], bufA);
+            if (!n)
+            {
+                m.sideDegenerate++;
+                continue;
+            }
+
+            float (*cur)[3] = bufA, (*nxt)[3] = bufB;
+            for (int o = 0; o < sideCount && n; o++)
+            {
+                if (o == s)
+                    continue;
+                n = WrBspClipToPlane(cur, n, sides[o], nxt);
+                float (*t)[3] = cur; cur = nxt; nxt = t;
+            }
+
+            if (n < 3)
+            {
+                m.sideDropped++;        // a bevel, almost always
+                continue;
+            }
+
+            const float area = WrBspPolyArea(cur, n);
+            if (area < WR_BSP_MIN_AREA)
+            {
+                m.sideDropped++;        // a sliver, which is the same thing
+                continue;
+            }
+
+            if (!WrBspPolyClosed(cur, n, sides, sideCount, s))
+            {
+                m.sideNotClosed++;
+                continue;
+            }
+
+            bool sane = true;
+            for (int i = 0; i < n && sane; i++)
+                for (int k = 0; k < 3; k++)
+                    if (!(cur[i][k] > -WR_WORLD_LIMIT &&
+                          cur[i][k] < WR_WORLD_LIMIT))
+                        sane = false;
+            if (!sane)
+            {
+                m.sideTooFar++;
+                continue;
+            }
+
+            if (!Grow((void **)&m.verts, &vertCap, m.vertCount + n,
+                      sizeof(float) * 3, &m.bytes) ||
+                !Grow((void **)&m.polys, &polyCap, m.polyCount + 1,
+                      sizeof(WrBspPoly), &m.bytes))
+            {
+                Fail(err, errCap, "out of memory");
+                ok = false;
+                break;
+            }
+
+            if (m.bytes > WR_BSP_MAX_RESIDENT)
+            {
+                Fail(err, errCap,
+                     "the geometry needs over %u bytes, which is the limit",
+                     (unsigned int)WR_BSP_MAX_RESIDENT);
+                ok = false;
+                break;
+            }
+
+            WrBspPoly *p = &m.polys[m.polyCount++];
+            memcpy(p->plane, sides[s], sizeof(p->plane));
+            p->first = m.vertCount;
+            p->count = n;
+            p->area = area;
+
+            for (int i = 0; i < n; i++)
+                for (int k = 0; k < 3; k++)
+                {
+                    const float v = cur[i][k];
+                    m.verts[m.vertCount + i][k] = v;
+                    if (v < m.mins[k]) m.mins[k] = v;
+                    if (v > m.maxs[k]) m.maxs[k] = v;
+                }
+            m.vertCount += n;
+
+            m.solidArea += area;
+            if (WrBspIsSurfBand(sides[s][2]))
+            {
+                m.surfPolys++;
+                m.surfArea += area;
+            }
+        }
+    }
+
+    free(owned);
+
+    if (!ok)
+    {
+        WrBspFreeMap(&m);
+        return false;
+    }
+
+    if (m.polyCount == 0)
+    {
+        // Not an error. A map really can have almost no world geometry --
+        // bhop_slope_v2 has 48 world brushes out of 1,351 -- and an empty
+        // bounding box would put the grid somewhere arbitrary, so it is made
+        // explicit rather than left at its sentinels.
+        for (int k = 0; k < 3; k++)
+        {
+            m.mins[k] = 0.0f;
+            m.maxs[k] = 1.0f;
+        }
+    }
+
+    *out = m;
+    return true;
+}
+
+void WrBspFreeMap(WrBspMap *m)
+{
+    if (!m)
+        return;
+    free(m->polys);
+    free(m->verts);
+    memset(m, 0, sizeof(*m));
+}

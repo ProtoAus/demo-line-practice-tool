@@ -37,6 +37,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
+#include <math.h>
 
 static bool g_verbose = false;
 
@@ -45,6 +46,14 @@ static bool g_verbose = false;
 // nothing, and knowing how bad that gets is what decides the wording.
 static float g_worstPct = 1e9f;
 static char  g_worstMap[128] = "none";
+
+// The map that costs the most to keep resident, and how many maps had a face
+// that did not close. Both are budget questions rather than curiosities: the
+// first sets WR_BSP_MAX_RESIDENT, and the second is the only signal a struct
+// stride is wrong in a way every index check passed.
+static float g_biggestBytes = 0.0f;
+static char  g_biggestMap[128] = "none";
+static int   g_unclosedMaps = 0;
 
 // ---------------------------------------------------------------------------
 // Small tallies
@@ -126,16 +135,30 @@ static float Pct(float *v, int n, double p)
 
 // ---------------------------------------------------------------------------
 
+// Area-weighted, one bin a degree, over every UP-FACING face. Area-weighted
+// and not face-counted, because a surf map is a handful of enormous ramps and
+// several thousand small brushes, and counting faces measures the brushes.
+static double g_angle[91];
+static double g_angleArea = 0.0;
+
+// ---------------------------------------------------------------------------
+
 int main(int argc, char **argv)
 {
     const char *root = "momentum\\maps";
+    const char *only = NULL;
     int limit = 0;
+    bool build = false, angles = false;
 
     for (int i = 1; i < argc; i++)
     {
         if (strcmp(argv[i], "--verbose") == 0) g_verbose = true;
+        else if (strcmp(argv[i], "--closure") == 0) build = true;
+        else if (strcmp(argv[i], "--angles") == 0) { build = true; angles = true; }
         else if (strcmp(argv[i], "--limit") == 0 && i + 1 < argc)
             limit = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--only") == 0 && i + 1 < argc)
+            only = argv[++i];
         else root = argv[i];
     }
 
@@ -159,8 +182,16 @@ int main(int argc, char **argv)
     long long totalBrushes = 0, totalOwned = 0, totalBytes = 0;
     long long refs = 0;
 
+    int built = 0, refusedBuild = 0;
+    long long sideTotal = 0, sideDropped = 0, sideDegenerate = 0;
+    long long sideNotClosed = 0, sideTooFar = 0, clipOnly = 0;
+    long long polys = 0, verts = 0;
+    double solidArea = 0.0, surfArea = 0.0;
+
     float *ownedPct = (float *)malloc(4096 * sizeof(float));
     int ownedN = 0;
+    float *resident = (float *)malloc(4096 * sizeof(float));
+    int residentN = 0;
 
     LARGE_INTEGER freq, t0, t1;
     QueryPerformanceFrequency(&freq);
@@ -169,6 +200,8 @@ int main(int argc, char **argv)
     do
     {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            continue;
+        if (only && _strnicmp(fd.cFileName, only, strlen(only)) != 0)
             continue;
         if (limit && maps >= limit)
             break;
@@ -238,6 +271,64 @@ int main(int argc, char **argv)
         }
 
         free(owned);
+
+        if (build)
+        {
+            WrBspMap map;
+            if (!WrBspBuild(&r, &map, err, (int)sizeof(err)))
+            {
+                refusedBuild++;
+                NoteReason(err, fd.cFileName);
+                if (g_verbose)
+                    printf("  [build] %-43s %s\n", fd.cFileName, err);
+            }
+            else
+            {
+                built++;
+                sideTotal      += map.sideTotal;
+                sideDropped    += map.sideDropped;
+                sideDegenerate += map.sideDegenerate;
+                sideNotClosed  += map.sideNotClosed;
+                sideTooFar     += map.sideTooFar;
+                clipOnly       += map.brushClipOnly;
+                polys          += map.polyCount;
+                verts          += map.vertCount;
+                solidArea      += map.solidArea;
+                surfArea       += map.surfArea;
+                if (residentN < 4096)
+                    resident[residentN++] = (float)map.bytes / 1048576.0f;
+                if ((float)map.bytes > g_biggestBytes)
+                {
+                    g_biggestBytes = (float)map.bytes;
+                    _snprintf_s(g_biggestMap, sizeof(g_biggestMap), _TRUNCATE,
+                                "%s (%d polys)", fd.cFileName, map.polyCount);
+                }
+                if ((map.sideNotClosed || map.sideTooFar) && g_unclosedMaps < 12)
+                {
+                    printf("  [closure] %-41s %d did not close, %d left the "
+                           "world, of %d sides\n", fd.cFileName,
+                           map.sideNotClosed, map.sideTooFar, map.sideTotal);
+                    g_unclosedMaps++;
+                }
+
+                if (angles)
+                    for (int i = 0; i < map.polyCount; i++)
+                    {
+                        const float nz = map.polys[i].plane[2];
+                        if (nz <= 0.0f)
+                            continue;       // a ceiling is not a ramp
+                        int bin = (int)(WrBspSurfaceAngle(map.polys[i].plane)
+                                        + 0.5f);
+                        if (bin < 0) bin = 0;
+                        if (bin > 90) bin = 90;
+                        g_angle[bin] += map.polys[i].area;
+                        g_angleArea += map.polys[i].area;
+                    }
+
+                WrBspFreeMap(&map);
+            }
+        }
+
         WrBspFreeRaw(&r);
     } while (FindNextFileA(find, &fd));
 
@@ -270,16 +361,76 @@ int main(int argc, char **argv)
     }
     printf("    %lld brushside plane references checked\n", refs);
 
-    printf("\nrefused: %d on read, %d on walk\n", refusedRead, refusedWalk);
+    if (build)
+    {
+        printf("\nthe clip: %d maps built\n", built);
+        printf("    %lld sides in, %lld polygons out\n", sideTotal, polys);
+        printf("    %lld dropped as bevels or slivers (%.1f%%)\n",
+               sideDropped, sideTotal ? 100.0 * sideDropped / sideTotal : 0.0);
+        printf("    %lld had a plane that was not a unit normal\n",
+               sideDegenerate);
+        printf("    %lld had a vertex outside the world\n", sideTooFar);
+        printf("    %lld FAILED THE CLOSURE ASSERTION (%.4f%%), on %d maps\n",
+               sideNotClosed,
+               sideTotal ? 100.0 * sideNotClosed / sideTotal : 0.0,
+               g_unclosedMaps);
+        printf("    %lld solid brushes were playerclip-only and skipped\n",
+               clipOnly);
+        printf("    %.0f sq units solid, %.0f in the surf band (%.1f%%)\n",
+               solidArea, surfArea, solidArea ? 100.0 * surfArea / solidArea : 0.0);
+
+        if (residentN)
+        {
+            qsort(resident, residentN, sizeof(float), CmpF);
+            printf("\n    resident: p50 %.2f MB  p90 %.2f MB  p99 %.2f MB\n",
+                   Pct(resident, residentN, 0.50), Pct(resident, residentN, 0.90),
+                   Pct(resident, residentN, 0.99));
+            printf("    largest: %.2f MB  %s\n", g_biggestBytes / 1048576.0f,
+                   g_biggestMap);
+            printf("    %lld vertices across the library\n", verts);
+        }
+    }
+
+    if (angles && g_angleArea > 0.0)
+    {
+        printf("\nup-facing surface angle, weighted by area\n");
+        printf("    0 is a floor, 90 a wall. 45.6 is Source's own standable\n"
+               "    cut -- below it you slide, and that is what a surf ramp is.\n\n");
+        double peak = 0.0;
+        for (int i = 0; i <= 90; i++)
+            if (g_angle[i] > peak)
+                peak = g_angle[i];
+        double band = 0.0;
+        for (int i = 0; i <= 90; i++)
+        {
+            double frac = g_angle[i] / g_angleArea;
+            if (WrBspIsSurfBand((float)cos(i * 3.14159265358979 / 180.0)))
+                band += frac;
+            if (frac < 0.002 && g_angle[i] < peak * 0.02)
+                continue;
+            int bars = (int)(60.0 * g_angle[i] / peak + 0.5);
+            printf("    %2d deg  %5.2f%%  ", i, 100.0 * frac);
+            for (int k = 0; k < bars; k++)
+                putchar('#');
+            putchar('\n');
+        }
+        printf("\n    %.1f%% of up-facing area is inside the surf band\n",
+               100.0 * band);
+    }
+
+    printf("\nrefused: %d on read, %d on walk, %d on build\n",
+           refusedRead, refusedWalk, refusedBuild);
     for (int i = 0; i < g_reasons; i++)
         printf("    %4d  %s\n            first: %s\n",
                g_reasonN[i], g_reason[i], g_reasonMap[i]);
 
     free(ownedPct);
+    free(resident);
 
     // The exit code is the whole assertion. Anything refused is a layout this
     // does not know about, and the point of running it is to find out.
-    bool clean = (refusedRead == 0 && refusedWalk == 0 && g_reasons == 0);
+    bool clean = (refusedRead == 0 && refusedWalk == 0 &&
+                  refusedBuild == 0 && sideNotClosed == 0 && g_reasons == 0);
     printf("\n%s\n", clean ? "every map read and walked"
                            : "SOME MAPS WERE REFUSED");
     return clean ? 0 : 1;

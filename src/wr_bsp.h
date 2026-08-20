@@ -103,6 +103,42 @@
 // collision reads to a user as "there is no ramp ahead", which is worse than
 // the feature not existing. Hence WrBspMap::coverage and the panel line.
 //
+// WHAT THE CLIP ACTUALLY PRODUCES
+//
+// Over the whole library: 33,857,967 brushsides in, 19,733,988 polygons out,
+// 41.7% dropped as bevels or slivers, and -- the number this was all arranged
+// to produce -- ZERO failures of the closure assertion. Not a low rate: none,
+// across thirty-four million sides and four struct layouts. Nothing else in
+// this file could have caught a stride wrong in a way every index check
+// passed, and it had thirty-four million chances to.
+//
+// Two other tallies, both small and both meaning something. No brushside
+// anywhere references one of the degenerate (0,0,0) planes, so those really
+// are unreferenced rather than merely rare. And 15 sides on 3 maps have a
+// vertex outside +-WR_WORLD_LIMIT; all three are maps with unusual extents,
+// one of them surf_colin_blaster_69000, which is the map that forced
+// WR_WORLD_LIMIT up to 65536 in the first place.
+//
+// THE UPPER EDGE OF THE SURF BAND IS DOING REAL WORK
+//
+// Area-weighted over every up-facing face on all 1,106 surf maps:
+//
+//      0 deg   85.6%   floors, which is what "up-facing" mostly means
+//     45 deg    1.69%  the largest non-floor feature by a wide margin
+//     51 deg    0.75%  the mode INSIDE the surf band
+//     27 deg    0.72%
+//
+// The 45-degree spike is mappers taking the default slope, and a 45-degree
+// slope has n.z = 0.7071, which is above Source's 0.7 standable cut -- so it
+// is something you walk up, not something you surf, and WR_BSP_BAND_HI
+// excludes it by a margin of one hundredth. Widening that bound by a rounding
+// error would more than double the drawn set with surfaces nobody slides on.
+// Inside the band the distribution runs from about 46 to 60 degrees and peaks
+// at 51, which is the shape a surf map has.
+//
+// 6.8% of up-facing area is inside the band. That is the honest size of this
+// feature: most of a map is floor.
+//
 // NOTHING SHAPED LIKE A NODE SURVIVES THE PARSE
 //
 // The tree is walked once, to decide which brushes the world owns, and then
@@ -127,6 +163,12 @@
 // exist because fileofs, filelen and the LZMA container's declared size all
 // come out of somebody else's file and each of them is an allocation.
 
+// WR_BSP_MAX_RESIDENT is what the POLYGONS are allowed to cost, and it is the
+// one of the three with real data behind it. Measured over all 1,304 maps: p50
+// 1.19 MB, p90 2.38 MB, p99 4.75 MB, worst 9.50 MB (bhop_canals, 95,955
+// faces). 64 MB is therefore about seven times the worst map in the library,
+// which is the right kind of margin for a number whose job is to stop rather
+// than to fit.
 #define WR_BSP_MAX_LUMP        (128u * 1024u * 1024u)
 #define WR_BSP_MAX_LUMPS_TOTAL (256u * 1024u * 1024u)
 #define WR_BSP_MAX_RESIDENT    (64u * 1024u * 1024u)
@@ -246,5 +288,78 @@ int  WrBspModelHeadNode(const WrBspRaw *r, int model);
 // `owned` must have room for count[WR_BSP_L_BRUSHES] bytes.
 bool WrBspWorldBrushes(const WrBspRaw *r, unsigned char *owned, int *ownedOut,
                        char *err, int errCap);
+
+// ---------------------------------------------------------------------------
+// The map, as polygons
+// ---------------------------------------------------------------------------
+//
+// What survives the parse. No node, no leaf, no lump and no version -- a face
+// is four floats of plane and a run of vertices, and that is the whole of what
+// stays resident. See wr_bspgeom.h for why the queries are over a grid built
+// here rather than over the tree the file came with.
+
+// Contents bits, from Valve's bspflags.h. Only the first is tested.
+//
+// CONTENTS_SOLID alone, and NOT a mask including CONTENTS_PLAYERCLIP: a
+// playerclip brush is invisible geometry a mapper put there to smooth a ramp
+// or block a shortcut, and drawing it as though it were the ramp would put a
+// surface on screen that nobody can see in game. Whether it should be included
+// is a real question and bsp_sweep --contents counts them so it can be
+// answered with a number; today it is not.
+#define WR_BSP_CONTENTS_SOLID      0x00000001
+#define WR_BSP_CONTENTS_PLAYERCLIP 0x00010000
+
+struct WrBspPoly
+{
+    float plane[4];     // the side's own plane: normal in 0..2, distance in 3
+    int   first;        // index of its first vertex in WrBspMap::verts
+    int   count;
+    float area;
+};
+
+struct WrBspMap
+{
+    int  version;
+    bool compressed;
+
+    float mins[3], maxs[3];
+
+    WrBspPoly *polys;
+    int        polyCount;
+    float    (*verts)[3];
+    int        vertCount;
+
+    // What was read, and -- the half that matters more -- what was not.
+    // A panel that shows geometry without showing coverage is telling
+    // somebody there is no ramp ahead when what happened is that nothing was
+    // read. On a map like bhop_slope_v2 that is the difference between a
+    // feature and a lie.
+    int brushTotal;         // brushes in the file
+    int brushWorld;         // owned by model 0
+    int brushSolid;         // ... and CONTENTS_SOLID, so actually considered
+    int brushClipOnly;      // playerclip and not solid: deliberately skipped
+    int sideTotal;          // sides of those brushes
+    int sideDropped;        // clipped away to nothing -- bevels, mostly
+    int sideDegenerate;     // the plane was not a unit normal
+    int sideNotClosed;      // failed the closure assertion, so refused
+    int sideTooFar;         // a vertex outside the world, so refused
+
+    int   surfPolys;        // in the surf band, facing up
+    float surfArea;
+    float solidArea;
+
+    size_t bytes;           // what all of the above cost
+};
+
+// Turn the lumps into polygons. Reads nothing from disk; the caller owns `r`
+// and may free it the moment this returns.
+bool WrBspBuild(const WrBspRaw *r, WrBspMap *out, char *err, int errCap);
+void WrBspFreeMap(WrBspMap *m);
+
+// A polygon's vertices, for a caller that would rather not do the arithmetic.
+static inline const float (*WrBspPolyVerts(const WrBspMap *m, int i))[3]
+{
+    return m->verts + m->polys[i].first;
+}
 
 #endif // WR_BSP_H

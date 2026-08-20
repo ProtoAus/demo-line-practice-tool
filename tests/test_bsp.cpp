@@ -30,6 +30,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 static int g_failures = 0;
 
@@ -772,6 +773,189 @@ static void TestWalkRefusals(void)
 }
 
 // ---------------------------------------------------------------------------
+// The clip pipeline, end to end
+// ---------------------------------------------------------------------------
+//
+// tests\test_bspgeom.exe already drives the clipper against shapes checked by
+// hand. What is new here is the wiring: real lumps, the worldspawn filter, the
+// contents filter, and the arithmetic that turns a run of sides into polygons.
+// Every number below can be worked out on paper from the fixture's own
+// comment, which is the only reason they are worth asserting.
+//
+//     the floor slab   1024 x 1024 x 64, so 2*1024^2 + 4*1024*64 = 2359296
+//     the ramp prism   bottom 225*512 = 115200, back 512*300 = 153600,
+//                      slant 375*512 = 192000, two ends 2*(225*300/2) = 67500
+//                                                          total  528300
+//     everything       2887596, of which 192000 is in the surf band
+
+static void TestBuild(void)
+{
+    printf("\nbrushes into polygons\n");
+
+    Bsp a = Copy(kBspV20, sizeof(kBspV20));
+    Bsp b = Copy(kBspV25, sizeof(kBspV25));
+    WrBspRaw v20, v25;
+    if (ReadBack(&a, "v20.bsp", &v20)[0] || ReadBack(&b, "v25.bsp", &v25)[0])
+    {
+        Check(false, "the fixtures load");
+        Drop(&a); Drop(&b);
+        return;
+    }
+
+    WrBspMap map[2];
+    bool built = true;
+    for (int w = 0; w < 2; w++)
+    {
+        char err[192] = { 0 };
+        if (!WrBspBuild(w ? &v25 : &v20, &map[w], err, (int)sizeof(err)))
+        {
+            printf("      %s\n", err);
+            built = false;
+        }
+    }
+    Check(built, "both fixtures build");
+    if (!built)
+    {
+        WrBspFreeRaw(&v20); WrBspFreeRaw(&v25);
+        Drop(&a); Drop(&b);
+        return;
+    }
+
+    for (int w = 0; w < 2; w++)
+    {
+        const WrBspMap *m = &map[w];
+        const char *tag = w ? "v25" : "v20";
+        char what[160];
+
+        printf("      %s: %d polys, %d verts, %.0f sq units solid, "
+               "%.0f in band, %u bytes\n", tag, m->polyCount, m->vertCount,
+               m->solidArea, m->surfArea, (unsigned int)m->bytes);
+
+        _snprintf_s(what, sizeof(what), _TRUNCATE,
+                    "%s: 2 of 3 brushes are the world's, both solid", tag);
+        Check(m->brushTotal == 3 && m->brushWorld == 2 && m->brushSolid == 2,
+              what);
+
+        // Six faces off the slab and five off the prism. Not "about eleven":
+        // a clipper that lost a face or kept a bevel would land somewhere
+        // else, and there is nowhere else to land.
+        _snprintf_s(what, sizeof(what), _TRUNCATE,
+                    "%s: 11 faces -- six off the slab, five off the prism", tag);
+        Check(m->polyCount == 11, what);
+
+        _snprintf_s(what, sizeof(what), _TRUNCATE,
+                    "%s: nothing failed closure, nothing left the world", tag);
+        Check(m->sideNotClosed == 0 && m->sideTooFar == 0 &&
+              m->sideDegenerate == 0, what);
+
+        _snprintf_s(what, sizeof(what), _TRUNCATE,
+                    "%s: total area is 2887596 to a part in ten thousand", tag);
+        Check(fabs(m->solidArea - 2887596.0) < 289.0, what);
+
+        // ONE surf-band face, and its area is the slant's exactly. Two would
+        // mean the trigger got in; nought would mean the band test folded the
+        // sign and threw the ramp out with the ceilings.
+        _snprintf_s(what, sizeof(what), _TRUNCATE,
+                    "%s: exactly one face in the surf band", tag);
+        Check(m->surfPolys == 1, what);
+
+        _snprintf_s(what, sizeof(what), _TRUNCATE,
+                    "%s: and its area is 192000, not 384000", tag);
+        Check(fabs(m->surfArea - WR_FIXTURE_BSP_SURF_AREA) < 20.0f, what);
+
+        // Find it and check the angle a user would be shown.
+        int found = -1;
+        for (int i = 0; i < m->polyCount; i++)
+            if (WrBspIsSurfBand(m->polys[i].plane[2]))
+                found = i;
+        _snprintf_s(what, sizeof(what), _TRUNCATE,
+                    "%s: it reads 53.13 degrees", tag);
+        Check(found >= 0 &&
+              fabs(WrBspSurfaceAngle(m->polys[found].plane) - 53.130102) < 0.001,
+              what);
+
+        // The winding is the plane's. Get this wrong and every polygon in the
+        // map is inside out, which still draws and silently inverts the
+        // front-face test that keeps a ramp's underside off the screen.
+        float wound[3] = { 0, 0, 0 };
+        bool haveNormal = found >= 0 &&
+            WrBspPolyNormal(WrBspPolyVerts(m, found), m->polys[found].count,
+                            wound);
+        _snprintf_s(what, sizeof(what), _TRUNCATE,
+                    "%s: its winding agrees with its own plane", tag);
+        Check(haveNormal && WrBspAngleBetween(wound, m->polys[found].plane)
+              < 0.01f, what);
+
+        _snprintf_s(what, sizeof(what), _TRUNCATE,
+                    "%s: the bounds are the slab's, raised to the prism's top",
+                    tag);
+        Check(m->mins[0] == -512.0f && m->maxs[0] == 512.0f &&
+              m->mins[1] == -512.0f && m->maxs[1] == 512.0f &&
+              m->mins[2] == -64.0f && m->maxs[2] == 300.0f, what);
+    }
+
+    // AND THE TWO AGREE. Different strides, different field offsets, one of
+    // them through LZMA -- and the same polygons out the far end.
+    bool identical = map[0].polyCount == map[1].polyCount &&
+                     map[0].vertCount == map[1].vertCount &&
+                     map[0].surfPolys == map[1].surfPolys;
+    if (identical)
+        for (int i = 0; i < map[0].vertCount && identical; i++)
+            for (int k = 0; k < 3; k++)
+                if (map[0].verts[i][k] != map[1].verts[i][k])
+                    identical = false;
+    Check(identical, "v20 and v25 produce the same vertices, to the last bit");
+
+    WrBspFreeMap(&map[0]);
+    WrBspFreeMap(&map[1]);
+    WrBspFreeRaw(&v20);
+    WrBspFreeRaw(&v25);
+    Drop(&a);
+    Drop(&b);
+}
+
+// The trigger, put back. This is the counterfactual the whole design rests on,
+// so it is worth measuring rather than asserting: give brush 2 to model 0 and
+// the surf-band area doubles.
+static void TestTriggerCounterfactual(void)
+{
+    printf("\nwhat including the trigger would have cost\n");
+
+    Bsp m = Copy(kBspV20, sizeof(kBspV20));
+
+    // Leaf 0 owns leafbrushes 0..2. Widen it to 0..3 and the world now owns
+    // the trigger too -- exactly the map a reader without the walk sees.
+    unsigned char *leaf0 = LumpBytes(&m, IX_LEAFS);
+    leaf0[26] = 3; leaf0[27] = 0;
+
+    WrBspRaw r;
+    const char *e = ReadBack(&m, "trig.bsp", &r);
+    if (e[0])
+    {
+        Check(false, "the mutated fixture loads");
+        Drop(&m);
+        return;
+    }
+
+    WrBspMap map;
+    char err[192] = { 0 };
+    bool ok = WrBspBuild(&r, &map, err, (int)sizeof(err));
+    Check(ok, "it still builds -- nothing about it is malformed");
+    if (ok)
+    {
+        printf("      with the trigger: %d brushes, %d band faces, %.0f sq units\n",
+               map.brushSolid, map.surfPolys, map.surfArea);
+        Check(map.brushSolid == 3 && map.surfPolys == 2 &&
+              fabs(map.surfArea - 2.0 * WR_FIXTURE_BSP_SURF_AREA) < 40.0,
+              "and reports twice the surf-band area, at the same angle");
+        WrBspFreeMap(&map);
+    }
+
+    WrBspFreeRaw(&r);
+    Drop(&m);
+}
+
+// ---------------------------------------------------------------------------
 // Nothing is left behind on a refusal
 // ---------------------------------------------------------------------------
 //
@@ -820,13 +1004,15 @@ int main(void)
     TestFields();
     TestWalk();
     TestWalkRefusals();
+    TestBuild();
+    TestTriggerCounterfactual();
     TestNoPartialSuccess();
 
     // Tidy up. Leaving these behind would be harmless and would also mean a
     // later run could read a stale one if a write ever failed silently.
     static const char *names[] = { "case.bsp", "v20.bsp", "v25.bsp",
                                    "short.bsp", "corrupt.bsp", "last.bsp",
-                                   "walk.bsp" };
+                                   "walk.bsp", "trig.bsp" };
     for (int i = 0; i < (int)(sizeof(names) / sizeof(names[0])); i++)
     {
         char p[512];
