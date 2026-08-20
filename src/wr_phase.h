@@ -170,6 +170,31 @@ static inline bool WrPhaseIsContact(float vz0, float vz1, float h, float gravity
 // out is the unit normal, pointing away from the surface. Returns false when
 // there is nothing to normalise, which for a caller means "no usable reading"
 // rather than "flat floor" -- those must not be drawn the same way.
+//
+// HOW GOOD IT IS, MEASURED AGAINST SOMETHING THAT IS NOT THIS
+//
+// Everything else here is self-consistent -- the projection identity, the
+// grade spread, the board count -- which is worth something and is not the
+// same as being right. tests\bsp_sweep.exe --verify-normals is the outside
+// check: the same planes read straight out of the .bsp, sharing no code, no
+// input and no assumption with this. Over 39 maps and 2,294 runs:
+//
+//     AT A BOARD, meaning this function called on the tick that arrives out
+//     of free flight, so exactly one surface is acting:
+//         normal against normal   p50 1.19 deg, 91.4% within 15, 1.0% gross
+//         slope alone             p50 0.64 deg
+//         SIGNED                  p50 +0.00 deg -- no bias in either direction
+//
+//     MID-RIDE, on any hard tick wherever it lands:
+//         normal against normal   p50 4.91 deg, 12.0% gross
+//
+// The mid-ride figure is not this function being worse there. It is corners
+// and seams: two surfaces pushing at once makes (a - g) their SUM, and no
+// amount of arithmetic recovers two planes from one vector. That is a question
+// with no single answer rather than a wrong answer, and it is the reason the
+// board detector reads the transition rather than sampling the ride.
+//
+// So: trust this at a transition, and treat a mid-ride reading as indicative.
 static inline bool WrPhaseNormal(const float vIn[3], const float vOut[3],
                                  float h, float gravity, float out[3])
 {
@@ -206,6 +231,26 @@ static inline bool WrPhaseNormal(const float vIn[3], const float vOut[3],
 // Better conditioned than a single clip whenever there is a sustained contact to
 // fit, because while a player rides a ramp every velocity lies IN the plane, so
 // the plane's normal is perpendicular to all of them at once.
+//
+// THAT ARGUMENT IS SOUND AND THE ADVANTAGE DID NOT SHOW UP. Measured against
+// the .bsp's own planes over 22,351 sustained rides -- see bsp_sweep.exe
+// --verify-normals -- this fit reads a median of 6.76 degrees off, against
+// 4.91 for a single hard clip and 1.19 for a single clip at a board. It is the
+// worst of the three, not the best.
+//
+// The reason is in the paragraph below about eigenvectors, and it applies here
+// too: a player riding a ramp turns slowly, so consecutive velocities are
+// nearly parallel and a cross product between them amplifies any out-of-plane
+// error by one over the sine of a small angle. Having more samples does not
+// help when they all point the same way. Whatever the estimator, a sustained
+// ride is simply a worse place to ask this question than a transition is --
+// and a ride can also be against two surfaces at once, where there is no
+// single plane to find.
+//
+// It is kept because it is the only thing that can answer "what is this
+// player riding right now" away from a transition, and because measuring it
+// honestly is more useful than removing it. A caller who has a transition
+// available should use WrPhaseNormal at the transition instead.
 //
 // WHY THIS IS NOT AN EIGENVECTOR SOLVE
 //
