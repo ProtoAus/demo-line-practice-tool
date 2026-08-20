@@ -149,6 +149,12 @@ Everything it creates lives in a `wrlines_data` folder next to the DLL, and noth
 your game install unless you press **send**, **local** or **watch** on a run — those copy one demo
 into Momentum's replay folder, and **take out** removes it again.
 
+It also **reads** one file out of the install that is not a demo: when the map changes, the map's own
+`.bsp`, read-only and shared, on a background thread, so it can show you the angle of a ramp before
+you reach it. That is ordinary file I/O and it makes no call into the game — but it is reading
+something, so it is a checkbox in **Display → The map's own geometry**, and turning it off frees what
+it read immediately.
+
 ## Updating
 
 The **About** tab has a **Check for updates** button. It is three presses and each one stops:

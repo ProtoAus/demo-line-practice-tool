@@ -203,7 +203,13 @@ They are **read, never swallowed**, so a collision means the game still acts on 
   **watch** button puts a console command on your clipboard for you to paste; WrLines does not
   execute it.
 - **In its default configuration it makes zero calls into the game.** It hooks `Present` to
-  draw, reads memory read-only, and reads two files.
+  draw, reads memory read-only, and reads files — including, on a map change, the map's own
+  `.bsp`, read-only and shared, from the install directory it already reads demos out of.
+- **The map reader takes brushes only, and says what it is missing.** Displacement ramps are not
+  read, and neither is `func_*` geometry, and on a map built out of either it reads almost
+  nothing. That is a hole rather than a rounding error — over half of maps have displacements
+  somewhere — so the panel prints how much of the map it actually got instead of leaving an empty
+  result to be mistaken for *there is no ramp ahead of you*.
 - **It reaches outside your machine in exactly two places, both behind a checkbox, both off
   unless you say otherwise.** Name/avatar tags ask the Steam client to look up each runner's
   persona and picture — the same request a scoreboard makes. And the Maps tab can download
@@ -1334,6 +1340,80 @@ question is ever asked. Two heuristics, each with a known failure, where one is 
 what the other gets wrong.
 
 All of it is re-derivable — `tests\phase_sweep.exe` for the corpus, `--live` for the estimator.
+
+### The other half: the ramp nobody has hit yet
+
+Everything above recovers the surface a player **did** touch. It needs no map, it works on every map,
+and it is exact where the demo is exact. What it cannot do is say anything about a ramp nobody has
+hit, because there is no measurement of a collision that did not happen. For that there is exactly
+one source: the `.bsp` itself, opened read-only from the game's own install, the same way the demo
+reader already opens files. No call into the game, no cvar, no console command, no trace.
+
+**The failure mode this is arranged around is that a wrong struct width does not crash.** It produces
+plausible planes at plausible angles in plausible places. So the reader refuses by name rather than
+guessing, and the stride table is keyed on `(bspVersion, lumpVersion)` — not on the BSP version,
+which is the obvious choice and the wrong one. Source's `dleaf_t` shrank from 56 bytes to 32 when its
+ambient lighting moved into a lump of its own, and Strata's v25 took it back **up** to 56. What
+records that is the lump's own version field.
+
+Measured across the 1,304 maps installed here:
+
+| | |
+| --- | --- |
+| versions | v20 86.0 %, v21 7.4 %, v25 5.9 %, v19 0.6 % |
+| collision lumps LZMA-compressed | **723 of 1,304** — compression is a property of the *file*, and no map mixes |
+| index references resolved | **117,031,588**, none out of range |
+| brushsides clipped | 33,857,967 in, 19,733,988 polygons out, 41.7 % correctly dropped as bevels |
+| **failed the closure assertion** | **0** |
+| resident | p50 2.25 MB, worst 10.50 MB |
+| one load | p50 16 ms, worst 124 ms — on a worker thread, once per map |
+
+The closure assertion is the only check here that could catch a stride wrong in a way every index
+check passed: a brush is the intersection of its half-spaces, so no face may stick out through
+another side. It had thirty-four million chances on four struct layouts and never fired.
+
+**Trigger volumes carry `CONTENTS_SOLID` verbatim.** Nothing in the file separates a
+`trigger_teleport` from a ramp — the distinction is only which model owns the brush, so the
+worldspawn tree has to be walked. On `surf_greensway` 47 % of solid brushes are teleport volumes and
+a teleport volume on a surf map is characteristically a big slanted box under the ramp. Skipping the
+walk does not produce garbage; it produces a second ramp.
+
+That walk costs something real, and the panel says so rather than hiding it. Model 0 owns 84.1 % of
+brushes across the library, but only **3.6 % on `bhop_slope_v2`**, which is built almost entirely out
+of entities. **Displacements are not read at all** — 95.5 % of surfable area is brush-backed and the
+median map is 100 %, but 51 surf maps are displacement-built and on those this reads almost nothing.
+Missing collision reads to a user as *there is no ramp ahead*, so the panel prints coverage next to
+the geometry and warns when a map is mostly entities.
+
+#### The two halves check each other
+
+This is the part worth having both for. A normal recovered from a velocity trace and a normal read
+out of a file share no code, no input and no assumption, so comparing them is an outside check on
+each. `tests\bsp_sweep.exe --verify-normals`, over 39 maps and 2,294 runs:
+
+| where | normal vs normal | slope alone | signed |
+| --- | --- | --- | --- |
+| **at a board** — arriving out of free flight | **p50 1.19°**, 91.4 % within 15°, 1.0 % gross | **p50 0.64°** | **+0.00°** |
+| mid-ride, any hard tick | p50 4.91°, 12.0 % gross | p50 2.55° | +0.00° |
+| sustained ride, fitted | p50 6.76° | — | — |
+
+**The signed median is +0.00° everywhere.** Not a small bias — none. Two measurements centred exactly
+on each other is as close to external validation as either layer gets.
+
+Three explanations for the mid-ride spread were checked and rejected before the right one turned up.
+It is not face identification: matching by a ray straight down instead of by nearest polygon moved
+the gross rate from 13.0 % to 12.4 %. It is not the size of the impulse: 300–600 u/s reads 4.91° and
+600–1200 reads 4.43°. It is **corners and seams** — two surfaces pushing at once makes `a − g` their
+sum, and no arithmetic recovers two planes from one vector. That is a question with no single answer
+rather than a wrong answer, and restricting to boards drops the gross rate to 1.0 % with the same
+estimator against the same faces.
+
+It also cost a belief. `WrPhaseFitNormal` exists because a sustained ride offers more data than one
+clip, which is true and loses anyway: 6.76° against 1.19°. A player on a ramp turns slowly, so
+consecutive velocities are nearly parallel and a cross product between them amplifies error by one
+over the sine of a small angle — the same conditioning problem the code already blamed the
+eigenvector method for, inherited by its replacement. More samples do not help when they all point
+the same way.
 
 ### Five presses across two tabs
 
@@ -2806,6 +2886,18 @@ wr_settings         one registration table, walked by both the reader and the
                     writer -- see "Settings, and where they live"
 wr_quick            the one-page panel on DELETE: legs, the top runs of one,
                     and the tick -> fetch -> extract -> draw chain
+wr_bsp              the map file: seven lumps, the stride table, the worldspawn
+                    walk, the brush clip and the grid the queries run over.
+                    PURE -- a path in, polygons or a refusal out, no threads,
+                    no settings, no engine, which is what lets both BSP
+                    harnesses link it with nothing else attached
+wr_bspload          the half that knows a game is running: the worker, the
+                    generation counter, and the handoff that needs no lock
+wr_bspgeom.h        the clipper, the ray and the grid arithmetic -- pure
+                    logic, tested
+wr_phase.h          air / ramp / ground and the board statistics, from the
+                    velocity trace alone -- pure logic, tested, and
+                    cross-checked against wr_bsp by bsp_sweep
 wr_matrixlife.h     when a chosen matrix has died -- pure logic, tested
 wr_pacing.h         when the next frame may be presented -- pure logic, tested
 wr_budget.h         gross gain/loss without counting noise -- pure logic, tested

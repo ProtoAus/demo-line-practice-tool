@@ -2293,6 +2293,17 @@ static void DrawDisplayTab(void)
                "a near-parallel entry, and the loss threshold is relaxed above "
                "1500 u/s because the same geometry costs proportionally more the "
                "faster you arrive.\n\n"
+               "The ramp it thinks you boarded is the real one. That is now "
+               "checked rather than argued: the surface recovered from the "
+               "velocity has been compared against the plane read straight out "
+               "of the map file -- two measurements sharing no code and no "
+               "input -- over 1,862 boards on 39 maps. They differ by half a "
+               "degree of slope at the median, and the SIGNED median is exactly "
+               "zero, so neither one leans against the other.\n\n"
+               "That holds at a board specifically. In the middle of a ride it "
+               "is five times looser, because a corner or a seam puts two "
+               "surfaces against you at once and one velocity change cannot be "
+               "separated back into two planes.\n\n"
                "Demo lines only. Your own velocity is differenced from the "
                "camera and has not been checked against this yet.");
     if (g_render.drawBoards)
