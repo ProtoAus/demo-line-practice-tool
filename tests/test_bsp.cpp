@@ -507,6 +507,271 @@ static void TestRefusals(void)
 }
 
 // ---------------------------------------------------------------------------
+// The fields, and the walk
+// ---------------------------------------------------------------------------
+
+// Where a lump's bytes are in the file image. Only useful on the raw fixture:
+// the v25 one is compressed, so its lump contents cannot be poked at in place.
+static unsigned char *LumpBytes(Bsp *m, int lumpIndex)
+{
+    return m->b + Get32(Entry(m, lumpIndex));
+}
+
+static void TestFields(void)
+{
+    printf("\nreading a field out of somebody else's struct\n");
+
+    Bsp a = Copy(kBspV20, sizeof(kBspV20));
+    Bsp b = Copy(kBspV25, sizeof(kBspV25));
+    WrBspRaw v20, v25;
+    if (ReadBack(&a, "v20.bsp", &v20)[0] || ReadBack(&b, "v25.bsp", &v25)[0])
+    {
+        Check(false, "the fixtures load");
+        Drop(&a); Drop(&b);
+        return;
+    }
+
+    const WrBspRaw *both[2] = { &v20, &v25 };
+    const char *tag[2] = { "v20", "v25" };
+
+    for (int w = 0; w < 2; w++)
+    {
+        const WrBspRaw *r = both[w];
+        char what[128];
+
+        // The plane the whole feature is about, read through the accessor.
+        float p[4] = { 0, 0, 0, 0 };
+        bool got = WrBspPlane(r, 6, p);
+        _snprintf_s(what, sizeof(what), _TRUNCATE,
+                    "%s: plane 6 is the ramp, (0.8, 0, 0.6) at 180", tag[w]);
+        Check(got && p[0] == 0.8f && p[1] == 0.0f && p[2] == 0.6f
+              && p[3] == 180.0f, what);
+
+        // Plane 16 is (0,0,0) and real maps have hundreds of these. It is read
+        // back rather than refused -- what refuses it is WrBspStartQuad, at
+        // the point where a normal has to be a direction.
+        float z[4] = { 1, 1, 1, 1 };
+        _snprintf_s(what, sizeof(what), _TRUNCATE,
+                    "%s: the degenerate plane reads back as (0,0,0) d 0", tag[w]);
+        Check(WrBspPlane(r, 16, z) && z[0] == 0 && z[1] == 0 && z[2] == 0
+              && z[3] == 0, what);
+
+        // Every brushside's plane index, at u16 on stock and int32 on v25.
+        static const int expect[16] = { 0, 1, 2, 3, 4, 5,
+                                        6, 7, 8, 9, 10,
+                                        11, 12, 13, 14, 15 };
+        bool sides = true;
+        for (int i = 0; i < 16; i++)
+            if (WrBspBrushSidePlane(r, i) != expect[i])
+                sides = false;
+        _snprintf_s(what, sizeof(what), _TRUNCATE,
+                    "%s: all 16 brushside plane indices", tag[w]);
+        Check(sides, what);
+
+        // The three brushes, and the fact that matters most about them.
+        int fs = 0, ns = 0, ct = 0;
+        bool brushes = WrBspBrush(r, 0, &fs, &ns, &ct) && fs == 0 && ns == 6;
+        int ct1 = 0, ct2 = 0;
+        brushes = brushes && WrBspBrush(r, 1, NULL, NULL, &ct1);
+        brushes = brushes && WrBspBrush(r, 2, NULL, NULL, &ct2);
+        _snprintf_s(what, sizeof(what), _TRUNCATE,
+                    "%s: brush 0 is sides 0..6", tag[w]);
+        Check(brushes && fs == 0 && ns == 6, what);
+        _snprintf_s(what, sizeof(what), _TRUNCATE,
+                    "%s: the trigger's contents are identical to the ramp's (%d)",
+                    tag[w], ct2);
+        Check(ct == ct1 && ct1 == ct2 && ct2 == 1, what);
+
+        // Node children, leaf ranges, model head nodes.
+        _snprintf_s(what, sizeof(what), _TRUNCATE,
+                    "%s: node 0's children are leaves -1 and -2", tag[w]);
+        Check(WrBspNodeChild(r, 0, 0) == -1 && WrBspNodeChild(r, 0, 1) == -2,
+              what);
+
+        int first = -1, num = -1;
+        _snprintf_s(what, sizeof(what), _TRUNCATE,
+                    "%s: leaf 0 owns leafbrushes 0..2", tag[w]);
+        Check(WrBspLeafBrushRange(r, 0, &first, &num) && first == 0 && num == 2,
+              what);
+
+        _snprintf_s(what, sizeof(what), _TRUNCATE,
+                    "%s: model 0 roots at node 0 and model 1 at node 1", tag[w]);
+        Check(WrBspModelHeadNode(r, 0) == 0 && WrBspModelHeadNode(r, 1) == 1,
+              what);
+
+        // Out of range in both directions, on every accessor that takes an
+        // index. These come out of somebody else's file and there is no value
+        // a real one could not hold.
+        _snprintf_s(what, sizeof(what), _TRUNCATE,
+                    "%s: every accessor refuses an index off either end", tag[w]);
+        float junk[4];
+        Check(!WrBspPlane(r, -1, junk) && !WrBspPlane(r, 17, junk) &&
+              WrBspBrushSidePlane(r, 16) == -1 &&
+              WrBspBrushSidePlane(r, -1) == -1 &&
+              WrBspLeafBrush(r, 3) == -1 &&
+              !WrBspBrush(r, 3, NULL, NULL, NULL) &&
+              !WrBspLeafBrushRange(r, 4, &first, &num) &&
+              WrBspModelHeadNode(r, 2) == -1 &&
+              WrBspNodeChild(r, 2, 0) == 0, what);
+    }
+
+    WrBspFreeRaw(&v20);
+    WrBspFreeRaw(&v25);
+    Drop(&a);
+    Drop(&b);
+}
+
+static void TestWalk(void)
+{
+    printf("\nthe worldspawn walk\n");
+
+    Bsp a = Copy(kBspV20, sizeof(kBspV20));
+    Bsp b = Copy(kBspV25, sizeof(kBspV25));
+    WrBspRaw v20, v25;
+    if (ReadBack(&a, "v20.bsp", &v20)[0] || ReadBack(&b, "v25.bsp", &v25)[0])
+    {
+        Check(false, "the fixtures load");
+        Drop(&a); Drop(&b);
+        return;
+    }
+
+    // THE CHECK THE FIXTURE WAS BUILT FOR. Brush 2 is a slanted box with the
+    // same CONTENTS_SOLID as the ramp, at the same angle, and owned by model 1
+    // rather than by the world. Nothing but the tree can tell them apart.
+    for (int w = 0; w < 2; w++)
+    {
+        const WrBspRaw *r = w ? &v25 : &v20;
+        const char *tag = w ? "v25" : "v20";
+        unsigned char owned[8] = { 9, 9, 9, 9, 9, 9, 9, 9 };
+        int n = -1;
+        char err[128] = { 0 };
+        bool got = WrBspWorldBrushes(r, owned, &n, err, (int)sizeof(err));
+
+        char what[128];
+        _snprintf_s(what, sizeof(what), _TRUNCATE, "%s: the walk completes", tag);
+        Check(got, what);
+        if (!got)
+            printf("      %s\n", err);
+
+        _snprintf_s(what, sizeof(what), _TRUNCATE,
+                    "%s: the world owns the floor and the ramp, and not the "
+                    "trigger", tag);
+        Check(n == 2 && owned[0] && owned[1] && !owned[2], what);
+    }
+
+    // Brush 2 IS reachable -- from model 1's head node, which is exactly what
+    // makes it a trigger rather than a stray. If this failed, the test above
+    // would be passing because the brush is unreferenced rather than because
+    // the walk excluded it.
+    {
+        int first = 0, num = 0;
+        bool leaf2 = WrBspLeafBrushRange(&v20, 2, &first, &num);
+        Check(leaf2 && num == 1 && WrBspLeafBrush(&v20, first) == 2,
+              "and the trigger is excluded despite being reachable from model 1");
+    }
+
+    WrBspFreeRaw(&v20);
+    WrBspFreeRaw(&v25);
+    Drop(&a);
+    Drop(&b);
+}
+
+// Every index the walk follows, pushed out of range. All of these are on the
+// v20 fixture, whose lumps are uncompressed and so can be poked at in place.
+static void WalkRefuses(void (*mutate)(Bsp *), const char *expect,
+                        const char *what)
+{
+    Bsp m = Copy(kBspV20, sizeof(kBspV20));
+    mutate(&m);
+
+    WrBspRaw r;
+    const char *e = ReadBack(&m, "walk.bsp", &r);
+    if (e[0])
+    {
+        printf("  %-64s FAILED\n", what);
+        printf("      the file itself was refused: %s\n", e);
+        g_failures++;
+        Drop(&m);
+        return;
+    }
+
+    unsigned char owned[8];
+    char err[192] = { 0 };
+    bool got = WrBspWorldBrushes(&r, owned, NULL, err, (int)sizeof(err));
+    bool ok = !got && strcmp(err, expect) == 0;
+    Check(ok, what);
+    if (!ok)
+        printf("      expected: %s\n      got     : %s\n", expect,
+               got ? "(accepted)" : err);
+
+    // Nothing survives a refusal here either: a half-marked bitmap read as
+    // "the world owns these" would be worse than no bitmap at all.
+    if (!got)
+    {
+        bool clean = true;
+        for (int i = 0; i < WR_FIXTURE_BSP_BRUSHES; i++)
+            if (owned[i])
+                clean = false;
+        Check(clean, "      and the bitmap comes back empty");
+    }
+
+    WrBspFreeRaw(&r);
+    Drop(&m);
+}
+
+static void MutHeadNode(Bsp *m)
+{
+    // model 0's headnode, 36 bytes into a 48-byte dmodel_t
+    Put32(LumpBytes(m, IX_MODELS) + 36, 999);
+}
+
+static void MutNodeChildNode(Bsp *m)
+{
+    Put32(LumpBytes(m, IX_NODES) + 4, 999);
+}
+
+static void MutNodeChildLeaf(Bsp *m)
+{
+    Put32(LumpBytes(m, IX_NODES) + 8, (unsigned int)(-999));
+}
+
+static void MutLeafBrushRange(Bsp *m)
+{
+    // leaf 0's numleafbrushes, a u16 at offset 26 of a 32-byte dleaf_t
+    unsigned char *p = LumpBytes(m, IX_LEAFS) + 26;
+    p[0] = 99; p[1] = 0;
+}
+
+static void MutLeafBrushTarget(Bsp *m)
+{
+    unsigned char *p = LumpBytes(m, IX_LEAFBRUSH);
+    p[0] = 99; p[1] = 0;
+}
+
+static void MutBrushSides(Bsp *m)
+{
+    Put32(LumpBytes(m, IX_BRUSHES) + 4, 99);
+}
+
+static void TestWalkRefusals(void)
+{
+    printf("\nevery index the walk follows, pushed off the end\n");
+
+    WalkRefuses(MutHeadNode, "model 0's head node is 999 of 2",
+                "a model whose head node is not a node");
+    WalkRefuses(MutNodeChildNode, "node 0's child 0 is node 999 of 2",
+                "a node child pointing past the node lump");
+    WalkRefuses(MutNodeChildLeaf, "node 0's child 1 is leaf 998 of 4",
+                "a node child pointing past the leaf lump");
+    WalkRefuses(MutLeafBrushRange, "leaf 0 claims leafbrushes 0..99 of 3",
+                "a leaf whose brush range leaves the lump");
+    WalkRefuses(MutLeafBrushTarget, "leafbrush 0 references brush 99 of 3",
+                "a leafbrush pointing at no brush");
+    WalkRefuses(MutBrushSides, "brush 0 claims sides 0..99 of 16",
+                "a brush whose side range leaves the lump");
+}
+
+// ---------------------------------------------------------------------------
 // Nothing is left behind on a refusal
 // ---------------------------------------------------------------------------
 //
@@ -552,12 +817,16 @@ int main(void)
     TestStrideTable();
     TestHappy();
     TestRefusals();
+    TestFields();
+    TestWalk();
+    TestWalkRefusals();
     TestNoPartialSuccess();
 
     // Tidy up. Leaving these behind would be harmless and would also mean a
     // later run could read a stale one if a write ever failed silently.
     static const char *names[] = { "case.bsp", "v20.bsp", "v25.bsp",
-                                   "short.bsp", "corrupt.bsp", "last.bsp" };
+                                   "short.bsp", "corrupt.bsp", "last.bsp",
+                                   "walk.bsp" };
     for (int i = 0; i < (int)(sizeof(names) / sizeof(names[0])); i++)
     {
         char p[512];

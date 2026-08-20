@@ -277,6 +277,18 @@ cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Itests /Ithird_party\lzma /I%ZS% ^
    /Fe:tests\test_bsp.exe /Fo:tests\ >nul
 if errorlevel 1 ( echo [!] test_bsp FAILED to build & exit /b 1 )
 
+rem bsp_sweep is BUILT but not RUN, exactly as phase_sweep is. It needs a game
+rem install -- 1,304 maps and about 2.5 GB of other people's work -- and it is
+rem where every number in wr_bsp.h's header came from. Building it here means a
+rem change to the reader that breaks the tool measuring the reader fails the
+rem build.
+rem   tests\bsp_sweep.exe "<game>\momentum\maps"
+cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% /Itests /Ithird_party\lzma /I%ZS% ^
+   tests\bsp_sweep.cpp ^
+   %S%\wr_bsp.cpp %S%\wr_mtv.cpp tests\LzmaDec.obj %ZSOBJ% ^
+   /Fe:tests\bsp_sweep.exe /Fo:tests\ >nul
+if errorlevel 1 ( echo [!] bsp_sweep FAILED to build & exit /b 1 )
+
 
 rem test_peek is the one harness here that touches the disk, and it has to: the
 rem thing under test is a claim about file metadata, so a stub that returned

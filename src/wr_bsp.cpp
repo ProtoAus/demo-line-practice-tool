@@ -468,3 +468,261 @@ void WrBspFreeRaw(WrBspRaw *r)
     }
     memset(r, 0, sizeof(*r));
 }
+
+// ---------------------------------------------------------------------------
+// The fields
+// ---------------------------------------------------------------------------
+//
+// One place where "is this Strata" is asked, and it is asked about the FILE
+// rather than about a stride -- because 56-byte leaves happen on v19 too, with
+// completely different field offsets, and a reader that keyed the offsets off
+// the size would read a v19 map's leaf brush range out of its ambient light
+// cube.
+
+static bool Strata(const WrBspRaw *r) { return r->version == 25; }
+
+static const unsigned char *Rec(const WrBspRaw *r, int lump, int i)
+{
+    if (i < 0 || i >= r->count[lump])
+        return NULL;
+    return r->data[lump] + (size_t)i * (size_t)r->stride[lump];
+}
+
+static int Rd16(const unsigned char *p)
+{
+    return (int)((unsigned int)p[0] | ((unsigned int)p[1] << 8));
+}
+
+static int RdI32(const unsigned char *p)
+{
+    return (int)Rd32(p);
+}
+
+// A node's child. Positive is a node, negative is -(leaf + 1). Returns 0 for
+// an index out of range, which the walk treats as a refusal -- there is no
+// sentinel a real file could not also contain, so the caller checks the index
+// before calling rather than the value after.
+int WrBspNodeChild(const WrBspRaw *r, int node, int which)
+{
+    const unsigned char *p = Rec(r, WR_BSP_L_NODES, node);
+    if (!p || which < 0 || which > 1)
+        return 0;
+    return RdI32(p + 4 + which * 4);
+}
+
+bool WrBspLeafBrushRange(const WrBspRaw *r, int leaf, int *first, int *num)
+{
+    const unsigned char *p = Rec(r, WR_BSP_L_LEAFS, leaf);
+    if (!p)
+        return false;
+    if (Strata(r))
+    {
+        *first = RdI32(p + 44);
+        *num = RdI32(p + 48);
+    }
+    else
+    {
+        // Offset 24, and not 22: firstleafface and numleaffaces sit at 20 and
+        // 22. Reading the pair two bytes early passes a divisibility check,
+        // passes a plausibility glance, and gives leaf brush ranges that are
+        // face ranges -- which is how this was wrong the first time.
+        *first = Rd16(p + 24);
+        *num = Rd16(p + 26);
+    }
+    return *first >= 0 && *num >= 0;
+}
+
+int WrBspLeafBrush(const WrBspRaw *r, int i)
+{
+    const unsigned char *p = Rec(r, WR_BSP_L_LEAFBRUSHES, i);
+    if (!p)
+        return -1;
+    return Strata(r) ? RdI32(p) : Rd16(p);
+}
+
+bool WrBspBrush(const WrBspRaw *r, int i, int *firstSide, int *numSides,
+                int *contents)
+{
+    const unsigned char *p = Rec(r, WR_BSP_L_BRUSHES, i);
+    if (!p)
+        return false;
+    if (firstSide) *firstSide = RdI32(p);
+    if (numSides)  *numSides = RdI32(p + 4);
+    if (contents)  *contents = RdI32(p + 8);
+    return true;
+}
+
+int WrBspBrushSidePlane(const WrBspRaw *r, int side)
+{
+    const unsigned char *p = Rec(r, WR_BSP_L_BRUSHSIDES, side);
+    if (!p)
+        return -1;
+    return Strata(r) ? RdI32(p) : Rd16(p);
+}
+
+bool WrBspPlane(const WrBspRaw *r, int i, float out[4])
+{
+    const unsigned char *p = Rec(r, WR_BSP_L_PLANES, i);
+    if (!p)
+        return false;
+    memcpy(out, p, 16);         // Vector normal, then float dist
+    return true;
+}
+
+int WrBspModelHeadNode(const WrBspRaw *r, int model)
+{
+    const unsigned char *p = Rec(r, WR_BSP_L_MODELS, model);
+    if (!p)
+        return -1;
+    return RdI32(p + 36);       // after mins, maxs and origin
+}
+
+// ---------------------------------------------------------------------------
+// The walk
+// ---------------------------------------------------------------------------
+//
+// Iterative, with its own stack, because the depth is somebody else's number.
+// A recursive walk of a 10,000-node tree is fine on a well-formed file and is
+// a stack overflow on a crafted one, and this runs inside another process.
+//
+// Termination does not rest on the file being a tree. A `seen` bitmap makes
+// every node visitable once, so a child pointer that loops back is simply not
+// followed again -- there is no arrangement of bytes that makes this run
+// twice as long as it has nodes.
+
+bool WrBspWorldBrushes(const WrBspRaw *r, unsigned char *owned, int *ownedOut,
+                       char *err, int errCap)
+{
+    if (err && errCap > 0)
+        err[0] = '\0';
+    if (ownedOut)
+        *ownedOut = 0;
+    if (!r || !owned || !r->data[WR_BSP_L_NODES])
+    {
+        Fail(err, errCap, "nothing to walk");
+        return false;
+    }
+
+    const int numNodes  = r->count[WR_BSP_L_NODES];
+    const int numLeafs  = r->count[WR_BSP_L_LEAFS];
+    const int numLB     = r->count[WR_BSP_L_LEAFBRUSHES];
+    const int numBrush  = r->count[WR_BSP_L_BRUSHES];
+    const int numSides  = r->count[WR_BSP_L_BRUSHSIDES];
+
+    memset(owned, 0, (size_t)numBrush);
+
+    const int head = WrBspModelHeadNode(r, 0);
+    if (head < 0 || head >= numNodes)
+    {
+        Fail(err, errCap, "model 0's head node is %d of %d", head, numNodes);
+        return false;
+    }
+
+    unsigned char *seen = (unsigned char *)calloc((size_t)numNodes, 1);
+    int *stack = (int *)malloc((size_t)numNodes * sizeof(int));
+    if (!seen || !stack)
+    {
+        free(seen);
+        free(stack);
+        Fail(err, errCap, "out of memory");
+        return false;
+    }
+
+    bool ok = true;
+    int top = 0;
+    stack[top++] = head;
+    seen[head] = 1;
+    int found = 0;
+
+    while (top > 0 && ok)
+    {
+        const int node = stack[--top];
+
+        for (int c = 0; c < 2; c++)
+        {
+            const int child = WrBspNodeChild(r, node, c);
+
+            if (child >= 0)
+            {
+                if (child >= numNodes)
+                {
+                    Fail(err, errCap, "node %d's child %d is node %d of %d",
+                         node, c, child, numNodes);
+                    ok = false;
+                    break;
+                }
+                if (seen[child])
+                    continue;           // not a tree; do not walk it twice
+                seen[child] = 1;
+                stack[top++] = child;
+                continue;
+            }
+
+            const int leaf = -1 - child;
+            if (leaf < 0 || leaf >= numLeafs)
+            {
+                Fail(err, errCap, "node %d's child %d is leaf %d of %d",
+                     node, c, leaf, numLeafs);
+                ok = false;
+                break;
+            }
+
+            int first = 0, num = 0;
+            if (!WrBspLeafBrushRange(r, leaf, &first, &num) ||
+                first > numLB || num < 0 || first + num > numLB)
+            {
+                Fail(err, errCap, "leaf %d claims leafbrushes %d..%d of %d",
+                     leaf, first, first + num, numLB);
+                ok = false;
+                break;
+            }
+
+            for (int i = 0; i < num; i++)
+            {
+                const int b = WrBspLeafBrush(r, first + i);
+                if (b < 0 || b >= numBrush)
+                {
+                    Fail(err, errCap, "leafbrush %d references brush %d of %d",
+                         first + i, b, numBrush);
+                    ok = false;
+                    break;
+                }
+
+                // A brush appears in every leaf it touches, so most of these
+                // are repeats -- the bitmap is what makes the walk a set
+                // union rather than a list with duplicates in it.
+                if (owned[b])
+                    continue;
+
+                // Its sides are checked HERE, once, rather than at clip time
+                // for every side of every brush. A brush whose side range
+                // leaves the lump is a stride that is wrong somewhere, and
+                // that is a fact about the file rather than about this brush.
+                int fs = 0, ns = 0;
+                if (!WrBspBrush(r, b, &fs, &ns, NULL) ||
+                    fs < 0 || ns < 0 || fs + ns > numSides)
+                {
+                    Fail(err, errCap, "brush %d claims sides %d..%d of %d",
+                         b, fs, fs + ns, numSides);
+                    ok = false;
+                    break;
+                }
+
+                owned[b] = 1;
+                found++;
+            }
+        }
+    }
+
+    free(seen);
+    free(stack);
+
+    if (!ok)
+    {
+        memset(owned, 0, (size_t)numBrush);
+        return false;
+    }
+    if (ownedOut)
+        *ownedOut = found;
+    return true;
+}
