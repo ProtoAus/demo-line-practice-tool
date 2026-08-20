@@ -133,6 +133,16 @@ cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% tests\test_phase.cpp ^
    /Fe:tests\test_phase.exe /Fo:tests\ >nul
 if errorlevel 1 ( echo [!] test_phase FAILED to build & exit /b 1 )
 
+rem test_bspgeom links nothing either. It drives the brush-to-polygon clipper
+rem against shapes whose answers are known by hand, because a wrong struct
+rem stride in the BSP reader does not produce an ERROR -- it produces plausible
+rem geometry, with plausible angles, in plausible places. The closure assertion
+rem is what catches that: a brush is the intersection of its half-spaces, so no
+rem face of it can stick out through another of its sides.
+cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% tests\test_bspgeom.cpp ^
+   /Fe:tests\test_bspgeom.exe /Fo:tests\ >nul
+if errorlevel 1 ( echo [!] test_bspgeom FAILED to build & exit /b 1 )
+
 rem phase_sweep is BUILT but not RUN. It is where every number in wr_phase.h's
 rem header and in WrEnergyPhase's came from, and it needs thousands of real
 rem .wrpath files to say anything -- other people's demos, which are not in this
@@ -393,6 +403,7 @@ tests\test_settings.exe   || set "RC=1"
 tests\test_quick.exe      || set "RC=1"
 tests\test_scale.exe      || set "RC=1"
 tests\test_phase.exe      || set "RC=1"
+tests\test_bspgeom.exe    || set "RC=1"
 tests\test_args.exe       || set "RC=1"
 tests\test_json.exe       || set "RC=1"
 tests\test_sha256.exe     || set "RC=1"
