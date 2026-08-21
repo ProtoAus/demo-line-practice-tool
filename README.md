@@ -5,7 +5,7 @@ See the route, see where they carried speed and where you don't.
 
 ![Six views: aiming at a line on surf_hades2 bonus 4, watching a replay on surf_colin_blaster_69000, the Graphs tab on surf_hades2 bonus 4, the Runs list on surf_utopia, the Board tab downloading from surf_tropic's leaderboard, and the Maps tab on surf_zoomathon](screenshots/tour.jpg)
 
-![Runs drawn on surf_fiellu bonus 4, coloured green where strafing is adding energy and red where it is being lost](screenshots/lines.jpg)
+[![Watch the tool in use — a video, on YouTube](https://img.youtube.com/vi/Udn2ilMsZs8/maxresdefault.jpg)](https://youtu.be/Udn2ilMsZs8)
 
 ---
 

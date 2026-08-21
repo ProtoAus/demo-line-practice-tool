@@ -9,6 +9,13 @@
 *.ilk
 *.idb
 
+# Demo recordings. The README's video is a YouTube link, so the capture it was
+# cut from is a working file rather than something to ship: a minute of gameplay
+# is tens of megabytes, git keeps it in the history of every clone for ever, and
+# GitHub only renders an inline player for videos on its own attachment CDN
+# anyway -- a committed .mp4 would be a permanent download link, not a video.
+*.mp4
+
 # A packaged build. The release archive is assembled by .github\workflows\release.yml
 # on the runner and published as a release asset -- it is never committed, and a
 # hand-made wrlines.zip left in the root is the one piece of build output that
