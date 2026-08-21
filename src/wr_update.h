@@ -32,8 +32,8 @@
 //
 // The reason to care is not purity. An unsigned program that reaches out on its
 // own and replaces its own executable is, byte for byte and behaviour for
-// behaviour, what a dropper looks like -- and this project already carries
-// Wacatac and Wacapew verdicts for its injector alone. Everything unattended is
+// behaviour, what a dropper looks like -- and this project already carries a
+// Wacatac verdict on both of its own files. Everything unattended is
 // something that has to be argued away in a false-positive report. So none of
 // it happens without a press, and the README can go on saying so.
 //

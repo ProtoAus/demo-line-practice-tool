@@ -89,22 +89,31 @@ What it does **not** do: no registry access at all — `ADVAPI32` is not even in
 persistence, no packing or obfuscation, no anti-debug, no hidden API names, no cross-process writes
 from the DLL, no driver and no elevation.
 
-**On VirusTotal at v0.9.3.** Every hit is a machine-learning or heuristic verdict; not one is a
-match against known malware:
+**On VirusTotal at v1.1.0.** The DLL's count went up since v0.9.3, from 5 to 13. Both files, scanned
+as published:
 
 | file | | engine | verdict |
 |---|---|---|---|
-| [`wrinject.exe`](https://www.virustotal.com/gui/file/42c3734aa9b12bbe7a64972409e1e34a3d62501db06c4d0ae63b31d83ffc8d61) | **2/70** | Microsoft | `Program:Win32/Wacapew.C!ml` |
+| [`wrinject.exe`](https://www.virustotal.com/gui/file/0053f48db2c17dc9dc41d435679a8f3e64835b2ff21f19211df8bec576d76f93) | **2/71** | Microsoft | `Trojan:Win32/Wacatac.C!ml` |
 | | | Trapmine | `Suspicious.low.ml.score` |
-| [`wrlines.dll`](https://www.virustotal.com/gui/file/5d3b4cdc2eeb9b7cfe517d3423b25a6ee0c4cfe1d8809121e353ffffed2d2186) | **5/70** | Microsoft | `Trojan:Win32/Wacatac.B!ml` |
+| [`wrlines.dll`](https://www.virustotal.com/gui/file/b6c32438c4887a0deeeae4075cf802a2180e1bc1707d4b5c87c9fd3bfbeeee82) | **13/71** | Microsoft | `Trojan:Win32/Wacatac.B!ml` |
 | | | ESET-NOD32 | `Win64/GameHack_AGen.CCQ` — *potentially unsafe* |
 | | | Symantec | `ML.Attribute.HighConfidence` |
 | | | Cynet | `Malicious (score: 100)` |
-| | | Bkav Pro | `W32.Malware.CA0BE60C` |
+| | | Bkav Pro | `W32.Malware.1A8B8303` |
+| | | Trapmine | `Malicious.moderate.ml.score` |
+| | | BitDefender | `Gen:Variant.Yogi.51898` |
+| | | Arcabit, CTX, Emsisoft, eScan, GData, VIPRE | *the same verdict — see below* |
 
-The `!ml` suffix on both Microsoft verdicts means a classifier decided, not a rule. ESET's is the
-only specific one, and it files this as a *potentially unsafe application* rather than as malware —
-a fair description of an overlay injected into a game.
+**13 of 71 is 7 engines, not 13.** Those last six all license BitDefender's engine and print its
+answer: `Gen:Variant.Yogi.51898` verbatim from four of them, `Trojan.Yogi.DCABA` and `Dll.unknown.yogi`
+from the two that rename. So the jump from 5 is one new engine plus Trapmine, counted seven times.
+
+Still nothing names a malware family. `!ml`, `ML.Attribute` and `.ml.score` say a classifier decided
+rather than a rule; `Gen:Variant` is a generic cluster, and CTX prints its bucket as `unknown` in so
+many words. ESET's is the only specific verdict, and it files this as a *potentially unsafe
+application* rather than as malware — a fair description of an overlay injected into a game. Bkav's
+trailing hex is derived from the file, so it is a new number on every build rather than a new finding.
 
 **Check the file you downloaded.** Every release publishes `SHA256SUMS.txt`, and both binaries are
 built by a public GitHub Actions runner from a tagged commit, with a

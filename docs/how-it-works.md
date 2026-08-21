@@ -382,7 +382,7 @@ on running out of the file it just renamed.
 runs at startup, on a timer or on a map change; there is no setting to enable an automatic check,
 and the absence is the feature. An unsigned program that reaches out unprompted and rewrites its own
 executables is, behaviour for behaviour, what a dropper is — and this project already carries
-`Trojan:Win32/Wacatac.B!ml` and `Program:Win32/Wacapew.C!ml` for its injector alone. Everything
+`Trojan:Win32/Wacatac.B!ml` on the DLL and `Trojan:Win32/Wacatac.C!ml` on the injector. Everything
 unattended is something that has to be argued away in a false-positive report, so there is nothing
 unattended. `src\wr_http.h`'s claim 5 — *"never called except from a job started by a button press"*
 — is unchanged by this feature, which is the test the design was written to pass.

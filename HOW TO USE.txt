@@ -199,12 +199,13 @@ IF YOUR ANTIVIRUS FLAGS THIS
   What it does not do: no registry access at all, no persistence, no packing or
   obfuscation, no anti-debug, no hidden API names, no driver, no elevation.
 
-  On VirusTotal at v0.9.3 that came to 2 of 70 engines for wrinject.exe and 5 of
-  70 for wrlines.dll, and every one of them is a machine-learning or heuristic
-  verdict rather than a match against known malware -- Microsoft's carry the
-  "!ml" suffix that says a classifier decided, and ESET's is filed as
-  "potentially unsafe application", which is a category judgement about game
-  overlays. The README lists them by name.
+  On VirusTotal at v1.1.0 that came to 2 of 71 engines for wrinject.exe and 13
+  of 71 for wrlines.dll. That 13 is seven engines rather than thirteen: six of
+  them license BitDefender's engine and reprint its single verdict. Not one
+  names a malware family -- Microsoft's carry the "!ml" suffix that says a
+  classifier decided, BitDefender's is a generic cluster rather than a family,
+  and ESET's is filed as "potentially unsafe application", which is a category
+  judgement about game overlays. The README lists them by name.
 
   Every release publishes SHA256SUMS.txt and both binaries are built by a
   public GitHub Actions runner with a provenance attestation you can verify.

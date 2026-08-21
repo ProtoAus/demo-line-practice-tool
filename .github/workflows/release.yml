@@ -199,7 +199,7 @@ jobs:
         shell: pwsh
         run: |
           @'
-          Still manual, and both matter more than anything above:
+          Still manual, and all three matter more than anything above:
 
             1. Upload the zip and both binaries to VirusTotal, and put the link
                in the README's "Why your antivirus may flag this" section.
@@ -208,8 +208,22 @@ jobs:
                Paste the SHA256s and this run's attestation. Defender keys on
                the file hash, so this has to be redone for every release, and it
                is the only step that actually changes a Defender verdict.
+            3. Submit both to Bitdefender as a false positive, and to ESET.
+               Bitdefender's engine is 7 of the DLL's 13 VirusTotal rows by
+               itself -- Arcabit, CTX, Emsisoft, eScan, GData and VIPRE all
+               license it and reprint its one verdict -- so a report accepted
+               there clears more of the table than any other single submission.
+               ESET's is the only specific verdict rather than a classifier
+               score, which makes it the one most worth arguing with.
 
-          Do both BEFORE announcing the release.
+          Do all three BEFORE announcing the release.
+
+          The receipts these produce are NOT for the README. A WDSI submission
+          URL redirects to a Microsoft sign-in, and a Bitdefender case number is
+          an account-linked ticket -- neither is checkable by anyone but the
+          submitter, so both would be dead links dressed up as evidence. The
+          README says the reports are made and links the VirusTotal pages, which
+          are the part a reader can verify without taking anyone's word.
 
           More so since v0.9.5 than before it: the in-game updater downloads
           these binaries and writes them next to the DLL, so a verdict against
