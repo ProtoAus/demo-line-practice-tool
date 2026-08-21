@@ -2549,12 +2549,20 @@ static void DrawDisplayTab(void)
             if (dm)
             {
                 const ImVec4 warn(1.0f, 0.75f, 0.2f, 1.0f);
-                if (dm->dispPolys <= 0 && dm->version >= 25)
+
+                // "The lump was refused before a single record was read", which
+                // is what an unknown layout looks like from out here: the
+                // directory says there are displacements, and the stride table
+                // had no row for the version it declared, so dispTotal never got
+                // set. That is a sharper test than the BSP version this used to
+                // ask about -- v25 IS read now, and the next thing Strata bumps
+                // will land here without this line needing to learn its number.
+                if (dm->dispTotal <= 0)
                     ImGui::TextColored(warn,
                         "This map has displacements this build could not read -- "
-                        "anything made of those is missing above. BSP v25 changed "
-                        "the face and displacement structures and the new layouts "
-                        "are not known here.");
+                        "anything made of those is missing above. Its displacement "
+                        "lumps are in a layout this build does not know (BSP v%d).",
+                        dm->version);
                 else if (dm->dispDropBy[WR_DISP_DROP_BUDGET] > 0)
                     ImGui::TextColored(warn,
                         "This map is dense enough that the displacement build ran "

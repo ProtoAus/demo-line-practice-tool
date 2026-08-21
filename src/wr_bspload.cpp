@@ -589,9 +589,10 @@ bool WrBspLoadHasDisplacements(void)
 bool WrBspLoadDisplacementsMissing(void)
 {
     // Having displacements is no longer a problem; having ones that could not
-    // be built still is. Both causes land here: a BSP v25, whose face and
-    // dispinfo layouts this reader does not know, and a map dense enough to hit
-    // the build budget.
+    // be built still is. Both causes land here: a displacement lump whose
+    // version has no row in the stride table -- which no longer includes v25,
+    // and is now a statement about the next bump rather than about any map in
+    // this library -- and a map dense enough to hit the build budget.
     const WrBspMap *m = WrBspLoadCurrent();
     if (!m || !m->hasDisplacements)
         return false;

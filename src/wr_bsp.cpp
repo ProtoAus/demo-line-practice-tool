@@ -174,17 +174,45 @@ int WrBspStride(int lump, int bspVersion, int lumpVersion)
         break;
 
     case WR_BSP_L_FACES:
-        // dface_t. Only four fields of it are wanted -- firstedge, numedges and
+        // dface_t. Only three fields of it are wanted -- firstedge, numedges and
         // the displacement index -- but the stride has to be exact anyway.
         //
-        // NOTHING FOR v25, DELIBERATELY. Its FACES lump is version 2 and the
-        // greatest common divisor of its lengths is 72 rather than 56, so the
-        // struct grew by sixteen bytes and the fields inside it moved. A stride
-        // measured from lengths is not the same as knowing where firstedge now
-        // sits, and guessing that produces plausible windings in plausible
-        // places -- which is the exact failure this table exists to prevent.
-        // Returning 0 skips displacements on those 77 maps and reads the rest.
+        // 72 FOR v25, AND THE 72 WAS NEVER THE PART THAT WAS MISSING. The gcd of
+        // the v25 FACES lengths measured 72 here long before this row existed,
+        // and the comment that used to sit in its place said so and refused
+        // anyway -- because a stride is not an offset. Knowing the struct is
+        // sixteen bytes longer says nothing about where firstedge went, and
+        // guessing that produces plausible windings in plausible places, which
+        // is the exact failure this table exists to prevent.
+        //
+        // What closed it is Strata publishing the struct:
+        // wiki.stratasource.org/modding/formats/bsp-v25. Every field widened and
+        // two moved:
+        //
+        //             stock 19/20/21              v25
+        //     planenum      u16 @0            u32 @0
+        //     side/onNode   u8 @2, u8 @3      u8 @4, u8 @5  (+2 pad)
+        //     firstedge     i32 @4            i32 @8
+        //     numedges      i16 @8            i32 @12
+        //     texinfo       i16 @10           i32 @16
+        //     dispinfo      i16 @12           i32 @20
+        //                   ... = 56          ... = 72
+        //
+        // VERIFIED AGAINST THE FILES, not taken on the wiki's word, and by a
+        // probe sharing no code with this reader. Over all 77 v25 maps and the
+        // 4,966 displacements on the 27 that have any: power in [2,4] 4966/4966;
+        // m_iMapFace in range 4966/4966; dface_t.dispinfo at the new offset 20
+        // pointing back at the displacement that named the face 4966/4966;
+        // numedges at the new offset 12 reading exactly 4 on 4966/4966. Read at
+        // the OLD offset instead, numedges says 4 on three of them.
+        //
+        // And the one that is not an index check. startPosition is a POINT, and
+        // it landed on a corner of the quad the face walks out to -- through
+        // SURFEDGES, EDGES and VERTEXES, three lumps this row does not touch --
+        // on 4966 of 4966, worst distance 0.111 units. Two lumps cannot agree on
+        // a position in space through a field offset that is wrong.
         if (lumpVersion == 1 && bspVersion <= 21) return 56;
+        if (lumpVersion == 2 && bspVersion == 25) return 72;
         break;
 
     case WR_BSP_L_DISPINFO:
@@ -192,10 +220,30 @@ int WrBspStride(int lump, int bspVersion, int lumpVersion)
         // forty bytes: startPosition at 0, m_iDispVertStart at 12, power at 20,
         // m_iMapFace at 36.
         //
-        // Nothing for v25 for the same reason as FACES: version 1 there, and a
-        // gcd of 232 against 176, so the tail grew and the prefix cannot be
-        // assumed to have stayed put.
+        // 232 on v25, and the interesting part is that ALL FOUR OF THOSE OFFSETS
+        // ARE UNCHANGED. The struct grew from 176 to 232 entirely in its tail:
+        // m_iMapFace widened from u16 to u32 in place, and the neighbour arrays
+        // behind it widened their own indices the same way, taking
+        // DispSubNeighbor_t from 6 bytes to 8 and DispCornerNeighbors_t from 10
+        // to 20. 48 + 4*16 + 4*20 + 40 = 232, which is the gcd this reader had
+        // already measured -- the arithmetic and the corpus arriving at the same
+        // number from opposite directions.
+        //
+        // So the prefix did stay put after all. That was not knowable from a
+        // length, which is why the row this replaces was right to refuse: "the
+        // tail grew" and "the prefix moved" are the same gcd.
+        //
+        // m_iMapFace still has to be read as 32 bits rather than 16. Little-endian
+        // hides it below 65,536 faces and v25 exists precisely because maps went
+        // past limits like that one.
+        //
+        // Four v25 maps carry lump version 0 here rather than 1 -- df_cavernish,
+        // df_elco-gbparadise, df_gpl-strangeland, df_precision2 -- and all four
+        // have a ZERO-LENGTH dispinfo lump, which is an absent lump's default
+        // version showing through rather than a third layout. They are refused by
+        // this row and lose nothing, because there is nothing in them to read.
         if (lumpVersion == 0 && bspVersion <= 21) return 176;
+        if (lumpVersion == 1 && bspVersion == 25) return 232;
         break;
 
     case WR_BSP_L_DISPVERTS:
@@ -1175,12 +1223,17 @@ static int WrBspEntityBrushes(const WrBspRaw *r, unsigned char *owned,
 // skip, because it was never in the input.
 //
 // Four fields of ddispinfo_t are wanted and all four are in the first forty
-// bytes, which is the part that did not move between BSP 19, 20 and 21:
+// bytes, which is the part that did not move between BSP 19, 20, 21 -- or, as
+// it turned out when Strata published the struct, 25 either:
 //
 //     0   Vector startPosition      which CORNER of the quad the grid starts at
 //     12  int    m_iDispVertStart   first row of DISPVERTS
 //     20  int    power              2, 3 or 4
 //     36  ushort m_iMapFace         the face whose winding is the quad
+//                                   (uint on v25, same offset)
+//
+// dface_t is the one that moved, and it is read in two places below. See the
+// FACES row of the stride table.
 //
 // and from CDispVert, 20 bytes: a unit direction at 0 and a distance at 12.
 //
@@ -1246,9 +1299,9 @@ static bool WrBspBuildDisplacements(const WrBspRaw *r, WrBspMap *m,
                                     int *vertCap, int *polyCap)
 {
     // Any of these absent means this map has no displacements this reader can
-    // build -- either it has none at all, or it is a v25 whose dface_t and
-    // ddispinfo_t layouts are not known here. Both are reported by
-    // hasDisplacements rather than pretended away.
+    // build -- either it has none at all, or one of the six lumps declares a
+    // version with no row in the stride table and was skipped. Both are reported
+    // by hasDisplacements rather than pretended away.
     if (!g_wrBspBuildDisp)
         return true;
     if (!r->data[WR_BSP_L_DISPINFO] || !r->data[WR_BSP_L_DISPVERTS] ||
@@ -1261,6 +1314,7 @@ static bool WrBspBuildDisplacements(const WrBspRaw *r, WrBspMap *m,
     const int nFace = r->count[WR_BSP_L_FACES];
     const int dStride = r->stride[WR_BSP_L_DISPINFO];
     const int fStride = r->stride[WR_BSP_L_FACES];
+    const bool strata = Strata(r);
 
     // Before any test, so "4 of 756 were not built" can be said rather than
     // "4 were skipped", which reads as a rounding error and was not one.
@@ -1274,7 +1328,12 @@ static bool WrBspBuildDisplacements(const WrBspRaw *r, WrBspMap *m,
         const float startPos[3] = { RdF(di), RdF(di + 4), RdF(di + 8) };
         const int vertStart = (int)Rd32(di + 12);
         const int power     = (int)Rd32(di + 20);
-        const int faceIndex = (int)Rd16(di + 36);
+
+        // m_iMapFace: same offset on both layouts, different width. Reading a
+        // v25 map's 32-bit field as 16 bits is correct on a little-endian
+        // machine right up to the 65,536th face and then silently names the
+        // wrong one -- and raising limits like that is what v25 is FOR.
+        const int faceIndex = strata ? RdI32(di + 36) : Rd16(di + 36);
 
         if (power < WR_DISP_MIN_POWER || power > WR_DISP_MAX_POWER)
         {
@@ -1298,13 +1357,52 @@ static bool WrBspBuildDisplacements(const WrBspRaw *r, WrBspMap *m,
             continue;
         }
 
-        // The base quad. dface_t: firstedge at 4, numedges at 8. A displacement
-        // is always built on a four-sided face; anything else is not one this
-        // knows how to subdivide.
+        // The base quad. dface_t: firstedge and numedges, and BOTH of them moved
+        // on v25 -- 4 and 8 on stock, 8 and 12 on Strata's, where numedges is
+        // also an int rather than a short. See the FACES row of the stride table
+        // for the full layout and for what was checked against the files.
+        //
+        // This is the one place the two layouts are read, and it is deliberately
+        // driven off the FILE's version rather than off fStride: a stride is a
+        // size and these are offsets, which is the whole reason v25 sat refused
+        // for as long as it did.
+        //
+        // A displacement is always built on a four-sided face; anything else is
+        // not one this knows how to subdivide.
         const unsigned char *f = r->data[WR_BSP_L_FACES] +
                                  (size_t)faceIndex * (size_t)fStride;
-        const int firstEdge = (int)Rd32(f + 4);
-        const int numEdges  = (int)Rd16(f + 8);
+        const int firstEdge = strata ? (int)Rd32(f + 8)  : (int)Rd32(f + 4);
+        const int numEdges  = strata ? (int)Rd32(f + 12) : Rd16(f + 8);
+
+        // dface_t.side: the face uses the BACK of its plane. u8 at 2 on stock
+        // and at 4 on v25, moved by the same widening that moved firstedge.
+        //
+        // THIS IS NOT COSMETIC, AND IT WAS WRONG HERE FOR AS LONG AS
+        // DISPLACEMENTS HAVE BEEN READ. A displacement triangle's normal is
+        // computed below from the cross product of the grid traversal, and the
+        // traversal's handedness follows the base quad's winding -- so on a face
+        // that sits on the back of its plane, every triangle came out pointing
+        // INTO the surface. WrBspIsSurfBand wants a positive n.z, so those
+        // triangles were built, stored, counted in solidArea, and then dropped
+        // out of the surf band as though they were ceilings.
+        //
+        // Measured over the 543,488 displacement triangles in this library, by
+        // comparing each built normal against the face's own oriented normal --
+        // planenum through the PLANES lump, negated when this flag is set, which
+        // is an answer the file gives directly and this builder never asked for:
+        //
+        //     side = 0    319,768 agree      90 flipped     0.0%
+        //     side = 1         47 agree 217,377 flipped   100.0%
+        //
+        // 40% of every displacement triangle in the library, inverted, and the
+        // flag that says so was four bytes away the whole time. It cost 384,068
+        // square units of surf-band displacement area -- 53.5% of the total --
+        // on maps whose ramps are made of nothing else.
+        //
+        // Rotating the base quad cannot fix it and WrBspDispBaseCorner is right
+        // not to try: a rotation preserves cyclic order, so it preserves
+        // handedness. Only a reversal changes the sign, which is what this does.
+        const bool backSide = strata ? (f[4] != 0) : (f[2] != 0);
         if (numEdges != 4)
         {
             m->dispDropBy[WR_DISP_DROP_NOTQUAD]++;
@@ -1410,9 +1508,18 @@ static bool WrBspBuildDisplacements(const WrBspRaw *r, WrBspMap *m,
 
                 for (int t = 0; t < 2; t++)
                 {
+                    // The reversal that puts a back-side face's normal the
+                    // right way out. Swapping two corners flips the cross
+                    // product AND the stored winding together, which is what
+                    // keeps "the winding agrees with its own plane" true --
+                    // negating the normal alone would leave every one of these
+                    // triangles inside out instead.
+                    const int k1 = backSide ? tri[t][2] : tri[t][1];
+                    const int k2 = backSide ? tri[t][1] : tri[t][2];
+
                     const float *a  = q[tri[t][0]];
-                    const float *b  = q[tri[t][1]];
-                    const float *cc = q[tri[t][2]];
+                    const float *b  = q[k1];
+                    const float *cc = q[k2];
 
                     float u[3], v[3], nrm[3];
                     for (int k = 0; k < 3; k++)
@@ -1449,9 +1556,10 @@ static bool WrBspBuildDisplacements(const WrBspRaw *r, WrBspMap *m,
                     p->area = area;
                     p->flags = WR_BSP_POLY_DISP;
 
+                    const int wound[3] = { tri[t][0], k1, k2 };
                     for (int k = 0; k < 3; k++)
                         for (int aa = 0; aa < 3; aa++)
-                            m->verts[m->vertCount + k][aa] = q[tri[t][k]][aa];
+                            m->verts[m->vertCount + k][aa] = q[wound[k]][aa];
                     m->vertCount += 3;
 
                     m->dispPolys++;
@@ -2169,10 +2277,13 @@ bool WrBspGeometryComplete(const WrBspMap *m)
     // half the map is missing. They are read now -- so the test is no longer
     // whether the map HAS them but whether any were LEFT OUT.
     //
-    // dispDropped covers three things, and dispDropBy says which: a BSP v25,
-    // whose dface_t and ddispinfo_t layouts this reader does not know, so
-    // dispPolys is 0; a map dense enough to run into WR_DISP_BUDGET; and a
-    // displacement refused one at a time by one of the per-displacement tests.
+    // dispDropped covers three things, and dispDropBy says which: a displacement
+    // lump whose version has no row in the stride table, so it was skipped and
+    // dispPolys is 0 -- which was every v25 map until Strata published the
+    // structs, and is now a statement about the next bump rather than about
+    // anything in this library; a map dense enough to run into WR_DISP_BUDGET;
+    // and a displacement refused one at a time by one of the per-displacement
+    // tests.
     //
     // That third used to be the common case and is now measured to zero across
     // the library. It was 88 refusals on 16 maps, every one of them the

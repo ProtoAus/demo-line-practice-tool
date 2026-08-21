@@ -111,7 +111,7 @@ built by a public GitHub Actions runner from a tagged commit, with a
 [build provenance attestation](https://github.com/ProtoAus/demo-line-practice-tool/attestations):
 
 ```
-gh attestation verify demo-line-practice-tool-v1.0.0.zip --repo ProtoAus/demo-line-practice-tool
+gh attestation verify demo-line-practice-tool-v1.1.0.zip --repo ProtoAus/demo-line-practice-tool
 ```
 
 **If Defender quarantines it, please report the false positive.** It is the only thing that actually

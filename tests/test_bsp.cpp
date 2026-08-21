@@ -183,6 +183,19 @@ static void TestStrideTable(void)
         { WR_BSP_L_BRUSHES,     25, 0, 12, "BRUSHES v25" },
         { WR_BSP_L_BRUSHSIDES,  20, 0,  8, "BRUSHSIDES v20" },
         { WR_BSP_L_BRUSHSIDES,  25, 1, 16, "BRUSHSIDES v25" },
+        // The displacement half. 72 and 232 were measured off the corpus as
+        // gcds long before the layouts were known; what was missing was where
+        // the fields inside them sit, which no length can tell you. See the
+        // FACES row of wr_bsp.cpp's table.
+        { WR_BSP_L_VERTEXES,    25, 0, 12, "VERTEXES v25" },
+        { WR_BSP_L_EDGES,       20, 0,  4, "EDGES v20" },
+        { WR_BSP_L_EDGES,       25, 1,  8, "EDGES v25" },
+        { WR_BSP_L_SURFEDGES,   25, 0,  4, "SURFEDGES v25" },
+        { WR_BSP_L_FACES,       20, 1, 56, "FACES v20 lump 1" },
+        { WR_BSP_L_FACES,       25, 2, 72, "FACES v25 lump 2" },
+        { WR_BSP_L_DISPINFO,    20, 0, 176, "DISPINFO v20 lump 0" },
+        { WR_BSP_L_DISPINFO,    25, 1, 232, "DISPINFO v25 lump 1" },
+        { WR_BSP_L_DISPVERTS,   25, 0, 20, "DISPVERTS v25" },
     };
 
     bool all = true;
@@ -215,6 +228,20 @@ static void TestStrideTable(void)
           "BRUSHSIDES lump version 0 is refused on BSP 25");
     Check(WrBspStride(WR_BSP_L_LEAFBRUSHES, 21, 1) == 0,
           "LEAFBRUSHES lump version 1 is refused on BSP 21");
+
+    // The displacement half of the same rule, and it is worth its own line
+    // because these two are the rows most recently added and the ones a future
+    // Strata bump will move again. Four v25 maps in the library carry DISPINFO
+    // lump version 0, all with a zero-length lump; a NON-empty one would be a
+    // layout nobody here has seen, and it has to stay a refusal.
+    Check(WrBspStride(WR_BSP_L_DISPINFO, 25, 0) == 0,
+          "DISPINFO lump version 0 is refused on BSP 25");
+    Check(WrBspStride(WR_BSP_L_FACES, 25, 1) == 0,
+          "FACES lump version 1 is refused on BSP 25");
+    Check(WrBspStride(WR_BSP_L_FACES, 20, 2) == 0,
+          "FACES lump version 2 is refused on BSP 20");
+    Check(WrBspStride(WR_BSP_L_EDGES, 20, 1) == 0,
+          "EDGES lump version 1 is refused on BSP 20");
 
     bool none = true;
     for (int l = 0; l < WR_BSP_L_COUNT; l++)
@@ -914,6 +941,169 @@ static void TestBuild(void)
     Drop(&b);
 }
 
+// ---------------------------------------------------------------------------
+// The displacement, read through both dface_t layouts
+// ---------------------------------------------------------------------------
+//
+// The gap this closes was a real one and it was open for a long time: v25's
+// FACES lump was refused outright, so 27 maps in this library read none of their
+// displacements. The stride was never the missing piece -- 72 had been measured
+// off the corpus as a gcd all along -- it was where firstedge and numedges went
+// inside those 72 bytes, and a length cannot answer that.
+//
+// Which is exactly why this test is a COMPARISON and not a set of magic numbers.
+// Reading firstedge at 4 on a v25 face gives a value that is in range, indexes a
+// real surfedge and builds a real quad somewhere else; every self-consistency
+// check in the file would pass. The only thing that catches it is the same
+// surface written in the other layout disagreeing.
+//
+// The numbers are exact rather than approximate because the fixture was chosen
+// that way: a flat quad, 250 by 512, every vertex pushed 100 along the quad's own
+// normal so the surface translates instead of deforming. See
+// tests\make_bsp_fixture.py.
+
+static void TestDisplacementLayouts(void)
+{
+    printf("\nthe same displacement, in both dface_t layouts\n");
+
+    Bsp a = Copy(kBspDispV20, sizeof(kBspDispV20));
+    Bsp b = Copy(kBspDispV25, sizeof(kBspDispV25));
+    WrBspRaw v20, v25;
+    if (ReadBack(&a, "d20.bsp", &v20)[0] || ReadBack(&b, "d25.bsp", &v25)[0])
+    {
+        Check(false, "the displacement fixtures load");
+        Drop(&a); Drop(&b);
+        return;
+    }
+
+    // The strides the table picked, before anything is built with them. A
+    // fixture that landed on the wrong row would fail further down for reasons
+    // that read like arithmetic, so say it here.
+    Check(v20.stride[WR_BSP_L_FACES] == 56 &&
+          v25.stride[WR_BSP_L_FACES] == 72,
+          "FACES resolves to 56 on v20 and 72 on v25");
+    Check(v20.stride[WR_BSP_L_DISPINFO] == 176 &&
+          v25.stride[WR_BSP_L_DISPINFO] == 232,
+          "DISPINFO resolves to 176 on v20 and 232 on v25");
+    Check(v20.stride[WR_BSP_L_EDGES] == 4 && v25.stride[WR_BSP_L_EDGES] == 8,
+          "EDGES resolves to 4 on v20 and 8 on v25");
+
+    WrBspMap map[2];
+    bool built = true;
+    for (int w = 0; w < 2; w++)
+    {
+        char err[192] = { 0 };
+        if (!WrBspBuild(w ? &v25 : &v20, &map[w], err, (int)sizeof(err)))
+        {
+            printf("      %s\n", err);
+            built = false;
+        }
+    }
+    Check(built, "both displacement fixtures build");
+    if (!built)
+    {
+        WrBspFreeRaw(&v20); WrBspFreeRaw(&v25);
+        Drop(&a); Drop(&b);
+        return;
+    }
+
+    for (int w = 0; w < 2; w++)
+    {
+        const WrBspMap *m = &map[w];
+        const char *tag = w ? "v25" : "v20";
+        char what[176];
+
+        printf("      %s: %d polys (%d from the displacement), %d verts, "
+               "%.0f sq units in band\n", tag, m->polyCount, m->dispPolys,
+               m->vertCount, m->surfArea);
+
+        _snprintf_s(what, sizeof(what), _TRUNCATE,
+                    "%s: the map declares %d displacements", tag,
+                    WR_FIXTURE_BSP_DISP_COUNT);
+        Check(m->dispTotal == WR_FIXTURE_BSP_DISP_COUNT, what);
+
+        // NOTHING DROPPED, and the corner test is why this line is worth
+        // having. startPosition is a point, and the only way it lands on a
+        // corner of the quad is if firstedge walked out to the right four
+        // vertices -- which on v25 is the field that moved.
+        _snprintf_s(what, sizeof(what), _TRUNCATE,
+                    "%s: and built it, refusing nothing", tag);
+        Check(m->dispDropped == 0, what);
+
+        _snprintf_s(what, sizeof(what), _TRUNCATE,
+                    "%s: %d triangles, two grids of 4x4x2", tag,
+                    WR_FIXTURE_BSP_DISP_TRIS);
+        Check(m->dispPolys == WR_FIXTURE_BSP_DISP_TRIS, what);
+
+        // 11 brush faces plus the grids. A displacement that built at the wrong
+        // power would land here rather than anywhere subtle.
+        _snprintf_s(what, sizeof(what), _TRUNCATE,
+                    "%s: 11 brush faces and the grids on top", tag);
+        Check(m->polyCount == 11 + WR_FIXTURE_BSP_DISP_TRIS, what);
+
+        // THE LINE THE side FLAG PAYS FOR. Both grids are in the band only if
+        // the back-side one was turned the right way out; ignore the flag and
+        // this reads 192000 + 128000, with the second grid's 32 triangles built,
+        // stored, and then discarded as ceilings.
+        _snprintf_s(what, sizeof(what), _TRUNCATE,
+                    "%s: surf-band area is 192000 + 2 x 128000", tag);
+        Check(fabs(m->surfArea - (WR_FIXTURE_BSP_SURF_AREA +
+                                  WR_FIXTURE_BSP_DISP_AREA)) < 80.0f, what);
+
+        _snprintf_s(what, sizeof(what), _TRUNCATE,
+                    "%s: and every triangle of both grids is a surf face", tag);
+        Check(m->surfPolys == 1 + WR_FIXTURE_BSP_DISP_TRIS, what);
+
+        // Every triangle is its quad's own plane. A push along the normal
+        // translates the surface; it does not tilt it, so anything but +0.6
+        // means the dispvert, the base quad or the side flag was read wrong --
+        // and -0.6 specifically means the side flag.
+        int up = 0, down = 0;
+        for (int i = 0; i < m->polyCount; i++)
+        {
+            const float nz = m->polys[i].plane[2];
+            if (fabs(nz - WR_FIXTURE_BSP_DISP_NZ) < 0.0005f)
+                up++;
+            else if (fabs(nz + WR_FIXTURE_BSP_DISP_NZ) < 0.0005f)
+                down++;
+        }
+        // The prism's slant has the same normal by construction, so the count
+        // is both grids plus one.
+        _snprintf_s(what, sizeof(what), _TRUNCATE,
+                    "%s: every triangle reads n.z = +0.6, none inside out", tag);
+        Check(up == WR_FIXTURE_BSP_DISP_TRIS + 1 && down == 0, what);
+
+        // The surface is the quad pushed 100 along (0.8, 0, 0.6), so its
+        // highest point is 500 + 60 and its lowest 300 + 60. Bounds are the
+        // cheapest way to catch a grid built off the wrong corner.
+        _snprintf_s(what, sizeof(what), _TRUNCATE,
+                    "%s: the grid raised the world's top to 560", tag);
+        Check(fabs(m->maxs[2] - 560.0f) < 0.01f, what);
+    }
+
+    // THE POINT OF THE PAIR. Different strides, different field offsets for
+    // firstedge and numedges, one of them through LZMA -- and the same
+    // triangles, to the bit.
+    bool identical = map[0].polyCount == map[1].polyCount &&
+                     map[0].vertCount == map[1].vertCount &&
+                     map[0].dispPolys == map[1].dispPolys &&
+                     map[0].surfPolys == map[1].surfPolys;
+    if (identical)
+        for (int i = 0; i < map[0].vertCount && identical; i++)
+            for (int k = 0; k < 3; k++)
+                if (map[0].verts[i][k] != map[1].verts[i][k])
+                    identical = false;
+    Check(identical,
+          "both layouts produce the same displacement, to the last bit");
+
+    WrBspFreeMap(&map[0]);
+    WrBspFreeMap(&map[1]);
+    WrBspFreeRaw(&v20);
+    WrBspFreeRaw(&v25);
+    Drop(&a);
+    Drop(&b);
+}
+
 // The trigger, put back. This is the counterfactual the whole design rests on,
 // so it is worth measuring rather than asserting: give brush 2 to model 0 and
 // the surf-band area doubles.
@@ -1324,6 +1514,7 @@ int main(void)
     TestWalk();
     TestWalkRefusals();
     TestBuild();
+    TestDisplacementLayouts();
     TestTriggerCounterfactual();
     TestGrid();
     TestGeometryComplete();
@@ -1333,7 +1524,8 @@ int main(void)
     // later run could read a stale one if a write ever failed silently.
     static const char *names[] = { "case.bsp", "v20.bsp", "v25.bsp",
                                    "short.bsp", "corrupt.bsp", "last.bsp",
-                                   "walk.bsp", "trig.bsp" };
+                                   "walk.bsp", "trig.bsp",
+                                   "d20.bsp", "d25.bsp" };
     for (int i = 0; i < (int)(sizeof(names) / sizeof(names[0])); i++)
     {
         char p[512];

@@ -223,11 +223,17 @@
 // The six after them are the displacement surfaces, and they are OPTIONAL in
 // the strict sense that more than half the library has no DISPINFO lump at all
 // and those maps are perfectly good. They are also optional in a second sense
-// that matters more: BSP v25 changed dface_t and ddispinfo_t and this reader
-// does not know the new layouts, so on those maps the displacement lumps are
-// skipped and the rest of the map is read exactly as before. Absent
-// displacements are a KNOWN GAP that hasDisplacements already reports; a
+// that matters more: a lump version with no row in the stride table is SKIPPED
+// rather than refused, and the rest of the map is read exactly as before.
+// Absent displacements are a KNOWN GAP that hasDisplacements already reports; a
 // refusal would turn a partial answer into no answer.
+//
+// v25 used to be the standing example of that, and is not any more. Strata
+// published dface_t and ddispinfo_t and both are read now -- 4,966
+// displacements across the 27 v25 maps in this library that have any. What
+// stays true is the shape of the arrangement: the next version bump lands in
+// the same skip, and says so on the panel, without this reader needing to know
+// its number in advance.
 enum
 {
     WR_BSP_L_PLANES = 0,

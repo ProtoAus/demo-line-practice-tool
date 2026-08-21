@@ -206,12 +206,13 @@ They are **read, never swallowed**, so a collision means the game still acts on 
   draw, reads memory read-only, and reads files — including, on a map change, the map's own
   `.bsp`, read-only and shared, from the install directory it already reads demos out of.
 - **The map reader takes brushes, displacements and solid brush entities, and says what it is
-  missing.** Displacement surfaces are subdivided from their own lumps on BSP 19, 20 and 21;
-  `func_*` brushes are read with triggers named and excluded; and clip brushes — collision with
-  no material, which is what a great many surf ramps actually are — are drawn rather than
-  counted and discarded. What is still missing is displacements on BSP v25, whose face and
-  displacement structures changed, and the panel prints how much of the map it actually got
-  instead of leaving an empty result to be mistaken for *there is no ramp ahead of you*.
+  missing.** Displacement surfaces are subdivided from their own lumps on BSP 19, 20, 21 and —
+  since Strata published the struct — 25; `func_*` brushes are read with triggers named and
+  excluded; and clip brushes — collision with no material, which is what a great many surf ramps
+  actually are — are drawn rather than counted and discarded. A lump version this reader has no
+  stride for is skipped rather than guessed at, and the panel prints how much of the map it
+  actually got instead of leaving an empty result to be mistaken for *there is no ramp ahead of
+  you*.
 - **It reaches outside your machine in exactly two places, both behind a checkbox, both off
   unless you say otherwise.** Name/avatar tags ask the Steam client to look up each runner's
   persona and picture — the same request a scoreboard makes. And the Maps tab can download
@@ -1605,14 +1606,52 @@ The six lumps were measured the way the other seven were, against all 1,304 maps
 | SURFEDGES | 4 | 4 |
 | DISPVERTS | 20 | 20 |
 | EDGES | 4 | **8** (lump version 1) |
-| FACES | 56 | **72, and not read** |
-| DISPINFO | 176 | **232, and not read** |
+| FACES | 56 | **72** (lump version 2) |
+| DISPINFO | 176 | **232** (lump version 1) |
 
-**v25 is refused by name, and that is the whole point of the table.** Its FACES lump is version 2
-with a gcd of 72 against 56, and its DISPINFO version 1 with 232 against 176 — so both structs grew
-and the fields inside them moved. Knowing a stride is not knowing where `firstedge` now sits, and
-guessing that produces plausible windings in plausible places, which is the failure mode this table
-exists to prevent. Those 27 maps read exactly as they did before and the panel says so.
+**v25 was refused by name for a long time, and the reason is worth keeping.** 72 and 232 were
+*already measured* — they are the greatest common divisors of the v25 lump lengths, and they had been
+in this table with the words "and not read" beside them. A stride is not an offset. Knowing the
+struct grew by sixteen bytes says nothing about where `firstedge` went, and a wrong guess there
+produces plausible windings in plausible places rather than an error.
+
+What closed it is [Strata publishing the struct](https://wiki.stratasource.org/modding/formats/bsp-v25).
+Every field of `dface_t` widened and two of the three this reader wants moved:
+
+| field | v19/20/21 | v25 |
+|---|---|---|
+| `planenum` | `u16` @0 | `u32` @0 |
+| `side` / `onNode` | `u8` @2, @3 | `u8` @4, @5 (+2 padding) |
+| `firstedge` | `i32` @4 | `i32` **@8** |
+| `numedges` | `i16` @8 | `i32` **@12** |
+| `dispinfo` | `i16` @12 | `i32` @20 |
+
+`ddispinfo_t` is the opposite story: it grew from 176 to 232 **entirely in its tail**, so all four
+fields this reader wants are at the same offsets they always were. `m_iMapFace` widened from `u16` to
+`u32` in place, and the neighbour arrays behind it widened their indices the same way, taking
+`DispSubNeighbor_t` from 6 bytes to 8 and `DispCornerNeighbors_t` from 10 to 20 — 48 + 4×16 + 4×20 +
+40 = 232, the arithmetic and the corpus arriving at the same number from opposite directions.
+
+**Verified against the files rather than taken on the wiki's word**, by a probe sharing no code with
+this reader. Over all 77 v25 maps and the 4,966 displacements on the 27 that have any:
+
+| check | result |
+|---|---|
+| `power` in [2,4] | 4966 / 4966 |
+| `m_iMapFace` in range | 4966 / 4966 |
+| `dface_t.dispinfo` @20 points back at the displacement that named the face | 4966 / 4966 |
+| `numedges` @12 reads exactly 4 | 4966 / 4966 |
+| `startPosition` lands on a corner of the quad the face walks out to | 4966 / 4966, worst 0.111 units |
+
+Read at the *old* offsets instead, `numedges` says 4 on three of the 4,966. The last row is the one
+that is not an index check: `startPosition` is a point, and it agrees with a quad assembled through
+SURFEDGES, EDGES and VERTEXES — three lumps that had no part in producing it. Two lumps cannot agree
+on a position in space through a field offset that is wrong.
+
+Four v25 maps carry DISPINFO lump version 0 rather than 1 (`df_cavernish`, `df_elco-gbparadise`,
+`df_gpl-strangeland`, `df_precision2`) and all four have a **zero-length** lump — an absent lump's
+default version showing through, not a third layout. They are still refused by the table and lose
+nothing.
 
 The traversal is the canonical one — row from `c0→c1`, column across to `c3→c2`, DISPVERTS indexed
 `i * side + j` — with the quad rotated so that `startPosition` is corner zero. That rotation is also
@@ -1620,6 +1659,37 @@ the check: `startPosition` is a *point*, written by vbsp from the corner itself,
 exact. **Every displacement on every map matched a corner** (0 dropped on `surf_boreas`'s 1,125 and
 `surf_nyx`'s 1,964), which is what says the face → surfedge → edge → vertex chain is being read
 correctly, sign of the surfedge included.
+
+#### The flag four bytes away, and 40 % of every displacement in the library
+
+Writing the v25 fixture turned up something that had nothing to do with v25. A displacement
+triangle's normal is a **cross product of the grid traversal**, so its sign follows the base quad's
+winding — and `dface_t.side`, which says the face sits on the **back** of its plane, was never read.
+
+Rotating the quad cannot fix this and `WrBspDispBaseCorner` is right not to try: a rotation preserves
+cyclic order, so it preserves handedness. Only a reversal changes the sign.
+
+Measured by comparing every built normal against the face's own oriented normal — `planenum` through
+the PLANES lump, negated when the flag is set, an answer the file gives directly and the builder
+never asked for. Over the 543,488 displacement triangles on v25 maps:
+
+| `dface_t.side` | agree | flipped | |
+|---|---|---|---|
+| 0 | 319,768 | 90 | 0.0 % |
+| 1 | 47 | 217,377 | **100.0 %** |
+
+Not a correlation — an identity. Those triangles were built, stored, counted in `solidArea`, and then
+dropped out of the surf band by `WrBspIsSurfBand`, which wants a positive `n.z`, exactly as though
+they were ceilings.
+
+The fix reverses two corners of the triangle rather than negating the normal, so the stored winding
+and the stored plane stay in agreement. Library-wide it moves the surf band by **+869,374,863 square
+units** — displacement band area up 2.1 %, from 41.66 to 42.53 billion — while *reducing* the band
+polygon count by 42,675, because the triangles it gains are larger than the ones it correctly gives
+up. On the v25 maps, where the flag is set on 40 % of faces, it roughly doubles the displacement band
+area: 426 M square units to 810 M.
+
+Closure is unaffected: **0 failures across 37,840,670 sides**, the same as before.
 
 Library-wide: **19,622,216 triangles across 598 of the 626 displacement maps, 191 dropped**, resident
 p99 23.2 MB against 7.4 MB before, load p99 164 ms against 60 ms. Both are inside their limits, and

@@ -209,11 +209,12 @@ bool WrBspLoadHasDisplacements(void);
 // Does this map have displacement geometry this reader could NOT build?
 //
 // The question that used to be worth asking was whether a map had displacements
-// at all, because none of them were read. They are read now, on BSP 19, 20 and
-// 21, so the useful question is what is still missing. Three causes, and
-// WrBspDispWorstDrop names which: a v25 map, whose face and displacement layouts
-// are not known here; a map dense enough to exhaust WR_DISP_BUDGET; and a
-// displacement refused one at a time. The third was 88 refusals on 16 maps and
+// at all, because none of them were read. They are read now, on BSP 19, 20, 21
+// and 25, so the useful question is what is still missing. Three causes, and
+// WrBspDispWorstDrop names which: a map whose displacement lumps declare a
+// version with no row in the stride table, which is nothing in this library
+// since v25 was worked out but is what the next bump will look like; a map dense
+// enough to exhaust WR_DISP_BUDGET; and a displacement refused one at a time. The third was 88 refusals on 16 maps and
 // is now zero across the library -- see WR_DISP_CORNER_SLACK for what it was and
 // what it cost.
 bool WrBspLoadDisplacementsMissing(void);
