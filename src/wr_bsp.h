@@ -213,9 +213,21 @@
 #define WR_BSP_MAX_BRUSH_SIDES 128
 
 // ---------------------------------------------------------------------------
-// The seven lumps
+// The seven lumps, and six more that are allowed to be absent
 // ---------------------------------------------------------------------------
-
+//
+// The first seven are the collision model and every one of them is REQUIRED: a
+// map missing any is refused by name, because a brush model with no brushsides
+// is not a map this can be careful about.
+//
+// The six after them are the displacement surfaces, and they are OPTIONAL in
+// the strict sense that more than half the library has no DISPINFO lump at all
+// and those maps are perfectly good. They are also optional in a second sense
+// that matters more: BSP v25 changed dface_t and ddispinfo_t and this reader
+// does not know the new layouts, so on those maps the displacement lumps are
+// skipped and the rest of the map is read exactly as before. Absent
+// displacements are a KNOWN GAP that hasDisplacements already reports; a
+// refusal would turn a partial answer into no answer.
 enum
 {
     WR_BSP_L_PLANES = 0,
@@ -225,8 +237,53 @@ enum
     WR_BSP_L_LEAFBRUSHES,
     WR_BSP_L_BRUSHES,
     WR_BSP_L_BRUSHSIDES,
+    WR_BSP_L_REQUIRED,          // everything below here may be missing
+
+    WR_BSP_L_VERTEXES = WR_BSP_L_REQUIRED,
+    WR_BSP_L_EDGES,
+    WR_BSP_L_SURFEDGES,
+    WR_BSP_L_FACES,
+    WR_BSP_L_DISPINFO,
+    WR_BSP_L_DISPVERTS,
+    WR_BSP_L_ENTITIES,
     WR_BSP_L_COUNT
 };
+
+// WHY a displacement was dropped, by name.
+//
+// dispDropped was a single int, and only one of these seven sites adds more than
+// one at a time -- so "did this map run out of build budget, or refuse a hundred
+// displacements one at a time" could not be answered from it at all. It had to
+// be recovered arithmetically, by replaying the per-displacement tests and
+// solving for the break index, which is refusal-by-inference in the file whose
+// whole convention is refusal-by-name.
+//
+// Measured over the 626 displacement maps in the library: five of these seven
+// counters are ZERO everywhere, 88 of the 191 drops were CORNER, and the other
+// 103 were BUDGET on surf_outra alone. That census is worth being able to
+// re-derive on demand rather than out of a commit message.
+enum
+{
+    WR_DISP_DROP_POWER = 0,   // power outside [WR_DISP_MIN_POWER, MAX_POWER]
+    WR_DISP_DROP_FACEINDEX,   // m_iMapFace is not inside the FACES lump
+    WR_DISP_DROP_VERTSTART,   // the grid's rows are not inside DISPVERTS
+    WR_DISP_DROP_NOTQUAD,     // the base face does not have exactly 4 edges
+    WR_DISP_DROP_FACEVERTEX,  // a corner would not walk out of SURFEDGES
+    WR_DISP_DROP_CORNER,      // startPosition named no corner of that quad
+    WR_DISP_DROP_BUDGET,      // WR_DISP_BUDGET ran out; the rest were not tried
+    WR_DISP_DROP__COUNT
+};
+
+// The names, for the panel and the sweep. Indexed by the enum above.
+extern const char *WrBspDispDropName[WR_DISP_DROP__COUNT];
+
+// Which of them refused the most, so one sentence can name a cause instead of
+// listing seven counters that are nearly always zero. Ties go to the earliest,
+// which is arbitrary and harmless: a map with two causes tied has bigger
+// problems than which one gets named. Returns WR_DISP_DROP_POWER on a map that
+// dropped nothing, so callers must check dispDropped first.
+struct WrBspMap;
+int WrBspDispWorstDrop(const WrBspMap *m);
 
 // Their index in the file's own 64-entry directory, and the name used in every
 // refusal message. Exposed so tests\test_bsp.exe can build a directory.
@@ -252,6 +309,18 @@ struct WrBspRaw
 
     unsigned int   totalBytes;      // uncompressed, across the seven
     bool           compressed;      // was any of them LZMA?
+
+    // The DISPINFO lump's length, and nothing else about it.
+    //
+    // This is the eighth lump the directory is read for and the only one that is
+    // never opened. All that is wanted is whether it is EMPTY, because that is
+    // the difference between "this reader saw the whole map" and "this reader
+    // saw the part of the map that is brushes" -- and a caller that vetoes a
+    // kinematic answer with geometry has to know which of those it is holding.
+    // Reading a length out of a directory entry that is already in a local
+    // costs nothing; parsing the lump would be the displacement work this
+    // version does not do.
+    unsigned int   dispInfoBytes;
 };
 
 // Read them, or fail with a reason a person can act on. Never partially
@@ -333,16 +402,46 @@ bool WrBspWorldBrushes(const WrBspRaw *r, unsigned char *owned, int *ownedOut,
 // stays resident. See wr_bspgeom.h for why the queries are over a grid built
 // here rather than over the tree the file came with.
 
-// Contents bits, from Valve's bspflags.h. Only the first is tested.
+// Contents bits, from Valve's bspflags.h.
 //
-// CONTENTS_SOLID alone, and NOT a mask including CONTENTS_PLAYERCLIP: a
-// playerclip brush is invisible geometry a mapper put there to smooth a ramp
-// or block a shortcut, and drawing it as though it were the ramp would put a
-// surface on screen that nobody can see in game. Whether it should be included
-// is a real question and bsp_sweep --contents counts them so it can be
-// answered with a number; today it is not.
+// BOTH are tested now, and for a long time only the first was. A playerclip
+// brush is invisible geometry a mapper put there to smooth a ramp or block a
+// shortcut -- so drawing one as though it were the ramp would put a surface on
+// screen that nobody can see in game, and it was left out on that basis. The
+// note here used to end "whether it should be included is a real question and
+// it can be answered with a number; today it is not."
+//
+// It is now. There are 141,841 of them, they carry 26% more surf-band area than
+// the solid brushes alone, and leaving them out meant this reader had no polygon
+// within 48 units of a player who was demonstrably touching something a QUARTER
+// of the time. The distinction that matters is not which brushes to read but
+// which query may use them: collision yes, drawing no. See WR_BSP_POLY_CLIP.
 #define WR_BSP_CONTENTS_SOLID      0x00000001
 #define WR_BSP_CONTENTS_PLAYERCLIP 0x00010000
+
+// This polygon came off a brush that is PLAYERCLIP and not solid.
+//
+// It collides and it cannot be seen. That difference decides which queries may
+// use it: "is there anything where the player is" must, because a clip brush is
+// frequently the thing a surf map is actually ridden on, and "draw the ramp
+// surface" must not, because drawing a clip brush puts a surface on screen that
+// nobody can see in game. See WrBspSurfNear, which filters, and
+// WrBspNearestFace and WrBspTraceRay, which do not.
+#define WR_BSP_POLY_CLIP 0x1u
+
+// This polygon is one triangle of a displacement rather than a brush side.
+//
+// It collides and it is visible, so no query filters it out. It is flagged
+// because a displacement is the one place this reader builds geometry that has
+// no brush behind it, and anything measuring where the map came from -- coverage
+// in the panel, the normal cross-check in bsp_sweep -- has to be able to tell
+// the two apart.
+#define WR_BSP_POLY_DISP 0x2u
+
+// The most polygons WrBspSurfNear will return, and the top of the panel's own
+// "how many faces" slider. The two have to agree: they did not, and the query's
+// private 64 quietly won.
+#define WR_BSP_SURF_MAX 512
 
 struct WrBspPoly
 {
@@ -350,12 +449,26 @@ struct WrBspPoly
     int   first;        // index of its first vertex in WrBspMap::verts
     int   count;
     float area;
+    unsigned int flags; // WR_BSP_POLY_*
 };
 
 struct WrBspMap
 {
     int  version;
     bool compressed;
+
+    // Does this map use displacements at all?
+    //
+    // Carried up from WrBspRaw::dispInfoBytes, and it is the difference between
+    // two quite different silences. When this is false, a trace that finds
+    // nothing found nothing because there is nothing -- every solid surface in
+    // the level is a brush and every brush was considered. When it is true, a
+    // trace that finds nothing may simply have looked at the half of the map
+    // this version does not read.
+    //
+    // Only a caller using absence as evidence needs this. Drawing what was
+    // found does not, which is why nothing needed it until now.
+    bool hasDisplacements;
 
     float mins[3], maxs[3];
 
@@ -380,6 +493,15 @@ struct WrBspMap
     int sideTooFar;         // a vertex outside the world, so refused
 
     int   surfPolys;        // in the surf band, facing up
+    int   surfClipPolys;    // ...and of those, how many are clip-only
+
+    int   dispPolys;        // triangles built from displacement surfaces
+    int   dispDropped;      // ...and how many were skipped, all causes together
+    int   dispTotal;        // how many the file declares, before any test
+    int   dispDropBy[WR_DISP_DROP__COUNT];  // ...and which test refused each
+
+    int   entModels;        // solid brush entities whose brushes were included
+    int   entBrushes;       // and how many brushes that added on top of model 0
     float surfArea;
     float solidArea;
 
@@ -400,10 +522,74 @@ struct WrBspMap
 bool WrBspBuild(const WrBspRaw *r, WrBspMap *out, char *err, int errCap);
 void WrBspFreeMap(WrBspMap *m);
 
+// The threshold below which the panel shouts rather than mentions.
+//
+// Not a round number pulled out of the air. Across the library model 0 owns
+// 84.1% of brushes with p10 at 68.7%, so two thirds is comfortably inside the
+// ordinary range and nothing normal trips this. What does trip it is a map like
+// bhop_slope_v2 at 3.6%, which is the case this exists for.
+#define WR_BSP_THIN_OWNED 0.55f
+
+// MAY ABSENCE BE USED AS EVIDENCE ON THIS MAP?
+//
+// True only when a map is built, world ownership is not thin, and every
+// displacement in the file was actually built. Both halves take a map rather
+// than reaching for the loaded one, because they are properties OF A MAP and
+// because the switch that this whole reader's live behaviour turns on had, until
+// it moved here, no test coverage in any harness at all -- WrBspMap is a plain
+// struct and tests\test_bsp.exe can now fill seven ints in by hand.
+//
+// The loader keeps its no-argument wrappers; see wr_bspload.h for what a false
+// answer does and, more importantly, does not mean.
+bool WrBspCoverageThin(const WrBspMap *m);
+bool WrBspGeometryComplete(const WrBspMap *m);
+
+// Whether WrBspBuild keeps PLAYERCLIP brushes that are not also solid. False,
+// which is what has always happened. A knob rather than a constant because the
+// library holds 141,841 of them and whether they belong here is a question with
+// a measurable answer -- see the note at its definition.
+extern bool g_wrBspIncludeClip;
+
+// Whether WrBspSurfNear -- the drawing query, and only that one -- will return
+// those clip polygons as well.
+//
+// The reasoning above says drawing a clip brush puts a surface on screen that
+// cannot be seen in game, and that is true. What it did not weigh is what the
+// alternative shows: on the maps built that way there is nothing else to draw.
+// surf_ethereal is 233 of its 342 world brushes playerclip-only and
+// surf_greensway 317 of 579, and on those the panel would report a healthy
+// surf-band count while the screen stayed empty -- because surfPolys counts them
+// and this query threw them away.
+//
+// An invisible brush that you ride is still the ramp. Drawn in its own style so
+// it is not mistaken for a face you could see.
+extern bool g_wrBspDrawClip;
+
+// Whether WrBspBuild subdivides displacement surfaces at all. On. A knob for
+// the same reason the two above are knobs: whether the geometry it adds agrees
+// with the geometry players actually collide with is a question with a
+// measurable answer, and measuring it means being able to turn it off.
+extern bool g_wrBspBuildDisp;
+
+// Whether brushes owned by solid brush ENTITIES are read as well as the
+// world's. On. Off is what every version before this did, and the difference is
+// measurable per map -- see WrBspEntityBrushes.
+extern bool g_wrBspIncludeEntities;
+
+// Running total of brush entities refused as non-solid -- triggers, mostly.
+// Read by bsp_sweep so the deny list can be checked against a corpus rather
+// than trusted.
+extern int g_wrBspEntSkipped;
+
 // A polygon's vertices, for a caller that would rather not do the arithmetic.
 static inline const float (*WrBspPolyVerts(const WrBspMap *m, int i))[3]
 {
     return m->verts + m->polys[i].first;
+}
+
+static inline unsigned int WrBspPolyFlags(const WrBspMap *m, int i)
+{
+    return m->polys[i].flags;
 }
 
 // ---------------------------------------------------------------------------
@@ -439,5 +625,27 @@ int WrBspSurfNear(const WrBspMap *m, const float pt[3], float radius,
 // which is why this measures distance to the polygon and not to its plane.
 bool WrBspNearestFace(const WrBspMap *m, const float pt[3], float radius,
                       int *polyOut, float *distOut);
+
+// THE SAME WALK, ALSO ANSWERING "WHICH OF THOSE COULD I BE RIDING".
+//
+// "Nearest of any facing" is the right question for whether the player is
+// touching something, and it was measured as such: R = 24 scores 98.3% at
+// wr_bspload.h. It is the WRONG question for which plane a board should be
+// graded against, and the difference is not theoretical. Land on a ramp near a
+// wall and the wall is nearer; the board's ramp-band gate then refuses it, and
+// because there was no second candidate the whole board vanished with no
+// message. Reported as ramps that "sometimes don't report numbers", landing
+// from the side.
+//
+// So this reports both, from one pass: `polyOut`/`distOut` are byte-identical
+// to WrBspNearestFace, because the touch verdict rests on a measurement taken
+// with exactly that rule and may not move without a new one; `rampOut` is the
+// nearest polygon that passes WrBspIsRampPlane, or -1 when none does.
+//
+// A ramp answer is not a claim that the player is on it. It is only the best
+// candidate available -- the caller still owns the distance and the grade.
+bool WrBspNearestFaceEx(const WrBspMap *m, const float pt[3], float radius,
+                        int *polyOut, float *distOut,
+                        int *rampOut, float *rampDistOut);
 
 #endif // WR_BSP_H

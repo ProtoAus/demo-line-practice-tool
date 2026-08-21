@@ -203,15 +203,51 @@ static inline float WrAirPowerCeiling(float gravity, float tickInterval)
 // Done ideally, dot(velocity, wishdir) is 0 -- that is what wr_stress.h's
 // derivation above maximises over -- so addspeed is the full 30 and the gain is
 // whichever of the two is smaller.
-static inline float WrAirGainPerTick(float tickInterval, float airAccel,
-                                     float maxSpeed)
+// surfaceFriction is the same factor WrAirPowerCeilingEx takes and for the same
+// reason: AirAccelerate's line is
+//
+//     accelspeed = accel * wishspeed * frametime * player->m_surfaceFriction
+//
+// and this function used to be the one place in the file that dropped it. It is
+// 1 everywhere except the deadstrafe period described in the header, so this
+// changes no shipped number -- but two functions modelling one line of engine
+// code differently is how they come apart later.
+static inline float WrAirGainPerTickEx(float tickInterval, float airAccel,
+                                       float maxSpeed, float surfaceFriction)
 {
     if (tickInterval < 1e-4f) tickInterval = 0.015f;
     if (airAccel < 0.0f) airAccel = 0.0f;
     if (maxSpeed < 0.0f) maxSpeed = 0.0f;
+    if (surfaceFriction < 0.0f) surfaceFriction = 0.0f;
 
-    float a = airAccel * maxSpeed * tickInterval;
+    float a = airAccel * maxSpeed * tickInterval * surfaceFriction;
     return (a > WR_AIR_WISHSPEED) ? WR_AIR_WISHSPEED : a;
+}
+
+static inline float WrAirGainPerTick(float tickInterval, float airAccel,
+                                     float maxSpeed)
+{
+    return WrAirGainPerTickEx(tickInterval, airAccel, maxSpeed, 1.0f);
+}
+
+// DOES THE WISHSPEED CAP BIND? Everything below needs this to be true.
+//
+// Two regimes, the same pair WrAirPowerCeilingEx splits on. When accelspeed
+// reaches the 30-unit cap the cap is what limits the gain, the optimum sits at
+// dot(velocity, wishdir) = 0, and the turn rate determines the alignment. When
+// it does not, `a` is accelspeed regardless of alignment -- and then the turn
+// rate says nothing about how well you are strafing, because it is pinned by the
+// acceleration rather than by where you are pointing.
+//
+// Surf is nowhere near the boundary (562.5 against 30). CS:GO KZ's airaccelerate
+// 12 is on the wrong side of it, which is the same configuration this file
+// already singles out twice.
+static inline bool WrAirCapBinds(float tickInterval, float airAccel,
+                                 float maxSpeed, float surfaceFriction)
+{
+    if (tickInterval < 1e-4f) tickInterval = 0.015f;
+    return (airAccel * maxSpeed * tickInterval * surfaceFriction)
+           >= WR_AIR_WISHSPEED;
 }
 
 // How far your view has to turn each tick to keep strafing ideally, in degrees.
@@ -239,6 +275,174 @@ static inline float WrPerfectStrafeDegrees(float speed, float tickInterval,
         speed = 1.0f;
     float gain = WrAirGainPerTick(tickInterval, airAccel, maxSpeed);
     return (float)(atan2((double)gain, (double)speed) * 57.29577951308232);
+}
+
+// THE SAME THING WHILE TOUCHING A RAMP, WHICH IS NOT THE SAME NUMBER
+//
+// A surf ramp is air movement: the engine only calls you grounded above
+// normal.z 0.7, so on anything steeper AirAccelerate runs every tick exactly as
+// it does in free flight. What changes is that TryPlayerMove then clips the
+// result back onto the plane, and the clip turns your velocity as well.
+//
+// One tick, with v already lying in the plane and P = I - n n^T:
+//
+//     v' = v + g*P(w) - G*P(z)              G = gravity * tick
+//
+// Work in the horizontal frame where x is along v_h and w is perpendicular to
+// it. Gravity contributes nothing along w by itself, but the clip couples it in
+// through the plane's own tilt, and the clip also takes a bite out of the gain:
+//
+//     rotating component = g(1 - wn^2) + G*nz*wn          wn = dot(w, n)
+//
+// so the ideal view rate is that over the horizontal speed. wn = 0 gives back
+// g/speed, which is the flat case above -- the air formula is this one on a
+// plane you are not touching.
+//
+// THIS IS A LARGE CORRECTION, NOT A REFINEMENT. Checked against a literal
+// AirAccelerate -> gravity -> ClipVelocity tick at nz = 0.6 and 1000 u/s
+// horizontal, ridden across the fall line so wn = +-0.8:
+//
+//     wn = +0.8    simulated 0.016558486    this 0.016560000    55.2% of air
+//     wn = -0.8    simulated 0.005039957    this 0.005040000    16.8% of air
+//
+// Agreement is 1.5e-6 rad, which is atan against the small-angle form. Reusing
+// the flat number on a ramp would overstate the target by between 1.8x and 6x,
+// which is why this readout refused to answer on ramps at all until there was a
+// real surface normal to hand.
+//
+// `n` must point AWAY from the surface, out towards the player. wn's sign is
+// the whole difference between the two rows above, so an unoriented plane normal
+// gives a confidently wrong answer rather than a slightly wrong one.
+static inline float WrPerfectStrafeDegreesOnPlane(float speed,
+                                                  float tickInterval,
+                                                  float airAccel, float maxSpeed,
+                                                  float gravity,
+                                                  const float n[3],
+                                                  float wn)
+{
+    if (speed < 1.0f)
+        speed = 1.0f;
+    if (tickInterval < 1e-4f)
+        tickInterval = 0.015f;
+    if (!n)
+        return WrPerfectStrafeDegrees(speed, tickInterval, airAccel, maxSpeed);
+
+    if (wn < -1.0f) wn = -1.0f;
+    if (wn > 1.0f) wn = 1.0f;
+
+    const float g = WrAirGainPerTick(tickInterval, airAccel, maxSpeed);
+    const float G = gravity * tickInterval;
+    float rot = g * (1.0f - wn * wn) + G * n[2] * wn;
+    if (rot < 0.0f) rot = -rot;
+
+    return (float)(atan2((double)rot, (double)speed) * 57.29577951308232);
+}
+
+// The steady-state c that a turn-rate ratio implies, scaled for a plane.
+//
+// WrStrafeQuality's third step sets w*|v|tick = 30 - c and reads off
+// c = 30(1 - r). Redo it with the rotating component above and the 30 picks up
+// the same two terms:
+//
+//     g(1-wn^2) + G*nz*wn = r * [30(1-wn^2) + G*nz*wn]
+//     c = 30 - g = (1 - r) * (30 + K)          K = G*nz*wn / (1 - wn^2)
+//
+// K = 0 is the flat case and gives back 30 exactly. On the nz = 0.6 ramp above
+// K is about 16, so the same fractional error costs 2.35x as much quality --
+// which is right: the ramp is doing part of the turning, so the part you are
+// responsible for is more sensitive to getting it wrong.
+//
+// wn^2 -> 1 is a wall, where no amount of air acceleration rotates anything;
+// the guard hands back the flat scale rather than an infinity.
+static inline float WrStrafeCScale(float gravity, float tickInterval,
+                                   const float n[3], float wn)
+{
+    if (!n)
+        return WR_AIR_WISHSPEED;
+    if (tickInterval < 1e-4f)
+        tickInterval = 0.015f;
+    if (wn < -1.0f) wn = -1.0f;
+    if (wn > 1.0f) wn = 1.0f;
+
+    const float denom = 1.0f - wn * wn;
+    if (denom < 0.05f)
+        return WR_AIR_WISHSPEED;
+
+    float k = (gravity * tickInterval) * n[2] * wn / denom;
+    float s = WR_AIR_WISHSPEED + k;
+    // A negative scale would flip the grade's sense; a huge one would make every
+    // reading zero. Both are outside the geometry this is defined on.
+    if (s < 1.0f) s = 1.0f;
+    if (s > 8.0f * WR_AIR_WISHSPEED) s = 8.0f * WR_AIR_WISHSPEED;
+    return s;
+}
+
+// HOW GOOD IS A TURN RATE, ON A SCALE, RATHER THAN IN OR OUT OF A BAND
+//
+// The readout beside this one shows the measured turn rate against the ideal.
+// Colouring it needed a quality, and picking a tolerance would have been an
+// invention -- so it comes out of AirAccelerate instead, in three steps.
+//
+// ONE. The gain, with c = dot(velocity, wishdir) and A = accel*maxspeed*tick:
+//
+//     a       = min(A, 30 - c)
+//     d|v|^2  = 2ac + a^2
+//
+// TWO. When the cap binds -- WrAirCapBinds, true of every surf configuration --
+// a is 30 - c and the whole thing collapses:
+//
+//     d|v|^2 = 2(30-c)c + (30-c)^2 = 900 - c^2
+//
+// Maximal at c = 0, worth exactly 900. That is WrAirPowerCeilingEx's ws^2 branch
+// arrived at from the other end, which is the check that this is the same model.
+//
+// THREE. In steady state the view turns with the velocity, so with w* the ideal
+// rate and r = w/w*:
+//
+//     w*|v|*tick = a*cos(theta) ~= 30 - c    ->    c ~= 30*(1 - r)
+//
+//     quality = (900 - c^2) / 900 = 1 - (1 - r)^2
+//
+// Symmetric about r = 1. Zero at r = 0 -- not turning at all adds nothing -- and
+// zero again at r = 2, where wishdir has swung far enough that it is behind the
+// velocity. Note it reproduces the +-20% band it replaced: r in [0.8, 1.2] is
+// quality >= 0.96, so the green that shipped before means what it always did and
+// there is now a scale either side of it.
+//
+// THE cos(theta) ~= 1 IS THE ONE APPROXIMATION and it is small: c never exceeds
+// 30 while |v| is in the hundreds, so the error is order (c/|v|)^2, which is
+// 0.09% at 1000 u/s. Everything else here is exact.
+//
+// Returns -1 for "no answer" rather than zero, so a caller shows neutral instead
+// of a bad grade. Callers must ALSO check WrAirCapBinds -- this function cannot,
+// since it is handed two rates and not the three cvars they came from.
+// `cScale` is the 30 in step THREE, which is only 30 when the surface is not
+// taking a share of the turning. See WrStrafeCScale. Passing WR_AIR_WISHSPEED
+// reproduces the flat formula exactly, term for term, and there is a test that
+// says so.
+static inline float WrStrafeQualityEx(float turnRate, float idealRate,
+                                      float cScale)
+{
+    if (!(idealRate > 1e-3f) || turnRate < 0.0f)
+        return -1.0f;
+    if (!(cScale > 1e-3f))
+        cScale = WR_AIR_WISHSPEED;
+
+    // Normalised before squaring rather than after. c^2 / 900 is the same
+    // number in algebra, but this way cScale == WR_AIR_WISHSPEED makes the
+    // factor exactly 1.0f and the result BIT-identical to the flat formula this
+    // replaced -- so switching to it cannot move a single existing reading.
+    float r = turnRate / idealRate;
+    float m = (1.0f - r) * (cScale / WR_AIR_WISHSPEED);
+    float q = 1.0f - m * m;
+    if (q < 0.0f) q = 0.0f;
+    if (q > 1.0f) q = 1.0f;
+    return q;
+}
+
+static inline float WrStrafeQuality(float turnRate, float idealRate)
+{
+    return WrStrafeQualityEx(turnRate, idealRate, WR_AIR_WISHSPEED);
 }
 
 // Past this much of the ceiling on the GAIN side, it was not the player -- it

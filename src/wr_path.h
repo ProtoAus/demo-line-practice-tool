@@ -66,7 +66,21 @@
 // climbed this far again. Without it, every wobble on a flat section becomes a
 // label and the line disappears under text.
 #define WR_DIP_MIN_DROP 32.0f
-#define WR_DIP_MIN_GAP 12          // points between successive dips
+
+// And how far apart two of them have to be, IN SECONDS.
+//
+// It was 12 points, which is 0.18 s at a 0.015 tick and 0.12 s at 0.01 -- so a
+// map recorded at 100 tick got half again as many labels on the same shape of
+// line, for no reason anybody chose. That is the exact defect wr_smooth.h was
+// written to remove from the live readout ("a velocity baseline of 4 frames...
+// behaved like a different instrument depending on the frame rate"), surviving
+// on the demo side because a tick felt more like a unit than a frame does. It
+// is not: 482 of the 503 demos here are 0.015 and all 21 bhop_futile runs are
+// 0.01.
+//
+// 0.18 is what 12 points meant on the tick the number was chosen at, so nothing
+// moves for the runs it was tuned against.
+#define WR_DIP_MIN_GAP_SECONDS 0.18f
 
 // Bits 1 and 2 of the format are HAS_ANGLES and IS_EYE_PATH. Nothing has ever
 // written either -- the extractor recovers positions, not view angles, and the
@@ -217,7 +231,21 @@ struct WrRun
     // Computed once at load at full resolution, like breaks and dips, so the
     // renderer only ever does a lookup.
     signed char *eff;
-    int effWindow;              // what it was built with; see WrPathRefreshEff
+    int effWindow;              // what it was built with; see WrPathRefreshDerived
+
+    // And the PHYSICS it was built with, for the same reason.
+    //
+    // eff, phase and boards all read g_energy at load: the efficiency ceiling
+    // needs gravity, air-accelerate and max-speed, and the air/contact split
+    // needs gravity. All four are sliders. So a run loaded at gravity 800 and
+    // then looked at with the slider on 600 was coloured against a ceiling that
+    // is no longer the one the key on screen describes -- quietly, with nothing
+    // to see, which is the failure mode this project keeps finding and keeps
+    // giving the same answer to: record what it was built with and rebuild when
+    // that changes. wr_profile.h::gravity is the same field for the same reason.
+    float builtGravity;
+    float builtAirAccel;
+    float builtMaxSpeed;
 
     // Per-point movement phase: WR_PHASE_AIR / RAMP / GROUND / UNKNOWN.
     //
@@ -414,7 +442,17 @@ void WrPathCancelAutoEnable(void);
 // looked at. The rebuild is a full pass over every loaded run, so it is called
 // when the slider is RELEASED, not while it is being dragged.
 extern int g_wrEffWindow;
-void WrPathRefreshEfficiency(void);
+
+// Rebuild every loaded run's derived arrays whose inputs have moved -- eff,
+// phase and boards. Runs already built with the wanted window and the current
+// physics are skipped, so this costs one comparison each when nothing has
+// changed and a full pass over every point when something has.
+//
+// It was WrPathRefreshEfficiency and it watched one input. There are four, and
+// three of them are on the Energy tab rather than the Display tab, which is
+// exactly why the staleness was invisible: the slider you moved and the lines
+// that went stale were not on the same page.
+void WrPathRefreshDerived(void);
 
 // Live self-recording. Feed it the player's FEET each frame, along with the
 // smoothed velocity and the run clock, so a live point carries the same three

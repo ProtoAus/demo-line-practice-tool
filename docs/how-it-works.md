@@ -205,11 +205,13 @@ They are **read, never swallowed**, so a collision means the game still acts on 
 - **In its default configuration it makes zero calls into the game.** It hooks `Present` to
   draw, reads memory read-only, and reads files — including, on a map change, the map's own
   `.bsp`, read-only and shared, from the install directory it already reads demos out of.
-- **The map reader takes brushes only, and says what it is missing.** Displacement ramps are not
-  read, and neither is `func_*` geometry, and on a map built out of either it reads almost
-  nothing. That is a hole rather than a rounding error — over half of maps have displacements
-  somewhere — so the panel prints how much of the map it actually got instead of leaving an empty
-  result to be mistaken for *there is no ramp ahead of you*.
+- **The map reader takes brushes, displacements and solid brush entities, and says what it is
+  missing.** Displacement surfaces are subdivided from their own lumps on BSP 19, 20 and 21;
+  `func_*` brushes are read with triggers named and excluded; and clip brushes — collision with
+  no material, which is what a great many surf ramps actually are — are drawn rather than
+  counted and discarded. What is still missing is displacements on BSP v25, whose face and
+  displacement structures changed, and the panel prints how much of the map it actually got
+  instead of leaving an empty result to be mistaken for *there is no ramp ahead of you*.
 - **It reaches outside your machine in exactly two places, both behind a checkbox, both off
   unless you say otherwise.** Name/avatar tags ask the Steam client to look up each runner's
   persona and picture — the same request a scoreboard makes. And the Maps tab can download
@@ -416,11 +418,23 @@ on its own; if yours lives somewhere unusual, edit `VCVARS` at the top of the sc
 build.bat
 ```
 
-Produces `wrlines.dll`, `wrlines.pdb` and `wrinject.exe`, all x64.
+Produces `wrlines.dll`, `wrlines.pdb`, `wrlines.map` and `wrinject.exe`, all x64.
+
+`wrlines.map` exists for the crash log. The exception filter reports a fault as
+`wrlines.dll+0x19FBD`, because at the moment it fires it has no symbols and cannot safely go
+looking for any; the map turns that number back into a function name with nothing installed — no
+debugger, no PDB reader. It changes no byte of the DLL (verified: `.text` is byte-identical with
+and without `/MAP`) and it is gitignored.
 
 **Close the game before rebuilding.** The DLL never unloads, so while Momentum is
 running the loaded copy cannot be overwritten. `build.bat` checks for this and says so
 rather than letting the linker fail with a bare `LNK1104`.
+
+That check calls `%SystemRoot%\System32\tasklist.exe` and `find.exe` by full path, which is not
+decoration. A bare `find` is whatever comes first on `PATH`, and on a machine with msys2 or Git for
+Windows — which is most machines that build this — that is the Unix `find`, which reads `/I` as a
+path and exits non-zero. The guard then decides the game is not running, the build carries on, and
+you get the bare `LNK1104` the check exists to replace.
 
 MSVC rather than mingw on purpose: this calls MSVC-laid-out C++ virtual interfaces in the
 engine, and several Source methods return structs by value where mingw's Itanium sret
@@ -703,6 +717,45 @@ Two ordinary-looking expressions do arithmetic nobody would write out:
 Where the reference is *naive*, so is the port. The dynamic program's own step lengths are a
 plain `sqrt` on both sides; "fixing" those would change which edges the DP accepts. `build.bat`
 passes `/fp:precise` for the same reason — reassociating any of this is a correctness change.
+
+#### The gate reported 317 mismatches it had never compared
+
+`parity.ps1` came back **6,268 identical, 317 MISMATCH** after eighteen minutes. Not one of the 317
+was a byte difference. Every row was the same:
+
+```
+ref: [!] zstd body and no zstandard installed     port: 3676786 bytes -> out.bin
+```
+
+The oracle needs the `zstandard` package to decompress a zstd body and did not have it, so it
+produced **no bytes at all**. The port links zstd and read them. Nothing was compared — and the
+difference in *stdout wording* was filed as a difference in output.
+
+The `skipped` bucket existed for exactly this and could not fire. It requires both sides to refuse
+**in the same words**, which was a safe assumption when neither side could do zstd. The port can now.
+The two sides are asymmetric and every zstd demo fell through to the mismatch branch.
+
+**That is the dangerous shape of failure**, and it is why the fix is not just `pip install`. A real
+byte regression in those 317 files would have produced a report that looked identical. So there is now
+a pre-flight that refuses to start without the codec — a gate that cannot read 5% of the corpus should
+say so in the first second, not the eighteenth minute — and an `UNCOMPARED` bucket that exits non-zero
+in its own words, so "not checked" can never again be read as "checked and different", nor as a pass.
+
+**The obvious one-flag fix would have been wrong**, which is the part worth remembering. This machine
+has `zstandard` under Python **3.10** and the run used **3.13.9**, and `parity.ps1` takes a `-Python`
+parameter. Pointing it at 3.10 looked free. It would have silently traded one false-mismatch cause for
+another: `wr_dp.h:120` pins the reference interpreter to CPython 3.13.9 precisely because of the
+compensated `sum()` two paragraphs up, which arrived in 3.12 — *"the port was correct against Python
+3.11 and wrong against 3.12."* So the version is now checked too, and a mismatch against the pin prints
+a warning that names `wr_dp.h`.
+
+`-Python` also turned out never to have worked at all: all nine call sites hardcoded `& $Python -3`,
+and `-3` selects a version from the `py` launcher rather than being an interpreter flag, so any real
+interpreter path died with `Unknown option: -3`. Fixing that produced its own lesson — `$x = if (...)
+{ @("-3") }` leaves a **string**, because PowerShell unrolls a one-element array on assignment, and
+splatting a string is not splatting a one-element array. The interpreter launched with no `-c`, sat in
+its REPL waiting on stdin, and the script appeared to hang rather than fail. The `[string[]]` on the
+declaration is what stops the unroll.
 
 **Launch the game**, then:
 
@@ -1051,6 +1104,61 @@ Boosters add energy for free — real runs contain `dE/dt` spikes of +726, +3116
 +13142 units/s, up to 350× the ceiling — so anything past 3× on the **gain** side is drawn as a
 gap rather than as perfect play.
 
+#### The same `ws² − c²` grades a turn rate, once you notice what fixes `c`
+
+The turn-rate readout used to be coloured by a band — green inside ±20 % of ideal, neutral outside.
+A band is a choice, and the request was for a red→green scale, which needs a quantity rather than a
+preference. The formula three paragraphs up turns out to be it.
+
+`c` is `dot(velocity, wishdir)`. Whenever the 30-unit wishspeed cap is the binding term — every surf
+configuration; at air-accelerate 150 and maxspeed 250 the other term is 562 — the per-tick gain is
+`900 − c²`. And in steady state the view turns with the velocity, so with `r` the ratio of your turn
+rate to the ideal one, `c ≈ 30(1 − r)`. Substituting:
+
+```
+quality = (900 − c²) / 900 = 1 − (1 − r)²
+```
+
+Symmetric about `r = 1`, zero at `r = 0` (not turning: nothing is added) and zero again at `r = 2`
+(turned so far that wishdir points behind the velocity). It reproduces the band it replaces —
+`r ∈ [0.8, 1.2]` is `q ≥ 0.96` — so the old green means what it always did.
+
+**Checked against a literal transcription of `AirAccelerate`**, keeping `wishspd = min(wishspeed, 30)`
+for `addspeed` and the *uncapped* `wishspeed` for `accelspeed`: swept across `c ∈ [0, 30]`, the gain is
+`900 − c²` to 0.06 units², and `1 − (1 − r)²` recovers the simulated gain fraction **from the turn
+alone** to within **0.012 %**.
+
+**And against 4.3 million real airborne ticks**, which is a different claim and came out messier:
+
+| r | per tick | over 16 ticks | `1 − (1−r)²` |
+| --- | --- | --- | --- |
+| 0.35 | +0.134 | +0.367 | +0.577 |
+| 0.55 | +0.280 | +0.574 | +0.798 |
+| 0.75 | +0.593 | +0.701 | +0.938 |
+| 0.85 | +0.526 | **+0.705** | +0.978 |
+| 0.95 | +0.429 | **+0.707** | +0.997 |
+| 1.05 | +0.496 | +0.666 | +0.997 |
+| 1.25 | +0.486 | +0.498 | +0.938 |
+| 1.55 | +0.115 | +0.136 | +0.698 |
+
+The per-tick column peaks at `r = 0.75` and is depressed everywhere, which looked at first like the
+formula being wrong. It is not: **`r` measured over a single tick is too noisy to bin on.** At surf
+speed both angles in the ratio are about 1.7°, recovered from central differences — and the curve is
+concave, so noise pulls every bin's mean down by Jensen, hardest at the apex, while binning on a noisy
+value drags the extremes toward the middle of the distribution. Averaging `r` over 16 ticks first
+moves the peak to **0.85–0.95** and lifts the whole curve, which is the signature of noise rather than
+of a wrong model.
+
+The first guess was contamination — a ramp turns the velocity far faster than strafing can, so
+misclassified contact ticks should pile into the high-`r` bins and bring a `ClipVelocity` loss with
+them. Widening the required clear-air window from 1 tick to 6 changed the table by less than 0.01.
+That guess was wrong and the noise explanation is what survived.
+
+The measured curve still sits below the predicted one everywhere, and that is **correct rather than a
+discrepancy**: `1 − (1 − r)²` is the gain your turn rate makes *available*, not the gain you took.
+Pointing at the right rate is necessary and not sufficient — the same relationship `dE/dt` has with
+the 37.5 ceiling above, where record-class play medians at +0.531.
+
 ### The rejection was symmetric, and that hid almost everything worth seeing
 
 Reported next: *"can you describe why it goes red or green like I'm 12? the colours don't make
@@ -1303,8 +1411,55 @@ catches is somebody riding a ramp perfectly well. Its own author marks the latch
 version of ramp detection`.
 
 What separates a board from riding a ramp is that **a board has air before it**. Three clear airborne
-ticks, then contact that sticks: **27,453 found, 12.3 per run**, graded perfect 31 / good 30 / okay
-18 / bad 20 / terrible 2. That is what a surf run actually has.
+ticks, then contact that sticks: **27,508 found, 12.2 per run**, graded perfect 31 / good 29 / okay
+18 / bad 12 / terrible 10. That is what a surf run actually has.
+
+#### Every board on screen said it cost nothing
+
+A player reported that every board they could see read `-0`, while the grade and the approach angle
+beside it both varied. Those cannot both be true of the same event: an entry 57° off the normal
+**must** shed 1 − sin 57° = 16 % of its speed, and 16 % of anything is not zero.
+
+The loss was `|vIn| − |vOut|`, which is the obvious way to measure it and is the wrong instrument.
+Four ways of asking, over 27,508 boards:
+
+| | p10 | p50 | p90 |
+| --- | --- | --- | --- |
+| measured `\|v[i]\| − \|v[i+1]\|` | 0.0 | 4.1 | 48.9 u/s |
+| wide `\|v[i−1]\| − \|v[i+2]\|` | 0.0 | 13.3 | 113.7 u/s |
+| clean `\|v[i−1]\| − \|v[i+1]\|` | 0.0 | **0.0** | 41.4 u/s |
+| **projected** `s₀(1 − sin approach)` | **2.0** | **22.7** | 116.0 u/s |
+
+**37.2 %** of boards rounded to `-0`.
+
+The first theory was a smear. A `.wrpath` velocity is a central difference, so `v[i]` at a contact
+straddles the clip — it is `(u+w)/2` where the two clean samples either side are `u` and `w`. That
+predicts the *clean* row should be exact. It is the **worst row in the table**, which killed the
+theory and found the real one:
+
+| speed change per tick, with no clip in it | p50 |
+| --- | --- |
+| in the air just before | **+7.1 u/s** |
+| on the ramp just after | **−11.6 u/s** |
+
+A board costs 4–23 u/s. The background it sits on moves 7–12 u/s **per tick**, in opposite directions
+either side of the event. Differencing two speeds measures the clip *plus the ride*, and here the ride
+is the larger term — so which answer you get is set by which ticks you happen to pick. No better pair
+of indices fixes that.
+
+The projection does, and it is exact rather than approximate. Source's `PM_ClipVelocity` is
+`backoff = dot(v, n) · overbounce` with overbounce 1, which is an orthogonal projection and nothing
+else, so `lossPct = 1 − sin(approach)` is the engine's own arithmetic. The only question is whether
+the normal is good enough to lean on, and it is, twice over: `bsp_sweep --verify-normals` puts it
+p50 1.19° from the plane read out of the `.bsp`, and moving which ticks it is recovered from shifts
+the approach angle by p50 0.26°. **The angle was always the solid input here; the speed difference
+never was.**
+
+Grades moved where you would expect and nowhere else: perfect 31 → 31, good 30 → 29, **bad 20 → 12,
+terrible 2 → 10**. The good end is untouched. What changed is the bad end, where a board's angle said
+*terrible* and its contradictory near-zero loss was holding the grade up. And on synthetic data — an
+exact clip fed straight in — the change is a **no-op**, which is `tests\test_phase.exe`'s projection
+identity going from a small error to `0.000000`.
 
 #### And it survives the camera, where efficiency did not
 
@@ -1372,18 +1527,113 @@ The closure assertion is the only check here that could catch a stride wrong in 
 check passed: a brush is the intersection of its half-spaces, so no face may stick out through
 another side. It had thirty-four million chances on four struct layouts and never fired.
 
+#### "Why do some maps show no ramps?" — and why the obvious answer was wrong
+
+Three maps were reported as showing nothing. The obvious suspect was displacements: 626 of the 1,304
+maps installed here have them, 548 of 1,106 `surf_` maps do, and this reader did not parse them.
+
+That was not the cause. The surf band on those maps was being **read, counted, and then thrown away
+by the one query that draws**:
+
+| map | surf-band polygons | clip-only | drawn before |
+|---|---|---|---|
+| `surf_ethereal` | 613 | 613 (100 %) | **0** |
+| `surf_nyx` | 100 | 100 (100 %) | **0** |
+| `surf_boreas` | 19 | 19 (100 %) | **0** |
+| `surf_greensway` | 312 | 294 (94 %) | 18 |
+| `surf_pandora` | 123 | 121 (98 %) | 2 |
+| `surf_666` (works) | 471 | 25 (5 %) | 446 |
+| `surf_utopia` (works) | 2,543 | 53 (2 %) | 2,490 |
+
+`WrBspSurfNear` refused every polygon flagged `WR_BSP_POLY_CLIP`, on the sound reasoning that
+outlining a clip brush puts a surface on screen that is not on screen in the game. What that
+reasoning did not weigh is what it leaves when the clip brush *is* the ramp — and on the maps people
+were complaining about, it is 100 % of the ramp. Worse, `surfPolys` was counted before the filter, so
+the panel reported *"613 in the surf band"* for a map that drew nothing.
+
+An invisible surface you ride is still the ramp. They are drawn now, dimmer and never shaded in, and
+the coverage line says how many of the band they are. **That one filter, not displacements, is why
+those maps looked broken.**
+
+Displacements were read afterwards anyway, and they matter for a different reason — see below.
+
 **Trigger volumes carry `CONTENTS_SOLID` verbatim.** Nothing in the file separates a
 `trigger_teleport` from a ramp — the distinction is only which model owns the brush, so the
 worldspawn tree has to be walked. On `surf_greensway` 47 % of solid brushes are teleport volumes and
 a teleport volume on a surf map is characteristically a big slanted box under the ramp. Skipping the
 walk does not produce garbage; it produces a second ramp.
 
-That walk costs something real, and the panel says so rather than hiding it. Model 0 owns 84.1 % of
-brushes across the library, but only **3.6 % on `bhop_slope_v2`**, which is built almost entirely out
-of entities. **Displacements are not read at all** — 95.5 % of surfable area is brush-backed and the
-median map is 100 %, but 51 surf maps are displacement-built and on those this reads almost nothing.
+That walk costs something real. Model 0 owns 84.1 % of brushes across the library, but only **3.6 %
+on `bhop_slope_v2`**, which is built almost entirely out of entities — and that map read **zero**
+surf-band polygons.
+
+The distinction that matters was never world-versus-entity, it is what the entity *is*, and the
+ENTITIES lump writes that down as a classname beside a `"model" "*N"`. So the triggers are named and
+refused and the rest are read. Across the library that is **51,797 brush entities included, 242,414
+brushes, against 177,219 refused as non-solid** — and the map that proves the rule is
+`surf_greensway`, where **0 were included and 90 refused**, because every one of its brush entities
+is a teleport volume. `bhop_slope_v2` goes from 186 polygons to 7,626.
+
+The deny list is a deny list and not an allow list on purpose. Momentum, Portal and CS mods each add
+their own brush entities, and an allow list would silently drop every one it had not heard of, which
+is the exact failure this section is about. A trigger is recognisable from its name; anything
+unrecognised is solid geometry until something says otherwise.
+
 Missing collision reads to a user as *there is no ramp ahead*, so the panel prints coverage next to
 the geometry and warns when a map is mostly entities.
+
+#### Displacements, and the one lump the header said would never be opened
+
+A displacement is a quad from the FACES lump subdivided into a `(2^power + 1)²` grid with every
+vertex pushed along its own direction by its own distance. **None of that geometry is in the BRUSHES
+lump**, so there was never anything to skip — it was never in the input. `surf_boreas` has 1,125
+displacements and 335 brushes in the entire file.
+
+Reading them means opening six more lumps — VERTEXES, EDGES, SURFEDGES, FACES, DISPINFO, DISPVERTS —
+and FACES is the one this file spent a header block explaining it would not use. That objection
+still stands and is untouched: faces are a *rendering* structure, they do not exist for collision
+with no material, and `surf_inner` reads 0 % brush-backed by faces against 100 % by brushes. Nothing
+here uses a face to decide that something is a ramp. A displacement is the one case where the face
+is not an approximation of the collision — `ddispinfo_t` names a face, and that face's four corners
+*are* the quad the grid is built on.
+
+The six lumps were measured the way the other seven were, against all 1,304 maps:
+
+| lump | v19/20/21 | v25 |
+|---|---|---|
+| VERTEXES | 12 | 12 |
+| SURFEDGES | 4 | 4 |
+| DISPVERTS | 20 | 20 |
+| EDGES | 4 | **8** (lump version 1) |
+| FACES | 56 | **72, and not read** |
+| DISPINFO | 176 | **232, and not read** |
+
+**v25 is refused by name, and that is the whole point of the table.** Its FACES lump is version 2
+with a gcd of 72 against 56, and its DISPINFO version 1 with 232 against 176 — so both structs grew
+and the fields inside them moved. Knowing a stride is not knowing where `firstedge` now sits, and
+guessing that produces plausible windings in plausible places, which is the failure mode this table
+exists to prevent. Those 27 maps read exactly as they did before and the panel says so.
+
+The traversal is the canonical one — row from `c0→c1`, column across to `c3→c2`, DISPVERTS indexed
+`i * side + j` — with the quad rotated so that `startPosition` is corner zero. That rotation is also
+the check: `startPosition` is a *point*, written by vbsp from the corner itself, so a real match is
+exact. **Every displacement on every map matched a corner** (0 dropped on `surf_boreas`'s 1,125 and
+`surf_nyx`'s 1,964), which is what says the face → surfedge → edge → vertex chain is being read
+correctly, sign of the surfedge included.
+
+Library-wide: **19,622,216 triangles across 598 of the 626 displacement maps, 191 dropped**, resident
+p99 23.2 MB against 7.4 MB before, load p99 164 ms against 60 ms. Both are inside their limits, and
+the build stops on a budget rather than refusing a map it cannot finish.
+
+**What is not verified.** `bsp_sweep --verify-normals` compares file planes against normals recovered
+from demo velocity traces, and it is the outside check this would want — but its corpus contains no
+displacement-built maps, so it returns byte-identical numbers with `--no-disp` and without. It cannot
+speak to this either way. The remaining risk it would have caught is a grid transposed against
+Valve's, which would mirror each surface across its own diagonal; the corner check above does not
+exclude it. That is a known gap, not a passed test.
+
+Two knobs exist for exactly this kind of question, beside `g_wrBspIncludeClip`:
+`g_wrBspBuildDisp` and `g_wrBspIncludeEntities`, with `--no-disp` on the sweep.
 
 #### The two halves check each other
 
@@ -1414,6 +1664,166 @@ consecutive velocities are nearly parallel and a cross product between them ampl
 over the sine of a small angle — the same conditioning problem the code already blamed the
 eigenvector method for, inherited by its replacement. More samples do not help when they all point
 the same way.
+
+#### …and then the obvious conclusion from that was wrong
+
+If the fit reads 6.76° and a single tick at a board reads 1.19°, then the loop that colours a whole
+ride RAMP or GROUND should surely use the board's normal. It was changed to, and measured, and put
+back. The same segments, the same faces, scored **before** any filter that reads either estimator's
+own answer:
+
+| | the fit over the ride | the tick at the entry |
+| --- | --- | --- |
+| all 24,789 segments | **94.7 % right** | 81.5 % |
+| the 1,801 whose entry impulse clears 300 u/s | 93.7 % | **93.9 %** |
+| …and by angle, on those | p50 12.72° | **p50 6.64°** |
+
+Worse by angle and better by verdict is not a contradiction, because they are not the same question.
+A verdict is one bit either side of `n.z = 0.7`, and the fit's error is largely in **heading**, which
+does not move `n.z` at all — measured separately at the same time, 1.97° of heading against 2.55° of
+slope. A single tick puts its error into the whole vector, `n.z` included. Restricting to hard
+entries buys a tie, on 7 % of segments.
+
+So: **angles from a transition, verdicts from the ride.** The two estimators do not compete, and the
+retraction above is about accuracy rather than about usefulness.
+
+#### The geometry fixes the live readout, and the first attempt said it couldn't
+
+The live phase test is right 92.9 % of the time and almost all of its error is one-sided — it
+essentially never misses a ramp (0.3 %) and it **invents** one 6.8 % of the time, during free flight.
+A query into the map cannot invent a surface that is not there, so letting the geometry veto an
+invented contact looks free. `tests\phase_sweep.exe --live --maps` measures exactly that, on maps with
+**no displacements at all**, vetoing a contact whose nearest map surface is further than R units away:
+
+| | agrees | missed a ramp | invented one |
+| --- | --- | --- | --- |
+| kinematics alone | 92.2 % | **0.3 %** | 7.6 % |
+| vetoed, R = 16 | 89.1 % | 10.8 % | 0.1 % |
+| **vetoed, R = 24** | **98.3 %** | 1.3 % | **0.4 %** |
+| vetoed, R = 32 | 98.0 % | 1.2 % | 0.8 % |
+| vetoed, R = 48 | 97.2 % | 1.1 % | 1.7 % |
+
+**The first version of that table read 73 %**, and the difference is one line of the reader. It skipped
+141,841 brushes that are `CONTENTS_PLAYERCLIP` and not `CONTENTS_SOLID`, on the sound grounds that a
+clip brush is invisible in game and drawing one would put a ramp on screen that is not on screen. But
+on a surf map a clip brush is very often **the thing being ridden** — a mapper builds the visible ramp
+out of something non-solid and puts the collision on a clip beside it. Without them, during genuine
+contact this reader had no polygon within 48 units of the player a quarter of the time, and a veto
+built on that deleted a quarter of the real ramps.
+
+The distinction that matters turned out not to be *which brushes to read* but *which query may use
+them*: collision yes, drawing no. Clip polygons are marked and `WrBspSurfNear` — the one query the
+renderer uses — filters them back out, so nothing new appears on screen. They cost 0.18 MB of the
+2.43 MB a map now takes, one millisecond of load, and **zero** failures of the closure assertion across
+35.6 million brush sides.
+
+Two gates are still load-bearing. The veto may only turn contact into air, never the reverse: if the
+vertical acceleration is gravity then nothing is pushing, whatever is beside your feet. And it is off
+entirely on maps with displacements, which this reader does not have at all — there the same veto reads
+83.2 % against 93.6 % for leaving it alone, because absence there means "not read". The panel now says
+outright when a map uses them, which is a gap none of the coverage percentages beside it can express,
+because a displacement was never a brush to be counted.
+
+#### And then your own boards could be graded, which had never been possible
+
+Boards were a demo-only feature, and not from lack of interest — the two things the demo detector runs
+on are both unavailable live. It searches a whole recorded path for the air-to-contact transition, and
+there is no future to search; it recovers the ramp's normal from the velocity change across that
+transition, and a normal recovered from one instant of a camera-differenced velocity is far worse than
+the same recovery on demo data.
+
+The `.bsp` work removes the second problem outright and the veto removes the first. So the live board is
+not the demo detector ported — it is the **same grading function** fed better inputs:
+
+| | demo | live |
+| --- | --- | --- |
+| the transition | three clear air ticks in the stored path | the live phase readout, at 98.3 % |
+| the normal | recovered from the velocity change, p50 1.19° | **read straight out of the map** — exact |
+| the arriving speed | the tick before contact | the raw window velocity 0.10 s earlier |
+
+That last row is the one that needed thought. The live phase test reads vertical acceleration over a
+0.10 s window, so by the time it says *contact* the clip is already inside its own window and the
+velocity now is part-clipped. Reaching back one whole window clears the event with the window's own
+margin — and **no further**, because 0.10 s of free fall adds 80 u/s of downward speed on its own, and
+charging that to the board would read every landing as worse than it was.
+
+It needs the map, so it is dark on levels this reader does not hold completely, and the row says which
+of the two it is rather than showing an empty box. And because the loss is now projected rather than
+subtracted, a live board and a demo board are graded by exactly the same arithmetic — there is no
+second implementation to drift.
+
+#### The movement model, checked against the engine rather than against itself
+
+Everything else in this document is measured — against demos, against the `.bsp`, against a Python
+oracle. The *movement* model never was. The air-strafing ceiling, the 30-unit cap, the standable
+threshold and the clip arithmetic were all derived from first principles and then only ever checked
+for self-consistency. `surf-physics.md`, a breakdown of `gamemovement.cpp`, is the outside check.
+
+**What it confirms**, which is most of it:
+
+| | |
+| --- | --- |
+| `WR_AIR_WISHSPEED 30` | `GetAirSpeedCap()`, and it is the cap on `wishspd` only |
+| `accelspeed = accel · maxspeed · tick` | the **uncapped** wishspeed, exactly as shipped |
+| `WR_PHASE_STANDABLE 0.7` | `pm.plane.normal[2] > 0.7` is the floor test |
+| ideal turn on *horizontal* speed | `AirMove` zeroes `forward[2]` and `right[2]` before building wishdir |
+| gravity nets to `g·dt` per tick | applied in halves by `StartGravity`/`FinishGravity`, but it sums |
+
+The second row is the one worth dwelling on, because it is the line most reimplementations get wrong,
+and `wr_stress.h` already had it right — along with a comment naming `strafe-analyzer`'s version as
+putting the wishspeed cap where `sv_maxspeed` belongs. That comment was written from the derivation,
+before there was anything to check it against. It holds.
+
+**It also confirms this session's board fix from the opposite direction.** `ClipVelocity`'s third step
+is `adjust = dot(out, normal); if (adjust < 0) out -= normal·adjust` — a correction that never fires at
+overbounce 1, because the first two steps already removed every component along the normal. A
+correction that is always a no-op is a statement that the clip is an exact orthogonal projection, which
+is precisely what the projected board loss rests on.
+
+**What it corrected**, all small, none of them changing a shipped number:
+
+- **A surf ramp does not take the branch that hard-codes overbounce 1.** `TryPlayerMove` splits on the
+  same 0.7: `normal[2] > 0.7` gets `ClipVelocity(…, 1)`, and everything else — which is every surf ramp
+  by definition — gets `ClipVelocity(…, 1 + sv_bounce·(1 − surfaceFriction))`. It still comes to 1.0,
+  twice over, since `sv_bounce` defaults to 0 and `surfaceFriction` is 1 outside the deadstrafe window.
+  But it is a default and not a law, and the board loss now says so out loud rather than assuming it
+  silently.
+- **`WrAirGainPerTick` was dropping `surfaceFriction`** while `WrAirPowerCeilingEx`, four lines above it
+  in the same file, applied it. Two functions modelling one line of engine code differently is how they
+  come apart later; they now share it.
+- **`nz == 0.7` was ground here and is a ramp to the engine.** The floor test is strict (`> 0.7`), so
+  exactly 0.7 is not standable. One character, measure-zero, and free.
+
+#### A tick is not a unit of time either
+
+`wr_smooth.h` exists because every filter in the live readout used to be counted in **frames** — "a
+velocity baseline of 4 frames, an EMA of alpha = 0.25 per frame" — so the readout behaved like a
+different instrument at every frame rate. All of it is seconds now.
+
+The same defect was still sitting on the demo side, wearing a better disguise: a tick feels like a
+unit, and it is not one. 482 of the 503 demos here are 0.015 and all 21 `bhop_futile` runs are 0.01, so
+a window counted in **points** is half again as long on one map as on another. Two were: the gap
+required between successive dip and peak labels (12 points, now 0.18 s) and how near a board the
+crosshair plate will attribute one to you (40 points, now 0.6 s). Both are the same duration as before
+at the tick they were chosen at, so nothing moves for the runs they were tuned against.
+
+And one thing genuinely was stale rather than merely tick-shaped. The efficiency colours are measured
+against a ceiling built from gravity, air-accelerate and max-speed, and the air/contact split from
+gravity — all four are sliders, all four were read **at load**, and only one of them rebuilt anything
+when it moved. So dragging Gravity on the Energy tab left every line on screen coloured against a
+number that was no longer on the page. The three physics sliders now rebuild on release, the same way
+the efficiency window already did, and each run records what it was built with.
+
+The stored per-point clock is not one of these. It is `index × tickInterval`, which is only elapsed
+time if every tick was recovered — but measured across all 2,294 files on this machine, against each
+run's own recorded duration and starting where the run starts, the median is **exactly 1.000**. Nearly
+all of the apparent error is pre-roll rather than missing ticks; the residual is 15.2 % of runs more
+than 2 % out and 3.0 % more than 10 %, which `CheckTimes` already identifies. Rescaling those was
+tried on paper and rejected for the reason the code already gives — the *rate* is right and the fault
+is local, so stretching every window in the run to make the endpoints meet would spread one gap over
+everything. A local signature was looked for instead: a tick dropped in free flight should read as a
+downward push of very close to a whole *g*. Over 1.25 million intervals only 0.79 % push downward at
+all, and they do not cluster at multiples of *g*. So `timeScale` stays a test.
 
 ### Five presses across two tabs
 
@@ -2621,6 +3031,30 @@ detection, and that is all ground detection is used for now.
 Single-frame differencing at 200 fps turns a two-unit view bob into a 400 u/s spike, hence the
 baseline and the smoothing; expect a few percent of error and slight lag on sharp changes.
 
+**The half of that sentence about the offset turned out to be the wrong shape of question.**
+`tests\velprobe.exe` sweeps for each component's own best bit offset, with a control that asks the
+same sweep the same question with the step-to-value pairing broken — same values, wrong
+correspondence — so the sweep's own floor is measured rather than assumed. Over 40 demos and 8,000
+steps:
+
+| | matches | control |
+| --- | --- | --- |
+| `vx` | **84.3 %** | 5.7 % |
+| `vy` | **83.4 %** | 5.8 % |
+| `vz` | **85.5 %** | 6.8 % |
+
+The control lands exactly on the 1.9–8.2 % floor the extractor's own chain identification measures for
+a wrong chain, which is what makes the first column mean anything. So **all three components are
+there**, not just the vertical one — and the reason a three-component match at one offset scores 0.19
+is now measured too: the three best offsets are **not** 32 bits apart on any of the 40 demos. Each is
+delta-encoded as its own send prop with its own index bits in front of it. Looking for a contiguous
+triple was looking for the wrong shape.
+
+What that does **not** yet show is that reading them would be more accurate than differencing, which
+is a different question and has an oracle waiting for it: the file's own planes read 1.19° against a
+recovered normal at a board today, and an exact velocity has to beat that or the idea is wrong. The
+central difference is already 4.2–4.8 u/s out at ~3900, which is 0.12 %, so the bar is not low.
+
 The camera is the eye, ~64 units above your feet. That offset **cancels out of `E_rel`**, because
 the reference height is a camera height too — it only survives in the comparison against a run,
 whose points are the player origin, and there is a slider for it. Gravity is a setting
@@ -2818,9 +3252,752 @@ told to open the other panel and find the ninth tab does not get told.
 
 ---
 
+## The ramp that was never ungradeable, only uncomputed
+
+The strafe readout refused to answer the moment you touched anything:
+
+```c
+if (WrEnergyPhase() != WR_PHASE_AIR)
+    return false;
+```
+
+with a comment saying that on a ramp the surface turns your velocity far faster than air
+acceleration ever could, so the comparison is against the wrong physics. Every word of that is true.
+None of it is a reason the right physics cannot be worked out.
+
+A surf ramp **is** air movement to the engine. You are only "on the ground" above a normal z of 0.7,
+so on anything steeper `AirAccelerate` runs every single tick you are riding it. The only extra term
+is the clip. With `v` already in the plane and `P = I - n nᵀ`, one tick is
+
+```
+v' = v + g·P(w) − G·P(z)                     G = gravity · tick
+```
+
+and in the horizontal frame where x is along `v_h` and `w` is perpendicular to it, the part that
+*rotates* the horizontal velocity is
+
+```
+g(1 − wn²) + G·nz·wn                          wn = w · n
+```
+
+so the ideal view rate is that over the horizontal speed, and `wn = 0` gives back `g / speed` — the
+flat formula is this one on a plane you are not touching.
+
+**It is a large correction, not a refinement.** Against a literal
+`AirAccelerate → gravity → ClipVelocity` tick at nz 0.6 and 1000 u/s horizontal, ridden across the
+fall line:
+
+| `wn` | simulated | closed form | vs the flat ideal |
+|---|---|---|---|
+| +0.8 | 0.016558487 | 0.016558483 | **55.2 %** |
+| −0.8 | −0.005039956 | 0.005039955 | **16.8 %** |
+
+Agreement is 4e-9 rad. Reusing the flat number on a ramp would overstate the target by between 1.8×
+and 6×, which is exactly why refusing was the right call while there was nothing better — and why
+the fix could not be a fudge.
+
+The quality curve moves by the same term. `WrStrafeQuality` rests on the steady state `c = 30(1−r)`;
+redo that with the rotating component above and it becomes `c = (1−r)(30 + K)` with
+`K = G·nz·wn / (1 − wn²)`. `K = 0` recovers the old formula — **bit-identically, 401 of 401 sample
+points**, because the scale is normalised before it is squared rather than after. On that same ramp
+`K ≈ 16`, so the same fractional error is graded 2.35× harder. That is right: the ramp is doing part
+of the turning, so the part you are responsible for is more sensitive to getting wrong.
+
+Two things had to exist first, and both arrived for other reasons. The **surface normal**, from the
+map reader. And the **sign of the turn** — `wr_energy.cpp` measured it and then threw it away one
+line later with `if (dy < 0) dy = -dy`, and `wn` is the whole difference between the two rows in that
+table. The normal is oriented from the physics rather than from the file: a surface can only push,
+and it pushes along `+n`, so `sign(n.z)` must agree with `sign(a_z + gravity)`, which the trend kept
+for the phase readout already measures. That is also what makes head ramps come out right.
+
+---
+
+## The clamp that bent every line crossing the near plane
+
+Lines were reported distorting when they left the screen, the far end landing somewhere it had never
+been. The obvious suspect is a missing near-plane clip — projecting a point with `w ≤ 0` and getting
+a mirrored result.
+
+Wrong: `ClipToNear` has been there all along and is exact, and no point with `w ≤ 0` is ever divided.
+The bug was four lines further on, in `ProjectKnownW`:
+
+```c
+float lim = 32.0f * (g_sw > g_sh ? g_sw : g_sh);
+out->x = WrClampF(sx, -lim, lim);
+out->y = WrClampF(sy, -lim, lim);
+```
+
+**Clamping x and y independently moves the point off the line.** When one axis saturates and the
+other does not, the slope changes. And it fired constantly rather than rarely: `ClipToNear` places a
+clipped endpoint *exactly* on `w = NEAR_W = 1.0`, and one world unit from the eye a lateral offset of
+about ninety units already projects past 61,440 pixels. The comment claimed "well off screen, so no
+visible kink" — the kink was on screen, because a bent segment still crosses the viewport on its way
+out.
+
+The fix is to bound the **segment**, which has a direction, instead of the **point**, which does not.
+`ClipSegment2D` is Liang–Barsky against the viewport plus a margin wider than any line here is thick;
+the result is always *on* the original line. Where it cuts an endpoint inside a polyline, the batch
+flushes and restarts, which is the same rule the near-plane clip already used and for the same
+reason. Every world-space `AddLine` in the file now goes through one `ProjectSegment`, so the
+clipping rules live in one place instead of nine copies of the first two thirds of them.
+
+It also removed the run-of-eight off-screen heuristic that used to sit there, which tested `pa` while
+the batch was chained on `pb` and let seven segments through before firing — seven segments that, back
+when the clamp was in, had already been bent.
+
+---
+
+## Two crashes, one address, and a minidump read by hand
+
+The game died twice in an afternoon with no line in the log either time. Momentum writes Sentry
+minidumps to `bin\win64\_sentry\reports`, and both of them said this:
+
+| when | exception | site |
+|---|---|---|
+| 5:10:37 PM | `0xC0000005`, read of address 0 | `wrlines.dll +0x19F3D` |
+| 7:19:00 PM | `0xC0000005`, read of address 0 | `wrlines.dll +0x19FBD` |
+
+Different builds, 0x80 apart: **the same code site, twice.** The second lands 0.14 s after the log's
+last line, and matched the build on disk, so the RVA was exact.
+
+Reading the instruction there gives `movzx r8d, byte ptr [rcx]` with `rcx = 0`. The enclosing
+function — RVA `0x19F60`–`0x1A007`, from the PE exception table — is a CRC32-table string loop with a
+special case for `'#'` and `###`, and its callers reference `##ContextMenu`, `##ComboPopup`,
+`#CLOSE` and `Table`. That is **`ImHashStr`**, Dear ImGui's label hasher.
+
+So: an ImGui widget was handed a NULL `const char *` label. ImHashStr walks the string with no null
+check, so one null name reaching one `Selectable` takes the whole game down from inside a
+third-party header with our own frame nowhere near the top of the stack.
+
+Things it was **not**, each checked rather than assumed: no fixed array in `wr_render.cpp` can be
+overrun (`rows[4]` and `lines[10]` are exactly full but bounded on every path); the window
+subclassing already refuses to restore unless it is still top of the chain, and all seven cycles in
+that session recorded the same original procedure, so nothing else had subclassed; vtable probing
+was off, so the one unguarded dereference in `FetchW2S` was never reached.
+
+`WrLabel` now guards every ID-producing call whose label comes from data, folding empty in with null
+(an empty label is legal, hashes to the seed, and therefore collides with every other empty label —
+which is the *"2 visible items with conflicting ID"* box).
+
+### And then it happened again, and the filter named it in one line
+
+The next crash wrote its own report, which is the whole reason the filter exists:
+
+```
+[545.109] subclassed window 00000000001A0128 (unicode), original 00007FFBF2215540
+[545.109] panel quick opened (open now: quick)
+[545.109] [!] crash: 0xC0000005 reading 0x0 at wrlines.dll+0x19FBD
+[545.109] crash:   [ 0] wrlines.dll+0x19FBD
+[545.109] crash:   [ 1] wrlines.dll+0x17BDE
+[545.109] crash:   [ 2] wrlines.dll+0x66F7E
+[545.109] crash:   [ 3] wrlines.dll+0xA3C95
+[545.109] crash:   [ 4] wrlines.dll+0x915DA
+[545.109] crash:   [ 5] wrlines.dll+0x8F650
+[545.109] crash:   [ 6] shaderapidx11.dll+0x29CE4
+```
+
+Same address, same timestamp as *"panel quick opened"* — it died on the first frame the quick panel
+ever drew. `build.bat` now passes `/MAP`, and `wrlines.map` turns those numbers into names with
+nothing installed:
+
+| offset | symbol |
+|---|---|
+| `+0x19FBD` | `ImHashStr +0x5D` |
+| `+0x17BDE` | `ImGuiWindow::GetID +0x5E` |
+| `+0x66F7E` | `ImGui::RadioButton +0x6E` |
+| `+0xA3C95` | `WrQuickDraw +0x1465` |
+| `+0x915DA` | `WrImGuiFrame +0x13A` |
+| `+0x8F650` | `HookedPresent +0x200` |
+
+`WrQuickDraw` has exactly two `RadioButton` loops, and one of them was this:
+
+```c
+static const char *kNames[WR_LINE_MODE_COUNT] = {
+    "off", "speed", "energy", "energy (relative)", "efficiency"
+};
+for (int i = 0; i < WR_LINE_MODE_COUNT; i++)
+    ImGui::RadioButton(kNames[i], ...);
+```
+
+`WR_LINE_MODE_COUNT` is **six**. `WR_LINE_PHASE` — *air / ramp / ground* — had been added to the enum
+at one end and this table had not been extended at the other. C++ zero-fills the initialisers you did
+not write, so `kNames[5]` was a null pointer, no warning at any level, and the loop handed it
+straight to a function that hashes its label without a null check. **The quick panel crashed the game
+on the first frame it drew, every single time.**
+
+So the paragraph above this one, which said the static tables *"were checked too and are all fine …
+so the null is coming from data rather than from a short initialiser list"*, was wrong. It was
+exactly a short initialiser list, in the one file that check did not cover.
+
+The fix is in two halves, on purpose. `WR_TABLE_IS_FULL` in `wr_common.h` makes the next omission a
+**build error** — the array is sized by its initialiser and `static_assert`ed against the enum, so a
+table that falls behind cannot compile:
+
+```
+src\wr_quick.cpp(1495): error C2338: static assertion failed:
+    'kNames is missing entries for WR_LINE_MODE_COUNT -- the enum grew and this table did not'
+```
+
+Every parallel table in the project now carries it, and `wr_phase.h` spells the same assertion out
+by hand rather than take an include it does not otherwise need. And `WrLabel` still wraps the lookup,
+so if one ever does get past the compiler the widget reads `"?"` instead of closing the game.
+
+Both halves are cheap and they fail differently, which is the point: one catches it before it ships
+and the other survives it if it does.
+
+---
+
+## The board gate that asked the wrong estimator
+
+Reported as *"not all lines had boarding numbers on every board — on surf_fiellu, Nobort's run
+doesn't have the boarding on the second ramp, are they too smooth?"*
+
+They were not too smooth. Across 2,258 runs and 100,193 contact segments, **974** were rejected for
+being too smooth — under 1%. The board loop was throwing away sustained ramp rides for a completely
+different reason.
+
+`wr_path.cpp` recovers a surface normal two ways, and the essay above pass two already says which is
+good at what: a plane **fitted to the whole ride** for the ramp-or-ground verdict, and the **impulse
+at the entry tick** for the board's own numbers. Pass three then gated ramp-vs-floor on the entry
+tick — the estimator that section says is the wrong one for exactly that question.
+
+Measured on `surf_fiellu` against the map's own brush faces (`bsp_sweep --verify-normals`), over the
+860 segments where both estimators could be asked:
+
+| | fit over the ride | tick at the entry |
+|---|---|---|
+| ramp vs ground, right | **99.8%** | **57.8%** |
+| angle error, p50 | 1.46° | 16.12° |
+
+They agreed with each other 57.6% of the time. That map's ramps sit at `nz` **0.657**, four
+hundredths under the 0.7 that separates a ramp from a floor, so an entry tick scattering ±16° lands
+on the wrong side about half the time. One run of Nobort's, per ride:
+
+```
+seg  t      ticks kind  speedIn  nzFIT   nzENTRY  verdict
+ 6   2.22   115   ramp  1547     0.274   0.278    board
+ 7   5.89   118   ramp  2252     0.661   0.810    NO: fit says RAMP, entry says floor
+12   10.50   46   ramp  2280     0.644   0.737    NO: fit says RAMP, entry says floor
+15   12.51  111   ramp  2800     0.654   0.964    NO: fit says RAMP, entry says floor
+...
+```
+
+`nzFIT` sits at 0.657 ± 0.006 across ten separate rides of the same ramp family. `nzENTRY` scatters
+0.67 to 0.96. **Three boards were reported where thirteen ramps were ridden.**
+
+The fix asks each bound of the estimator that has been measured on it:
+
+```c
+const float nzEntry = nrm[2] < 0.0f ? -nrm[2] : nrm[2];
+const float nzFloor = (segNz[i] >= 0.0f) ? segNz[i] : nzEntry;
+if (nzEntry < WR_PHASE_MIN_RAMP_NZ || nzFloor > WR_PHASE_STANDABLE)
+    continue;
+```
+
+The **floor** bound moves to the fit. The **wall** bound stays on the entry tick, and that restraint
+is deliberate: `--verify-normals` scores ramp against ground, not ramp against wall, so nothing has
+measured either estimator on the lower bound. Moving it too would have taken back 2,867 of the boards
+this change adds, with no evidence saying whether those are walls or fit failures. A bound is only
+moved where there is a measurement of *that* bound.
+
+Across the corpus: **8,414 boards gained, 2,202 lost, none of the losses to the wall bound.** The
+2,202 are segments the fit calls a floor and the entry tick calls a ramp — the case the fit is 99.8%
+right about, so losing them is the change working rather than a cost of it.
+
+`tests\test_wrpath.exe` carries the regression: a synthetic run whose velocity is kept exactly in a
+plane of `nz` 0.65 while its entry tick is clipped against that ramp *and* a flat lip in the same
+tick, so the two estimators land on opposite sides of 0.7. It asserts both halves — that the entry
+normal really does read over 0.7, so the fixture still exercises what it claims to, and that a board
+comes out anyway. Restore the old gate and it fails on the second one.
+
+The live readout was never affected: it grades against `g_geomNormal`, the plane out of the `.bsp`,
+which is exact. This was demo lines only.
+
+---
+
+## What a ramp looks like when the file has one face for it
+
+Reported as *"surf_666 doesn't have the faces of the first ramp covered correctly, only one face near
+the end … surf_fiellu is the same, but does have the faces show up correctly."*
+
+The drawing query was measured first and is not the limiter. At three of the four ramps sampled on
+`surf_666`, `WrBspSurfNear` returned **everything** in the surf band within the draw radius — 3 of 3,
+2 of 2, 11 of 11. On `surf_fiellu` the same query returns **512 of 1,664**, because that map's ramps
+are displacement grids and there are thousands of small triangles around you.
+
+That difference is the whole story. `surf_fiellu` has 62,641 surf-band polygons; `surf_666` has
+3,743, and near a ramp only a handful, because its ramps are **single brush faces thousands of units
+long**. Sampling the nearest in-band polygon along one ride, in units:
+
+```
+928  784  644  537  507  545  523  432  280  76
+```
+
+— which is *"only one face near the end"*, exactly as reported, and it is what the file contains.
+
+But there was a real defect underneath it, and it is why the big-face maps looked so much worse than
+the displacement ones. The fill was refused unless **every** vertex of a polygon projected in front
+of the near plane:
+
+```c
+for (int j = 0; j < poly->count && whole; j++)
+    if (!Project(...) || fabsf(sp[j].x) > fillLim || ...)
+        whole = false;
+```
+
+A ramp long enough to ride always has an end behind your head once you are on it. So the polygon you
+are standing on — the one the tool exists to show — is precisely the one that never gets filled, and
+all you see of it is a faint outline away in the distance. A fifty-unit displacement triangle under
+your feet has all its corners in front of you and fills normally, which is why maps built out of
+those never showed the problem.
+
+The answer to *"a convex polygon clipped against the near plane is not the polygon ImGui was handed"*
+is to hand ImGui the clipped polygon. `ClipPolyToNear` is one Sutherland–Hodgman pass against the
+same `w = NEAR_W` half-space the segment clipper uses; `ClipW` is linear in the point, so the plane
+is an ordinary half-space and a convex polygon clipped by it stays convex and gains at most one
+vertex. The lateral `fillLim` goes with it, for the same reason the clamp in `ProjectKnownW` went:
+after a correct near clip a large screen coordinate is a large surface seen up close, not a corner
+that has been moved.
+
+**One thing that is not a tool bug and is worth knowing.** The first "ramp" the phase classifier finds
+on `surf_666` is a `trigger_push`: 136 ticks of contact at 1,000–1,400 u/s with the nearest solid
+being a vertical clip brush 66 units away and no surf-band polygon within 400. A push changes vertical
+acceleration away from gravity, which is exactly what the classifier reads as contact. Boards and the
+phase colour will both be wrong inside a push volume, and nothing currently says so.
+
+Its entity list is otherwise unremarkable and the deny list handles it correctly: 351
+`trigger_teleport`, 27 `trigger_multiple`, 22 `func_dustmotes`, 3 `func_illusionary` all refused, 9
+`func_brush` included.
+
+---
+
+## Two controls that could not be reached
+
+Two reports in one session, and the same shape both times: the setting existed and the widget that
+changes it was not on screen.
+
+**The colour key.** `g_render.lineKey` had four checkboxes, one inside each of the speed, energy,
+relative-energy and efficiency blocks. Each is drawn only while that mode is selected, so two states
+had the key on screen with no control anywhere that could turn it off: *air / ramp / ground*, added
+to the enum after the four checkboxes were written, and *one colour per run*, where the key still
+draws a row for the map's outlines whenever those are on. Reported as *"is there an option to disable
+the top left window? I can't find it"* — and there was not one. One bool now has one checkbox, beside
+the mode combo, outside every branch.
+
+(The key goes in the corner opposite the corner block, which is why it is top-left when the block is
+bottom-right.)
+
+**The pointer, once a second.** Reported as *"the mouse keeps centering on the screen when I stop
+moving the mouse for 1 sec, annoying for reading tool tips."*
+
+Source warps the OS cursor back to the middle of the window every frame it holds mouselook, and every
+one of those warps posts a `WM_MOUSEMOVE` carrying the centre. `WrWndProc` has a fallback that takes
+the position out of that message, for setups where raw input never arrives — and it was armed by
+*"has raw input gone quiet for a second"*. Move the mouse, read a tooltip, and the window lapses; the
+next warp message is believed and the pointer is thrown to the middle of the screen. Every second,
+for as long as you keep reading.
+
+This has now been wrong in both directions, which is why both are written down at the declaration.
+It began as *"have we ever seen raw input"* — a flag set by the first packet and never cleared, so one
+packet at any time permanently disabled the fallback, including on the setups that only deliver raw
+input while the pointer is grabbed. The replacement is **since the panel opened**: a setup with no raw
+input has seen none since it opened and the fallback is armed; a setup with working raw input has, so
+a still mouse leaves the cursor where it was left. It re-arms on every open, so nothing carries over
+from a session when the game was in a menu and the pointer behaved differently.
+
+Diagnostics now prints which source is armed, because the age it was already printing is not what
+decides it any more.
+
+---
+
+## Four displacements out of seven hundred and fifty-six
+
+Reported as *"on surf_kvas b4, whenever I'm on a ramp it says 'no surface' and doesn't tell me the
+ideal turn speed."* The strafe readout knew the player was on a ramp — the phase row said so — and in
+the same breath claimed there was no surface. Both halves came from the same place, and the map was
+never asked.
+
+**The chain.** `WrTurnRates` needs a surface normal on a ramp, `WrEnergySurfaceNormal` only has one if
+the map query ran, and [dllmain.cpp](../src/dllmain.cpp) only ran the query when
+`WrBspLoadGeometryComplete()` said the map was whole. That predicate refused any map that had
+displacements and dropped even one of them:
+
+```c
+if (m->hasDisplacements && (m->dispPolys <= 0 || m->dispDropped > 0))
+    return false;
+```
+
+surf_kvas built **74,272 displacement triangles and dropped 4**. Four out of 756 switched off the live
+map query for the entire level — the ramp strafe ideal, the live boards, and the map's half of the
+phase readout with them.
+
+**Which four, and why.** Six sites can drop a displacement. Across all 1,304 maps installed here,
+**five of the six have never fired**: 172,862 displacements, 191 drops, 103 of them one map running
+out of build budget and **88 of them a single test** — the startPosition corner match. Its comment
+stated the premise it rested on:
+
+> A quarter of a unit squared. startPosition is written by vbsp from the corner itself, so a real
+> match is exact to floating point.
+
+Measured, that premise is false for 21.9% of the library. Only 134,883 of 172,759 displacements match
+a corner exactly. 88 miss by more than half a unit while still naming a corner that is unmistakably
+theirs — surf_kvas's four miss by 0.52, 1.02, 1.02 and 1.04 units on base quads that are **512 × 704
+and 833 × 605 units**. An absolute cut was judging a quantity that scales with the face: a one-unit
+miss is 0.12% of that diagonal, and the face was thrown away for it.
+
+Two of the four are ~290,000 sq unit ramp faces, 43 and 40 triangles of them in the surf band, with
+184 to 314 already-built polygons within 256 units. Holes punched in a ramp complex, not props.
+
+**The fix is the same test, relative to the quad it judges** — `WR_DISP_CORNER_SLACK`, 1% of the
+quad's own longest separation. Both directions were measured before relaxing anything:
+
+| | 0.25 sq units | 1% of the diagonal |
+|---|---|---|
+| correct read, 172,759 displacements | 88 refused | **0 refused**, worst case 2.7× inside the cut |
+| startPosition read 4 bytes late | 8 accepted | **8 accepted** — identical |
+
+That second row is the half that mattered. The test exists to catch a moved struct prefix, and it
+catches exactly as much of one as before: under the wrong read the worst case is twelve orders of
+magnitude outside the cut, so the two populations do not touch. The corner *choice* is never close
+either — surf_kvas's four beat their runner-up by 244,868× to 954,273× in squared distance, and the
+library floor is 9×. `test_bspgeom` asserts on that margin, so if a future vbsp ever makes it close,
+it fails loudly instead of silently building a surface rotated a quarter turn.
+
+**Result.** surf_kvas: 4 dropped → **0**, 74,272 triangles → 74,784, 15,965 surf-band polygons →
+16,049, closure failures still 0. Library-wide: 191 drops → **103**, and those 103 are one map's
+memory budget. **14 maps** go from no live geometry to live — surf_agony, surf_road_to_hell,
+surf_hellenic, surf_sedona, surf_rise, what_is_this, surf_kvas, surf_surreal, surf_nocturn,
+surf_destruction, surf_simpsons2, bhop_challenjour_fix, surf_eryr2, surf_eryr2_fix. Seven of them
+were losing everything over **a single displacement**. surf_andromeda and surf_greensway stay refused
+by thin coverage, which is a different veto and a correct one.
+
+**What the strafe row says now.** `"no surface"` was one string for four different situations, and it
+fitted the reported one worst of all. It is now `map not read` (the reader is off), `map part read`
+(this level has geometry that could not be built), `not a ramp` (you are against a wall or a floor),
+or `no lift yet` (the surface is barely holding you). The corner block grows one orange row —
+`map part read -- see Display tab` — because the HUD said *"no surface"*, the Display tab said
+*"displacements skipped"*, they were on different tabs and shared no word, and the chain between them
+was five inferences long. The Display tab's own warning was **factually wrong** on this map: it named
+BSP v25 as the cause, and surf_kvas is v20. It branches by cause now, off a new per-reason census.
+
+**Two things deliberately not done.** The other half of this — always asking the map, and letting a
+*found* face count even where absence cannot — is written up but unshipped. Positive and negative
+evidence are not symmetric: a face the query returns is genuinely in the file, while "nothing within
+24 units" needs the map to have been read whole. But the only measurement of that change's harm was
+taken over the sixteen maps this fix removes, and its exposure on the **49 that remain** — 27 BSP v25
+maps where no displacement geometry exists at all, surf_pure, surf_outra past displacement 1712, and
+22 thin-coverage maps — is unmeasured. `bsp_sweep --verify-normals` is the tool that would settle it
+and it needs demos for those maps; this machine holds them for exactly one, and that one is a
+thin-coverage map rather than a displacement map. So it waits for the measurement rather than
+shipping on the argument.
+
+And a **proportionate threshold** was rejected on the numbers rather than on taste. surf_outra, the
+one map that genuinely runs out of memory mid-build and *should* be refused, drops 5.67% — which is
+**less** than surf_eryr2's 6.12% rounding-error drop. No ratio separates them. If one is ever wanted,
+the budget break needs its own flag rather than being inferred from a count.
+
+---
+
+## Ten silent refusals wearing one grey label
+
+Reported as *"sometimes the board detection doesn't work properly and doesn't report numbers — I'm
+not sure if it's because I'm landing on the ramp from the side and it doesn't know where the ramp
+is?"*
+
+That guess is right, and it is one of several. **Thirteen tests stand between a landing and a
+number**, and ten of them ended in the same string:
+
+```c
+_snprintf_s(lines[n], ..., "board   --  (none yet)");
+```
+
+Which reads as *you have not boarded*. It meant *I refused*, and the tool knew which test had done it
+every single time. This is the same shape as the `no surface` defect two sections up, and the fix is
+the same: a refusal that names itself.
+
+### The nearest surface is not the one you landed on
+
+`WrBspNearestFace` returns *the nearest polygon of any facing* — no surf-band filter, no direction
+test. That is the right question for **am I touching something**, and its 24-unit radius was swept
+against exactly that question (98.3%, `wr_bspload.h`). It is the wrong question for **what did I land
+on**. Land at the side of a ramp and the wall is nearer; the board's ramp-band gate then refuses the
+wall, and because nothing had asked for a second candidate, **the ramp sitting in the same query went
+unused and the board vanished**.
+
+Compare `WrBspTraceRay`, which is front-faces-only and says why in its own header: *"it is what stops
+a ramp's UNDERSIDE being reported as the ramp"*. The same care had never been taken here.
+
+So the walk now reports **both**, from one pass: the nearest of any facing, byte-identical to before
+because the touch verdict rests on a measurement taken with exactly that rule, and separately the
+nearest polygon inside the ramp band. On the v20 test fixture **141 of 2,507 sampled points (5.6%)
+have a nearer face that is not the ramp** — the test sweeps for them rather than hard-coding one, so
+it cannot go vacuous if the fixture changes shape.
+
+The band test uses `|n.z|` rather than `n.z`, and that differs from `WrBspIsSurfBand` on purpose: a
+displacement triangle's normal is a cross product of its grid winding and nothing orients it, so half
+of a displacement ramp comes out facing down while being the surface you are standing on.
+
+### One fake frame could cost the landing after it
+
+`g_bAirFor = 0.0f` ran *before* the refusal return, so every contact frame — including refused ones —
+emptied the air accumulator. The phase readout invents a contact on about 0.4% of frames; one of
+those in flight left the genuine landing 50 ms later failing `BOARD_AIR_BEFORE`. Air already earned
+now survives a contact that produced nothing, for 0.05 s. That cannot manufacture a board on a
+sustained ride: a ride is contact frame after contact frame, and the grace is spent by the second one.
+
+### The last board never expired
+
+`WrEnergyBoard`'s header always said it would answer false once the board was *"older than the caller
+cares about"*. The implementation only checked whether there had ever been one, so the corner row
+described a ramp two ramps back for the rest of the level, indistinguishable at a glance from the one
+under your feet. The cap is measured rather than chosen — over **2,255 runs and 26,132 gaps between
+consecutive boards on the same run**:
+
+| p50 | p90 | p95 | p99 |
+|---|---|---|---|
+| 4.05 s | 8.33 s | 10.17 s | 16.53 s |
+
+Twenty seconds is past the p99, so the row never blinks out between ramps, and short enough that
+nothing on screen is describing somewhere you left twenty seconds ago.
+
+### And the cause is now printed, and counted
+
+Ten phrases — `nothing to touch`, `not a ramp`, `no air before it`, `too glancing` and the rest —
+with the `n.z` printed beside the ramp one, because 0.95 is a floor and 0.04 is a wall and which it
+was tells you whether you clipped the lip or the side. The Energy tab keeps a **tally per cause since
+the map loaded**, which is what turns *"sometimes"* into a number that can be reported.
+
+One subtlety worth recording: the cause is written on the **transition frame only**. Every frame of a
+sustained ride is a contact with no air behind it, so recording it unconditionally overwrote the
+landing's real reason within one frame — the row would name the answer for 3 ms and then spend four
+seconds saying `no air before it`, which is true, useless, and hides it.
+
+---
+
+## Digits that are earned
+
+Asked for as *"pro surfers are very accurate, so we need like a 99.99% level of accuracy if
+possible?"*
+
+The arithmetic in `WrPhaseBoard` is an exact identity of Source's `ClipVelocity` and was never the
+limit. **The numbers were limited entirely by their inputs**, in four separate ways, and adding
+decimals to them would have been inventing precision.
+
+### The velocity was fetched from an instant nobody had measured
+
+`vIn` was the raw window velocity from a fixed 0.10 s before the phase detector fired — and the
+detector's own lag is *not* fixed, because it is a threshold crossing on a smoothed signal. Three
+faults, all pointing the same way:
+
+- **No gravity correction.** Over the reach, free fall adds up to 80 u/s of downward speed that was
+  never charged to anything.
+- **A frame-rate dependent age.** The lookback walked until its accumulator passed the mark and then
+  returned the sample it was standing on, whose real age is in `[back − dt, back)`. The same landing
+  read differently at 60 fps and at 300.
+- **A guessed instant at all**, when the map holds the answer.
+
+It is now **solved**. Before contact the player is in free flight — that is what AIR means — so the
+crossing of a known plane by a known parabola has a closed form. `WrBspLoadNearestEx` hands back all
+four floats of the ramp's plane, the board ring stores positions beside its velocities, and
+`WrBoardSolveEntry` brackets the crossing and bisects it. Twenty halvings resolve it to under a
+microsecond; bisection rather than the quadratic formula because a surf entry is nearly tangent by
+definition and the discriminant is a subtraction of two close numbers exactly where the answer
+matters.
+
+Three details cost real debugging and are worth writing down, because each of them *looked* like it
+worked:
+
+**The plane's side may not be read from where the player is now.** "Now" is *on* the surface, where
+`n·p − d` is zero to within float noise, so the sign came out of rounding. The solve then found its
+crossing on whichever side the noise pointed at. It passed at one frame rate out of three. The side
+is taken from the last sample that is unambiguously clear of the plane instead.
+
+**The bracket has to be a whole velocity-window clear, not merely clear.** The stored velocity is a
+backward difference over 40 ms; a sample taken half a window before the clip has the clip *inside its
+own window*, so position and velocity are both averages across the event and no amount of integrating
+forward recovers what came before it. The clearance required scales with how fast that sample is
+closing on the plane.
+
+**The search span has to be bounded by physics, not by a count.** Growing the bracket by a fixed four
+doublings reaches half a second at 60 fps and fifty milliseconds at 300 — so the same landing solved
+on one machine and quietly fell back to the estimate on another. It is bounded by the sample's own
+age now.
+
+And `mid` — the position paired with the window velocity — is the stored sample *nearest* the
+window's centre, not the centre itself, so it trails by up to half a frame: eight units at 60 fps and
+1000 u/s. Invisible behind the energy readout's output filter, and not invisible when it is the
+position half of the pair a plane crossing is solved from. `WrVelEstimate` now hands back that offset
+for callers that care.
+
+**Measured against a trajectory whose answer is known in closed form:**
+
+| | 60 fps | 144 fps | 300 fps |
+|---|---|---|---|
+| solved | **18.028** | **18.034** | **18.034** |
+| the fixed lookback | 19.958 | 19.632 | 19.438 |
+
+against a true 18.034 u/s. Worst error **0.006 u/s**, against 1.9 — and it no longer moves with the
+frame rate. `tests\test_energy.exe` carries all three, because the test that was there asserted only
+that `loss` was the projection of *whatever* `vIn` it got, which is true by construction and would
+pass with the velocity taken from anywhere at all.
+
+### A tenth of the number was the width of a float
+
+`dot` was a float32 dot product of three terms with operands around 2500, and `lossPct` was
+`1.0f - sinA` with `sinA` above 0.9997. Both are worst exactly where a competitive board lives.
+Sweeping 85° to 89.95° against a double reference computed cancellation-free
+(`1 − sin(90° − φ) ≡ 2 sin²(φ/2)`):
+
+| | worst relative error in `lossPct` |
+|---|---|
+| the old float32 arithmetic | **9.58e-02** |
+| now | **1.83e-05** |
+
+**Nine and a half per cent**, at the angles a good board is actually made at, arriving from nothing
+but the arithmetic. `dot` is computed in double, and `lossPct` uses the identity
+`1 − √(1 − x) ≡ x / (1 + √(1 − x))`, which has no subtraction in it. `WrBoardLossHorizontal` got the
+same treatment via `a − b ≡ (a² − b²)/(a + b)`. The test prints the old figure beside the new one on
+the same inputs, so the claim is a measurement rather than an assertion.
+
+Planes are also **renormalised** now rather than merely sanity-checked: a `|n|² ∈ (0.98, 1.02)` band
+was accepted as-is, and `|n| = 1.005` inflates every dot product taken against it by half a percent.
+
+### The eye height was a guess, and 36 units wrong while crouched
+
+Everything live was derived from the camera solved out of the world-to-clip matrix. Position was that
+camera, velocity was that camera differenced over 40 ms, and the feet were that camera less a
+**setting** — 64, whether or not you were ducking. Source's ducked view offset is 28. So a crouched
+player's feet were taken 36 units too low **against a map search radius of 24**: the query could only
+answer "nothing there". The duck itself lerps into the velocity as if you had moved, and view bob
+rides on top of both.
+
+So `wr_player.cpp` reads the game's own origin and velocity, under exactly the rules `wr_scan.cpp`
+already works to: `ReadProcessMemory` on our own process, never a write, never a call into game code,
+nothing believed until it has predicted something independently known.
+
+**The oracle is strong because this search has a live reference signal**, which the matrix scan did
+not. The camera and the player origin are the same point in x and y — Source's view offset is purely
+vertical — so the question is not *does this look like a position*, which billions of float triples
+do. It is *do these two floats track the two the camera solve produces, this frame and the next and
+the next, while the third stays a plausible constant below it*. A surfer moves thirty units a frame;
+ninety consecutive frames of that is not something unrelated memory does. Finding it **measures the
+eye height as a side effect** — `cam.z − origin.z`, live, crouched or not — which is what kills the
+error at its source rather than filtering it afterwards.
+
+The velocity is then found from a better seed: with an exact origin, differencing it frame to frame
+carries no bob and no duck, and that estimate is the oracle for the game's own velocity vector. Two
+tests, and the second cannot be faked — the triple must predict the origin's motion, and in free
+flight its `z` must fall by exactly `gravity × dt`.
+
+**It is allowed to find nothing**, and that is not a caveat bolted on. The estimator fixes above ship
+regardless and every caller keeps its camera-derived fallback; the Diagnostics tab says which of the
+two is in use, because they do not deserve the same number of decimal places. The pair is used **both
+or neither**: a true origin with a camera-differenced velocity would be two instants 20 ms apart,
+which is the defect `WrEnergySampleAt` exists to have stopped.
+
+With the pair pushed in, the same fixture reads **−18.0340 against a true 18.0340**.
+
+### Only then, more decimals
+
+`board.decimals` (0–3, default 2), with the percentage and the angle always taking one place more —
+they are what the cost is derived *from*, and `d(loss)/dθ` is `s0·cos θ`, nearly four units per
+degree at 85° and 2500 u/s. A whole-degree readout was hiding about 1.9 u/s of cost inside one
+printed value.
+
+And a fourth copy of the board formatter turned up. `BoardCostText`'s header said *"Three readouts
+print a board"* — the pick plate was the fourth, it hard-coded `u/s` so the units combo never reached
+it, and it printed `lossPct` where the others print `WrBoardPerfectPct`, so **the same board read
+0.4% there and 99.6% in the corner**. A list of callers kept by hand is a list that goes stale; what
+stops it recurring is that no site formats a board itself any more.
+
+### Still open
+
+Over two recorded sessions, **1026 of 1052 save-loc seeds were rejected** (and 880 of 914 before
+that), every one reading *"the file said 2187 u/s, the first measurement says 0"*. A rejection resets
+the whole filter chain including the trend the phase readout runs on, and holds for three taus —
+which lands on the first third of a second of every save-loc practice attempt, which is exactly when
+a player is watching for a board. The tolerance has **not** been touched: the log now records the
+file's vector, the measured vector, the elapsed time and the frame count, because the old line could
+not distinguish a game that does not restore the velocity from a measurement taken while the player
+was still held at the load position. Next session's log can answer it; this one could not.
+
+---
+
+## A strafe reading you do not have to look at
+
+Asked for as *"is it possible to make a visualizer for the ideal strafe? Reading the values at a
+glance can be difficult in difficult surf."*
+
+Which is exactly right, and it is not a matter of font size. All three strafe readouts are text, and
+text has to be found, focused on and parsed. On a hard ramp none of those three is available; by the
+time your eye has made the trip the moment it described is gone. A bar is read by shape, which
+peripheral vision does perfectly well and which costs no glance at all.
+
+**Centre is the ideal, not zero.** The fill leans left when you should turn faster and right when you
+should turn slower — the same sense as the `^` and `v` already printed beside the number. A gauge
+running zero-to-ideal was the alternative and is worse here on two counts: half its width goes on
+rates nobody strafes at, and overshoot — the common error on a ramp, not the rare one — has nowhere
+to go, so turning far too fast looks identical to turning perfectly.
+
+**Nothing about it is a new setting.** The scale is `strafeBand` and `strafeTolerance`, the colour is
+`StrafeColour`, and the dead zone is `StrafeArrow`'s quarter-tolerance, lifted into a function of its
+own so the two cannot drift. The bar, the number's colour and the arrow are three renderings of one
+comparison; any independent knob is a way for them to contradict each other on screen.
+
+The look is the comparison lean bar's, deliberately: a dark track, the fill from the centre, the
+centre tick drawn **last** so the fill can never hide where the ideal is, and an arrowhead past the
+end for overflow rather than a bar that silently sits at maximum.
+
+It sits **above** the crosshair, because below is spoken for — `WR_BOARD_FLASH_DROP` puts the board
+grade at 46 — and it fades rather than vanishing when there is nothing to grade, holding its last
+deflection while it does. On a ramp lip the phase readout flickers, and something that disappears
+between one frame and the next reads as a glitch. An empty bar and a bar reading zero error are
+different claims and must not look the same.
+
+It is its own element rather than a new `WR_HUD_` mode, and that is the point: modes are *exclusive*
+with the numbers, and the numbers are what the bar is meant to sit beside. It is also on by default,
+unlike most things here — a bar you are not using costs a glance you do not spend, and it works with
+the HUD block off, which is how most people run.
+
+One thing fixed while in there: the colourblind switch governs this bar and the strafe colours as
+much as it governs the lines, and its only tick-box was nested inside a line-colouring mode most
+people never select. It appears in both places now — one setting shown twice, not two.
+
+---
+
 ## If it breaks
 
-Everything goes to `wrlines_data\wrlines.log`, flushed on every line.
+Everything goes to `wrlines_data\wrlines.log`, flushed on every line, and the previous session is
+kept as `wrlines.prev.log` — because the run you want to read is usually the one before the one you
+had to restart to go looking.
+
+**A crash names itself now.** `SetUnhandledExceptionFilter` writes the exception code, the address,
+the module and offset it landed in, and a walked stack, before handing the exception on so the
+game's own reporter still gets its minidump. `_set_invalid_parameter_handler` covers the other way
+this process has died: the secure CRT terminates on a bad `strcpy_s` with no exception raised at all,
+so no filter runs and nothing is written anywhere.
+
+Both were added after two crashes that left no line behind. See below — the very next crash wrote its
+own report and was fixed the same afternoon.
+
+**Turning a backtrace into names.** The filter can only print `wrlines.dll+0x19FBD`, because it runs
+inside a process that is already broken and must not go looking for symbols. `wrlines.map`, which
+`build.bat` writes beside the DLL, is the other half:
+
+```
+.\tests\symbolise.ps1                     # reads wrlines_data\wrlines.log
+.\tests\symbolise.ps1 -Rva 19FBD,17BDE    # or resolve offsets directly
+```
+
+```
++0x19FBD    ?ImHashStr@@YAIPEBD_KI@Z +0x5D
++0x17BDE    ?GetID@ImGuiWindow@@QEAAIPEBD0@Z +0x5E
++0x66F7E    ?RadioButton@ImGui@@YA_NPEBD_N@Z +0x6E
++0xA3C95    ?WrQuickDraw@@YAXXZ +0x1465
+```
+
+The map must be the one built alongside the DLL that crashed. A rebuild moves the addresses, and
+nothing checks — the names would be confident and wrong. Keep the `.map` if you keep the log.
 
 - **Panel never appears** — check the log for `Present @ ...`. If the first bytes there
   are a jump, something else (Steam overlay, RTSS) hooked DXGI first.
@@ -2851,6 +4028,9 @@ wr_pe               PE section walk -> "is this pointer code in that module"
 wr_probe            the safe-call layer (shadow this, scratch args, SEH, blacklist)
                     -- fallback only, off by default
 wr_scan             read-only memory search for the world->screen matrix
+wr_player           the same, for the player's own origin and velocity -- proved
+                    against the camera for 90 frames before it is believed, and
+                    allowed to find nothing
 wr_engine           the oracles, camera solve, map name from demoheader.tmp
 wr_steam            steam_api64 by name -> persona names and avatar textures
 wr_energy           E = z + v^2/2g, live sampling, ground/jump detection
@@ -2906,6 +4086,20 @@ wr_quick.h          the quick page's chain, as a decision, and which leaderboard
                     a map's name implies -- pure logic, tested
 wr_scale.h          one colour range per leg of a map -- pure logic, tested
 wr_ui               the full panel on INSERT
+tests\phase_sweep   where every number in wr_phase.h and WrEnergyPhase came
+                    from. BUILT, never run by the harness: it needs thousands
+                    of real .wrpath files. --live pushes each run through the
+                    real wr_smooth.h estimator; --maps also loads the map, and
+                    is what measured the geometry veto and rejected it. Also
+                    where the strafe quality curve meets 4.3M real ticks
+tests\bsp_sweep     the same for wr_bsp.h, over a real install. --verify-normals
+                    is the cross-check between the two halves
+tests\symbolise.ps1 wrlines.dll+0x19FBD -> ImHashStr +0x5D, out of the .map
+                    that build.bat writes. The other half of the crash filter,
+                    which can only print an offset
+tests\velprobe      one question, about wr_dp.cpp's own comment: does the
+                    netstream carry the velocity, and could it be read instead
+                    of differenced. Built, never run, needs real .mtv files
 tests\              standalone harnesses -- tests\build.bat builds and runs all
                     of them. Most link the real .cpp files, because the
                     defects they cover were in those files rather than in the

@@ -165,10 +165,71 @@ $natBin  = Join-Path $Work "nat.bin"
 $errPath = Join-Path $Work "stderr.txt"
 $report  = Join-Path $Work "report.txt"
 
+# `-3` picks a version out of the py LAUNCHER and is not an interpreter flag, so
+# passing -Python a real python.exe used to die with "Unknown option: -3" at the
+# first call. The parameter has been documented and unusable since it was added.
+# [string[]] AND NOT `$x = if (...) { @("-3") }`. PowerShell unrolls a
+# single-element array on assignment, so that form leaves a STRING, and splatting
+# a string is not the same operation as splatting a one-element array -- the
+# interpreter ended up launching with no -c at all and sat in the REPL, which
+# presents as the script hanging rather than as an error. The type constraint is
+# what stops the unroll.
+[string[]]$PyPre = @()
+if ($Python -match '(^|[\\/])py(\.exe)?$') { $PyPre = @("-3") }
+
 # The interpreter is part of the result. math.dist is version-sensitive and the
 # port is bit-compatible with exactly one CPython, so a report that does not say
 # which one was on the other side of the comparison is worth less than it looks.
-$pyVersion = (& $Python -3 -c "import sys; print(sys.version.replace(chr(10),' '))")
+$pyVersion = (& $Python @PyPre -c "import sys; print(sys.version.replace(chr(10),' '))")
+
+# WHICH CPython, AND DOES IT HAVE THE CODEC. BOTH BEFORE THE EIGHTEEN MINUTES.
+#
+# This block exists because the gate spent 1,082 seconds and then reported 317
+# MISMATCH, none of which were byte differences: the oracle had no `zstandard`,
+# so it produced NO BYTES for every zstd-bodied demo while the port -- which
+# links zstd -- read them all. Nothing was compared, and a difference in stdout
+# wording was filed as a difference in output.
+#
+# A missing codec is a HARD STOP. A gate that cannot read 5% of the corpus must
+# say so in the first second rather than in the eighteenth minute, and it must
+# never say it in the vocabulary of a failure.
+$pyHasZstd = $true
+try {
+    & $Python @PyPre -c "import zstandard" 2>$null
+    if ($LASTEXITCODE -ne 0) { $pyHasZstd = $false }
+} catch { $pyHasZstd = $false }
+
+if (-not $pyHasZstd) {
+    Write-Host "[!] this interpreter cannot decompress zstd demo bodies:"
+    Write-Host "      $Python  ($pyVersion)"
+    Write-Host ""
+    Write-Host "    The reference would produce no output for every zstd demo"
+    Write-Host "    while the port reads them, and each one would be counted as"
+    Write-Host "    a MISMATCH it never actually compared. Install it:"
+    Write-Host ""
+    Write-Host "      $Python $($PyPre -join ' ') -m pip install zstandard"
+    exit 2
+}
+
+# The version, on the other hand, is a WARNING and not a stop.
+#
+# The pin is wr_dp.h:120 -- the port transcribes CPython's vector_norm and its
+# Neumaier-compensated sum(), and the second of those only exists since 3.12, so
+# this code "would have been correct against 3.11". Running the oracle on
+# anything else is a legitimate thing to want to do deliberately and a disaster
+# to do by accident, which is what a loud line and a note in the report are for.
+$PY_PIN = "3.13.9"      # keep in step with wr_dp.h:120
+$pyOffPin = ($pyVersion -notmatch [regex]::Escape($PY_PIN))
+if ($pyOffPin) {
+    Write-Host ""
+    Write-Host "[!] WARNING: this is not the pinned interpreter."
+    Write-Host "      running $pyVersion"
+    Write-Host "      pinned  CPython $PY_PIN  (wr_dp.h:120)"
+    Write-Host "    Byte parity is version-sensitive -- sum() gained compensated"
+    Write-Host "    summation in 3.12 and the port implements it. Mismatches from"
+    Write-Host "    here may be the interpreter rather than the port."
+    Write-Host ""
+}
 
 # ---------------------------------------------------------------------------
 # -Verb board
@@ -270,7 +331,7 @@ if ($Verb -eq "board") {
         Write-Host "  recording from the live API -- this is the only pass that"
         Write-Host "  touches the network, and it paces itself"
         for ($i = 0; $i -lt $steps.Count; $i++) {
-            $out = & $Python -3 $ref @common "--board" "--out" $refOut `
+            $out = & $Python @PyPre $ref @common "--board" "--out" $refOut `
                              "--api-record" (Step-Tape $i) @($steps[$i].args) 2>&1
             $recorded += ,@(($out | Out-String).TrimEnd() -split "`r?`n")
             Write-Host ("    {0,-24} {1}" -f $steps[$i].name, "recorded")
@@ -291,7 +352,7 @@ if ($Verb -eq "board") {
     $refLines = @()
     $refFiles = @()
     for ($i = 0; $i -lt $steps.Count; $i++) {
-        $out = & $Python -3 $ref @common "--board" "--out" $refOut `
+        $out = & $Python @PyPre $ref @common "--board" "--out" $refOut `
                          "--api-replay" (Step-Tape $i) @($steps[$i].args) 2>&1
         $refLines += ,@(($out | Out-String).TrimEnd() -split "`r?`n")
         $refFiles += (Board-Hash $refDir)
@@ -528,12 +589,12 @@ if ($Verb -eq "fetch") {
         if (Test-Path $tape) { Remove-Item -Recurse -Force $tape }
         Write-Host "  recording from the live API -- the only pass that touches"
         Write-Host "  the network, and it pays for the demo bodies as well"
-        & $Python -3 $ref @common "--out" $refOut "--api-record" $setupTape `
+        & $Python @PyPre $ref @common "--out" $refOut "--api-record" $setupTape `
                   @setupArgs | Out-Null
         Write-Host ("    {0,-26} {1}" -f "a board to pick from", "recorded")
         for ($i = 0; $i -lt $steps.Count; $i++) {
             $before = Snapshot $dest
-            $out = & $Python -3 $ref @common "--out" $refOut `
+            $out = & $Python @PyPre $ref @common "--out" $refOut `
                              "--api-record" (Step-Tape $i) @($steps[$i].args) 2>&1
             $recorded += ,@(($out | Out-String).TrimEnd() -split "`r?`n")
 
@@ -572,7 +633,7 @@ if ($Verb -eq "fetch") {
 
     # The board the --ranks step reads, rebuilt from the recording so it holds
     # the same thirty rows however long ago the recording was made.
-    & $Python -3 $ref @common "--out" $refOut "--api-replay" $setupTape `
+    & $Python @PyPre $ref @common "--out" $refOut "--api-replay" $setupTape `
               @setupArgs | Out-Null
 
     # The map id, so the game's replay folder can be found. Taken from what the
@@ -622,7 +683,7 @@ if ($Verb -eq "fetch") {
         $s = $steps[$i]
         $wantGame = [bool]$s.game
 
-        $r = Run-Side $Python (@("-3", $ref) + $common + @("--out", $refOut,
+        $r = Run-Side $Python ($PyPre + @($ref) + $common + @("--out", $refOut,
                       "--api-replay", (Step-Tape $i)) + $s.args) $refKeep $wantGame
         if (-not $mapIdResolved) {
             foreach ($l in $r.lines) {
@@ -863,7 +924,7 @@ if ($Verb -eq "extract") {
     Write-Host "  reference running..."
     $swR = [System.Diagnostics.Stopwatch]::StartNew()
     $refLog = Join-Path $Work "extract-ref.txt"
-    & $Python -3 $stagePy @common --out $refOut *> $refLog
+    & $Python @PyPre $stagePy @common --out $refOut *> $refLog
     $refCode = $LASTEXITCODE
     $swR.Stop()
     Write-Host ("  reference   exit {0}, {1:n0}s" -f $refCode, $swR.Elapsed.TotalSeconds)
@@ -1149,7 +1210,7 @@ if ($Limit -gt 0 -and $demos.Count -gt $Limit) { $demos = $demos[0..($Limit - 1)
 Write-Host "  demos       $($demos.Count)"
 Write-Host ""
 
-$same = 0; $skipped = 0; $noOracle = 0; $mismatch = 0
+$same = 0; $skipped = 0; $noOracle = 0; $mismatch = 0; $uncompared = 0
 $lines = New-Object System.Collections.Generic.List[string]
 $lines.Add("wrlines parity --dump-body")
 $lines.Add("python: $pyVersion")
@@ -1163,13 +1224,13 @@ foreach ($d in $demos) {
     if ($i % 100 -eq 0) {
         $rate = $i / [Math]::Max($sw.Elapsed.TotalSeconds, 0.001)
         $left = [int](($demos.Count - $i) / [Math]::Max($rate, 0.001))
-        Write-Host ("  [{0}/{1}]  {2} same, {3} skipped, {4} no oracle, {5} MISMATCH  (~{6}s left)" -f `
-            $i, $demos.Count, $same, $skipped, $noOracle, $mismatch, $left)
+        Write-Host ("  [{0}/{1}]  {2} same, {3} skipped, {4} no oracle, {5} uncompared, {6} MISMATCH  (~{7}s left)" -f `
+            $i, $demos.Count, $same, $skipped, $noOracle, $uncompared, $mismatch, $left)
     }
 
     Remove-Item -Force -ErrorAction SilentlyContinue $outPath, $refBin, $natBin
 
-    $refOut = & $Python -3 $ref --game $Game --file $d.FullName --dump-body $outPath 2>$errPath
+    $refOut = & $Python @PyPre $ref --game $Game --file $d.FullName --dump-body $outPath 2>$errPath
     $refExit = $LASTEXITCODE
     $refOut = ($refOut | Out-String).Trim()
     if (Test-Path $outPath) { Move-Item -Force $outPath $refBin }
@@ -1188,6 +1249,26 @@ foreach ($d in $demos) {
         } else {
             $noOracle++
         }
+        continue
+    }
+
+    # THE ORACLE HAS NO CODEC FOR THIS ONE AND THE PORT DOES. That is not a
+    # mismatch -- nothing was compared, because the reference produced no bytes.
+    #
+    # This case did not exist when the `skipped` bucket below was written: it
+    # assumed that if the reference could not read a zstd body then neither
+    # could the port, so both would refuse in the same words and fall through
+    # together. The port links zstd now, so the two sides are asymmetric and
+    # every zstd demo was landing in LINE -- 317 of them in one run, reported in
+    # the vocabulary of a byte difference.
+    #
+    # The pre-flight at the top of this script is what stops that happening at
+    # all. This is the second line of defence, and the reason it must be its own
+    # bucket rather than a quiet pass: a REAL regression in these files would
+    # otherwise be indistinguishable from a missing pip package.
+    if ($refOut -match 'no zstandard installed' -and $natExit -eq 0) {
+        $uncompared++
+        $lines.Add("UNCOMPARED`t$($d.FullName)`tref: $refOut`tport: $natOut")
         continue
     }
 
@@ -1221,6 +1302,7 @@ $lines.Add("")
 $lines.Add("identical:  $same")
 $lines.Add("skipped:    $skipped")
 $lines.Add("no oracle:  $noOracle")
+$lines.Add("UNCOMPARED: $uncompared")
 $lines.Add("MISMATCH:   $mismatch")
 Set-Content -Path $report -Value $lines -Encoding UTF8
 
@@ -1228,6 +1310,7 @@ Write-Host ""
 Write-Host ("  identical   {0}" -f $same)
 Write-Host ("  skipped     {0}   (both refused, same words)" -f $skipped)
 Write-Host ("  no oracle   {0}   (reference threw; the port refused too)" -f $noOracle)
+Write-Host ("  UNCOMPARED  {0}   (oracle has no codec; NOTHING was checked)" -f $uncompared)
 Write-Host ("  MISMATCH    {0}" -f $mismatch)
 Write-Host ("  took        {0:n0}s" -f $sw.Elapsed.TotalSeconds)
 Write-Host "  report      $report"
@@ -1235,5 +1318,15 @@ Write-Host ""
 
 Remove-Item -Force -ErrorAction SilentlyContinue $outPath, $refBin, $natBin, $errPath
 if ($mismatch -gt 0) { Write-Host "=== PARITY FAILED ==="; exit 1 }
+
+# UNCOMPARED is not a pass. It is a hole in the corpus, and a run that ended
+# with one has not made the claim this script exists to make -- so it exits
+# non-zero, in its own words rather than in the words of a byte difference. The
+# pre-flight should mean this is never reached.
+if ($uncompared -gt 0) {
+    Write-Host "=== PARITY INCOMPLETE: $uncompared demos were never compared ==="
+    Write-Host "    The reference could not decompress them. See the report."
+    exit 1
+}
 Write-Host "=== parity holds ==="
 exit 0

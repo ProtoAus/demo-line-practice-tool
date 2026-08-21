@@ -3,10 +3,17 @@
 *.dll
 *.exe
 *.pdb
+*.map
 *.exp
 *.lib
 *.ilk
 *.idb
+
+# A packaged build. The release archive is assembled by .github\workflows\release.yml
+# on the runner and published as a release asset -- it is never committed, and a
+# hand-made wrlines.zip left in the root is the one piece of build output that
+# `git add .` would otherwise sweep into a commit.
+*.zip
 
 # Runtime data.
 #
@@ -54,6 +61,20 @@ __pycache__/
 # stray copy still turns up in the working tree, and it is per-machine state
 # rather than anything to ship.
 imgui.ini
+
+# Reference material dropped in to be read, and NOT to be republished.
+#
+# surf-physics.md is somebody else's write-up of Valve's gamemovement.cpp. It
+# carries no licence, and it quotes the Source SDK at length -- so committing it
+# to a public MIT repository would be redistributing two things that are not
+# ours to redistribute. The same rule the other reference drops already follow by
+# living outside the repo entirely (see wrlines-reference\).
+#
+# What it taught is in docs\how-it-works.md and in the comments on wr_stress.h
+# and wr_phase.h, as FACTS and formulas reimplemented from the description --
+# the same standard applied to strafe-analyzer and sm-boardstats. The document
+# itself stays local.
+surf-physics.md
 
 # Editors / IDE
 .vs/

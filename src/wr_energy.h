@@ -140,10 +140,94 @@ struct WrEnergySettings
     bool showPhase;
 
     // A row comparing how fast you are turning against how fast Source's own
-    // AirAccelerate says you should be. Airborne only -- on a ramp the surface
-    // turns your velocity far faster than air acceleration could, which is the
-    // finding behind wr_stress.h refusing turn rate as an efficiency metric.
+    // AirAccelerate says you should be. In the air and, since the map reader can
+    // supply a surface normal, on ramps -- where the ideal is a different number
+    // and not a nearby one. See WrPerfectStrafeDegreesOnPlane.
     bool showStrafe;
+
+    // HOW THAT COMPARISON IS COLOURED.
+    //
+    // The physics grade is exact and it is unforgiving on purpose: quality is
+    // zero at twice the ideal rate, and the ideal FALLS as you speed up -- about
+    // 115 deg/s at 1000 u/s and 44 at 2600 -- so an ordinary flick at speed is
+    // genuinely off the scale and genuinely costing you. Correct, and not much
+    // use to look at when it is red for minutes at a time.
+    //
+    // So the colour can come instead from a window you set. It says nothing new
+    // about the physics; it decides how much slack the colour gives before it
+    // starts complaining, which is a preference and belongs to whoever is
+    // looking at it.
+    int strafeColour;       // WR_STRAFE_COLOUR_*
+    int strafeBand;         // WR_STRAFE_BAND_*, what `strafeTolerance` measures
+    float strafeTolerance;  // deg/s, or % of ideal, per strafeBand
+
+    // The physics grade as a number, beside whatever the colour is doing. With
+    // the 30-unit cap binding -- every surf configuration -- this is exactly the
+    // fraction of the best possible speed-squared gain, so "82%" is a real
+    // quantity and not a rating.
+    bool showStrafePercent;
+
+    // `^` turn faster, `v` turn slower, nothing when close enough. The trend
+    // arrow on the big line uses the same two glyphs for a different thing, so
+    // this one is drawn tight against the strafe number rather than at the end.
+    bool showStrafeArrow;
+
+    // THE SAME READING AS A SHAPE, because a number is the wrong instrument.
+    //
+    // Asked for as "reading the values at a glance can be difficult in difficult
+    // surf" -- which is exactly right, and it is not a matter of font size. On a
+    // hard ramp your eyes are on the ramp; a three-digit figure 192 pixels to
+    // one side has to be found, focused on and read before it means anything,
+    // and by then the moment it described is gone. A bar has none of those
+    // steps: how far it leans and which way is legible in peripheral vision.
+    //
+    // Centre is the IDEAL rather than zero, because the actionable question on a
+    // ramp is never "how fast am I turning" -- it is "faster or slower than I
+    // should be". That also puts the full width on the error instead of half.
+    //
+    // It takes its scale from strafeBand and strafeTolerance, deliberately: the
+    // bar, the colour and the arrow are three renderings of one comparison, and
+    // a second tolerance setting is a way for them to disagree.
+    bool showStrafeBar;
+    float strafeBarWidth;   // pixels before hudScale; 0 tracks the HUD block
+    float strafeBarHeight;
+    float strafeBarRise;    // above the crosshair -- the flash owns 46 below it
+
+    // GRADE YOUR OWN BOARDS, the same way a demo's are graded.
+    //
+    // Two readouts from one switch, because they answer the same question at
+    // different moments: a flash under the crosshair at the instant you land,
+    // which is the feedback, and a row on the corner block holding the last one,
+    // which is what you read afterwards.
+    //
+    // Off by default and it will stay dark on maps whose geometry this reader
+    // does not hold completely -- a live board needs the map's own plane normal,
+    // and there is no honest way to grade one without it. See WrEnergyBoard.
+    bool showBoard;
+    float boardFlashSeconds;    // how long the crosshair flash lasts
+
+    // WHAT A BOARD IS QUOTED IN.
+    //
+    // A clip is exactly dv = -(v.n)n, so once the normal is kept alongside the
+    // board every one of these is the same measurement written out differently
+    // -- not four estimates. See WrBoardLoss.
+    int boardUnit;              // WR_BOARD_UNIT_*
+    bool boardPercent;          // append how close to a perfect board it was
+
+    // HOW MANY DECIMALS, because whole units were throwing away real digits.
+    //
+    // A board at 2500 u/s costs 10 to 15 units, so rounding the cost to whole
+    // numbers is 3-5% of quantisation on the figure itself, and the approach
+    // angle is worse: the loss moves 3.8 u/s per degree at 85 degrees, so a
+    // whole-degree readout hides a couple of units of cost inside one printed
+    // value. The percentage and the angle always take one place more than this,
+    // because they are the quantities the cost is derived FROM.
+    //
+    // It is a setting and not a constant because how many of those digits are
+    // meaningful depends on where the velocity came from -- see
+    // WrEnergyBoardExact. Two is right when the entry was solved against the
+    // map; a camera estimate does not earn the second one.
+    int boardDecimals;          // 0..3, applied to the cost
 
     bool showOverlay;       // the corner block; ON by default
     int overlayCorner;      // 0 TL, 1 TR, 2 BL, 3 BR
@@ -265,7 +349,34 @@ enum WrHudMode
     WR_HUD_BUDGET,      // spent / banked / wasted
     WR_HUD_GAINED,      // gross gained and gross lost since the anchor
     WR_HUD_STRAFE,      // how close to the physical best your strafing is
+    WR_HUD_TURN,        // how fast you are turning, against how fast you should
+    WR_HUD_NET_STRAFE,  // the first one, with the one above on the second line
     WR_HUD_MODE_COUNT
+};
+
+enum WrStrafeColour
+{
+    WR_STRAFE_COLOUR_BAND = 0,  // a window you set, in whatever strafeBand says
+    WR_STRAFE_COLOUR_PHYSICS,   // WrStrafeQuality, which is what shipped before
+    WR_STRAFE_COLOUR_COUNT
+};
+
+enum WrStrafeBand
+{
+    WR_STRAFE_BAND_DEGREES = 0, // |turn - ideal|, in degrees per second
+    WR_STRAFE_BAND_PERCENT,     // |1 - turn/ideal|, as a percentage
+    WR_STRAFE_BAND_COUNT
+};
+
+// What a board's cost is written as. Every one of these comes out of the same
+// dv = -(v.n)n; none of them is an approximation of another.
+enum WrBoardUnit
+{
+    WR_BOARD_UNIT_SPEED = 0,    // 3D speed, which is what surf HUDs quote
+    WR_BOARD_UNIT_HORIZONTAL,   // xy speed alone
+    WR_BOARD_UNIT_ENERGY,       // as a height, comparable with the rest of the HUD
+    WR_BOARD_UNIT_AXES,         // the x, y and z of it separately
+    WR_BOARD_UNIT_COUNT
 };
 
 // Where the energy went, as three numbers that add up.
@@ -507,6 +618,10 @@ float WrEnergyPeak(void);           // peak relative energy
 //
 // Erring towards inventing a surface rather than missing one is deliberate and
 // is what the tolerance is chosen for.
+//
+// AND THE MAP NOW TAKES THE INVENTED ONES BACK: 98.3% on a map this reader holds
+// all of, with the false surfaces down from 7.6% to 0.4%. See
+// WrEnergySetGeometryTouch and the table on WrEnergyPhase.
 // How fast your view is turning in YAW alone, degrees a second.
 //
 // Separate from the view turn rate beside it, which is the full angle between
@@ -517,7 +632,167 @@ float WrEnergyPeak(void);           // peak relative energy
 // matrix oracle validated, not from anything differenced.
 float WrEnergyYawRate(void);
 
+// The same rate with its sign: positive turning one way, negative the other.
+//
+// Only the ramp ideal needs this, and it needs it badly -- dot(wishdir, normal)
+// changes sign with the strafe direction, and the ideal turn rate on a 53-degree
+// ramp is 55% of the flat one strafing one way and 17% strafing the other.
+float WrEnergyYawRateSigned(void);
+
+// The ramp under you, oriented out of the surface towards you, or false if the
+// map has not answered or the reading has no sign worth trusting. See the
+// definition -- the orientation comes from the physics, not from the file.
+bool WrEnergySurfaceNormal(float out[3]);
+
 int WrEnergyPhase(void);
+
+// What the map said about the player's surroundings, pushed in once a frame
+// before anything reads WrEnergyPhase.
+//
+// WHY IT IS PUSHED IN AND NOT LOOKED UP. This file cannot ask wr_bspload
+// anything, for the same reason WrEnergyEta takes its tick interval as an
+// argument: six of the nine harnesses do not link the geometry layer, and one
+// of them is the harness that measures this. Pushing the answer in keeps
+// wr_energy.cpp linkable with nothing attached, and leaves every harness with
+// the kinematics-only behaviour unless a test deliberately says otherwise.
+enum WrGeomTouch
+{
+    WR_GEOM_UNKNOWN = 0,    // no map, or one whose absences prove nothing
+    WR_GEOM_NOTHING,        // asked, and there is no surface within reach
+    WR_GEOM_TOUCHING,       // asked, and there is
+};
+// `normal`, when given, is the unit plane normal of the surface that was found.
+// It is ignored unless `state` is WR_GEOM_TOUCHING, and it is what makes a live
+// THE GAME'S OWN POSITION AND VELOCITY, when they have been found and proved.
+//
+// Pushed in rather than pulled out, for the same reason the geometry answer is:
+// most of the test harnesses that link this file do not link a memory scanner,
+// and they must go on getting exactly the camera-derived behaviour that every
+// measurement in this header was taken against.
+//
+// Both or neither. A true origin paired with a camera-differenced velocity
+// would be two instants about 20 ms apart, which is precisely the defect
+// WrEnergySampleAt exists to have stopped -- so when only one of them is known,
+// this is called with neither and the estimate is used for both.
+//
+// `eyeHeight` is cam.z - origin.z, measured rather than assumed, or negative
+// when unknown. It is what makes a crouched player's feet land in the right
+// place: the SETTING is 64 whether or not you are ducking, and Source ducks to
+// 28, which is more than the whole 24-unit search radius of the map query.
+void WrEnergySetTruePlayer(const Vec3 *origin, const Vec3 *velocity,
+                           float eyeHeight);
+
+// Is the live board being graded off the game's own velocity, or off the
+// camera estimate? The two do not deserve the same number of decimal places.
+bool WrEnergyTrueVelocityLive(void);
+
+// board gradeable -- see WrEnergyBoard.
+//
+// `rampPlane`, when given, is four floats -- the nearest RIDEABLE surface's
+// normal and its own plane distance, from WrBspLoadNearestEx. It is a separate
+// argument rather than a better `normal` because the two answer different
+// questions and the touch verdict may only be measured against the first one.
+void WrEnergySetGeometryTouch(int state, const float *normal = 0,
+                              const float *rampPlane = 0, float rampDist = -1.0f,
+                              float nearDist = -1.0f);
+
+// The last two answers, unprocessed, so a REFUSAL CAN NAME ITS CAUSE.
+//
+// WrEnergySurfaceNormal folds four different failures into one false: the map
+// was never asked, it found nothing, it found something that is not a ramp, and
+// the lift has no sign yet. The strafe row printed "no surface" for all of them,
+// which on surf_kvas meant a player was told there was no surface while standing
+// on one -- the map had simply never been asked, because four displacements out
+// of 756 were not built. These two let the caller tell those apart and say which.
+int  WrEnergyGeomTouch(void);
+bool WrEnergyGeomNormalRaw(float out[3]);
+
+// YOUR OWN LAST BOARD, GRADED THE SAME WAY A DEMO'S IS.
+//
+// Demo boards are found by looking for the air-to-contact transition in a whole
+// recorded path and recovering the surface normal from the velocity change
+// across it (see wr_path.cpp pass three). Live, neither half of that is
+// available in the same form: there is no future to look at, and a normal
+// recovered from a camera-differenced velocity at one instant is far worse than
+// the same recovery on demo data.
+//
+// So the live board is not a port of the demo one. It is the same GRADE applied
+// to better inputs:
+//
+//     the transition   the live phase readout, which the .bsp veto took to
+//                      98.3% -- accurate enough to trust an edge of
+//     the normal       read straight out of the map, not recovered from
+//                      anything. Exact, where the demo path's is p50 1.19 deg
+//     the velocity     the raw window velocity from BOARD_LOOKBACK seconds
+//                      before the transition, because the live phase test reads
+//                      a 0.10 s window and the velocity at the instant it fires
+//                      is already partly post-clip
+//
+// This is only offered where all three hold, which means brush-complete maps
+// only -- the same gate as the veto. WrPhaseBoard does the grading, so a live
+// board and a demo board cannot be graded by different rules.
+//
+// False when there has been no board, or the last one is older than the caller
+// cares about. `ageOut` is seconds since it happened.
+//
+// `maxAge` in seconds; anything <= 0 means "however old it is". This parameter
+// is what the paragraph above always claimed and the code never did: the
+// implementation only tested "has there ever been one", so the corner row went
+// on showing a board from two ramps back for the rest of the level, and a stale
+// number is indistinguishable from a fresh one at a glance.
+bool WrEnergyBoard(WrBoardStats *out, float *ageOut, float maxAge = 0.0f);
+
+// WHY THE LAST LANDING DID NOT PRODUCE ONE.
+//
+// A board passes thirteen tests and every one of them used to fail into the
+// same silence. These name the one that fired, so a refusal can be read instead
+// of guessed at, and count them, so "sometimes" becomes a number.
+//
+// The order is the order the tests run in, which is also roughly the order of
+// how much they mean: the first three are about the map, the middle four about
+// the moment, and the last three about the board itself being too small to say
+// anything about.
+enum
+{
+    WR_BOARD_WHY_NONE = 0,      // nothing has been refused; no landing yet
+    WR_BOARD_WHY_MAP_OFF,       // the map layer has not answered at all
+    WR_BOARD_WHY_NO_SURFACE,    // nothing within WR_BSP_TOUCH_RADIUS of the feet
+    WR_BOARD_WHY_BAD_PLANE,     // what it found was not a unit normal
+    WR_BOARD_WHY_UNKNOWN_PHASE, // not enough history to say air or contact
+    WR_BOARD_WHY_NO_AIR,        // contact, but no sustained air before it
+    WR_BOARD_WHY_NO_HISTORY,    // the ring could not reach back far enough
+    WR_BOARD_WHY_NOT_RAMP,      // the surface is a wall or a floor, not a ramp
+    WR_BOARD_WHY_DEGENERATE,    // WrPhaseBoard refused the arithmetic
+    WR_BOARD_WHY_TOO_SLOW,      // under WR_BOARD_MIN_SPEED
+    WR_BOARD_WHY_TOO_GLANCING,  // under WR_BOARD_MIN_INTO_PLANE
+    WR_BOARD_WHY__COUNT
+};
+
+// A short phrase for each, for a HUD row. Never null.
+const char *WrEnergyBoardWhyName(int why);
+
+// The last refusal, and -- for WR_BOARD_WHY_NOT_RAMP, the one a player can act
+// on -- the |n.z| that was actually seen.
+int   WrEnergyBoardWhy(void);
+float WrEnergyBoardWhyNz(void);
+
+// How many times each cause has fired since the map loaded, so a report can say
+// "eleven of them were the wall" instead of "sometimes".
+int   WrEnergyBoardWhyCount(int why);
+
+// Was the last board's arriving velocity SOLVED against the map's own plane, or
+// estimated by reaching back a fixed distance? The two do not deserve the same
+// number of decimal places and the panel says which it is showing.
+bool WrEnergyBoardExact(void);
+
+// Once a frame, AFTER WrEnergySetGeometryTouch -- it reads the phase, and the
+// phase is not settled for the frame until the geometry answer is in.
+void WrEnergyTickBoards(float dt);
+
+// Live boards need the transition AND a normal, so they exist only on maps the
+// geometry layer holds completely. Anything drawing a live board readout should
+// say so rather than showing an empty box on maps that cannot have one.
+bool WrEnergyBoardAvailable(void);
 
 bool WrEnergyOnGround(void);
 bool WrEnergyHaveRef(void);

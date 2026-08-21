@@ -232,6 +232,161 @@ long long WrNowEpoch(void)
 }
 
 // ---------------------------------------------------------------------------
+// Saying what happened, when what happened is that it stopped
+// ---------------------------------------------------------------------------
+//
+// This process has died twice without leaving a line behind, and there are two
+// separate ways for that to happen. Both are covered here.
+//
+// A read of address zero inside our own code took a minidump and a hex editor
+// to place. The exception went straight past us to the game's own reporter,
+// which wrote a .dmp naming a module and an offset and nothing else; turning
+// `wrlines.dll+0x19FBD` into a function meant parsing the PE exception table by
+// hand. WrCrashFilter writes that line itself, with a walked stack, and then
+// hands the exception on so the game's reporter still gets its dump.
+//
+// The other way is quieter and worse. The secure CRT calls the invalid-
+// parameter handler for things like a strcpy_s whose source does not fit, and
+// the DEFAULT HANDLER TERMINATES THE PROCESS -- no exception raised, so no
+// filter runs, no unwind happens, and nothing is written anywhere. See the note
+// above the truncation in EmitEnergyHud, which is where this was first noticed.
+// A process that vanishes with a full log ending mid-frame looks exactly like a
+// GPU hang, and is not one.
+//
+// Both handlers are process-wide, because that is the only kind there is. We
+// are a guest here: neither swallows anything, and the crash filter chains to
+// whatever was installed before us.
+
+static LPTOP_LEVEL_EXCEPTION_FILTER g_prevFilter = NULL;
+
+// "wrlines.dll+0x19FBD" for a code address.
+//
+// GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS rather than psapi's EnumProcessModules:
+// no extra import, and it does not walk the module list, which matters when the
+// thing that just faulted may have been holding the loader lock.
+static void WrDescribeAddress(const void *addr, char *out, int cap)
+{
+    HMODULE mod = NULL;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)addr, &mod) &&
+        mod)
+    {
+        char path[MAX_PATH];
+        if (GetModuleFileNameA(mod, path, MAX_PATH))
+        {
+            const char *base = strrchr(path, '\\');
+            base = base ? base + 1 : path;
+            _snprintf_s(out, cap, _TRUNCATE, "%s+0x%llX", base,
+                        (unsigned long long)((const char *)addr -
+                                             (const char *)mod));
+            return;
+        }
+    }
+    _snprintf_s(out, cap, _TRUNCATE, "0x%016llX (no module)",
+                (unsigned long long)(uintptr_t)addr);
+}
+
+// x64 keeps no frame pointer to follow, so this walks the unwind data the ABI
+// requires every non-leaf function to publish -- the same tables the PE's
+// .pdata section holds. RtlLookupFunctionEntry returns null for a leaf, which
+// is normal at the very top of a stack and is handled the way the ABI says: the
+// return address is sitting at RSP.
+static void WrLogBacktrace(const CONTEXT *from)
+{
+    CONTEXT c = *from;
+    for (int frame = 0; frame < 24; frame++)
+    {
+        char where[192];
+        WrDescribeAddress((const void *)c.Rip, where, (int)sizeof(where));
+        WrLogf("crash:   [%2d] %s", frame, where);
+
+        DWORD64 imageBase = 0;
+        PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(c.Rip, &imageBase, NULL);
+        if (fn)
+        {
+            PVOID handlerData = NULL;
+            DWORD64 establisher = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, c.Rip, fn, &c,
+                             &handlerData, &establisher, NULL);
+        }
+        else
+        {
+            if (!c.Rsp)
+                break;
+            c.Rip = *(DWORD64 *)c.Rsp;
+            c.Rsp += 8;
+        }
+        if (!c.Rip)
+            break;
+    }
+}
+
+static LONG CALLBACK WrCrashFilter(EXCEPTION_POINTERS *ep)
+{
+    // Once only. If describing the crash crashes, the second pass must not come
+    // back through here and loop.
+    static LONG entered = 0;
+    if (InterlockedExchange(&entered, 1) != 0)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    __try
+    {
+        const EXCEPTION_RECORD *er = ep->ExceptionRecord;
+        char where[192];
+        WrDescribeAddress(er->ExceptionAddress, where, (int)sizeof(where));
+
+        if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+            er->NumberParameters >= 2)
+        {
+            const ULONG_PTR op = er->ExceptionInformation[0];
+            const char *what = (op == 0) ? "reading"
+                             : (op == 1) ? "writing"
+                                         : "executing";
+            WrLogf("[!] crash: 0x%08lX %s 0x%llX at %s",
+                   (unsigned long)er->ExceptionCode, what,
+                   (unsigned long long)er->ExceptionInformation[1], where);
+        }
+        else
+        {
+            WrLogf("[!] crash: 0x%08lX at %s",
+                   (unsigned long)er->ExceptionCode, where);
+        }
+        WrLogBacktrace(ep->ContextRecord);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        // Nothing useful left to say, and saying it would fault again.
+    }
+
+    return g_prevFilter ? g_prevFilter(ep) : EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void __cdecl WrInvalidParameter(const wchar_t *expr, const wchar_t *func,
+                                       const wchar_t *file, unsigned int line,
+                                       uintptr_t)
+{
+    // The release CRT passes null for all four of these unless _DEBUG is on, so
+    // usually the only thing recovered is the fact that it happened and where
+    // the stack was. That is still the difference between a bug report and a
+    // shrug.
+    char e[160], f[160], fl[MAX_PATH];
+    strcpy_s(e, sizeof(e), "?");
+    strcpy_s(f, sizeof(f), "?");
+    strcpy_s(fl, sizeof(fl), "?");
+    if (expr) WideCharToMultiByte(CP_UTF8, 0, expr, -1, e, (int)sizeof(e), NULL, NULL);
+    if (func) WideCharToMultiByte(CP_UTF8, 0, func, -1, f, (int)sizeof(f), NULL, NULL);
+    if (file) WideCharToMultiByte(CP_UTF8, 0, file, -1, fl, (int)sizeof(fl), NULL, NULL);
+
+    WrLogf("[!] CRT invalid parameter: %s in %s (%s:%u) -- the CRT is about to "
+           "terminate the process", e, f, fl, line);
+
+    CONTEXT c;
+    RtlCaptureContext(&c);
+    WrLogBacktrace(&c);
+}
+
+// ---------------------------------------------------------------------------
 // Logging
 // ---------------------------------------------------------------------------
 
@@ -243,11 +398,25 @@ void WrLogInit(void)
     g_lockReady = true;
     g_startTick = GetTickCount();
 
+    // Keep exactly one generation. The log opens "w" and is therefore truncated
+    // on every injection -- which is fine until the run you actually want to
+    // read is the one before this one, because the game died and you relaunched
+    // it to find out why. That is not a hypothetical; it cost a crash.
+    // Both copied out rather than held: WrDataPath rotates four static buffers,
+    // so two live pointers happen to be safe today, and depending on that is how
+    // you get a rename of a file onto itself the day it becomes three.
+    char path[MAX_PATH], prev[MAX_PATH];
+    strcpy_s(path, sizeof(path), WrDataPath("wrlines.log"));
+    strcpy_s(prev, sizeof(prev), WrDataPath("wrlines.prev.log"));
+    MoveFileExA(path, prev, MOVEFILE_REPLACE_EXISTING);
+
     // Shared, not exclusive. fopen would lock the file for as long as the game
     // runs, and the log is least useful exactly when you cannot restart to read
     // it. _SH_DENYNO lets you tail it live from outside.
-    const char *path = WrDataPath("wrlines.log");
     g_file = _fsopen(path, "w", _SH_DENYNO);
+
+    g_prevFilter = SetUnhandledExceptionFilter(WrCrashFilter);
+    _set_invalid_parameter_handler(WrInvalidParameter);
 
     SYSTEMTIME st;
     GetLocalTime(&st);

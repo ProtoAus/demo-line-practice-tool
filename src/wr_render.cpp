@@ -64,7 +64,6 @@ WrRenderSettings g_render;
 // WR_LINE_PHASE is categorical rather than a ramp: air, ramp, ground, unknown.
 // Four batch classes, one per value of WR_PHASE_*.
 #define PHASE_CLASSES 4
-#define OFFSCREEN_BREAK 8
 
 static ImVec2 g_batch[MAX_BATCH];
 static int g_batchCount = 0;
@@ -365,11 +364,23 @@ static bool ProjectKnownW(const Vec3 &p, float w, ImVec2 *out)
     float sy = (g_sh * 0.5f) - (0.5f * y * inv * g_sh);
     if (!WrSaneFloat(sx) || !WrSaneFloat(sy))
         return false;
-    // Bound the coordinates so a point just past the near plane cannot hand
-    // ImGui a 1e6-pixel vertex; well off screen, so no visible kink.
-    float lim = 32.0f * (g_sw > g_sh ? g_sw : g_sh);
-    out->x = WrClampF(sx, -lim, lim);
-    out->y = WrClampF(sy, -lim, lim);
+    // EXACT, and deliberately unbounded. This used to clamp each axis to
+    // +-32 screens to keep a huge vertex out of ImGui, and clamping x and y
+    // INDEPENDENTLY moves the point off the line: when one axis saturates and
+    // the other does not, the slope changes, and the far end of the segment
+    // lands somewhere it never was.
+    //
+    // It was not a rare case either. ClipToNear puts a clipped endpoint exactly
+    // on w = NEAR_W = 1.0, and one world unit from the eye a lateral offset of
+    // about ninety units already projects past the old limit -- so nearly every
+    // segment crossing the near plane was bent. The comment that used to be here
+    // said "well off screen, so no visible kink"; the kink was on screen,
+    // because the bent segment still crosses the viewport on its way out.
+    //
+    // Bounding is still needed, but it belongs to the SEGMENT, not the point.
+    // See ClipSegment2D.
+    out->x = sx;
+    out->y = sy;
     return true;
 }
 
@@ -403,6 +414,133 @@ static bool ClipToNear(Vec3 *a, Vec3 *b)
     else
         *b = hit;
     return true;
+}
+
+// Clip a convex polygon against the same w = NEAR_W plane, in world space.
+//
+// ClipW is linear in the point, so "w >= NEAR_W" is an ordinary half-space and
+// this is one Sutherland-Hodgman pass over it: keep vertices in front, and where
+// an edge crosses, insert the crossing. A convex polygon clipped by one plane is
+// still convex and gains at most one vertex, which is why `cap` only has to be
+// one more than the input.
+//
+// THE POLYGON YOU ARE STANDING ON IS ALWAYS THE ONE THAT NEEDED THIS. A surf
+// ramp is frequently a single brush face thousands of units long, so riding it
+// means some of its corners are behind your head -- and the fill used to be
+// refused outright unless EVERY corner projected. The result was that the ramp
+// under you contributed nothing but a faint outline away in the distance, which
+// is exactly what "the first ramp isn't covered, only one face near the end"
+// looks like. Maps built out of small displacement triangles never showed it,
+// because a fifty-unit triangle under your feet has all four corners in front of
+// you; maps built out of big brush faces showed it on every ramp.
+static int ClipPolyToNear(const Vec3 *in, int n, Vec3 *out, int cap)
+{
+    if (n < 3 || cap < n + 1)
+        return 0;
+
+    int m = 0;
+    float wPrev = ClipW(in[n - 1]);
+    for (int i = 0; i < n; i++)
+    {
+        const float wCur = ClipW(in[i]);
+        const bool inPrev = (wPrev >= NEAR_W);
+        const bool inCur = (wCur >= NEAR_W);
+
+        if (inPrev != inCur)
+        {
+            const float denom = wCur - wPrev;
+            if (fabsf(denom) > 1e-6f)
+            {
+                float t = (NEAR_W - wPrev) / denom;
+                t = WrClampF(t, 0.0f, 1.0f);
+                const Vec3 &a = in[(i + n - 1) % n];
+                if (m < cap)
+                    out[m++] = WrAdd(a, WrScale(WrSub(in[i], a), t));
+            }
+        }
+        if (inCur && m < cap)
+            out[m++] = in[i];
+
+        wPrev = wCur;
+    }
+    return (m >= 3) ? m : 0;
+}
+
+// Clip a projected segment to the viewport, in screen space.
+//
+// This is the bound that ProjectKnownW used to apply per point, done in the one
+// place where it is meaningful. A segment has a direction; a point on its own
+// does not, which is why clamping a point could not help but bend the line.
+//
+// Liang-Barsky: solve for the sub-interval of t in [0,1] that lies inside all
+// four half-planes at once, then take the endpoints from it. The result is
+// always ON the original line, so the visible part of the segment is drawn
+// exactly where it belongs however far off screen the other end was.
+//
+// The rectangle is the viewport plus a margin wider than any line this draws is
+// thick, so a segment that only grazes an edge still contributes the pixels it
+// should. `movedA`/`movedB` report whether an endpoint was cut, which is what a
+// polyline needs in order to break rather than draw a chord across the screen.
+#define WR_CLIP_MARGIN 256.0f
+
+static bool ClipSegment2D(ImVec2 *a, ImVec2 *b, bool *movedA, bool *movedB)
+{
+    const float xmin = -WR_CLIP_MARGIN, xmax = g_sw + WR_CLIP_MARGIN;
+    const float ymin = -WR_CLIP_MARGIN, ymax = g_sh + WR_CLIP_MARGIN;
+
+    const float dx = b->x - a->x, dy = b->y - a->y;
+    const float p[4] = { -dx, dx, -dy, dy };
+    const float q[4] = { a->x - xmin, xmax - a->x, a->y - ymin, ymax - a->y };
+
+    float t0 = 0.0f, t1 = 1.0f;
+    for (int i = 0; i < 4; i++)
+    {
+        if (p[i] == 0.0f)
+        {
+            // Parallel to this edge: either wholly inside it or wholly outside,
+            // and there is no t that changes the answer.
+            if (q[i] < 0.0f)
+                return false;
+            continue;
+        }
+        const float r = q[i] / p[i];
+        if (p[i] < 0.0f)
+        {
+            if (r > t1) return false;
+            if (r > t0) t0 = r;
+        }
+        else
+        {
+            if (r < t0) return false;
+            if (r < t1) t1 = r;
+        }
+    }
+
+    if (movedA) *movedA = (t0 > 0.0f);
+    if (movedB) *movedB = (t1 < 1.0f);
+
+    // b first, from a copy of a, because a is about to move under it.
+    const ImVec2 a0 = *a;
+    if (t1 < 1.0f) { b->x = a0.x + t1 * dx; b->y = a0.y + t1 * dy; }
+    if (t0 > 0.0f) { a->x = a0.x + t0 * dx; a->y = a0.y + t0 * dy; }
+    return true;
+}
+
+// The whole pipeline for one world-space segment: clip to the near plane,
+// project both ends, clip the result to the viewport. False means none of it is
+// on screen.
+//
+// Every world-space AddLine in this file goes through here, so the clipping
+// rules live in one place instead of nine copies of the first two thirds of
+// them. Takes its endpoints by value because clipping moves them and no caller
+// wants them back.
+static bool ProjectSegment(Vec3 a, Vec3 b, ImVec2 *pa, ImVec2 *pb)
+{
+    if (!ClipToNear(&a, &b))
+        return false;
+    if (!Project(a, pa) || !Project(b, pb))
+        return false;
+    return ClipSegment2D(pa, pb, 0, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -997,7 +1135,6 @@ static void EmitPath(ImDrawList *dl, const WrPathDraw &d)
     int lastBucket = -1;
     unsigned int lastColour = 0;
     ImVec2 lastEmitted(0.0f, 0.0f);
-    int offscreenRun = 0;
     bool have = false;
 
     // Teleports come from wr_path.cpp, found at full resolution when the file
@@ -1084,25 +1221,31 @@ static void EmitPath(ImDrawList *dl, const WrPathDraw &d)
             continue;
         }
 
-        // Break the polyline after a sustained off-screen stretch. The
-        // discontinuity is by definition not visible.
-        bool onGuard = (pa.x > -g_sw && pa.x < g_sw * 2.0f &&
-                        pa.y > -g_sh && pa.y < g_sh * 2.0f);
-        if (!onGuard)
+        // Clip to the viewport, which replaces the run-of-eight off-screen
+        // heuristic that used to live here. That guard tested `pa` while the
+        // batch was chained on `pb`, and let seven segments through before it
+        // fired -- seven segments that, back when ProjectKnownW clamped, had
+        // already been bent.
+        //
+        // A segment with nothing inside the rectangle contributes nothing and
+        // ends the batch. One cut at its START does not begin where the last one
+        // ended, and one cut at its END does not finish where the next one
+        // begins: both break the polyline, for exactly the reason the near-plane
+        // clip above breaks it.
+        bool cutA = false, cutB = false;
+        if (!ClipSegment2D(&pa, &pb, &cutA, &cutB))
         {
-            if (++offscreenRun >= OFFSCREEN_BREAK)
+            if (have)
             {
-                if (have)
-                {
-                    FlushBatch(dl, lastColour, thickness);
-                    have = false;
-                }
-                continue;
+                FlushBatch(dl, lastColour, thickness);
+                have = false;
             }
+            continue;
         }
-        else
+        if (have && cutA)
         {
-            offscreenRun = 0;
+            FlushBatch(dl, lastColour, thickness);
+            have = false;
         }
 
         // Fade with distance. Only the FADE is quantised -- it varies per point,
@@ -1226,9 +1369,15 @@ static void EmitPath(ImDrawList *dl, const WrPathDraw &d)
             lastEmitted = pa;
             have = true;
         }
-        else
+        else if (!cutB)
         {
             // Screen-space decimation: skip points that barely move on screen.
+            //
+            // Not when the far end was clipped. Dropping `pb` there would leave
+            // the batch ending at a point the line no longer reaches, and the
+            // break below would never happen -- so the next segment would be
+            // chained straight onto a stale vertex, which is the chord this
+            // whole block exists to prevent.
             float dx = pb.x - lastEmitted.x;
             float dy = pb.y - lastEmitted.y;
             if (dx * dx + dy * dy < tol * tol)
@@ -1243,6 +1392,16 @@ static void EmitPath(ImDrawList *dl, const WrPathDraw &d)
         lastEmitted = pb;
         lastBucket = bucket;
         lastColour = colour;
+
+        // The line stops here because the viewport does. The next chord starts
+        // from the UNCLIPPED b, so continuing this batch would draw from the
+        // edge of the screen to wherever that point projects.
+        if (cutB)
+        {
+            FlushBatch(dl, colour, thickness);
+            have = false;
+            continue;
+        }
 
         if (g_batchCount >= MAX_BATCH - 2)
         {
@@ -1525,6 +1684,92 @@ static unsigned int GradeColour(unsigned char g)
 // the loss beside it. Deliberately NOT a number per board by default: a surf run
 // boards a dozen times, and twelve labels on one line is a wall of text over the
 // route it is describing.
+// A BOARD, WRITTEN OUT, IN ONE PLACE
+//
+// FOUR readouts print a board -- the flash under the crosshair, the row on the
+// corner block, the labels along a demo line, and the pick plate -- and all
+// four held their own copy of "%s  -%.0f  %.0f deg". Four copies of a format
+// string is four chances for a unit setting to reach three of them.
+//
+// This comment said "three" for as long as there were four, and the one it had
+// forgotten was the one that had drifted: the pick plate hard-coded u/s and
+// printed the loss percentage where the others print the kept percentage, so
+// the same board read 0.4% there and 99.6% in the corner. A list of callers
+// kept by hand is a list that goes stale; what stops it happening again is that
+// no site formats a board itself any more.
+//
+// The units are not conversions of each other's answers: a clip is exactly
+// dv = -(v.n)n, so each is that identity read off along a different axis. See
+// WrBoardLoss* in wr_phase.h.
+// HOW MANY DECIMALS A BOARD HAS EARNED.
+//
+// Asked for as "pro surfers are very accurate, so we need like a 99.99% level
+// of accuracy" -- and the honest reading of that is that whole units are too
+// coarse, not that any number of digits can be printed. A whole-unit loss at
+// 2500 u/s is +-0.5 u/s of quantisation on a figure that is often under 15, and
+// a whole DEGREE of approach hides +-1.9 u/s of loss at 85 degrees, because
+// d(loss)/d(theta) is s0 cos(theta) and that is 3.8 u/s per degree there.
+//
+// The angle is given one more place than the cost. It has to be: the cost is
+// the angle's consequence and the derivative between them is nearly four, so
+// printing them at the same width would show a cost changing while the angle it
+// came from appeared not to.
+static int BoardDecimals(void) { return g_energy.boardDecimals; }
+
+static void BoardCostText(const WrBoardStats *b, char *out, int cap)
+{
+    const int dp = BoardDecimals();
+    switch (g_energy.boardUnit)
+    {
+    case WR_BOARD_UNIT_HORIZONTAL:
+        _snprintf_s(out, cap, _TRUNCATE, "-%.*f h", dp,
+                    WrBoardLossHorizontal(b));
+        break;
+    case WR_BOARD_UNIT_ENERGY:
+        // One place more than the rest: a board costs single-digit units of
+        // height where it costs tens of units of speed, and "-8" and "-9" is
+        // not a readout.
+        _snprintf_s(out, cap, _TRUNCATE, "-%.*f E", dp + 1,
+                    WrBoardLossEnergy(b, g_energy.gravity));
+        break;
+    case WR_BOARD_UNIT_AXES:
+    {
+        // Signed, because the signs are the interesting part: the clip pushes
+        // along its own normal, so z is usually POSITIVE here. The board took
+        // speed and gave back height, which is the trade a board actually is.
+        float d[3];
+        WrBoardDeltaAxes(b, d);
+        _snprintf_s(out, cap, _TRUNCATE, "x%+.*f y%+.*f z%+.*f",
+                    dp, d[0], dp, d[1], dp, d[2]);
+        break;
+    }
+    default:
+        _snprintf_s(out, cap, _TRUNCATE, "-%.*f", dp, b->loss);
+        break;
+    }
+}
+
+static void BoardText(const WrBoardStats *b, char *out, int cap, bool full)
+{
+    const int dp = BoardDecimals();
+
+    char cost[80];
+    BoardCostText(b, cost, (int)sizeof(cost));
+
+    char pct[24];
+    pct[0] = '\0';
+    if (g_energy.boardPercent)
+        _snprintf_s(pct, sizeof(pct), _TRUNCATE, "  %.*f%%", dp + 1,
+                    WrBoardPerfectPct(b));
+
+    if (full)
+        _snprintf_s(out, cap, _TRUNCATE, "%s  %s%s  %.*f deg",
+                    WrPhaseGradeName(b->grade), cost, pct, dp + 1,
+                    b->approachDeg);
+    else
+        _snprintf_s(out, cap, _TRUNCATE, "%s%s", cost, pct);
+}
+
 static void EmitBoards(ImDrawList *dl, const WrRun *run)
 {
     if (!g_render.drawBoards || !run->boards || run->boardCount <= 0)
@@ -1568,11 +1813,7 @@ static void EmitBoards(ImDrawList *dl, const WrRun *run)
         if (g_render.boardLabels)
         {
             char label[96];
-            if (g_render.boardLabelDetail)
-                _snprintf_s(label, sizeof(label), _TRUNCATE, "%s  -%.0f  %.0f deg",
-                            WrPhaseGradeName(b.s.grade), b.s.loss, b.s.approachDeg);
-            else
-                _snprintf_s(label, sizeof(label), _TRUNCATE, "-%.0f", b.s.loss);
+            BoardText(&b.s, label, (int)sizeof(label), g_render.boardLabelDetail);
 
             if (!DrawLabel(dl, ImVec2(s.x + 9.0f, s.y - 7.0f), label, col))
                 continue;
@@ -1580,6 +1821,81 @@ static void EmitBoards(ImDrawList *dl, const WrRun *run)
         drawn++;
     }
 }
+
+// YOUR BOARD, AT THE MOMENT YOU LAND, WHERE YOU ARE ALREADY LOOKING.
+//
+// The corner block holds the same figures and is the better place to read them
+// afterwards -- but a board is over in a tenth of a second and a player mid-run
+// is not looking at a corner. So the grade appears under the crosshair for
+// boardFlashSeconds and then goes away.
+//
+// It fades over the last third rather than vanishing, because something that
+// disappears between one frame and the next reads as a glitch, and it is drawn
+// BELOW the crosshair by a fixed margin rather than through the HUD block's
+// offsets: the HUD can be moved anywhere, and a flash that landed on top of it
+// would hide the readout it is meant to complement.
+#define WR_BOARD_FLASH_DROP 46.0f
+
+// HOW LONG THE CORNER ROW KEEPS A BOARD.
+//
+// It kept it for ever. WrEnergyBoard's own header always said it would answer
+// false once the board was "older than the caller cares about", and no caller
+// ever said, so the row went on describing a ramp two ramps back for the rest
+// of the level -- with nothing to distinguish that from the one under your feet.
+// Half of "the board readout doesn't work properly" can look exactly like this.
+//
+// The number is measured rather than chosen. Over 2,255 runs and 26,132 gaps
+// between consecutive boards ON THE SAME RUN (tests\phase_sweep.exe):
+//
+//     p50 4.05 s    p90 8.33    p95 10.17    p99 16.53
+//
+// Twenty is past the p99, so in practice a live board stays up until the next
+// one replaces it and the row never blinks out between ramps -- and it is still
+// short enough that nothing on screen can be describing a part of the map you
+// left twenty seconds ago.
+#define WR_BOARD_ROW_LIFE 20.0f
+
+static void EmitBoardFlash(ImDrawList *dl)
+{
+    if (!g_energy.showBoard)
+        return;
+
+    WrBoardStats b;
+    float age = 0.0f;
+    if (!WrEnergyBoard(&b, &age))
+        return;
+
+    const float life = (g_energy.boardFlashSeconds > 0.1f)
+                     ? g_energy.boardFlashSeconds : 0.1f;
+    if (age >= life)
+        return;
+
+    float a = 1.0f;
+    const float fadeFrom = life * 0.67f;
+    if (age > fadeFrom)
+        a = 1.0f - (age - fadeFrom) / (life - fadeFrom);
+    if (a < 0.0f) a = 0.0f;
+    if (a > 1.0f) a = 1.0f;
+
+    char text[96];
+    BoardText(&b, text, (int)sizeof(text), true);
+
+    float size = 0.0f;
+    ImFont *font = WrFontFor(20.0f * g_energy.hudScale, &size);
+    ImVec2 m = font->CalcTextSizeA(size, FLT_MAX, 0.0f, text);
+
+    const float x = g_sw * 0.5f - m.x * 0.5f;
+    const float y = g_sh * 0.5f + WR_BOARD_FLASH_DROP * g_energy.hudScale;
+
+    // The same dark plate the other readouts use. A grade is a colour first and
+    // a word second, and a coloured word on a bright skybox is neither.
+    const float p = 5.0f * g_energy.hudScale;
+    dl->AddRectFilled(ImVec2(x - p, y - p), ImVec2(x + m.x + p, y + m.y + p),
+                      WithAlpha(0x00000000u, 0.44f * a), 4.0f);
+    dl->AddText(font, size, ImVec2(x, y),
+                WithAlpha(GradeColour(b.grade), a), text);
+}
+
 
 // Where the comparison is actually reading from.
 //
@@ -1617,7 +1933,7 @@ static void EmitComparePoint(ImDrawList *dl)
         a.z -= (g_energy.eyeHeight - 36.0f);
         Vec3 b = p;
         ImVec2 pa, pb;
-        if (ClipToNear(&a, &b) && Project(a, &pa) && Project(b, &pb))
+        if (ProjectSegment(a, b, &pa, &pb))
             dl->AddLine(pa, pb, WithAlpha(WrRunColour(ref), 0.35f), 1.0f);
     }
 
@@ -1960,6 +2276,414 @@ static bool EnergyGap(const WrRun *ref, float *theirs, float *gap)
 }
 
 // ---------------------------------------------------------------------------
+// How fast you are turning, against how fast you should be
+// ---------------------------------------------------------------------------
+//
+// Both halves are honest for different reasons. The measured rate is EXACT: it
+// is the angle between two successive camera forward vectors, out of the basis
+// the matrix oracle validated, which is literally how fast the mouse is moving.
+// The ideal is not a measurement at all but a consequence of Source's
+// AirAccelerate -- held perpendicular to the velocity, each tick adds at most
+// sv_air_max_wishspeed at a right angle to it, so the velocity direction rotates
+// by atan(gain / speed) and the view has to follow by exactly that. Which is why
+// the ideal turn SLOWS as you speed up, and why chasing a fixed number is wrong.
+//
+// IN THE AIR, AND NOW ON RAMPS TOO. This used to refuse outright the moment you
+// touched anything, because on a ramp the surface turns your velocity far faster
+// than air acceleration can and comparing against the flat ideal is comparing
+// against the wrong physics. That was true. It was never a reason the right
+// physics could not be worked out -- a surf ramp IS air movement to the engine,
+// AirAccelerate runs every tick you are on one, and the only extra term is the
+// clip. WrPerfectStrafeDegreesOnPlane has the derivation and the numbers.
+//
+// What was actually missing was the surface normal, which arrived with the map
+// reader, and the SIGN of the turn, which was being thrown away one line after
+// it was measured. With both, a ramp grades like anything else and the refusal
+// shrinks to the honest one: no surface to compare against.
+//
+// One function because two readouts show this now, the corner block and the
+// crosshair, and two copies of the tick rule is two chances to disagree about
+// the same number on the same screen.
+// `qualOut` is WrStrafeQuality's, or -1 where there is no answer -- which is the
+// regime where sv_airaccelerate is low enough that the acceleration binds
+// instead of the 30-unit wishspeed cap. The turn rate is then set by the cvars
+// rather than by how well you are pointing, so grading it would be grading the
+// server. This is the ONE place that test lives, so the crosshair and the corner
+// block cannot end up disagreeing about whether the number means anything.
+//
+// HORIZONTAL speed, not 3D: AirMove zeroes the z of forward and right before
+// building wishdir, so the whole of air acceleration happens in the xy plane and
+// the ideal turn belongs on the xy speed.
+static bool WrTurnRates(float *gotOut, float *idealOut, float *qualOut,
+                        const char **whyOut)
+{
+    if (whyOut)
+        *whyOut = "no reading";
+
+    const int phase = WrEnergyPhase();
+    if (phase != WR_PHASE_AIR && phase != WR_PHASE_RAMP)
+    {
+        if (whyOut)
+            *whyOut = (phase == WR_PHASE_GROUND) ? "not while standing"
+                                                 : "no reading";
+        return false;
+    }
+
+    // The compared run's own tick if there is one, else 0.015. 482 of the 503
+    // demos measured are 0.015 but every bhop_futile run is 0.01, so this is
+    // not a constant.
+    const WrRun *tr = WrEnergyReferenceRun();
+    const float tick = (tr && tr->tickInterval > 1e-4f) ? tr->tickInterval
+                                                        : 0.015f;
+    const float speed = WrEnergyHorizontalSpeed();
+    const float got = WrEnergyYawRate();
+
+    float ideal = 0.0f;
+    float cScale = WR_AIR_WISHSPEED;
+
+    if (phase == WR_PHASE_RAMP)
+    {
+        // wn = dot(wishdir, n), and wishdir under ideal play is horizontal and
+        // perpendicular to the horizontal velocity. Which of the two
+        // perpendiculars is the one the player is actually holding, and the only
+        // evidence of that is the direction they are turning: Source measures
+        // yaw as atan2(y, x), so a positive rate is a turn to the left and the
+        // wishdir is the left-hand perpendicular.
+        float n[3];
+        Vec3 vel;
+        if (!WrEnergySurfaceNormal(n) || !WrEnergyVelocity(&vel) ||
+            speed < 1.0f)
+        {
+            // WHICH OF THE FOUR, because for a long time this said "no surface"
+            // for all of them and the one that mattered was the one it fitted
+            // worst. A player on surf_kvas read "no surface" on every ramp while
+            // standing on one: the map had never been asked, because 4 of its
+            // 756 displacements failed a corner tolerance and that switched the
+            // whole level's query off. "No surface" was true of the tool's
+            // knowledge and false of the world, and nothing on screen said which
+            // it meant. See WrBspGeometryComplete.
+            if (whyOut)
+            {
+                float raw[3];
+                if (speed < 1.0f)
+                    *whyOut = "too slow";
+                else if (WrBspLoadStateNow() != WR_BSPLOAD_READY)
+                    *whyOut = "map not read";
+                else if (WrEnergyGeomTouch() != WR_GEOM_TOUCHING ||
+                         !WrEnergyGeomNormalRaw(raw))
+                    *whyOut = "map part read";
+                else
+                {
+                    const float nz = raw[2] < 0.0f ? -raw[2] : raw[2];
+                    *whyOut = (nz < WR_PHASE_MIN_RAMP_NZ ||
+                               nz > WR_PHASE_STANDABLE) ? "not a ramp"
+                                                        : "no lift yet";
+                }
+            }
+            return false;
+        }
+
+        const float inv = 1.0f / speed;
+        const float vx = vel.x * inv, vy = vel.y * inv;
+        const float s = (WrEnergyYawRateSigned() >= 0.0f) ? 1.0f : -1.0f;
+        const float wx = -vy * s, wy = vx * s;
+        const float wn = wx * n[0] + wy * n[1];
+
+        ideal = WrPerfectStrafeDegreesOnPlane(speed, tick,
+                                              g_energy.airAccelerate,
+                                              g_energy.maxSpeed,
+                                              g_energy.gravity, n, wn) / tick;
+        cScale = WrStrafeCScale(g_energy.gravity, tick, n, wn);
+    }
+    else
+    {
+        ideal = WrPerfectStrafeDegrees(speed, tick, g_energy.airAccelerate,
+                                       g_energy.maxSpeed) / tick;
+    }
+
+    if (gotOut)   *gotOut = got;
+    if (idealOut) *idealOut = ideal;
+    if (qualOut)
+        *qualOut = WrAirCapBinds(tick, g_energy.airAccelerate,
+                                 g_energy.maxSpeed, 1.0f)
+                 ? WrStrafeQualityEx(got, ideal, cScale) : -1.0f;
+    if (whyOut)
+        *whyOut = "";
+    return true;
+}
+
+// The ideal rate, in blue, wherever it is shown. Not a grade -- it is the target
+// and it does not move with how well you are doing, so it must not share the
+// red-to-green scale beside it or it would read as a score of its own.
+#define WR_IDEAL_COLOUR 0xFFFF9940u     // ABGR
+
+// How good a turn rate is, on a scale, coloured.
+//
+// The quality is WrStrafeQuality's -- 1 - (1-r)^2, straight out of AirAccelerate;
+// see wr_stress.h for the three lines that get there. This only chooses colours
+// for it.
+//
+// Red/green is the worst possible pair for the ~8% of men with deuteranomaly, so
+// it follows the SAME switch EfficiencyColour does rather than quietly being the
+// one readout that ignores it. It cannot call EfficiencyColour itself: that maps
+// a SIGNED eta with a grey neutral band at zero, so an unsigned quality would
+// only ever reach the green half of it.
+//
+// A negative quality means WrStrafeQuality had no answer -- the acceleration
+// binds rather than the wishspeed cap, and the turn rate is then pinned by the
+// cvars rather than by how well you are pointing. Neutral, not red.
+// The ramp both strafe colourings share. `t` is already the position on the
+// scale: 0 as bad as it is shown, 1 perfect.
+static unsigned int StrafeRampColour(float t)
+{
+    t = WrClampF(t, 0.0f, 1.0f);
+
+    float br, bg, bb, gr, gg, gb;
+    if (g_render.effColourblind)
+    {
+        br = 1.00f; bg = 0.55f; bb = 0.10f;     // bad:  orange
+        gr = 0.20f; gg = 0.55f; gb = 1.00f;     // good: blue
+    }
+    else
+    {
+        br = 1.00f; bg = 0.13f; bb = 0.10f;
+        gr = 0.10f; gg = 1.00f; gb = 0.10f;
+    }
+
+    float r = br + (gr - br) * t;
+    float g = bg + (gg - bg) * t;
+    float b = bb + (gb - bb) * t;
+    return 0xFF000000u | ((unsigned int)(b * 255.0f) << 16)
+                       | ((unsigned int)(g * 255.0f) << 8)
+                       | ((unsigned int)(r * 255.0f));
+}
+
+static unsigned int StrafeQualityColour(float q, unsigned int neutral)
+{
+    if (q < 0.0f)
+        return neutral;
+    q = WrClampF(q, 0.0f, 1.0f);
+
+    // Weighted toward the top, because that is where the whole range lives: the
+    // old +-20% band is q >= 0.96, so a linear ramp would paint every strafe
+    // worth distinguishing the same green. Squaring the distance from perfect
+    // spreads 0.9..1.0 across most of the scale.
+    return StrafeRampColour(1.0f - (1.0f - q) * (1.0f - q));
+}
+
+// The colour actually shown, which is a preference and not a measurement.
+//
+// WrStrafeQuality is exact and it is brutal: it reaches zero at twice the ideal
+// rate, and the ideal FALLS with speed -- 115 deg/s at 1000 u/s, 44 at 2600 --
+// so at speed an ordinary correction is r = 2.3 and the readout is pinned red.
+// That is not wrong. c = 30(1-r) really has gone negative and you really are
+// losing speed. It is just not a thing anybody can watch for a whole run.
+//
+// So by default the colour comes from a window you choose, and the percentage
+// beside it keeps telling the truth. The physics curve stays available and
+// unchanged, because it is the one that means something.
+//
+// The window keeps working where the QUALITY has no answer -- low
+// sv_airaccelerate, where the acceleration binds instead of the wishspeed cap.
+// The ideal rate is still a real target there; it is only the quality curve that
+// needs the cap. The percentage goes neutral, the colour does not.
+static unsigned int StrafeColour(float got, float ideal, float qual,
+                                 unsigned int neutral)
+{
+    if (g_energy.strafeColour == WR_STRAFE_COLOUR_PHYSICS)
+        return StrafeQualityColour(qual, neutral);
+    if (!(ideal > 1e-3f))
+        return neutral;
+
+    float tol = g_energy.strafeTolerance;
+    float d;
+    if (g_energy.strafeBand == WR_STRAFE_BAND_PERCENT)
+    {
+        d = fabsf(1.0f - got / ideal) * 100.0f;
+        if (tol > 60.0f) tol = 60.0f;       // the per-cent slider's own top
+    }
+    else
+    {
+        d = fabsf(got - ideal);
+    }
+    if (tol < 1.0f) tol = 1.0f;
+
+    return StrafeRampColour(1.0f - WrClampF(d / tol, 0.0f, 1.0f));
+}
+
+// Which way to correct, or nothing when it is close enough to leave alone.
+//
+// `^` reads as "more" and means turn faster; `v` means turn slower. The big line
+// already uses those two glyphs for the energy trend, so every caller puts this
+// one hard against the strafe number instead of at the end of the row.
+//
+// The deadband is a quarter of the tolerance rather than a constant, so widening
+// the window widens the silence with it and the arrow never contradicts a colour
+// that is still fully green.
+//
+// It is a function of its own because the bar has to draw the same silence the
+// arrow keeps. Two cues for one comparison, disagreeing about where "close
+// enough" starts, would be worse than either alone. In DEG/S, always -- the
+// per-cent band converts through `ideal` here rather than at each caller.
+static float StrafeDeadbandDeg(float ideal)
+{
+    float dead = (g_energy.strafeBand == WR_STRAFE_BAND_PERCENT)
+               ? ideal * (g_energy.strafeTolerance * 0.01f)
+               : g_energy.strafeTolerance;
+    dead *= 0.25f;
+    if (dead < 1.0f) dead = 1.0f;
+    return dead;
+}
+
+static const char *StrafeArrow(float got, float ideal)
+{
+    if (!g_energy.showStrafeArrow || !(ideal > 1e-3f))
+        return "";
+
+    const float dead = StrafeDeadbandDeg(ideal);
+    if (got < ideal - dead) return "^";
+    if (got > ideal + dead) return "v";
+    return "";
+}
+
+// ---------------------------------------------------------------------------
+// The strafe error bar
+// ---------------------------------------------------------------------------
+//
+// Asked for as a visualizer, because "reading the values at a glance can be
+// difficult in difficult surf". The three strafe readouts are all text, and
+// text has to be found, focused on and parsed; on a hard ramp none of those
+// three things is available. A bar is read by shape, which peripheral vision
+// does perfectly well and which costs no glance at all.
+//
+// WHAT IT SHOWS, AND WHY NOT THE OBVIOUS THING
+//
+// Centre is the IDEAL, not zero. The bar leans left when you should turn
+// faster and right when you should turn slower -- the same sense as the ^ and v
+// already printed beside the number, because two cues that mean the same thing
+// must never point different ways.
+//
+// A gauge running 0 to ideal was the other candidate and is worse for this: it
+// spends half its width on rates nobody strafes at, and overshoot -- which on a
+// ramp is the common error, not the rare one -- has nowhere to go, so turning
+// far too fast looks identical to turning perfectly. Centring on the error puts
+// the whole width on the quantity being corrected and gives both directions
+// room.
+//
+// EVERYTHING ELSE IS BORROWED ON PURPOSE
+//
+// The scale is strafeBand and strafeTolerance, the colour is StrafeColour, and
+// the dead zone is StrafeArrow's. Not one of those is a new setting, because
+// the bar, the number's colour and the arrow are three renderings of a single
+// comparison and any independent knob is a way for them to contradict each
+// other on screen.
+//
+// The look is the comparison lean bar's, for the same reason: a dark track, the
+// fill from the centre, the centre tick drawn last so the fill can never hide
+// where zero is, and an arrowhead past the end for overflow rather than a
+// silently pinned bar.
+#define WR_STRAFE_BAR_FADE 0.25f    // seconds to fade in and out of a refusal
+
+static void EmitStrafeBar(ImDrawList *dl)
+{
+    if (!g_energy.showStrafeBar)
+        return;
+
+    float got = 0.0f, ideal = 0.0f, qual = -1.0f;
+    const char *why = "";
+    const bool have = WrTurnRates(&got, &ideal, &qual, &why) && ideal > 1e-3f;
+
+    // A bar that appears and disappears with the phase readout would flicker at
+    // every ramp lip. It fades instead, and it holds its last deflection while
+    // it does -- an empty bar and a bar reading zero error are different claims.
+    static float sAlpha = 0.0f;
+    static float sFrac = 0.0f;
+    static float sDeadFrac = 0.25f;
+    static unsigned int sCol = 0xFFCCCCCCu;
+    static bool sOver = false;
+
+    const float dt = ImGui::GetIO().DeltaTime;
+    const float step = (WR_STRAFE_BAR_FADE > 1e-3f) ? dt / WR_STRAFE_BAR_FADE : 1.0f;
+    sAlpha += have ? step : -step;
+    if (sAlpha < 0.0f) sAlpha = 0.0f;
+    if (sAlpha > 1.0f) sAlpha = 1.0f;
+    if (sAlpha <= 0.0f)
+        return;
+
+    if (have)
+    {
+        // The error in whatever unit the tolerance is quoted in, so the two
+        // cannot be divided by different things.
+        const bool pct = (g_energy.strafeBand == WR_STRAFE_BAND_PERCENT);
+        const float err = pct ? (got / ideal - 1.0f) * 100.0f : (got - ideal);
+        const float tol = (g_energy.strafeTolerance > 1e-3f)
+                        ? g_energy.strafeTolerance : 1e-3f;
+
+        sFrac = err / tol;
+        sOver = (sFrac > 1.0f || sFrac < -1.0f);
+        sFrac = WrClampF(sFrac, -1.0f, 1.0f);
+        sCol = StrafeColour(got, ideal, qual, 0xFFCCCCCCu);
+
+        // The silence the arrow keeps, on this bar's own axis. Cached with the
+        // rest so a fade-out holds the whole picture still rather than
+        // recomputing half of it from an `ideal` that no longer exists.
+        const float deadDeg = StrafeDeadbandDeg(ideal);
+        const float deadAxis = pct ? deadDeg / ideal * 100.0f : deadDeg;
+        sDeadFrac = WrClampF(deadAxis / tol, 0.0f, 1.0f);
+    }
+
+    const float scale = g_energy.hudScale;
+    float w = g_energy.strafeBarWidth * scale;
+    if (w <= 0.0f)
+    {
+        // Match the HUD block, so the two read as one instrument when both are
+        // on. hudWidth is 0 by default and means "as wide as the text", which
+        // this cannot ask for -- so it falls back to a width that is legible on
+        // its own rather than to nothing.
+        w = (g_energy.hudWidth > 1.0f) ? g_energy.hudWidth * scale : 220.0f * scale;
+    }
+    const float h = g_energy.strafeBarHeight * scale;
+    const float cx = g_sw * 0.5f;
+    const float x0 = cx - w * 0.5f;
+    const float x1 = cx + w * 0.5f;
+    const float y = g_sh * 0.5f - g_energy.strafeBarRise * scale - h;
+
+    dl->AddRectFilled(ImVec2(x0, y), ImVec2(x1, y + h),
+                      WithAlpha(0x00000000u, 0.31f * sAlpha), 2.0f);
+
+    const float ex = cx + sFrac * w * 0.5f;
+    const float fx0 = (ex < cx) ? ex : cx;
+    const float fx1 = (ex < cx) ? cx : ex;
+    const unsigned int fill = WithAlpha(sCol, sAlpha);
+    dl->AddRectFilled(ImVec2(fx0, y), ImVec2(fx1, y + h), fill, 2.0f);
+
+    // The dead zone, as a pair of faint uprights rather than a colour. Inside
+    // it the arrow prints nothing, and a bar that still leans where the arrow
+    // has gone quiet is the two of them disagreeing.
+    if (sDeadFrac > 0.01f)
+    {
+        const float dx = sDeadFrac * w * 0.5f;
+        const unsigned int g = WithAlpha(0xFFB0B0B0u, 0.35f * sAlpha);
+        dl->AddRectFilled(ImVec2(cx - dx - 0.5f, y), ImVec2(cx - dx + 0.5f, y + h), g);
+        dl->AddRectFilled(ImVec2(cx + dx - 0.5f, y), ImVec2(cx + dx + 0.5f, y + h), g);
+    }
+
+    // Centre last, so the fill never hides the ideal it is measured from.
+    dl->AddRectFilled(ImVec2(cx - 0.5f, y - 1.0f), ImVec2(cx + 0.5f, y + h + 1.0f),
+                      WithAlpha(0xFFB0B0B0u, sAlpha));
+
+    if (sOver)
+    {
+        const float t = h * 0.6f;
+        const float tipX = (sFrac > 0.0f) ? (x1 + t) : (x0 - t);
+        const float baseX = (sFrac > 0.0f) ? x1 : x0;
+        dl->AddTriangleFilled(ImVec2(baseX, y), ImVec2(baseX, y + h),
+                              ImVec2(tipX, y + h * 0.5f), fill);
+    }
+}
+
+
+// ---------------------------------------------------------------------------
 // Crosshair readout
 // ---------------------------------------------------------------------------
 //
@@ -1975,6 +2699,19 @@ static void EmitEnergyHud(ImDrawList *dl)
     char big[48], sub[48], cmp[64];
     float rel = WrEnergyRelative();
     int dir = WrEnergyTrendDir();
+
+    // A SECOND SEGMENT ON THE SUB LINE, for the one mode that puts two numbers
+    // there meaning different things: what you are doing and what you should be.
+    // Empty for every other mode, which is what leaves them untouched.
+    //
+    // Two segments rather than two rows because they belong on one line -- the
+    // request was for the pair to sit under the headline figure, not to push the
+    // block a row taller every frame.
+    char sub2[32];
+    sub2[0] = '\0';
+    unsigned int subCol = 0xFFB0B0B0u;
+    unsigned int sub2Col = 0xFFB0B0B0u;
+    const char *wideSub2 = "";
 
     // The worst case each mode's two lines can produce. Reserved rather than
     // measured from this frame's text -- see the comment at the layout below,
@@ -2075,6 +2812,85 @@ static void EmitEnergyHud(ImDrawList *dl)
             break;
         }
 
+        case WR_HUD_TURN:
+        {
+            // The two angles rather than a score, because this one is a thing
+            // to DO: the big figure is where your mouse is and the small one is
+            // where it should be, and the gap between them is the correction.
+            //
+            // Not the rise/fall arrow either -- turning faster is not better,
+            // it is only better if you were turning too slowly. So the colour
+            // is the red-to-green quality the corner row uses, from the same
+            // function, and the ideal is blue because it is a target and not a
+            // score.
+            float got = 0.0f, ideal = 0.0f, qual = -1.0f;
+            const char *why = "";
+            if (!WrTurnRates(&got, &ideal, &qual, &why))
+            {
+                bigCol = 0xFF909090u;
+                _snprintf_s(big, sizeof(big), _TRUNCATE, "--");
+                _snprintf_s(sub, sizeof(sub), _TRUNCATE, "%s", why);
+            }
+            else
+            {
+                bigCol = StrafeColour(got, ideal, qual, 0xFFCCCCCCu);
+                _snprintf_s(big, sizeof(big), _TRUNCATE, "%.0f/s%s", got,
+                            StrafeArrow(got, ideal));
+                if (g_energy.showStrafePercent && qual >= 0.0f)
+                    _snprintf_s(sub, sizeof(sub), _TRUNCATE,
+                                "ideal %.0f/s  %.0f%%", ideal, qual * 100.0f);
+                else
+                    _snprintf_s(sub, sizeof(sub), _TRUNCATE, "ideal %.0f/s",
+                                ideal);
+                subCol = WR_IDEAL_COLOUR;
+            }
+            wideBig = "9999/s ^";
+            // The reservation the block's width comes from, so it has to be the
+            // WIDEST thing this case can print and not the most representative.
+            // "ideal 9999/s  100%" beats every refusal string; when it did not,
+            // the refusal hung out past the backing rectangle every time you
+            // touched a ramp.
+            wideSub = "ideal 9999/s  100%";
+            break;
+        }
+
+        case WR_HUD_NET_STRAFE:
+        {
+            // The headline figure of WR_HUD_NET, with the strafe pair on the
+            // line under it -- both at once, which is what neither of the two
+            // modes it is made of could do.
+            //
+            // The big line is byte for byte what the default case produces,
+            // arrow and colour included, so switching between the two modes
+            // never moves the number they share.
+            _snprintf_s(big, sizeof(big), _TRUNCATE, "%.0f%s", rel, arrow);
+
+            float got = 0.0f, ideal = 0.0f, qual = -1.0f;
+            const char *why = "";
+            if (!WrTurnRates(&got, &ideal, &qual, &why))
+            {
+                _snprintf_s(sub, sizeof(sub), _TRUNCATE, "%s", why);
+                subCol = 0xFF808080u;
+            }
+            else
+            {
+                _snprintf_s(sub, sizeof(sub), _TRUNCATE, "%.0f/s%s  ", got,
+                            StrafeArrow(got, ideal));
+                if (g_energy.showStrafePercent && qual >= 0.0f)
+                    _snprintf_s(sub2, sizeof(sub2), _TRUNCATE,
+                                "ideal %.0f/s  %.0f%%", ideal, qual * 100.0f);
+                else
+                    _snprintf_s(sub2, sizeof(sub2), _TRUNCATE, "ideal %.0f/s",
+                                ideal);
+                subCol = StrafeColour(got, ideal, qual, 0xFFCCCCCCu);
+                sub2Col = WR_IDEAL_COLOUR;
+            }
+            wideBig = "-99999 v";
+            wideSub = "9999/s ^  ";
+            wideSub2 = "ideal 9999/s  100%";
+            break;
+        }
+
         default:
             _snprintf_s(big, sizeof(big), _TRUNCATE, "%.0f%s", rel, arrow);
             // The energy above, expressed as a speed. The same number twice, so
@@ -2145,6 +2961,10 @@ static void EmitEnergyHud(ImDrawList *dl)
     ImVec2 mSub = fSub->CalcTextSizeA(sSub, FLT_MAX, 0.0f, sub);
     ImVec2 mCmp = haveCmp ? fSub->CalcTextSizeA(sSub, FLT_MAX, 0.0f, cmp)
                           : ImVec2(0.0f, 0.0f);
+    // The second segment measured on its own, because it is drawn at an x offset
+    // by exactly this much and painted a different colour.
+    ImVec2 mSub2 = sub2[0] ? fSub->CalcTextSizeA(sSub, FLT_MAX, 0.0f, sub2)
+                           : ImVec2(0.0f, 0.0f);
 
     // Lay out on a WORST-CASE width, not on this frame's text.
     //
@@ -2158,6 +2978,8 @@ static void EmitEnergyHud(ImDrawList *dl)
     // moving while the digits change.
     ImVec2 wBig = fBig->CalcTextSizeA(sBig, FLT_MAX, 0.0f, wideBig);
     ImVec2 wSub = fSub->CalcTextSizeA(sSub, FLT_MAX, 0.0f, wideSub);
+    if (wideSub2[0])
+        wSub.x += fSub->CalcTextSizeA(sSub, FLT_MAX, 0.0f, wideSub2).x;
 
     // The run clock, which until now lived only in a tab you close before you
     // play -- so a save-loc putting the clock back where it was had nothing on
@@ -2302,27 +3124,42 @@ static void EmitEnergyHud(ImDrawList *dl)
     }
 
     float ty = y;
-    struct { const char *s; float size; float width; unsigned int col; } rows[4];
+    // `s2` is an optional second run of text on the same line, drawn straight
+    // after the first at a different colour. Null for every row but the strafe
+    // pair; `width` is the row's TOTAL, so alignment does not have to know.
+    struct
+    {
+        const char *s; const char *s2;
+        float size; float width; float width1;
+        unsigned int col; unsigned int col2;
+    } rows[4];
     int n = 0;
-    rows[n].s = big; rows[n].size = sBig; rows[n].width = mBig.x; rows[n].col = bigCol; n++;
+    rows[n].s = big; rows[n].s2 = 0; rows[n].size = sBig;
+    rows[n].width = mBig.x; rows[n].width1 = mBig.x;
+    rows[n].col = bigCol; rows[n].col2 = bigCol; n++;
     if (haveSub)
     {
-        rows[n].s = sub; rows[n].size = sSub; rows[n].width = mSub.x;
-        rows[n].col = 0xFFB0B0B0u; n++;
+        rows[n].s = sub; rows[n].s2 = sub2[0] ? sub2 : 0; rows[n].size = sSub;
+        rows[n].width = mSub.x + mSub2.x; rows[n].width1 = mSub.x;
+        rows[n].col = subCol; rows[n].col2 = sub2Col; n++;
     }
     if (haveClk)
     {
         // Green for a couple of seconds after a save-loc put it back, so the
         // restore is something you SEE rather than something you infer from the
         // number having changed while you were not looking at it.
-        rows[n].s = clk; rows[n].size = sSub; rows[n].width = mClk.x;
+        rows[n].s = clk; rows[n].s2 = 0; rows[n].size = sSub;
+        rows[n].width = mClk.x; rows[n].width1 = mClk.x;
         rows[n].col = clkFresh ? 0xFF80FF80u
                               : (WrTimerRunning() ? 0xFFE0E0E0u : 0xFF808080u);
+        rows[n].col2 = rows[n].col;
         n++;
     }
     if (haveCmp)
     {
-        rows[n].s = cmp; rows[n].size = sSub; rows[n].width = mCmp.x; rows[n].col = cmpCol; n++;
+        rows[n].s = cmp; rows[n].s2 = 0; rows[n].size = sSub;
+        rows[n].width = mCmp.x; rows[n].width1 = mCmp.x;
+        rows[n].col = cmpCol; rows[n].col2 = cmpCol; n++;
     }
 
     // Held reads as dimmed, never as blank and never as hidden. A readout that
@@ -2339,6 +3176,16 @@ static void EmitEnergyHud(ImDrawList *dl)
         dl->AddText(f, rows[i].size, ImVec2(tx + 1.0f, ty + 1.0f), 0xC0000000u,
                     rows[i].s);
         dl->AddText(f, rows[i].size, ImVec2(tx, ty), col, rows[i].s);
+        if (rows[i].s2)
+        {
+            const float tx2 = tx + rows[i].width1;
+            unsigned int c2 = held ? MixColour(rows[i].col2, 0.45f, 0.45f,
+                                               0.45f, 0.55f)
+                                   : rows[i].col2;
+            dl->AddText(f, rows[i].size, ImVec2(tx2 + 1.0f, ty + 1.0f),
+                        0xC0000000u, rows[i].s2);
+            dl->AddText(f, rows[i].size, ImVec2(tx2, ty), c2, rows[i].s2);
+        }
         ty += (i == 0) ? mBig.y : mSub.y;
     }
 
@@ -2529,28 +3376,28 @@ static void EmitStartZone(ImDrawList *dl)
 
     // The ring, as a world-space polygon so it lies flat on the floor and
     // shrinks with distance like everything else here.
+    // Segment by segment rather than as one list of points. Stand inside a start
+    // zone and the ring surrounds you: some of it is behind the camera and the
+    // rest sweeps off to both sides, which is precisely the case a polyline of
+    // projected vertices cannot express. It used to drop the behind-camera
+    // points and splice the survivors, so the ring cut across itself.
+    //
+    // ProjectSegment does the near plane and the viewport together, and the last
+    // segment wraps to i + 1 == kSegs, which is angle zero -- so the ring closes
+    // itself without needing ImDrawFlags_Closed.
     const int kSegs = 48;
-    ImVec2 pts[kSegs];
-    int n = 0;
-    bool broken = false;
     for (int i = 0; i < kSegs; i++)
     {
-        float a = (float)i / (float)kSegs * 6.28318531f;
-        Vec3 p = WrVec(z->centre.x + cosf(a) * zr,
-                       z->centre.y + sinf(a) * zr, zBase);
-        if (!Project(p, &pts[n]))
-        {
-            broken = true;      // wraps behind the camera; draw what is left
-            if (n >= 2)
-                dl->AddPolyline(pts, n, ring, 0, g_render.thickness);
-            n = 0;
-            continue;
-        }
-        n++;
+        const float a0 = (float)i / (float)kSegs * 6.28318531f;
+        const float a1 = (float)(i + 1) / (float)kSegs * 6.28318531f;
+        Vec3 p0 = WrVec(z->centre.x + cosf(a0) * zr,
+                        z->centre.y + sinf(a0) * zr, zBase);
+        Vec3 p1 = WrVec(z->centre.x + cosf(a1) * zr,
+                        z->centre.y + sinf(a1) * zr, zBase);
+        ImVec2 q0, q1;
+        if (ProjectSegment(p0, p1, &q0, &q1))
+            dl->AddLine(q0, q1, ring, g_render.thickness);
     }
-    if (n >= 2)
-        dl->AddPolyline(pts, n, ring, broken ? 0 : ImDrawFlags_Closed,
-                        g_render.thickness);
 
     if (WrLength(z->outDir) < 0.5f)
         return;                 // no usable heading: no line and no arrow
@@ -2568,7 +3415,7 @@ static void EmitStartZone(ImDrawList *dl)
         Vec3 b = WrAdd(WrAdd(c, WrScale(side, zr)),
                        WrScale(z->outDir, off));
         ImVec2 pa, pb;
-        if (!ClipToNear(&a, &b) || !Project(a, &pa) || !Project(b, &pb))
+        if (!ProjectSegment(a, b, &pa, &pb))
             continue;
         dl->AddLine(pa, pb, k == 0 ? ring : band,
                     g_render.thickness * (k == 0 ? 1.6f : 0.8f));
@@ -2579,7 +3426,7 @@ static void EmitStartZone(ImDrawList *dl)
         Vec3 a = c;
         Vec3 b = WrAdd(c, WrScale(z->outDir, zr * 0.9f));
         ImVec2 pa, pb;
-        if (ClipToNear(&a, &b) && Project(a, &pa) && Project(b, &pb))
+        if (ProjectSegment(a, b, &pa, &pb))
         {
             dl->AddLine(pa, pb, ring, g_render.thickness);
             for (int s = -1; s <= 1; s += 2)
@@ -2588,7 +3435,7 @@ static void EmitStartZone(ImDrawList *dl)
                 Vec3 h1 = WrAdd(b, WrAdd(WrScale(z->outDir, -48.0f),
                                          WrScale(side, 28.0f * (float)s)));
                 ImVec2 q0, q1;
-                if (ClipToNear(&h0, &h1) && Project(h0, &q0) && Project(h1, &q1))
+                if (ProjectSegment(h0, h1, &q0, &q1))
                     dl->AddLine(q0, q1, ring, g_render.thickness);
             }
         }
@@ -2636,7 +3483,7 @@ static void EmitVelocityVector(ImDrawList *dl)
 
     Vec3 a = base, b = tip;
     ImVec2 pa, pb;
-    if (!ClipToNear(&a, &b) || !Project(a, &pa) || !Project(b, &pb))
+    if (!ProjectSegment(a, b, &pa, &pb))
         return;
     dl->AddLine(pa, pb, col, g_render.thickness * 1.4f);
 
@@ -2655,7 +3502,7 @@ static void EmitVelocityVector(ImDrawList *dl)
                               WrScale(WrNormalize(side), 0.42f * (float)s));
             Vec3 h0 = tip, h1 = WrAdd(tip, WrScale(WrNormalize(back), hl));
             ImVec2 q0, q1;
-            if (ClipToNear(&h0, &h1) && Project(h0, &q0) && Project(h1, &q1))
+            if (ProjectSegment(h0, h1, &q0, &q1))
                 dl->AddLine(q0, q1, col, g_render.thickness * 1.4f);
         }
     }
@@ -2679,6 +3526,10 @@ static void EmitVelocityVector(ImDrawList *dl)
 // on screen, which is why there is a face cap and not just a radius.
 static void EmitMapSurfaces(ImDrawList *dl)
 {
+    // The query reads a global rather than taking a parameter, because the same
+    // filter has to apply to the ahead-readout and anything else that asks.
+    g_wrBspDrawClip = g_bspLoad.drawClip;
+
     if (!g_bspLoad.drawSurf)
         return;
     const WrBspMap *map = WrBspLoadCurrent();
@@ -2725,22 +3576,47 @@ static void EmitMapSurfaces(ImDrawList *dl)
         // it properly and tells nobody anything.
         fade = 0.25f + 0.75f * fade;
 
-        unsigned int col = WithAlpha(WR_BSP_SURF_COLOUR,
-                                     g_bspLoad.drawAlpha * fade);
+        // A clip-brush ramp is real collision with no material on it: you ride
+        // it, and you cannot see it. Drawn, because on the maps built that way
+        // it is the only ramp there is -- but dimmer and never filled, so it
+        // never reads as a surface that is actually there to look at.
+        const bool isClip = (WrBspPolyFlags(map, pi) & WR_BSP_POLY_CLIP) != 0;
 
-        // The fill wants every vertex in front of the near plane, because a
-        // convex polygon clipped against it is no longer the polygon ImGui was
-        // handed. The outline has no such problem -- each edge is clipped on
-        // its own -- so a face that is half behind you still gets its edges.
-        ImVec2 sp[WR_BSP_MAX_POLY_VERTS];
-        bool whole = g_bspLoad.drawFill;
-        if (whole)
+        unsigned int col = WithAlpha(WR_BSP_SURF_COLOUR,
+                                     g_bspLoad.drawAlpha * fade *
+                                         (isClip ? 0.60f : 1.0f));
+
+        // CLIPPED IN 3D, then filled -- rather than refused because one corner
+        // was behind the camera.
+        //
+        // This used to demand that every vertex project, on the sound reasoning
+        // that a convex polygon clipped against the near plane is not the
+        // polygon ImGui was handed. The answer to that is to hand ImGui the
+        // clipped polygon, which is still convex; refusing was throwing away the
+        // fill on precisely the surfaces the tool exists to show, because a ramp
+        // long enough to ride always has an end behind you once you are on it.
+        //
+        // The lateral bound is gone with it, and for the same reason the clamp
+        // in ProjectKnownW went: after a correct near clip every vertex is in
+        // front of the eye, so a large screen coordinate is a large surface seen
+        // up close, not a corner that has been moved. WrSaneFloat still rejects
+        // a non-finite one, and ImGui rasterises against its own clip rect.
+        ImVec2 sp[WR_BSP_MAX_POLY_VERTS + 1];
+        if (g_bspLoad.drawFill && !isClip)
         {
-            for (int j = 0; j < poly->count && whole; j++)
-                if (!Project(WrVec(v[j][0], v[j][1], v[j][2]), &sp[j]))
+            Vec3 world[WR_BSP_MAX_POLY_VERTS];
+            for (int j = 0; j < poly->count; j++)
+                world[j] = WrVec(v[j][0], v[j][1], v[j][2]);
+
+            Vec3 clipped[WR_BSP_MAX_POLY_VERTS + 1];
+            const int cn = ClipPolyToNear(world, poly->count, clipped,
+                                          WR_BSP_MAX_POLY_VERTS + 1);
+            bool whole = (cn >= 3);
+            for (int j = 0; j < cn && whole; j++)
+                if (!ProjectKnownW(clipped[j], ClipW(clipped[j]), &sp[j]))
                     whole = false;
             if (whole)
-                dl->AddConvexPolyFilled(sp, poly->count,
+                dl->AddConvexPolyFilled(sp, cn,
                                         WithAlpha(WR_BSP_SURF_COLOUR,
                                                   g_bspLoad.drawAlpha * fade
                                                   * 0.22f));
@@ -2752,7 +3628,7 @@ static void EmitMapSurfaces(ImDrawList *dl)
             const int j2 = (j + 1 == poly->count) ? 0 : j + 1;
             Vec3 b = WrVec(v[j2][0], v[j2][1], v[j2][2]);
             ImVec2 pa, pb;
-            if (!ClipToNear(&a, &b) || !Project(a, &pa) || !Project(b, &pb))
+            if (!ProjectSegment(a, b, &pa, &pb))
                 continue;
             dl->AddLine(pa, pb, col, g_render.thickness * 0.7f);
             g_statSegments++;
@@ -3071,8 +3947,12 @@ static void EmitEnergyOverlay(ImDrawList *dl)
     // exclusive, and with all of them on the old ten were exactly full -- so
     // adding the map reader's row would have written off the end of the array
     // for anybody who had turned the other two on.
-    char lines[12][96];
-    unsigned int cols[12];
+    // Sized for every row that can be on at once, which is now twelve. It was
+    // exactly twelve slots for exactly twelve rows before the board row, and a
+    // fixed array one short of its worst case is a stack overwrite waiting for
+    // whoever adds the next one.
+    char lines[16][96];
+    unsigned int cols[16];
     int n = 0;
 
     _snprintf_s(lines[n], sizeof(lines[0]), _TRUNCATE, "energy  %.0f  (%.0f u/s)",
@@ -3099,32 +3979,25 @@ static void EmitEnergyOverlay(ImDrawList *dl)
     // behind wr_stress.h refusing to use turn rate as an efficiency metric.
     if (g_energy.showStrafe)
     {
-        int ph = WrEnergyPhase();
-        if (ph == WR_PHASE_AIR)
+        float got = 0.0f, ideal = 0.0f, qual = -1.0f;
+        const char *why = "";
+        if (WrTurnRates(&got, &ideal, &qual, &why))
         {
-            // The same rule the Energy tab uses: a compared run's own tick if
-            // there is one, else 0.015. 482 of the 503 demos measured are 0.015
-            // but every bhop_futile run is 0.01, so this is not a constant.
-            const WrRun *tr = WrEnergyReferenceRun();
-            float tick = (tr && tr->tickInterval > 1e-4f) ? tr->tickInterval
-                                                          : 0.015f;
-            float ideal = WrPerfectStrafeDegrees(WrEnergyHorizontalSpeed(), tick,
-                                                 g_energy.airAccelerate,
-                                                 g_energy.maxSpeed) / tick;
-            float got = WrEnergyYawRate();
-            _snprintf_s(lines[n], sizeof(lines[0]), _TRUNCATE,
-                        "strafe  %.0f/s  ideal %.0f/s", got, ideal);
+            char extra[32];
+            extra[0] = '\0';
+            if (g_energy.showStrafePercent && qual >= 0.0f)
+                _snprintf_s(extra, sizeof(extra), _TRUNCATE, "  %.0f%%",
+                            qual * 100.0f);
 
-            // Green inside a fifth of the ideal either way. Not tighter: the
-            // rate is smoothed over 0.12 s and a surfer is never meant to sit
-            // exactly on it -- the point is the size of the miss, not a score.
-            float rel = (ideal > 1.0f) ? (got / ideal) : 1.0f;
-            cols[n++] = (rel > 0.8f && rel < 1.2f) ? 0xFF66FF66u : 0xFFCCCCCCu;
+            _snprintf_s(lines[n], sizeof(lines[0]), _TRUNCATE,
+                        "strafe  %.0f/s%s  ideal %.0f/s%s", got,
+                        StrafeArrow(got, ideal), ideal, extra);
+            cols[n++] = StrafeColour(got, ideal, qual, 0xFFCCCCCCu);
         }
         else
         {
             _snprintf_s(lines[n], sizeof(lines[0]), _TRUNCATE,
-                        "strafe  --  (only in the air)");
+                        "strafe  --  (%s)", why);
             cols[n++] = 0xFF808080u;
         }
     }
@@ -3144,6 +4017,76 @@ static void EmitEnergyOverlay(ImDrawList *dl)
         cols[n++] = (ph == WR_PHASE_UNKNOWN) ? 0xFF808080u
                                              : PhaseColour((unsigned char)ph,
                                                            0xFFE0E0E0u);
+    }
+
+    // THE BRIDGE THAT DID NOT EXIST.
+    //
+    // The HUD said "no surface". The Display tab said "displacements skipped".
+    // They shared no word, they are on different tabs, and the chain a player
+    // had to guess unaided ran: no surface -> the normal was refused -> the map
+    // was never asked -> four displacements out of 756 failed a corner
+    // tolerance. Nothing in the product stated a single link of that.
+    //
+    // Only when a map IS loaded and is not whole -- a level with no map read at
+    // all is a setting, not a surprise, and the rows already say "map not read".
+    // Same orange the Display tab uses for its own two warnings.
+    if (WrBspLoadStateNow() == WR_BSPLOAD_READY && !WrBspLoadGeometryComplete())
+    {
+        _snprintf_s(lines[n], sizeof(lines[0]), _TRUNCATE,
+                    "map     part read -- see Display tab");
+        cols[n++] = 0xFF33BFFFu;
+    }
+
+    // Your own last board, graded by the same function that grades a demo's.
+    //
+    // Three states rather than two, because "no board yet" and "this map cannot
+    // have one" are different things and reading the first when the second is
+    // true would be a player waiting for a number that is never coming.
+    //
+    // AND THE THIRD STATE NOW NAMES ITSELF. "(none yet)" was standing in for
+    // ten separate refusals -- nothing within reach of the feet, a wall picked
+    // instead of the ramp, not enough air before the contact, too glancing to
+    // grade -- which is why the readout could look broken while working exactly
+    // as written. Reported as boards that "sometimes don't report numbers".
+    // This is the same treatment the strafe row got for "no surface".
+    if (g_energy.showBoard)
+    {
+        WrBoardStats b;
+        float age = 0.0f;
+        if (!WrEnergyBoardAvailable())
+        {
+            // "not fully read" covered two different things -- a map that was
+            // partly read, and "Read the map file" switched off entirely, where
+            // nothing was read at all. The row above now names a partial map, so
+            // this one says the plainer thing.
+            _snprintf_s(lines[n], sizeof(lines[0]), _TRUNCATE,
+                        "board   --  (%s)",
+                        WrBspLoadStateNow() == WR_BSPLOAD_READY
+                            ? "map part read" : "map not read");
+            cols[n++] = 0xFF808080u;
+        }
+        else if (WrEnergyBoard(&b, &age, WR_BOARD_ROW_LIFE))
+        {
+            char text[80];
+            BoardText(&b, text, (int)sizeof(text), true);
+            _snprintf_s(lines[n], sizeof(lines[0]), _TRUNCATE, "board   %s", text);
+            cols[n++] = GradeColour(b.grade);
+        }
+        else
+        {
+            const int why = WrEnergyBoardWhy();
+            if (why == WR_BOARD_WHY_NOT_RAMP)
+                // The one a player can act on, so it carries its evidence: an
+                // n.z of 0.95 is a floor and 0.04 is a wall, and which of those
+                // it was tells you whether you clipped the lip or the side.
+                _snprintf_s(lines[n], sizeof(lines[0]), _TRUNCATE,
+                            "board   --  (not a ramp, nz %.2f)",
+                            WrEnergyBoardWhyNz());
+            else
+                _snprintf_s(lines[n], sizeof(lines[0]), _TRUNCATE,
+                            "board   --  (%s)", WrEnergyBoardWhyName(why));
+            cols[n++] = 0xFF808080u;
+        }
     }
 
     // What you are LOOKING at, which is the other half of the row above.
@@ -3326,11 +4269,16 @@ static struct
 // close. The number is there to admit a coin toss, so it has to be countable.
 // How near the picked point has to be to a board for the plate to report it.
 //
-// In POINTS, which is ticks: 40 is about six tenths of a second at a 0.015
-// interval, so it covers the arrival and the moment either side of it and not
-// the whole ramp. Wider and the plate starts attributing a board to a stretch of
-// line the player was nowhere near when it happened.
-#define WR_PICK_BOARD_POINTS 40
+// IN SECONDS, converted per run.
+//
+// It was 40 points, and points are ticks -- so the window it actually meant was
+// six tenths of a second at a 0.015 interval and four tenths at 0.01. The
+// quantity it is reasoning about is a duration ("the arrival and the moment
+// either side of it, and not the whole ramp"), so it should be written as one;
+// a tick is no more a fixed amount of time here than a frame is in wr_smooth.h.
+//
+// 0.6 is what 40 points meant at the tick it was chosen at.
+#define WR_PICK_BOARD_SECONDS 0.6f
 
 #define WR_PICK_CAND 8
 static struct { int slot; float score; } g_cand[WR_PICK_CAND];
@@ -3784,7 +4732,11 @@ static void EmitPickPlate(ImDrawList *dl)
     if (run->boards && run->boardCount > 0 && n < kMaxLines - 1)
     {
         const WrBoard *closest = NULL;
-        int bestGap = WR_PICK_BOARD_POINTS + 1;
+        float tick = run->tickInterval > 1e-5f ? run->tickInterval : 0.015f;
+        int reach = (int)(WR_PICK_BOARD_SECONDS / tick + 0.5f);
+        if (reach < 4) reach = 4;
+        if (reach > 512) reach = 512;
+        int bestGap = reach + 1;
         for (int i = 0; i < run->boardCount; i++)
         {
             int gap = run->boards[i].pointIndex - idx;
@@ -3798,17 +4750,27 @@ static void EmitPickPlate(ImDrawList *dl)
 
         if (closest)
         {
-            _snprintf_s(lines[n], sizeof(lines[0]), _TRUNCATE,
-                        "boarded %s  -%.0f u/s (%.1f%%)",
-                        WrPhaseGradeName(closest->s.grade), closest->s.loss,
-                        closest->s.lossPct * 100.0f);
+            // THROUGH THE SHARED FORMATTER, like the other three.
+            //
+            // BoardCostText exists because three readouts each held their own
+            // copy of the format and a unit setting could reach two of them.
+            // This was the fourth copy and it had drifted furthest of all: it
+            // hard-coded u/s so the units combo never touched it, and it
+            // printed lossPct where every other site prints WrBoardPerfectPct,
+            // so the same board read "0.4%" here and "99.6%" in the corner.
+            char text[80];
+            BoardText(&closest->s, text, (int)sizeof(text), false);
+            _snprintf_s(lines[n], sizeof(lines[0]), _TRUNCATE, "boarded %s  %s",
+                        WrPhaseGradeName(closest->s.grade), text);
             cols[n++] = WithAlpha(GradeColour(closest->s.grade), fade);
 
             if (n < kMaxLines)
             {
+                const int dp = BoardDecimals();
                 _snprintf_s(lines[n], sizeof(lines[0]), _TRUNCATE,
-                            "%.0f deg onto a %.0f deg ramp at %.0f",
-                            closest->s.approachDeg, closest->s.rampDeg,
+                            "%.*f deg onto a %.*f deg ramp at %.0f",
+                            dp + 1, closest->s.approachDeg,
+                            dp + 1, closest->s.rampDeg,
                             closest->s.speedIn);
                 cols[n++] = WithAlpha(0xFFDDDDDDu, fade);
             }
@@ -4097,6 +5059,8 @@ void WrRenderWorld(void)
     EmitComparePoint(dl);
     EmitVelocityVector(dl);
     EmitEnergyHud(dl);
+    EmitStrafeBar(dl);      // above the crosshair; the flash owns below it
+    EmitBoardFlash(dl);
     EmitPickPlate(dl);      // last, so it is never drawn under anything
 
     if (g_render.drawLive)

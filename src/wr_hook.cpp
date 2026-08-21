@@ -91,9 +91,32 @@ static bool g_cursorShowing = false;     // what the last GetCursorInfo said
 // WR_OS_CURSOR_STALE_FRAMES lives in wr_hook.h, because Diagnostics shows the
 // running count against it and two copies of the number would drift.
 
-// Raw input counts as the live source only if it arrived recently. It used to
-// count for ever -- see the WM_MOUSEMOVE case in WrWndProc.
-#define WR_RAW_INPUT_FRESH_MS 1000
+// Whether any raw mouse packet has arrived SINCE THE PANEL WAS OPENED, which is
+// what arms the WM_MOUSEMOVE fallback in WrWndProc. Reset by WrSetPanelOpen.
+//
+// This has now been wrong in both directions, so both are written down.
+//
+// It began as "have we EVER seen raw input", a flag set by the first packet of
+// the session and never cleared -- so one packet at any time permanently
+// disabled the fallback, including on the setups that only deliver raw input
+// while the pointer is grabbed and therefore need it most.
+//
+// The fix for that was "did raw input arrive in the last second", and that is
+// the bug this replaces: idleness is not absence. Source warps the OS cursor
+// back to the middle of the window every frame it holds mouselook, and every
+// one of those warps posts a WM_MOUSEMOVE carrying the CENTRE. Move the mouse,
+// read a tooltip for a second, and the freshness window lapses -- then the next
+// warp message is believed and the pointer is thrown to the middle of the
+// screen. Reported as "the mouse keeps centering when I stop moving for 1sec,
+// annoying for reading tool tips", and it would repeat every second.
+//
+// Since the panel opened is the test that separates the two cases without
+// either failure. A setup with no raw input has seen none since it opened, so
+// the fallback is armed. A setup with working raw input has, so a still mouse
+// simply leaves the cursor where the user left it -- which is the whole point
+// of a cursor. And it re-arms on every open, so nothing carries over from a
+// time when the game was in a menu and the pointer behaved differently.
+static bool g_rawSeenSinceOpen = false;
 static bool g_renderReady = false;
 static bool g_isDxvk = false;
 static char g_d3d11Path[MAX_PATH] = {0};
@@ -214,11 +237,15 @@ void WrCursorUpdate(void)
 // has to be able to answer it from the machine where it happens -- one
 // screenshot instead of a round trip per guess.
 void WrCursorDiag(bool *followsOs, bool *cursorShowing, int *staleFrames,
-                  double *rawAgeSeconds)
+                  double *rawAgeSeconds, bool *moveFallbackArmed)
 {
     if (followsOs)     *followsOs = g_cursorFollowsOS;
     if (cursorShowing) *cursorShowing = g_cursorShowing;
     if (staleFrames)   *staleFrames = g_osStaleFrames;
+    // Armed means WM_MOUSEMOVE is allowed to place the cursor. On a machine
+    // where the pointer jumps to the middle of the screen, this is the line
+    // that says whether that is us believing a warp message.
+    if (moveFallbackArmed) *moveFallbackArmed = !g_rawSeenSinceOpen;
     if (rawAgeSeconds)
     {
         *rawAgeSeconds = g_rawMotionTick
@@ -276,6 +303,10 @@ void WrSetPanelOpen(unsigned int which, bool open)
         g_osStaleFrames = 0;
         g_osLastX = g_osLastY = -1;
         g_rawMotionSeen = g_rawMotionSeq;
+        // Arms the WM_MOUSEMOVE fallback for this opening only. A device that
+        // delivered raw input last time may not this time, and the other way
+        // round -- so the question is asked again rather than remembered.
+        g_rawSeenSinceOpen = false;
         // The window procedure goes in only for as long as a panel is up. See
         // SubclassWindow for why.
         SubclassWindow(g_window);
@@ -332,6 +363,7 @@ static void AccumulateRawMouse(LPARAM lParam)
     // panel usable when raw input stops arriving.
     g_rawMotionSeq++;
     g_rawMotionTick = GetTickCount64();
+    g_rawSeenSinceOpen = true;
 
     // Only integrate deltas when we are not already tracking the OS cursor;
     // otherwise the two sources would add together and the pointer would run
@@ -389,8 +421,9 @@ static LRESULT CALLBACK WrWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
             // the first raw packet of the session and never cleared, which
             // turned the fallback off permanently the moment it was needed
             // least.
-            if ((GetTickCount64() - g_rawMotionTick) >= WR_RAW_INPUT_FRESH_MS &&
-                !g_cursorFollowsOS)
+            // NOT "has raw input gone quiet", which is what a user reading a
+            // tooltip looks like. See g_rawSeenSinceOpen.
+            if (!g_rawSeenSinceOpen && !g_cursorFollowsOS)
             {
                 g_curX = WrClampF((float)WR_LPARAM_X(lParam), 0.0f, (float)g_bbWidth);
                 g_curY = WrClampF((float)WR_LPARAM_Y(lParam), 0.0f, (float)g_bbHeight);

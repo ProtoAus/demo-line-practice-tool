@@ -74,6 +74,7 @@ static WrVelWindow g_win;
 static WrEma g_velX, g_velY, g_velZ;
 static WrEma g_speedEma, g_energyEma, g_viewTurnEma, g_velTurnEma, g_accelEma;
 static WrEma g_yawTurnEma;      // yaw alone, for the strafe readout
+static WrEma g_yawSignedEma;    // and again with its sign, for the ramp ideal
 static WrEma g_zEma;                // the height alone, so K can be separated
 static WrTrendWindow g_trend;
 
@@ -112,6 +113,152 @@ static float g_gaugeClock = 0.0f;
 #define PHASE_LIVE_WINDOW 0.10f
 #define PHASE_LIVE_TOL 250.0f
 static WrTrendWindow g_vzTrend;
+
+// What the map said about the player's surroundings this frame.
+//
+// WR_GEOM_UNKNOWN unless somebody pushes an answer in, and nothing outside the
+// DLL does -- so every harness that links this file gets exactly the kinematic
+// behaviour that was measured at 92.9%, with no geometry attached.
+static int g_geomTouch = WR_GEOM_UNKNOWN;
+static float g_geomNormal[3] = { 0.0f, 0.0f, 0.0f };
+static bool g_geomHaveNormal = false;
+
+// AND THE BEST RAMP CANDIDATE, WHICH IS A DIFFERENT ANSWER.
+//
+// g_geomNormal is the nearest surface of any facing, because that is the
+// question the touch verdict was measured on. A board wants the nearest surface
+// it could have RIDDEN, and on a side entry beside a wall those are not the
+// same polygon -- the wall wins on distance and the board is then refused for
+// not being a ramp, silently, which is the defect this pair exists to end.
+//
+// Four floats: the plane's normal, then its own distance, so the board can
+// solve where the crossing was rather than assume when it happened.
+static float g_geomRampPlane[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+static bool g_geomHaveRamp = false;
+static float g_geomRampDist = -1.0f;
+static float g_geomNearDist = -1.0f;
+
+// HOW MUCH FURTHER THE RAMP CANDIDATE MAY BE THAN THE NEAREST SURFACE.
+//
+// Preferring the ramp unconditionally fixes the reported defect and introduces
+// a smaller one going the other way. Land on a FLOOR that happens to have a
+// ramp twenty units off, and there is a rideable plane in range, and the board
+// would be graded against a surface the player never touched -- a board
+// invented where the old code merely stayed quiet.
+//
+// The case being rescued is a hull straddling a junction, where the ramp and
+// whatever beat it to the query meet and are both within a few units of the
+// feet. Twelve is inside the player hull's own half-width of sixteen, so it
+// covers that and excludes a surface across the room.
+//
+// This one is a judgement rather than a measurement: the corpus that could
+// settle it is live geometry queries against recorded runs, which is
+// bsp_sweep's territory and not something the .wrpath library can answer.
+#define GEOM_RAMP_PREFER 12.0f
+
+// ---------------------------------------------------------------------------
+// Live boards
+// ---------------------------------------------------------------------------
+//
+// See WrEnergyBoard in the header for what this is and why it is not a port of
+// the demo detector. The mechanism here is only the bookkeeping.
+//
+// HOW FAR BACK TO REACH FOR THE ARRIVING VELOCITY
+//
+// The phase test reads vertical acceleration over PHASE_LIVE_WINDOW (0.10 s), so
+// by the time it says "contact" the clip is already inside its window and the
+// velocity now is part clipped. Reaching back one whole window puts the sample
+// before the event with the window's own margin -- and no further, because in
+// 0.10 s of free fall gravity alone has added 80 u/s of downward speed, and
+// charging that to the board would read every landing as worse than it was.
+// ...AND WHY THAT IS ONLY THE FALLBACK NOW.
+//
+// Reaching back a fixed distance was always an estimate of an instant nobody
+// had measured, and it has three defects that all point the same way. The
+// detector's own lag is not fixed -- it is a threshold crossing on a smoothed
+// signal, so contact is located to perhaps +-50 ms, and 50 ms of free fall is
+// 40 u/s of vertical speed unaccounted for. The walk below returned the first
+// sample PAST the threshold rather than the sample AT it, so the age came out
+// in [back - dt, back) and the answer depended on the frame rate: 13 u/s of
+// gravity at 60 fps against 2.7 at 300. And nothing corrected for the gravity
+// that did accumulate between the sample and the surface.
+//
+// Where the map can offer the plane, none of that is necessary. The player was
+// in free flight -- that is what AIR means -- so the crossing of a known plane
+// by a known parabola has a closed form, and the velocity there is exact up to
+// the estimator's own noise. WrBoardEntry solves it and falls back to this
+// constant, gravity-corrected, only when it cannot bracket a crossing.
+#define BOARD_LOOKBACK 0.10f
+
+// How far back the solve is allowed to look for the crossing. Generous against
+// the detector's worst lag (about 180 ms end to end) and short enough that it
+// cannot reach past the previous ramp -- beyond this the free-flight model it
+// rests on is no longer describing what happened.
+#define BOARD_SOLVE_REACH 0.35f
+
+// How far off the plane a sample has to be before its SIDE means anything. A
+// player riding a ramp sits within a fraction of a unit of it and the sign
+// there is float noise; two units is past every source of that and well inside
+// one frame of approach at any speed worth grading.
+#define BOARD_SOLVE_CLEAR 2.0f
+
+// About 0.85 s at 300 fps, which is far more than BOARD_LOOKBACK needs. The ring
+// is sized for the frame rate rather than the window so that a stall cannot walk
+// the read off the end of it.
+#define BOARD_RING 256
+
+static Vec3  g_bRingV[BOARD_RING];
+static Vec3  g_bRingP[BOARD_RING];      // the FEET the velocity belonged to
+static float g_bRingDt[BOARD_RING];
+static int   g_bRingHead = 0, g_bRingCount = 0;
+
+// The game's own pair, when the scanner has proved one. Both or neither -- see
+// WrEnergySetTruePlayer. `g_trueLive` is what the panel reports, and it is a
+// property of the last frame rather than of the last board.
+static Vec3 g_trueOrigin, g_trueVel;
+static bool g_trueLive = false;
+static float g_trueEye = -1.0f;
+
+// The transition detector. A board is AIR that has lasted, then contact -- the
+// same shape as the demo rule (PHASE_BOARD_AIR_BEFORE), expressed in seconds
+// because live has no ticks.
+#define BOARD_AIR_BEFORE 0.10f
+
+// AND A GRACE ON IT, because one frame used to be able to cost a whole board.
+//
+// The air accumulator was zeroed on every contact frame including refused ones,
+// so a single fake contact -- and the phase readout fakes one on about 0.4% of
+// frames -- emptied it, and the genuine landing 50 ms later then failed
+// BOARD_AIR_BEFORE and reported nothing. Air that has already been earned is
+// kept for this long across a contact that produced no board, which cannot
+// manufacture a board on a sustained ride: a ride is contact frame after
+// contact frame, and the grace is spent by the second one.
+#define BOARD_AIR_GRACE 0.05f
+
+static int   g_bPrevPhase = WR_PHASE_UNKNOWN;
+static float g_bAirFor = 0.0f;
+static float g_bAirGrace = 0.0f;
+
+// WHY THE LAST LANDING PRODUCED NOTHING.
+//
+// Thirteen tests stand between a landing and a number and every one of them
+// used to fail into the same grey "(none yet)", which reads as "you have not
+// boarded" rather than "I refused". Reported as boards that "sometimes don't
+// report numbers" -- the honest answer to which is that they were reported and
+// then thrown away, and the tool knew which test did it every single time.
+//
+// This is the same treatment the strafe row got when it printed "no surface"
+// on a map it had never read.
+static int   g_bWhy = WR_BOARD_WHY_NONE;
+static int   g_bWhyCount[WR_BOARD_WHY__COUNT] = { 0 };
+static float g_bWhyNz = 0.0f;           // what the refused plane actually was
+
+static WrBoardStats g_bLast;
+static bool  g_bHave = false;
+static float g_bAge = 0.0f;
+static bool  g_bAvailable = false;
+static bool  g_bExact = false;          // the entry was solved, not guessed
+
 static WrArrow g_arrow;
 static WrSwing g_swing;
 static bool g_spliced = false;
@@ -155,6 +302,13 @@ static bool g_seedChecked = false;      // a result exists to report
 static bool g_seedRejected = false;
 static float g_seedErr = 0.0f, g_seedSpeedErr = 0.0f;
 static int g_seedCount = 0, g_seedRejects = 0;
+
+// What the file said, and how long the check waited. Kept only so the log line
+// on a rejection can be read afterwards -- see the guard-rail in
+// WrEnergySample. Nothing here takes part in the decision.
+static Vec3 g_seedVel = { 0.0f, 0.0f, 0.0f };
+static float g_seedAge = 0.0f;
+static int g_seedFrames = 0;
 
 // After a discontinuity, how long the output filter is given to converge before
 // the gain/loss accumulator is allowed to bank anything. Three time constants is
@@ -220,6 +374,7 @@ static float g_lastSpeedForRate = 0.0f;
 static bool g_haveLastSpeed = false;
 static float g_viewTurn = 0.0f, g_velTurn = 0.0f, g_speedRate = 0.0f;
 static float g_yawTurn = 0.0f;
+static float g_yawSigned = 0.0f;
 
 // Displayed value, quantised with hysteresis so the last digit stops churning.
 static float g_shown = 0.0f;
@@ -297,6 +452,35 @@ void WrEnergyDefaults(void)
     g_energy.powerSeconds = POWER_WINDOW;
     g_energy.showPhase = true;
     g_energy.showStrafe = false;
+    // The window, not the physics curve, because the curve is red more often
+    // than it is useful once you are quick. 30 deg/s is the default because that
+    // is the slack a good strafe actually wanders by; the curve is one combo
+    // away and unchanged.
+    g_energy.strafeColour = WR_STRAFE_COLOUR_BAND;
+    g_energy.strafeBand = WR_STRAFE_BAND_DEGREES;
+    g_energy.strafeTolerance = 30.0f;
+    g_energy.showStrafePercent = true;
+    g_energy.showStrafeArrow = true;
+
+    // ON, unlike most things here, and for a reason that is not a preference:
+    // it was asked for, and unlike the numbers beside it there is nothing to
+    // read -- a bar you are not using costs a glance you do not spend. It also
+    // sits above the crosshair rather than in the HUD block, so it is visible
+    // even for the majority of players who never turn the block on.
+    g_energy.showStrafeBar = true;
+    g_energy.strafeBarWidth = 0.0f;     // 0 = match the HUD block's width
+    g_energy.strafeBarHeight = 7.0f;
+    // Above the crosshair. Below it is spoken for: WR_BOARD_FLASH_DROP puts the
+    // board grade at 46, and a strafe bar landing on top of a board flash would
+    // hide the one readout that only exists for a tenth of a second.
+    g_energy.strafeBarRise = 54.0f;
+
+    g_energy.showBoard = false;
+    g_energy.boardFlashSeconds = 2.0f;
+    g_energy.boardUnit = WR_BOARD_UNIT_SPEED;
+    g_energy.boardPercent = true;
+    // Two, which is what the solved entry earns. See BoardDecimals.
+    g_energy.boardDecimals = 2;
     g_energy.gaugeSeconds = 2.0f;
     g_energy.arrowBand = ARROW_BAND;
     g_energy.anchorToRunStart = true;
@@ -322,8 +506,8 @@ void WrEnergyDefaults(void)
 
 void WrEnergyCycleHudMode(int step)
 {
-    // Both directions, because there are five modes now and cycling forward past
-    // the one you wanted costs four more presses mid-ramp. The double modulus is
+    // Both directions, because there are six modes now and cycling forward past
+    // the one you wanted costs five more presses mid-ramp. The double modulus is
     // the usual guard against C's truncating negative remainder.
     int n = WR_HUD_MODE_COUNT;
     int m = g_energy.hudMode;
@@ -348,9 +532,46 @@ void WrEnergyReset(void)
     WrEmaReset(&g_speedEma); WrEmaReset(&g_energyEma); WrEmaReset(&g_zEma);
     WrEmaReset(&g_viewTurnEma); WrEmaReset(&g_velTurnEma); WrEmaReset(&g_accelEma);
     WrEmaReset(&g_yawTurnEma);
+    WrEmaReset(&g_yawSignedEma);
     WrTrendReset(&g_trend);
     WrTrendReset(&g_gauge);
     WrTrendReset(&g_vzTrend);
+
+    // A map change comes through here, and the geometry answer belongs to the
+    // level that was on screen when it was taken.
+    g_geomTouch = WR_GEOM_UNKNOWN;
+    g_geomHaveNormal = false;
+    g_geomHaveRamp = false;
+    g_geomRampDist = -1.0f;
+    g_geomNearDist = -1.0f;
+
+    // The scanner's answer dies with the level too -- a heap object moves and
+    // the address that held the origin holds something else. wr_player.cpp
+    // notices on its own, but it must not be believed for the frames in
+    // between.
+    g_trueLive = false;
+    g_trueEye = -1.0f;
+
+    // So does the last board. Showing the previous map's board after a level
+    // change is the same class of mistake as drawing its ramps.
+    g_bRingHead = 0;
+    g_bRingCount = 0;
+    g_bPrevPhase = WR_PHASE_UNKNOWN;
+    g_bAirFor = 0.0f;
+    g_bAirGrace = 0.0f;
+    g_bHave = false;
+    g_bAge = 0.0f;
+    g_bAvailable = false;
+    g_bExact = false;
+
+    // And so does the tally of what went wrong: it is a fact about this level's
+    // ramps, and carrying it across a map change would make it a fact about
+    // nothing.
+    g_bWhy = WR_BOARD_WHY_NONE;
+    g_bWhyNz = 0.0f;
+    for (int i = 0; i < WR_BOARD_WHY__COUNT; i++)
+        g_bWhyCount[i] = 0;
+
     g_gaugeClock = 0.0f;
     WrArrowReset(&g_arrow);
     WrSwingReset(&g_swing, WR_SWING_HYSTERESIS);
@@ -386,6 +607,7 @@ void WrEnergyReset(void)
     g_haveShown = false;
     g_viewTurn = g_velTurn = g_speedRate = 0.0f;
     g_yawTurn = 0.0f;
+    g_yawSigned = 0.0f;
     g_vel = WrVec(0.0f, 0.0f, 0.0f);
 }
 
@@ -534,6 +756,7 @@ static void Teleported(const Vec3 &pos)
     g_held = false;
     g_speedRate = g_viewTurn = g_velTurn = 0.0f;
     g_yawTurn = 0.0f;
+    g_yawSigned = 0.0f;
 
     if (!g_haveRef)
         return;
@@ -594,6 +817,10 @@ void WrEnergySeed(const Vec3 &camPos, const Vec3 &vel, const char *why)
 
     float energy = WrEnergyOf(camPos, vel);
     float speed = WrLength(vel);
+
+    g_seedVel = vel;
+    g_seedAge = 0.0f;
+    g_seedFrames = 0;
 
     g_vel = vel;
     WrEmaSeed(&g_velX, vel.x);
@@ -775,6 +1002,17 @@ void WrEnergySample(const Vec3 &pos, float dt)
 
     g_clock += dt;
 
+    // Counted here rather than beside the check, deliberately: this function has
+    // four early returns before the seed is judged -- a held camera, a save-loc
+    // still being held down, a window that cannot yet estimate, an insane speed
+    // -- and how many frames went by inside those is precisely what the log
+    // needs in order to explain a measurement of zero.
+    if (g_seedPending)
+    {
+        g_seedAge += dt;
+        g_seedFrames++;
+    }
+
     if (havePrev && WrDist(prev, pos) > TELEPORT_UNITS)
         Teleported(pos);
 
@@ -817,8 +1055,9 @@ void WrEnergySample(const Vec3 &pos, float dt)
 
     float rx = 0.0f, ry = 0.0f, rz = 0.0f;
     float mx = 0.0f, my = 0.0f, mz = 0.0f;
+    float midLead = 0.0f;
     if (!WrVelEstimate(&g_win, g_energy.velWindowSeconds,
-                       &rx, &ry, &rz, &mx, &my, &mz))
+                       &rx, &ry, &rz, &mx, &my, &mz, &midLead))
         return;
 
     Vec3 raw = WrVec(rx, ry, rz);
@@ -861,6 +1100,32 @@ void WrEnergySample(const Vec3 &pos, float dt)
         g_seedErr = WrEnergyOf(mid, raw) - g_seedEnergy;
         g_seedSpeedErr = measured - g_seedSpeed;
         g_seedRejected = (dv > allow);
+
+        // THE REJECTION IS NOT RARE AND THE LOG DID NOT SAY ENOUGH TO EXPLAIN IT.
+        //
+        // Over two recorded sessions, 1026 of 1052 seeds were thrown out and 880
+        // of 914 before that -- 97% and 96% -- every one of them reading "the
+        // file said 2187 u/s, the first measurement says 0". A rejection resets
+        // the whole filter chain including the trend the phase readout runs on,
+        // and holds for three taus, which lands squarely on the first third of a
+        // second of every save-loc practice attempt. That is the same third of a
+        // second a player is watching for a board.
+        //
+        // What the old line could not distinguish: a game that genuinely does
+        // not restore the velocity, from a measurement taken while the player
+        // was still held at the load position, from a window that filled with
+        // repeated frames. So the vector and the elapsed time go in the log
+        // too. This CHANGES NOTHING about the decision -- the tolerance is
+        // untouched -- it only makes the next session's log able to answer the
+        // question.
+        if (g_seedRejected)
+            WrLogf("energy: seed check -- file (%.1f %.1f %.1f) |v| %.0f, "
+                   "measured (%.1f %.1f %.1f) |v| %.0f, %.0f ms and %d frames "
+                   "after the load, window span %.0f ms",
+                   g_seedVel.x, g_seedVel.y, g_seedVel.z, g_seedSpeed,
+                   raw.x, raw.y, raw.z, measured,
+                   g_seedAge * 1000.0f, g_seedFrames,
+                   g_energy.velWindowSeconds * 1000.0f);
 
         if (g_seedRejected)
         {
@@ -937,6 +1202,47 @@ void WrEnergySample(const Vec3 &pos, float dt)
     // over a third of a second smears it across the transition.
     WrTrendPush(&g_vzTrend, g_vel.z, dt);
 
+    // The RAW window velocity for the board lookback, not the EMA beside it. The
+    // EMA's whole job is to be steady, which here means it is still carrying the
+    // pre-clip speed for a tau after the clip and the post-clip speed for a tau
+    // before this reaches back far enough -- it would flatten exactly the edge
+    // the board is measuring.
+    //
+    // The POSITION goes in beside it, and it is the window's midpoint less the
+    // eye height -- the feet, at the instant `raw` refers to. Pairing the raw
+    // velocity with the current camera would be pairing two moments about 20 ms
+    // apart, which is the defect WrEnergySampleAt exists to have stopped. This
+    // is what lets the board solve where the plane was crossed.
+    //
+    // ...unless the game's own pair has been found, in which case that is used
+    // for both. It is exact, it refers to one instant, it carries no view bob
+    // and no duck, and it needs no eye height at all. Both or neither, for the
+    // pairing reason above.
+    g_bRingHead = (g_bRingHead + 1) % BOARD_RING;
+    if (g_trueLive)
+    {
+        g_bRingV[g_bRingHead] = g_trueVel;
+        g_bRingP[g_bRingHead] = g_trueOrigin;
+    }
+    else
+    {
+        // `mid` is the stored sample NEAREST the window's centre, not the centre
+        // itself, so it trails the instant `raw` refers to by up to half a
+        // frame -- eight units at 60 fps and 1000 u/s. Everywhere else that is
+        // invisible behind the output filter; here it is the position half of
+        // the pair the plane crossing is solved from, so it is carried forward
+        // to the velocity's own instant. Linear is enough: the quadratic term
+        // over half a frame is three hundredths of a unit.
+        const float eye = (g_trueEye > 0.0f) ? g_trueEye : g_energy.eyeHeight;
+        g_bRingV[g_bRingHead] = raw;
+        g_bRingP[g_bRingHead] = WrVec(mid.x + raw.x * midLead,
+                                      mid.y + raw.y * midLead,
+                                      mid.z + raw.z * midLead - eye);
+    }
+    g_bRingDt[g_bRingHead] = dt;
+    if (g_bRingCount < BOARD_RING)
+        g_bRingCount++;
+
     // The height alone, through the SAME filter and from the SAME instant --
     // mid.z, not pos.z. Because an EMA is linear, subtracting it from the
     // filtered energy gives exactly the filtered kinetic term, so the budget
@@ -985,6 +1291,18 @@ void WrEnergySample(const Vec3 &pos, float dt)
             float dy = yaw - lastYaw;
             while (dy > 180.0f) dy -= 360.0f;
             while (dy < -180.0f) dy += 360.0f;
+
+            // The sign, kept separately and smoothed separately, because the
+            // ramp ideal needs to know WHICH WAY you are strafing: wn is
+            // dot(wishdir, normal), and the two directions give ideals that
+            // differ by a factor of three on the same surface. Taking the sign
+            // off an EMA of the magnitude would be no answer at all.
+            //
+            // Smoothing the signed rate also does the right thing through a
+            // strafe switch: it crosses zero rather than staying high, which is
+            // exactly when there is no meaningful strafe direction to report.
+            g_yawSigned = WrEmaStep(&g_yawSignedEma, dy / dt, dt, TURN_TAU);
+
             if (dy < 0.0f) dy = -dy;
             g_yawTurn = WrEmaStep(&g_yawTurnEma, dy / dt, dt, TURN_TAU);
         }
@@ -1230,6 +1548,7 @@ float WrEnergyGaugeSpan(void)
 
 float WrEnergyViewTurnRate(void) { return g_viewTurn; }
 float WrEnergyYawRate(void) { return g_yawTurn; }
+float WrEnergyYawRateSigned(void) { return g_yawSigned; }
 float WrEnergyVelTurnRate(void) { return g_velTurn; }
 float WrEnergySpeedRate(void) { return g_speedRate; }
 
@@ -1311,6 +1630,50 @@ bool WrEnergyBudgetSpliced(void) { return g_spliced; }
 // ever asked. Two heuristics, each with a known failure, and the failure of one
 // is exactly what the other is sure about.
 //
+// AND THE MAP TAKES THE INVENTED ONES BACK, once it is holding enough of the
+// map to be believed. A contact the kinematics found, with no map surface within
+// WR_BSP_TOUCH_RADIUS of the feet, is a contact with nothing to touch.
+//
+// At the shipped window and tolerance, on maps with no displacements:
+//
+//     kinematics alone               92.2%  (miss 0.3  fake 7.6)
+//     ...vetoed, clip brushes SKIPPED 73.8%  (miss 26.0 fake 0.2)
+//     ...vetoed, clip brushes kept   98.3%  (miss  1.3 fake 0.4)
+//
+// WHICH GATE THOSE THREE WERE MEASURED THROUGH, said plainly because it has
+// since changed. phase_sweep kept a private copy of the completeness test and it
+// was stale: it refused every displacement map rather than every partly-built
+// one, and it left out the entity brushes the shipped test counts. That copy is
+// gone -- it calls WrBspGeometryComplete now -- but these numbers predate the
+// call, so they describe the OLD gate. Re-deriving them needs the corpus they
+// came from, which is thousands of runs and not the forty directories a
+// development machine happens to hold; until somebody runs phase_sweep over that
+// corpus again, read them as the shape of the result and not as this build's.
+//
+// THE MIDDLE ROW IS THE POINT. The veto was written, measured, found to be much
+// worse, and backed out -- and the reason turned out not to be the idea. It was
+// that this reader skipped 141,841 PLAYERCLIP brushes, and on a surf map a clip
+// brush is very often the thing being ridden, so during genuine contact there
+// was no polygon anywhere near the player a quarter of the time. Including them
+// (g_wrBspIncludeClip) turns the same veto from a disaster into the largest
+// single accuracy gain this readout has had.
+//
+// Two gates, both load-bearing:
+//
+//   WrBspLoadGeometryComplete   every displacement BUILT, and enough of the map
+//                               owned by worldspawn or by a solid entity. On a
+//                               map with unbuilt geometry the same veto reads
+//                               83.2% against 93.6% for leaving it alone,
+//                               because absence there means "not read". It used
+//                               to say "no displacements at all", which refused
+//                               597 maps that are in fact complete -- and on one
+//                               of them, four unbuilt displacements out of 756,
+//                               it cost the whole level its live map query.
+//   one-sided                   it may only turn contact into AIR, never the
+//                               reverse. If the vertical acceleration is
+//                               gravity then nothing is pushing, whatever is
+//                               beside your feet.
+//
 // WR_PHASE_UNKNOWN when there is no camera, or not enough history yet.
 int WrEnergyPhase(void)
 {
@@ -1333,7 +1696,594 @@ int WrEnergyPhase(void)
 
     if (d < PHASE_LIVE_TOL)
         return WR_PHASE_AIR;
+
+    // Contact, kinematically. Now the map, if it is in a position to be asked.
+    if (g_geomTouch == WR_GEOM_NOTHING)
+        return WR_PHASE_AIR;
+
     return g_onGround ? WR_PHASE_GROUND : WR_PHASE_RAMP;
+}
+
+// The surface being ridden, oriented OUT of it and towards the player.
+//
+// A BSP plane normal points whichever way the brush side was written, and there
+// is nothing in the file that says which side of it a player is on. For drawing
+// a ramp that does not matter and the reader folds the sign away; for the strafe
+// ideal it decides the answer, because wn = dot(wishdir, n) changes sign with it
+// and the ideal turn rate on a 53-degree ramp is 55% of the flat one one way
+// round and 17% the other.
+//
+// So it is resolved from the physics rather than from the file: a surface can
+// only push, and it pushes along +n. The vertical part of that push is what
+// stops you falling at g, so sign(n.z) has to agree with sign(a_z + gravity),
+// which the trend this file already keeps for the phase readout measures
+// directly. That is also what makes head ramps come out right -- pinned to the
+// underside of one, the push is downward and the normal genuinely points down.
+//
+// Refuses rather than guesses when the lift is too small to have a sign, which
+// is the free-flight case, and when the plane is outside the band a ramp lives
+// in.
+bool WrEnergySurfaceNormal(float out[3])
+{
+    if (!out || !g_geomHaveNormal || g_geomTouch != WR_GEOM_TOUCHING)
+        return false;
+
+    const float nz = (g_geomNormal[2] < 0.0f) ? -g_geomNormal[2]
+                                              : g_geomNormal[2];
+    if (nz < WR_PHASE_MIN_RAMP_NZ || nz > WR_PHASE_STANDABLE)
+        return false;
+
+    float span = 0.0f;
+    const float dvz = WrTrendOverSpan(&g_vzTrend, PHASE_LIVE_WINDOW, &span);
+    if (span < PHASE_LIVE_WINDOW * 0.75f)
+        return false;
+
+    const float lift = dvz / span + g_energy.gravity;
+
+    // Half the phase tolerance. Below this the surface is barely holding you and
+    // the sign is noise, which is worse than no answer.
+    if (lift > -PHASE_LIVE_TOL * 0.5f && lift < PHASE_LIVE_TOL * 0.5f)
+        return false;
+
+    const float s = (lift * g_geomNormal[2] < 0.0f) ? -1.0f : 1.0f;
+    out[0] = g_geomNormal[0] * s;
+    out[1] = g_geomNormal[1] * s;
+    out[2] = g_geomNormal[2] * s;
+    return true;
+}
+
+int WrEnergyGeomTouch(void)
+{
+    return g_geomTouch;
+}
+
+bool WrEnergyGeomNormalRaw(float out[3])
+{
+    if (!out || !g_geomHaveNormal)
+        return false;
+    out[0] = g_geomNormal[0];
+    out[1] = g_geomNormal[1];
+    out[2] = g_geomNormal[2];
+    return true;
+}
+
+// Accept a plane only if it is a unit normal, and then MAKE it one.
+//
+// The band was +-1% on |n|^2 and whatever arrived was used as it stood. A plane
+// at |n| = 1.005 passes and inflates every dot product taken against it by half
+// a percent, which lands directly on lossPct and so directly on the number the
+// player reads. The band is a sanity test, not a licence to skip the division:
+// anything inside it is close enough to be real and is then normalised exactly.
+static bool AcceptPlane(const float *in, int n, float *out)
+{
+    if (!in)
+        return false;
+    double m = (double)in[0] * in[0] + (double)in[1] * in[1] +
+               (double)in[2] * in[2];
+    if (!(m > 0.98 && m < 1.02))
+        return false;
+    const double inv = 1.0 / sqrt(m);
+    out[0] = (float)(in[0] * inv);
+    out[1] = (float)(in[1] * inv);
+    out[2] = (float)(in[2] * inv);
+    // The plane's own distance scales with the normal it was written beside, so
+    // it has to be divided by the same thing or the plane MOVES.
+    if (n > 3)
+        out[3] = (float)(in[3] * inv);
+    return true;
+}
+
+void WrEnergySetTruePlayer(const Vec3 *origin, const Vec3 *velocity,
+                           float eyeHeight)
+{
+    g_trueLive = false;
+    g_trueEye = (eyeHeight > 0.0f) ? eyeHeight : -1.0f;
+
+    if (!origin || !velocity)
+        return;
+    if (!WrSaneVec(*origin) || !WrSaneVec(*velocity))
+        return;
+    if (WrLength(*velocity) > MAX_SANE_SPEED)
+        return;
+
+    g_trueOrigin = *origin;
+    g_trueVel = *velocity;
+    g_trueLive = true;
+}
+
+bool WrEnergyTrueVelocityLive(void) { return g_trueLive; }
+
+void WrEnergySetGeometryTouch(int state, const float *normal,
+                              const float *rampPlane, float rampDist,
+                              float nearDist)
+{
+    g_geomTouch = (state == WR_GEOM_NOTHING || state == WR_GEOM_TOUCHING)
+                ? state : WR_GEOM_UNKNOWN;
+
+    g_geomHaveNormal = false;
+    g_geomHaveRamp = false;
+    g_geomRampDist = -1.0f;
+    g_geomNearDist = nearDist;
+    if (g_geomTouch == WR_GEOM_TOUCHING)
+    {
+        // Trust nothing that is not a unit vector. A degenerate plane in a map
+        // file would otherwise flow straight into a dot product and produce an
+        // approach angle out of nothing.
+        g_geomHaveNormal = AcceptPlane(normal, 3, g_geomNormal);
+
+        if (AcceptPlane(rampPlane, 4, g_geomRampPlane))
+        {
+            g_geomHaveRamp = true;
+            g_geomRampDist = rampDist;
+        }
+    }
+}
+
+// The raw velocity from `back` seconds ago, walked out of the ring by summing
+// the frame times actually recorded. Frame times vary, so counting frames would
+// mean a different duration at every frame rate -- the defect wr_smooth.h exists
+// to have stopped happening.
+// It INTERPOLATES rather than returning the first sample past the mark, and
+// that is a correctness fix rather than a polish one. Returning `V[idx]` after
+// the accumulator had already passed `back` gave a sample whose real age was
+// somewhere in [back - dt, back) -- so the same landing read differently at 60
+// fps and at 300, by the amount gravity moves in one frame. `ageOut` reports
+// the age actually delivered, which the caller needs to correct for gravity.
+static bool WrBoardLookback(float back, Vec3 *out, Vec3 *posOut, float *ageOut)
+{
+    float acc = 0.0f;
+    int idx = g_bRingHead;
+    for (int i = 0; i < g_bRingCount; i++)
+    {
+        const float step = g_bRingDt[idx];
+        const float prev = acc;
+        acc += step;
+        if (acc >= back)
+        {
+            // `idx` is `acc` old and the one after it is `prev` old, so the
+            // wanted age sits between them. A frame with no duration cannot be
+            // interpolated across; take its endpoint.
+            const int later = (idx + 1) % BOARD_RING;
+            float t = (step > 1e-6f) ? (acc - back) / step : 0.0f;
+            if (t < 0.0f) t = 0.0f;
+            if (t > 1.0f) t = 1.0f;
+            const bool haveLater = (i > 0);
+            const Vec3 &va = g_bRingV[idx];
+            const Vec3 &vb = haveLater ? g_bRingV[later] : va;
+            const Vec3 &pa = g_bRingP[idx];
+            const Vec3 &pb = haveLater ? g_bRingP[later] : pa;
+            if (out)
+                *out = WrVec(va.x + (vb.x - va.x) * t,
+                             va.y + (vb.y - va.y) * t,
+                             va.z + (vb.z - va.z) * t);
+            if (posOut)
+                *posOut = WrVec(pa.x + (pb.x - pa.x) * t,
+                                pa.y + (pb.y - pa.y) * t,
+                                pa.z + (pb.z - pa.z) * t);
+            if (ageOut)
+                *ageOut = haveLater ? back : prev + step;
+            return true;
+        }
+        idx = (idx - 1 + BOARD_RING) % BOARD_RING;
+    }
+    return false;       // not enough history yet
+}
+
+// THE ARRIVING VELOCITY, SOLVED AGAINST THE SURFACE RATHER THAN GUESSED AT.
+//
+// Before contact the player is in free flight -- that is what AIR means -- so
+// between two ring samples the feet follow a parabola with a known second
+// derivative, and the plane is known exactly because it was read out of the
+// file. Where the two meet has a closed form, and the velocity there needs no
+// window, no lookback constant and no assumption about how late the detector
+// fired.
+//
+// Walk back from now until a sample is found on the free side of the plane,
+// then solve inside the one frame that crossed it:
+//
+//     f(s) = n . (p + v s + 0.5 g s^2) - d,   f(0) < 0 wanted, f(step) >= 0
+//
+// A quadratic, taken by bisection rather than by the closed form -- the
+// discriminant of a nearly-tangent approach is a subtraction of two close
+// numbers, and a surf entry is nearly tangent by definition. Twenty halvings of
+// a frame is under a microsecond of time resolution and cannot cancel anything.
+//
+// `nrm` must already point AWAY from the side the player came in on. False when
+// no crossing is bracketed inside the history held, which is the ordinary case
+// on a ramp already being ridden.
+static bool WrBoardSolveEntry(const float plane[4], float gravity, Vec3 *velOut,
+                              float *ageOut)
+{
+    if (g_bRingCount < 2)
+        return false;
+
+    const float n[3] = { plane[0], plane[1], plane[2] };
+    const float d = plane[3];
+
+    // WHICH SIDE IS "OUTSIDE", AND WHY IT MAY NOT BE ASKED OF THE PRESENT.
+    //
+    // A brush side's plane faces out of its brush and a displacement triangle's
+    // faces whichever way its grid was wound, so the file does not say which
+    // side a player rides on and it has to be read off the trajectory.
+    //
+    // The obvious place to read it is where the player is now -- and that is
+    // exactly wrong, because "now" is ON the surface. n.p - d is zero there to
+    // within float noise, so the sign came out of rounding and the solve found
+    // its crossing on whichever side the noise pointed at. It looked like it
+    // worked, at one frame rate out of three.
+    //
+    // The side is taken from the last sample that is unambiguously clear of the
+    // plane instead. That one is airborne by definition, which is the side the
+    // player arrived from, which is the side the question is about.
+    float sgn = 0.0f;
+    {
+        float acc0 = 0.0f;
+        int scan = g_bRingHead;
+        for (int i = 0; i < g_bRingCount && acc0 <= BOARD_SOLVE_REACH; i++)
+        {
+            const Vec3 &q = g_bRingP[scan];
+            const float f = n[0] * q.x + n[1] * q.y + n[2] * q.z - d;
+            if (f > BOARD_SOLVE_CLEAR || f < -BOARD_SOLVE_CLEAR)
+            {
+                sgn = (f > 0.0f) ? 1.0f : -1.0f;
+                break;
+            }
+            acc0 += g_bRingDt[scan];
+            scan = (scan - 1 + BOARD_RING) % BOARD_RING;
+        }
+    }
+    if (sgn == 0.0f)
+        return false;       // never clear of it; this is a ride, not an arrival
+
+    float acc = 0.0f;
+    int idx = g_bRingHead;
+    for (int i = 0; i < g_bRingCount - 1; i++)
+    {
+        const int older = (idx - 1 + BOARD_RING) % BOARD_RING;
+        const float step = g_bRingDt[idx];
+        acc += step;
+
+        // Beyond this there is no free flight to model -- a board reached out
+        // of a ride is a different event and the demo detector's own
+        // PHASE_BOARD_AIR_BEFORE bounds it the same way.
+        if (acc > BOARD_SOLVE_REACH)
+            return false;
+        if (!(step > 1e-6f))
+        {
+            idx = older;
+            continue;
+        }
+
+        const Vec3 &p0 = g_bRingP[older];
+        const Vec3 &v0 = g_bRingV[older];
+        const float f0 = sgn * (n[0] * p0.x + n[1] * p0.y + n[2] * p0.z - d);
+
+        // CLEARLY outside, not merely outside, and clear by a distance that
+        // depends on how fast this sample is closing on the plane.
+        //
+        // Two separate things are being avoided. A sample taken while riding
+        // the ramp sits within float noise of the plane and falls on whichever
+        // side rounding put it -- bracket on that and the solve starts ON the
+        // surface, finds its crossing at s = 0 and reports the SLIDING velocity
+        // as the arriving one, which reads as no board at all.
+        //
+        // The second is subtler and cost more. The velocity stored here is a
+        // backward difference over velWindowSeconds, and a sample taken half a
+        // window before the clip has the clip INSIDE its own window: the
+        // position and the velocity are then both averages across an event, and
+        // no amount of integrating forward from them recovers what was
+        // happening before it. So the bracket has to be a whole window clear,
+        // which in distance is how far this sample travels towards the plane in
+        // that time. Being further back costs nothing -- free flight is a
+        // parabola and the solve integrates along it exactly.
+        const float closing = -(v0.x * n[0] + v0.y * n[1] + v0.z * n[2]) * sgn;
+        float need = BOARD_SOLVE_CLEAR;
+        if (closing > 0.0f)
+            need += closing * g_energy.velWindowSeconds * 1.5f;
+        if (f0 <= need)
+        {
+            idx = older;
+            continue;       // still on or past it, or too close to trust
+        }
+
+        // This sample is genuinely in flight, and it is the last one that is --
+        // the walk runs newest to oldest. Find where its own arc meets the
+        // plane. The span is allowed to run past one frame because the stored
+        // position is the velocity window's midpoint and so trails the frame it
+        // was recorded on; capping the search at exactly one step would make
+        // the answer depend on that lag.
+        // The far end of the search is `acc` -- this sample's own age. The
+        // crossing cannot be later than now, because the phase readout has
+        // already said contact, and it cannot be earlier than this sample,
+        // because this sample is clear of the plane. Bounding it by that rather
+        // than by a count of doublings is what makes the answer independent of
+        // the frame rate: a fixed number of steps reaches half a second at
+        // 60 fps and fifty milliseconds at 300, so the same landing solved on
+        // one machine and quietly fell back to the estimate on another.
+        const float ez = -0.5f * gravity;
+        float hi = step;
+        float fHi = 0.0f;
+        bool bracketed = false;
+        for (;;)
+        {
+            if (hi > acc) hi = acc;
+            fHi = sgn * (n[0] * (p0.x + v0.x * hi) +
+                         n[1] * (p0.y + v0.y * hi) +
+                         n[2] * (p0.z + v0.z * hi + ez * hi * hi) - d);
+            if (fHi <= 0.0f) { bracketed = true; break; }
+            if (hi >= acc) break;
+            hi *= 2.0f;
+        }
+        if (!bracketed)
+        {
+            return false;   // it never got there; the contact was something else
+        }
+
+        // Bisection rather than the quadratic formula: a surf entry is nearly
+        // tangent by definition, so the discriminant is a subtraction of two
+        // close numbers exactly where the answer matters most. Twenty halvings
+        // resolve the crossing to under a microsecond and cancel nothing.
+        float lo = 0.0f;
+        for (int k = 0; k < 20; k++)
+        {
+            const float s = 0.5f * (lo + hi);
+            const float f = sgn * (n[0] * (p0.x + v0.x * s) +
+                                   n[1] * (p0.y + v0.y * s) +
+                                   n[2] * (p0.z + v0.z * s + ez * s * s) - d);
+            if (f > 0.0f) lo = s; else hi = s;
+        }
+        const float s = 0.5f * (lo + hi);
+
+        if (velOut)
+            *velOut = WrVec(v0.x, v0.y, v0.z - gravity * s);
+        if (ageOut)
+            *ageOut = acc - s;
+        return true;
+    }
+    return false;
+}
+
+// Record why a landing produced nothing. Only the FIRST refusal of a contact
+// event is counted -- the same landing hitting the same wall for twenty frames
+// is one story, not twenty -- which is what makes the tally readable as
+// "eleven boards went to the wall" rather than as a frame count.
+static void BoardRefuse(int why, bool fresh)
+{
+    g_bWhy = why;
+    if (fresh && why > WR_BOARD_WHY_NONE && why < WR_BOARD_WHY__COUNT)
+        g_bWhyCount[why]++;
+}
+
+void WrEnergyTickBoards(float dt)
+{
+    if (g_bHave)
+        g_bAge += dt;
+    if (g_bAirGrace > 0.0f)
+        g_bAirGrace -= dt;
+
+    // Only where all three inputs exist. Without a normal from the map there is
+    // nothing to project against, and guessing one from the velocity change is
+    // the thing the header says this deliberately does not do.
+    g_bAvailable = (g_geomTouch != WR_GEOM_UNKNOWN);
+
+    const int ph = WrEnergyPhase();
+    if (ph == WR_PHASE_UNKNOWN)
+    {
+        // Not a refusal anybody can act on -- it is the first fraction of a
+        // second after a load or a teleport -- so it is named but not tallied.
+        g_bWhy = WR_BOARD_WHY_UNKNOWN_PHASE;
+        g_bPrevPhase = ph;
+        return;
+    }
+
+    if (ph == WR_PHASE_AIR)
+    {
+        g_bAirFor += dt;
+        g_bPrevPhase = ph;
+        return;
+    }
+
+    // Contact. A board only if there was sustained air before it -- otherwise
+    // every flicker of the phase readout on a ramp already being ridden would
+    // be graded as an arrival.
+    //
+    // The air is spent through a grace rather than zeroed outright: see
+    // BOARD_AIR_GRACE. `fresh` is what makes the tally count landings instead
+    // of frames.
+    const float airHad = (g_bAirFor > g_bAirGrace) ? g_bAirFor : g_bAirGrace;
+    const bool fresh = (g_bPrevPhase == WR_PHASE_AIR);
+    const bool arriving = (airHad >= BOARD_AIR_BEFORE);
+    g_bPrevPhase = ph;
+    g_bAirFor = 0.0f;
+
+    if (!arriving)
+    {
+        // Recorded ONLY on the transition frame, and this is the difference
+        // between a diagnostic and a nuisance. Every frame of a sustained ride
+        // is a contact with no air behind it, so writing the cause here
+        // unconditionally overwrote whatever the landing itself had said within
+        // one frame -- the row would name the real reason for 3 ms and then
+        // spend the next four seconds saying "no air before it", which is true,
+        // useless, and hides the answer.
+        if (fresh)
+            BoardRefuse(WR_BOARD_WHY_NO_AIR, true);
+        return;
+    }
+
+    // Earned air survives a contact that produced nothing, so one fake frame in
+    // flight cannot cost the landing that follows it.
+    g_bAirGrace = BOARD_AIR_GRACE;
+
+    if (g_geomTouch == WR_GEOM_UNKNOWN)
+    {
+        BoardRefuse(WR_BOARD_WHY_MAP_OFF, fresh);
+        return;
+    }
+    if (g_geomTouch == WR_GEOM_NOTHING)
+    {
+        BoardRefuse(WR_BOARD_WHY_NO_SURFACE, fresh);
+        return;
+    }
+    if (!g_geomHaveNormal)
+    {
+        BoardRefuse(WR_BOARD_WHY_BAD_PLANE, fresh);
+        return;
+    }
+
+    // WHICH PLANE TO GRADE AGAINST.
+    //
+    // The nearest surface of any facing is the right answer to "am I touching
+    // something" and the wrong one to "what did I land on". Entering a ramp
+    // from the side puts a wall nearer the feet than the ramp, and this used to
+    // take the wall, fail the ramp test below and report nothing at all -- with
+    // the ramp sitting right there in the same query, unasked for.
+    //
+    // So the ramp candidate is preferred where the map offered one AND it is
+    // close enough to the nearest surface to be the same contact -- see
+    // GEOM_RAMP_PREFER, which is what stops this inventing a board on a floor
+    // landing that merely has a ramp in range. The nearest-of-any is the
+    // fallback.
+    //
+    // The ramp band is still checked afterwards rather than assumed: preferring
+    // a candidate is not the same as trusting it, and a map with no rideable
+    // surface anywhere near must still refuse.
+    bool useRamp = g_geomHaveRamp;
+    if (useRamp && g_geomNearDist >= 0.0f && g_geomRampDist >= 0.0f &&
+        g_geomRampDist > g_geomNearDist + GEOM_RAMP_PREFER)
+        useRamp = false;
+    const float *plane = useRamp ? g_geomRampPlane : g_geomNormal;
+
+    const float nz = plane[2] < 0.0f ? -plane[2] : plane[2];
+    g_bWhyNz = nz;
+    if (nz < WR_PHASE_MIN_RAMP_NZ || nz > WR_PHASE_STANDABLE)
+    {
+        BoardRefuse(WR_BOARD_WHY_NOT_RAMP, fresh);
+        return;
+    }
+
+    // THE ARRIVING VELOCITY. Solved against that plane where the geometry
+    // allows it, and reached back for otherwise -- with the gravity that
+    // accumulated over the reach put back, which the fixed lookback never did.
+    Vec3 vIn;
+    float age = 0.0f;
+    bool exact = false;
+    if (useRamp &&
+        WrBoardSolveEntry(g_geomRampPlane, g_energy.gravity, &vIn, &age))
+    {
+        exact = true;
+    }
+    else
+    {
+        Vec3 unusedPos;
+        if (!WrBoardLookback(BOARD_LOOKBACK, &vIn, &unusedPos, &age))
+        {
+            BoardRefuse(WR_BOARD_WHY_NO_HISTORY, fresh);
+            return;
+        }
+        // The sample is `age` seconds before the detector fired, and over that
+        // stretch gravity has been acting. Carrying it forward is not a
+        // correction to the estimate, it is the estimate finished: without it
+        // the board is judged on a velocity the player never had at the
+        // surface, and by an amount that varies with the frame rate.
+        vIn.z -= g_energy.gravity * age;
+    }
+
+    // vOut is unused by the grading now that the loss is projected rather than
+    // subtracted -- WrPhaseBoard still wants a sample, so it gets the current
+    // one, which is the honest thing it is: where the velocity actually went.
+    const Vec3 &out = g_trueLive ? g_trueVel : g_vel;
+    const float vi[3] = { vIn.x, vIn.y, vIn.z };
+    const float vo[3] = { out.x, out.y, out.z };
+
+    WrBoardStats s;
+    if (!WrPhaseBoard(vi, vo, plane, &s))
+    {
+        BoardRefuse(WR_BOARD_WHY_DEGENERATE, fresh);
+        return;
+    }
+    if (s.speedIn < WR_BOARD_MIN_SPEED)
+    {
+        BoardRefuse(WR_BOARD_WHY_TOO_SLOW, fresh);
+        return;
+    }
+    if (s.intoPlane < WR_BOARD_MIN_INTO_PLANE)
+    {
+        BoardRefuse(WR_BOARD_WHY_TOO_GLANCING, fresh);
+        return;
+    }
+
+    g_bLast = s;
+    g_bHave = true;
+    g_bAge = 0.0f;
+    g_bExact = exact;
+    g_bWhy = WR_BOARD_WHY_NONE;
+}
+
+bool WrEnergyBoard(WrBoardStats *out, float *ageOut, float maxAge)
+{
+    if (!g_bHave)
+        return false;
+    if (maxAge > 0.0f && g_bAge > maxAge)
+        return false;
+    if (out) *out = g_bLast;
+    if (ageOut) *ageOut = g_bAge;
+    return true;
+}
+
+bool WrEnergyBoardAvailable(void) { return g_bAvailable; }
+bool WrEnergyBoardExact(void) { return g_bExact; }
+int  WrEnergyBoardWhy(void) { return g_bWhy; }
+float WrEnergyBoardWhyNz(void) { return g_bWhyNz; }
+
+int WrEnergyBoardWhyCount(int why)
+{
+    if (why < 0 || why >= WR_BOARD_WHY__COUNT)
+        return 0;
+    return g_bWhyCount[why];
+}
+
+// Phrases, not sentences: these go in a HUD row beside the word "board", and
+// the row has to stay one line at every HUD scale.
+static const char *kBoardWhy[] = {
+    "none yet",
+    "map not read",
+    "nothing to touch",
+    "plane unusable",
+    "still settling",
+    "no air before it",
+    "not enough history",
+    "not a ramp",
+    "cannot grade that",
+    "too slow",
+    "too glancing"
+};
+WR_TABLE_IS_FULL(kBoardWhy, WR_BOARD_WHY__COUNT);
+
+const char *WrEnergyBoardWhyName(int why)
+{
+    if (why < 0 || why >= WR_BOARD_WHY__COUNT)
+        return "?";
+    return kBoardWhy[why];
 }
 
 bool WrEnergyOnGround(void) { return g_onGround; }

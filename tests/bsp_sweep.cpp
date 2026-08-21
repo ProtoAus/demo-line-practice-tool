@@ -75,6 +75,7 @@ static char  g_worstMap[128] = "none";
 static float g_biggestBytes = 0.0f;
 static char  g_biggestMap[128] = "none";
 static int   g_unclosedMaps = 0;
+static int   g_dispDropMaps = 0;
 
 // ---------------------------------------------------------------------------
 // Small tallies
@@ -515,6 +516,70 @@ static void VcCheckRun(const WrBspMap *m, const float *p, int n, float h)
     }
 }
 
+// ---------------------------------------------------------------------------
+// Which estimator should decide RAMP vs GROUND for a whole ride
+// ---------------------------------------------------------------------------
+//
+// A different question from "how many degrees off is this normal", and it is
+// the one wr_path.cpp's FindPhase actually asks: a segment gets ONE verdict and
+// every point in it is coloured by it. So the thing worth measuring is how often
+// each estimator gets that verdict right, against the .bsp's own face -- and on
+// the SAME segments, or the comparison is between two different populations.
+//
+// The entry normal is only available where a ride began out of clear air, which
+// is exactly the condition wr_phase.h says makes it good: one surface acting.
+#define VN_ENTRY_AIR 3          // == PHASE_BOARD_AIR_BEFORE in wr_path.cpp
+
+static int   g_phPaired = 0, g_phFitOk = 0, g_phEntryOk = 0, g_phSame = 0;
+static float g_phFitErr[VN_BUCKET_CAP];
+static float g_phEntErr[VN_BUCKET_CAP];
+static int   g_phErrN = 0;
+
+// And the same three, restricted to entries whose IMPULSE clears the bar the
+// board population is defined by.
+//
+// This split exists because the first version of this measurement did not have
+// it and got the answer backwards. wr_phase.h's 1.19 degrees is measured at a
+// BOARD, and a board is not merely "contact that began out of air" -- it is that
+// AND a velocity change of at least VN_CLIP_MIN_IMPULSE in the tick. Drop the
+// second half and the recovery is dividing a normal out of a vector that is
+// mostly nothing, which is noise with a direction.
+static int   g_phHardPaired = 0, g_phHardFitOk = 0, g_phHardEntryOk = 0;
+static float g_phHardFitErr[VN_BUCKET_CAP];
+static float g_phHardEntErr[VN_BUCKET_CAP];
+static int   g_phHardErrN = 0;
+
+// The normal at the tick a contact segment begins, when it begins out of clear
+// air. The same rule PhaseEntryNormal applies in wr_path.cpp, restated here
+// because this program links wr_phase.h and nothing else.
+static bool VnEntryNormal(const float *p, int n, int start, float h,
+                          float out[3], float *impulseOut)
+{
+    if (start < VN_ENTRY_AIR || start + 1 >= n)
+        return false;
+    for (int k = VN_ENTRY_AIR; k >= 1; k--)
+    {
+        const float *a = p + 7 * (start - k), *b = p + 7 * (start - k + 1);
+        const float dx = b[0] - a[0], dy = b[1] - a[1], dz = b[2] - a[2];
+        const float step = sqrtf(dx * dx + dy * dy + dz * dz);
+        const float sp = sqrtf(a[3] * a[3] + a[4] * a[4] + a[5] * a[5]);
+        if (WrPhaseIsTeleport(step, sp, h))
+            return false;
+        if (WrPhaseIsContact(a[5], b[5], h, 800.0f))
+            return false;
+    }
+    const float *a = p + 7 * start, *b = p + 7 * (start + 1);
+    const float vIn[3]  = { a[3], a[4], a[5] };
+    const float vOut[3] = { b[3], b[4], b[5] };
+    if (impulseOut)
+    {
+        const float dx = vOut[0] - vIn[0], dy = vOut[1] - vIn[1],
+                    dz = vOut[2] - vIn[2];
+        *impulseOut = sqrtf(dx * dx + dy * dy + dz * dz);
+    }
+    return WrPhaseNormal(vIn, vOut, h, 800.0f, out);
+}
+
 static void VnCheckRun(const WrBspMap *m, const float *p, int n, float h)
 {
     // Sustained contact, found the same way the board detector finds one: a
@@ -589,6 +654,56 @@ static void VnCheckRun(const WrBspMap *m, const float *p, int n, float h)
             g_vnNoFit++;
             continue;
         }
+        // The paired verdict comparison, scored BEFORE the surf-band filter
+        // below. That filter selects on the FIT'S OWN answer, so scoring after
+        // it would hand the fit every segment it was already right about and
+        // throw away every one it was wrong about -- which is not a measurement,
+        // it is a way of agreeing with yourself.
+        {
+            const float *mp = p + 7 * ((start + i) / 2);
+            const float mat[3] = { mp[0], mp[1], mp[2] };
+            int mpoly = -1;
+            float mdist = 0.0f;
+            float ent[3];
+            float impulse = 0.0f;
+            if (VnFaceUnder(m, mat, &mpoly, &mdist) &&
+                mdist <= VN_MAX_FACE_DIST &&
+                VnEntryNormal(p, n, start, h, ent, &impulse))
+            {
+                const float *pl = m->polys[mpoly].plane;
+                const int truth = WrPhaseFromNz(pl[2]);
+                const int fitPh = WrPhaseFromNormal(nrm);
+                const int entPh = WrPhaseFromNormal(ent);
+                const float fitE = WrBspAngleBetween(nrm, pl);
+                const float entE = WrBspAngleBetween(ent, pl);
+
+                g_phPaired++;
+                if (fitPh == truth) g_phFitOk++;
+                if (entPh == truth) g_phEntryOk++;
+                if (fitPh == entPh) g_phSame++;
+
+                if (g_phErrN < VN_BUCKET_CAP)
+                {
+                    g_phFitErr[g_phErrN] = fitE;
+                    g_phEntErr[g_phErrN] = entE;
+                    g_phErrN++;
+                }
+
+                if (impulse >= VN_CLIP_MIN_IMPULSE)
+                {
+                    g_phHardPaired++;
+                    if (fitPh == truth) g_phHardFitOk++;
+                    if (entPh == truth) g_phHardEntryOk++;
+                    if (g_phHardErrN < VN_BUCKET_CAP)
+                    {
+                        g_phHardFitErr[g_phHardErrN] = fitE;
+                        g_phHardEntErr[g_phHardErrN] = entE;
+                        g_phHardErrN++;
+                    }
+                }
+            }
+        }
+
         if (nrm[2] < VN_MIN_NZ || nrm[2] > VN_MAX_NZ)
             continue;       // ground or a wall; see VN_MIN_NZ for why not
 
@@ -807,6 +922,10 @@ int main(int argc, char **argv)
     {
         if (strcmp(argv[i], "--verbose") == 0) g_verbose = true;
         else if (strcmp(argv[i], "--closure") == 0) build = true;
+        // The point of the switch: run --verify-normals with and without, and
+        // the difference is whether the displacement geometry agrees with the
+        // surfaces players actually collide with.
+        else if (strcmp(argv[i], "--no-disp") == 0) g_wrBspBuildDisp = false;
         else if (strcmp(argv[i], "--angles") == 0) { build = true; angles = true; }
         else if (strcmp(argv[i], "--rays") == 0)
         { build = true; rays = (i + 1 < argc && argv[i + 1][0] != '-')
@@ -847,6 +966,11 @@ int main(int argc, char **argv)
     long long sideNotClosed = 0, sideTooFar = 0, clipOnly = 0;
     long long polys = 0, verts = 0;
     double solidArea = 0.0, surfArea = 0.0;
+    long long surfPolys = 0, surfClipPolys = 0;
+    long long dispPolys = 0, dispDropped = 0;
+    long long entModels = 0, entBrushes = 0;
+    int dispMaps = 0;
+    long long dispDropBy[WR_DISP_DROP__COUNT] = { 0 };
 
     float *ownedPct = (float *)malloc(4096 * sizeof(float));
     int ownedN = 0;
@@ -973,6 +1097,13 @@ int main(int argc, char **argv)
                 sideNotClosed  += map.sideNotClosed;
                 sideTooFar     += map.sideTooFar;
                 clipOnly       += map.brushClipOnly;
+                surfPolys      += map.surfPolys;
+                surfClipPolys  += map.surfClipPolys;
+                dispPolys      += map.dispPolys;
+                dispDropped    += map.dispDropped;
+                if (map.dispPolys > 0) dispMaps++;
+                entModels      += map.entModels;
+                entBrushes     += map.entBrushes;
                 polys          += map.polyCount;
                 verts          += map.vertCount;
                 solidArea      += map.solidArea;
@@ -991,6 +1122,29 @@ int main(int argc, char **argv)
                            "world, of %d sides\n", fd.cFileName,
                            map.sideNotClosed, map.sideTooFar, map.sideTotal);
                     g_unclosedMaps++;
+                }
+
+                // WHICH TEST REFUSED THEM, per map and by name.
+                //
+                // This tool had no per-map row at all, so "did this map hit the
+                // build budget, or refuse a hundred displacements one at a time"
+                // could not be answered from anything it printed -- and the
+                // difference decided whether a whole level's live geometry was
+                // switched off for a reason or for a rounding error. Answering
+                // it took a throwaway probe that replayed the reader's own tests
+                // and solved for the break index. It should not take that twice.
+                for (int q = 0; q < WR_DISP_DROP__COUNT; q++)
+                    dispDropBy[q] += map.dispDropBy[q];
+                if (map.dispDropped && g_dispDropMaps < 12)
+                {
+                    printf("  [dispdrop] %-40s %d of %d dropped:", fd.cFileName,
+                           map.dispDropped, map.dispTotal);
+                    for (int q = 0; q < WR_DISP_DROP__COUNT; q++)
+                        if (map.dispDropBy[q])
+                            printf(" %s %d", WrBspDispDropName[q],
+                                   map.dispDropBy[q]);
+                    printf("\n");
+                    g_dispDropMaps++;
                 }
 
                 if (rays > 0)
@@ -1083,10 +1237,35 @@ int main(int argc, char **argv)
                sideTotal ? 100.0 * sideNotClosed / sideTotal : 0.0);
         printf("    %d maps had a side refused for either reason\n",
                g_unclosedMaps);
-        printf("    %lld solid brushes were playerclip-only and skipped\n",
-               clipOnly);
+        printf("    %lld brushes were playerclip and not solid -- %s\n",
+               clipOnly,
+               g_wrBspIncludeClip
+                   ? "kept, for collision only (see g_wrBspIncludeClip)"
+                   : "SKIPPED");
         printf("    %.0f sq units solid, %.0f in the surf band (%.1f%%)\n",
                solidArea, surfArea, solidArea ? 100.0 * surfArea / solidArea : 0.0);
+        // The split the drawing query used to turn into an empty screen: it
+        // refused every clip polygon while the panel counted them, so a map
+        // could report hundreds in the band and draw none of them.
+        printf("    %lld polygons in the surf band, %lld of them clip-only "
+               "(%.1f%%)\n", surfPolys, surfClipPolys,
+               surfPolys ? 100.0 * (double)surfClipPolys / (double)surfPolys
+                         : 0.0);
+        printf("    %lld displacement triangles built across %d maps, "
+               "%lld displacements dropped\n", dispPolys, dispMaps, dispDropped);
+        if (dispDropped)
+        {
+            printf("        by cause:");
+            for (int q = 0; q < WR_DISP_DROP__COUNT; q++)
+                if (dispDropBy[q])
+                    printf("  %s %lld", WrBspDispDropName[q], dispDropBy[q]);
+            printf("\n");
+        }
+        // The second number is the one that matters. A trigger volume drawn as
+        // a ramp is a worse answer than a missing ramp, so the deny list has to
+        // be seen refusing things rather than assumed to.
+        printf("    %lld brush entities included (%lld brushes), %d refused as "
+               "non-solid\n", entModels, entBrushes, g_wrBspEntSkipped);
 
         if (residentN)
         {
@@ -1189,6 +1368,60 @@ int main(int argc, char **argv)
                 if (g_vnWorstMedian >= 0.0f)
                     printf("    worst map by median: %.1f deg  %s\n",
                            g_vnWorstMedian, g_vnWorstMap);
+
+                // WHO SHOULD DECIDE A WHOLE RIDE. The paired comparison: the
+                // same segments, the same faces, scored before any filter that
+                // reads either estimator's answer. This is the measurement
+                // behind FindPhase asking the entry first and the fit second.
+                if (g_phPaired > 0)
+                {
+                    printf("\n    RAMP vs GROUND for a whole segment, against "
+                           "the face under the player\n");
+                    printf("      %d segments where both estimators could be "
+                           "asked\n", g_phPaired);
+                    printf("      the fit over the ride   %.1f%% right\n",
+                           100.0 * g_phFitOk / g_phPaired);
+                    printf("      the tick at the entry   %.1f%% right\n",
+                           100.0 * g_phEntryOk / g_phPaired);
+                    printf("      they agreed with each other %.1f%% of the "
+                           "time\n", 100.0 * g_phSame / g_phPaired);
+                }
+                if (g_phErrN > 0)
+                {
+                    qsort(g_phFitErr, g_phErrN, sizeof(float), CmpF);
+                    qsort(g_phEntErr, g_phErrN, sizeof(float), CmpF);
+                    printf("      and by angle, on those same segments:\n");
+                    printf("        fit    p50 %.2f deg  p90 %.2f\n",
+                           Pct(g_phFitErr, g_phErrN, 0.50),
+                           Pct(g_phFitErr, g_phErrN, 0.90));
+                    printf("        entry  p50 %.2f deg  p90 %.2f\n",
+                           Pct(g_phEntErr, g_phErrN, 0.50),
+                           Pct(g_phEntErr, g_phErrN, 0.90));
+                }
+
+                if (g_phHardPaired > 0)
+                {
+                    printf("\n      ...and restricted to entries whose impulse "
+                           "clears %.0f u/s:\n", VN_CLIP_MIN_IMPULSE);
+                    printf("        %d segments (%.1f%% of the above)\n",
+                           g_phHardPaired,
+                           100.0 * g_phHardPaired / g_phPaired);
+                    printf("        the fit over the ride   %.1f%% right\n",
+                           100.0 * g_phHardFitOk / g_phHardPaired);
+                    printf("        the tick at the entry   %.1f%% right\n",
+                           100.0 * g_phHardEntryOk / g_phHardPaired);
+                }
+                if (g_phHardErrN > 0)
+                {
+                    qsort(g_phHardFitErr, g_phHardErrN, sizeof(float), CmpF);
+                    qsort(g_phHardEntErr, g_phHardErrN, sizeof(float), CmpF);
+                    printf("        fit    p50 %.2f deg  p90 %.2f\n",
+                           Pct(g_phHardFitErr, g_phHardErrN, 0.50),
+                           Pct(g_phHardFitErr, g_phHardErrN, 0.90));
+                    printf("        entry  p50 %.2f deg  p90 %.2f\n",
+                           Pct(g_phHardEntErr, g_phHardErrN, 0.50),
+                           Pct(g_phHardEntErr, g_phHardErrN, 0.90));
+                }
 
                 static const char *kB[3] = { "face within 8 units",
                                              "8 to 24 units",

@@ -1250,6 +1250,41 @@ bool WrDpExtract(const WrDpArgs *args, WrDpResult *out, bool *cancelled,
     // the origin, but not at a reliable offset across runs, so we do not use
     // them.
     //
+    // THAT SENTENCE IS TRUE AND IT IS NOT THE WHOLE STORY, and the difference
+    // matters because a central difference is an average across two ticks --
+    // exact under constant acceleration, and a smear across exactly the tick a
+    // board happens in. tests\velprobe.exe sweeps for each component's own best
+    // offset over 40 demos and 8,000 steps, with a control that asks the same
+    // sweep the same question with the step-to-value pairing broken:
+    //
+    //                  matches      control (wrong pairing)
+    //         vx        84.3%              5.7%
+    //         vy        83.4%              5.8%
+    //         vz        85.5%              6.8%
+    //
+    // The control lands exactly on OriginScore's own 1.9-8.2% floor, which is
+    // what makes the first column mean something. So ALL THREE components are
+    // there, not only the vertical one -- OriginScore matches on vz alone
+    // because a three-component match at ONE offset scores 0.19, and the reason
+    // for that is now measured too: the three best offsets are not 32 bits
+    // apart on any of the 40 demos. Each component is delta-encoded as its own
+    // send prop with its own index bits in front of it, so they are spaced by
+    // something that is not a float width. Looking for a contiguous triple was
+    // looking for the wrong shape.
+    //
+    // Also measured, and the reason nobody found this from the field already in
+    // WrDpInfo: derivOffset is only ever filled in when the SPEED ORACLE FAILS
+    // (see `if (identN == 0)` in the identify loop). On a demo whose chain
+    // covers most of the run the oracle passes first time and the derivative
+    // sweep never runs at all -- 0 of the first 150 demos in this library carry
+    // an offset.
+    //
+    // What is NOT yet measured is whether reading them would be more accurate
+    // than differencing, which is a different question from whether they are
+    // there, and it has an oracle waiting for it: bsp_sweep --verify-normals
+    // reads 1.19 degrees at a board today, and an exact velocity should beat
+    // that or the idea is wrong. Until that is run this stays as it is.
+    //
     // Differenced within a segment only: across a teleport the difference is the
     // length of the teleport, which would read as a speed of tens of thousands
     // of units per second and wreck colour-by-speed for the whole run.

@@ -174,6 +174,29 @@ static void RegisterEnergy(void)
 
     WrSettingsBool("phase.show", &g_energy.showPhase);
     WrSettingsBool("strafe.show", &g_energy.showStrafe);
+    WrSettingsInt("strafe.colour", &g_energy.strafeColour, 0,
+                  WR_STRAFE_COLOUR_COUNT - 1);
+    WrSettingsInt("strafe.band", &g_energy.strafeBand, 0,
+                  WR_STRAFE_BAND_COUNT - 1);
+    // One field behind two sliders: 5..120 deg/s and 5..60 per cent. The wider
+    // of the two is the range here, since the rule for this file is that the
+    // widest thing it can say is the widest thing the panel could have said, and
+    // the narrower slider clamps its own on the way in.
+    WrSettingsFloat("strafe.tolerance", &g_energy.strafeTolerance, 5.0f, 120.0f);
+    WrSettingsBool("strafe.percent", &g_energy.showStrafePercent);
+    WrSettingsBool("strafe.arrow", &g_energy.showStrafeArrow);
+    // The bar takes its SCALE from strafe.tolerance above and has none of its
+    // own, so what is here is geometry only. Width 0 means "match the HUD
+    // block", which is the default and the reason the range starts there.
+    WrSettingsBool("strafe.bar", &g_energy.showStrafeBar);
+    WrSettingsFloat("strafe.barWidth", &g_energy.strafeBarWidth, 0.0f, 600.0f);
+    WrSettingsFloat("strafe.barHeight", &g_energy.strafeBarHeight, 2.0f, 40.0f);
+    WrSettingsFloat("strafe.barRise", &g_energy.strafeBarRise, -400.0f, 400.0f);
+    WrSettingsBool("board.show", &g_energy.showBoard);
+    WrSettingsFloat("board.flashSeconds", &g_energy.boardFlashSeconds, 0.5f, 10.0f);
+    WrSettingsInt("board.unit", &g_energy.boardUnit, 0, WR_BOARD_UNIT_COUNT - 1);
+    WrSettingsBool("board.percent", &g_energy.boardPercent);
+    WrSettingsInt("board.decimals", &g_energy.boardDecimals, 0, 3);
     WrSettingsBool("hud.show", &g_energy.showHud);
     WrSettingsFloat("hud.offsetX", &g_energy.hudOffsetX, -2000.0f, 2000.0f);
     WrSettingsFloat("hud.offsetY", &g_energy.hudOffsetY, -2000.0f, 2000.0f);
@@ -259,6 +282,7 @@ static void RegisterBsp(void)
     WrSettingsFloat("bsp.drawAlpha", &g_bspLoad.drawAlpha, 0.05f, 1.0f);
     WrSettingsInt("bsp.maxDrawPolys", &g_bspLoad.maxDrawPolys, 8, 512);
     WrSettingsBool("bsp.drawFill", &g_bspLoad.drawFill);
+    WrSettingsBool("bsp.drawClip", &g_bspLoad.drawClip);
     WrSettingsBool("bsp.showAhead", &g_bspLoad.showAhead);
     WrSettingsFloat("bsp.aheadDistance", &g_bspLoad.aheadDistance,
                     256.0f, 8192.0f);

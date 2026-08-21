@@ -10,6 +10,7 @@
 #include "wr_path.h"
 #include "wr_engine.h"
 #include "wr_scan.h"
+#include "wr_player.h"
 #include "wr_steam.h"
 #include "wr_energy.h"
 #include "wr_limit.h"
@@ -114,7 +115,7 @@ static void KeyBindCombo(const char *label, int *key)
         names[i] = kBindKeys[i].name;
 
     ImGui::SetNextItemWidth(140.0f);
-    if (ImGui::Combo(label, &sel, names, kBindKeyCount))
+    if (ImGui::Combo(WrLabel(label), &sel, names, kBindKeyCount))
         *key = kBindKeys[sel].vk;
 
     if (!*key)
@@ -1384,8 +1385,8 @@ static void DrawIntoGameLine(const char *map, int mapId, int tab)
 // was showing.
 static void LabelPicker(const char *title, unsigned int *mask, bool *on)
 {
-    ImGui::PushID(title);
-    ImGui::Checkbox(title, on);
+    ImGui::PushID(WrLabel(title));
+    ImGui::Checkbox(WrLabel(title), on);
     if (*on)
     {
         static const struct { unsigned int bit; const char *name; } kBits[4] = {
@@ -1959,9 +1960,10 @@ static void DrawDisplayTab(void)
         "ticked more than are being drawn.");
 
     ImGui::SeparatorText("Colour");
-    const char *kRank[WR_RANK_MODE_COUNT] = {
+    const char *kRank[] = {
         "off -- each run its own colour", "by placing", "by time behind the best"
     };
+    WR_TABLE_IS_FULL(kRank, WR_RANK_MODE_COUNT);
     if (g_render.rankColour < 0 || g_render.rankColour >= WR_RANK_MODE_COUNT)
         g_render.rankColour = 0;
     ImGui::Combo("Colour runs by rank", &g_render.rankColour, kRank,
@@ -2031,14 +2033,42 @@ static void DrawDisplayTab(void)
         "that back to a tenth of a percent, so this is measured rather than "
         "guessed. Demo lines only, for now: your own velocity comes from "
         "differencing the camera and has not been checked against this yet.");
-    const char *kLine[WR_LINE_MODE_COUNT] = {
+    const char *kLine[] = {
         "nothing -- one colour per run", "speed", "energy (absolute height)",
         "energy above its own start", "strafing efficiency",
         "air / ramp / ground"
     };
+    WR_TABLE_IS_FULL(kLine, WR_LINE_MODE_COUNT);
     if (g_render.lineColour < 0 || g_render.lineColour >= WR_LINE_MODE_COUNT)
         g_render.lineColour = WR_LINE_FLAT;
     ImGui::Combo("##linecolour", &g_render.lineColour, kLine, WR_LINE_MODE_COUNT);
+
+    // ONE checkbox for one setting, and OUTSIDE every mode branch.
+    //
+    // g_render.lineKey had four checkboxes, one inside each of the speed,
+    // energy, relative-energy and efficiency blocks. Every one of them is
+    // reachable only while that mode is selected, so two states had the key on
+    // screen with no control anywhere that could turn it off:
+    //
+    //   - air / ramp / ground, which was added to the enum after the four
+    //     checkboxes were written and never got one
+    //   - one colour per run, where the key still draws a row for the map's
+    //     own outlines whenever those are on -- lineKey gates that row too
+    //
+    // Reported as "is there an option to disable the top left window? I can't
+    // find it", and there was not one. The key is a single bool; it gets a
+    // single control, where the mode is chosen, whatever the mode is.
+    ImGui::Checkbox("Show the colour key on screen", &g_render.lineKey);
+    ImGui::SameLine();
+    HelpMarker(
+        "The small box in the corner opposite the corner block, saying what "
+        "the line colours mean.\n\n"
+        "It also carries a row for the map's own outlines while those are "
+        "drawn, which is why this is here rather than inside one colour mode: "
+        "with lines set to one colour per run the box can still be on screen, "
+        "and it used to have no off switch at all in that state.\n\n"
+        "The rank key is separate, above, because rank composes with these "
+        "rather than replacing them.");
 
     if (g_render.lineColour != WR_LINE_FLAT ||
         g_render.rankColour != WR_RANK_OFF)
@@ -2082,7 +2112,6 @@ static void DrawDisplayTab(void)
         ImGui::SliderFloat("Fast", &g_render.speedMax, 100.0f, 6000.0f, "%.0f u/s");
         if (g_render.speedMax < g_render.speedMin + 50.0f)
             g_render.speedMax = g_render.speedMin + 50.0f;
-        ImGui::Checkbox("Show the key on screen##spd", &g_render.lineKey);
         ImGui::TextDisabled("blue slow -> cyan -> green -> yellow -> red fast");
     }
     else if (g_render.lineColour == WR_LINE_ENERGY)
@@ -2103,7 +2132,6 @@ static void DrawDisplayTab(void)
             "Not done automatically, and not cached: the figure moves with the "
             "gravity setting, so a range fitted once and kept would quietly "
             "stop matching the lines it was fitted to.");
-        ImGui::Checkbox("Show the key on screen##nrg", &g_render.lineKey);
         ImGui::TextDisabled("blue low -> cyan -> green -> yellow -> red high");
     }
     else if (g_render.lineColour == WR_LINE_ENERGY_REL)
@@ -2128,7 +2156,6 @@ static void DrawDisplayTab(void)
             "units lower than another is not painted worse for it, which is the "
             "right question when what you want to know is who held on to what "
             "they had.");
-        ImGui::Checkbox("Show the key on screen##rel", &g_render.lineKey);
         ImGui::TextDisabled("blue lost the most -> green -> red gained the most");
     }
 
@@ -2423,7 +2450,7 @@ static void DrawDisplayTab(void)
         // of every loaded run, and doing that on each frame of a slider drag is
         // a freeze rather than a preview.
         if (ImGui::IsItemDeactivatedAfterEdit())
-            WrPathRefreshEfficiency();
+            WrPathRefreshDerived();
         ImGui::SameLine();
         HelpMarker(
             "The window the figure is differenced over, in points either side. "
@@ -2433,8 +2460,12 @@ static void DrawDisplayTab(void)
             "lost its energy over the points around it. Rebuilt when you let go "
             "of the slider, because it is a pass over every point of every "
             "loaded run.");
-        ImGui::Checkbox("Show the key on screen", &g_render.lineKey);
-        ImGui::SameLine();
+        // The SAME setting is offered on the Energy tab, beside the strafe
+        // readout. It is not a duplicate by accident: it governs the strafe
+        // colours and the strafe bar as well as the lines, and it lived here
+        // only, nested inside a mode most people never select -- so a player
+        // who needed it could not find it without first switching line colouring
+        // to something they were not asking for.
         ImGui::Checkbox("Blue/orange instead", &g_render.effColourblind);
         ImGui::SliderFloat("Full colour at", &g_render.effSaturation,
                            0.2f, 1.0f, "eta %.2f");
@@ -2500,12 +2531,57 @@ static void DrawDisplayTab(void)
                 ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
                                    "Most of this map is built out of entities, "
                                    "so most of it is not read.");
+
+            // The same omission from the other direction, and the one the
+            // coverage numbers cannot express: they are all ratios of brushes,
+            // and a displacement was never a brush. Over half the library has
+            // some.
+            //
+            // BRANCHED BY CAUSE, because for a year this said one thing and it
+            // was the wrong thing on the map somebody actually reported.
+            // surf_kvas is BSP v20 -- the layouts were known perfectly well --
+            // and it lost 4 of its 756 displacements to a corner tolerance. A
+            // user who found this line was handed a cause that did not apply and
+            // would reasonably have stopped looking. dispDropBy exists so this
+            // can name which test refused them.
+            const WrBspMap *dm = WrBspLoadDisplacementsMissing()
+                               ? WrBspLoadCurrent() : 0;
+            if (dm)
+            {
+                const ImVec4 warn(1.0f, 0.75f, 0.2f, 1.0f);
+                if (dm->dispPolys <= 0 && dm->version >= 25)
+                    ImGui::TextColored(warn,
+                        "This map has displacements this build could not read -- "
+                        "anything made of those is missing above. BSP v25 changed "
+                        "the face and displacement structures and the new layouts "
+                        "are not known here.");
+                else if (dm->dispDropBy[WR_DISP_DROP_BUDGET] > 0)
+                    ImGui::TextColored(warn,
+                        "This map is dense enough that the displacement build ran "
+                        "out of room, so the last %d of its %d displacements are "
+                        "missing above. The rest of the map is read as usual.",
+                        dm->dispDropBy[WR_DISP_DROP_BUDGET], dm->dispTotal);
+                else if (dm->dispPolys <= 0)
+                    ImGui::TextColored(warn,
+                        "This map declares %d displacements and not one of them "
+                        "produced a surface, so anything built out of them is "
+                        "missing above.", dm->dispTotal);
+                else
+                    ImGui::TextColored(warn,
+                        "%d of this map's %d displacements were not built (%s), "
+                        "so the ramp surface has holes in it that nothing above "
+                        "can show. Standing in one, the strafe and board rows say "
+                        "nothing rather than answering from a face that may not be "
+                        "the one you are on.",
+                        dm->dispDropped, dm->dispTotal,
+                        WrBspDispDropName[WrBspDispWorstDrop(dm)]);
+            }
         }
 
         ImGui::TextDisabled("Brushes only, and only the ones the world owns.");
         ImGui::SameLine();
         HelpMarker(
-            "Three things are deliberately left out, and each of them is a real "
+            "Two things are deliberately left out, and each of them is a real "
             "hole rather than a rounding error.\n\n"
             "DISPLACEMENTS. Over half of maps have some, and on 51 of the 1,106 "
             "surf maps here the ramps ARE displacements -- on those this reads "
@@ -2525,10 +2601,18 @@ static void DrawDisplayTab(void)
             "volumes, and a teleport volume on a surf map is characteristically "
             "a big slanted box under the ramp. Skipping the walk does not "
             "produce garbage; it produces a second ramp.\n\n"
-            "PLAYERCLIP. 141,841 brushes across the library are clip and not "
-            "solid: invisible geometry a mapper put there to smooth a ramp. "
-            "They are what you collide with, but drawing them would put a "
-            "surface on screen that nobody can see in game.");
+            "PLAYERCLIP is READ, and is the one that used to be on this list. "
+            "141,841 brushes across the library are clip and not solid: "
+            "invisible geometry a mapper puts there to smooth a ramp, and on a "
+            "surf map frequently the thing you are actually riding. They are "
+            "used for every question about where you are and left out of "
+            "everything drawn, because drawing one would put a surface on "
+            "screen that nobody can see in game.\n\n"
+            "Leaving them out cost more than it looked. With clip brushes "
+            "skipped, this reader had no polygon within 48 units of a player "
+            "who was demonstrably touching something a QUARTER of the time -- "
+            "which is why the live phase readout reads 98.3% with them and "
+            "73.8% without.");
 
         ImGui::Spacing();
         ImGui::Checkbox("Draw the ramps around you", &g_bspLoad.drawSurf);
@@ -2560,13 +2644,33 @@ static void DrawDisplayTab(void)
                        "screen at once.");
             ImGui::SliderInt("At most", &g_bspLoad.maxDrawPolys, 8, 512,
                              "%d faces");
-            ImGui::SliderFloat("Opacity", &g_bspLoad.drawAlpha, 0.05f, 1.0f,
+            // ##bsp because the line opacity slider at the top of this same tab
+            // is also called "Opacity", and two visible widgets with the same
+            // label in one ID scope is an ImGui error box on screen -- which is
+            // what a player got the moment they ticked the box above. The
+            // suffix changes the ID and not the label.
+            ImGui::SliderFloat("Opacity##bsp", &g_bspLoad.drawAlpha, 0.05f, 1.0f,
                                "%.2f");
             ImGui::Checkbox("Shade them in", &g_bspLoad.drawFill);
             ImGui::SameLine();
             HelpMarker("Off by default: a filled face hides the demo line lying "
                        "on it, which is the thing this whole tool exists to "
                        "show.");
+            ImGui::Checkbox("Include invisible clip ramps", &g_bspLoad.drawClip);
+            ImGui::SameLine();
+            HelpMarker("Playerclip brushes: collision with no material on it. You "
+                       "ride them and you cannot see them.\n\n"
+                       "These used to be read for collision and refused by the "
+                       "drawing query, on the grounds that outlining one puts a "
+                       "surface on screen that is not on screen in game. True, "
+                       "and it left some maps blank -- surf_ethereal is 233 of "
+                       "its 342 world brushes clip-only, surf_greensway 317 of "
+                       "579. On those the panel reported a healthy surf-band "
+                       "count while nothing at all was drawn.\n\n"
+                       "An invisible brush you ride is still the ramp. They are "
+                       "drawn dimmer and never shaded in, so they do not read as "
+                       "geometry you should be able to see, and the coverage line "
+                       "above says how many of the band they are.");
         }
 
         ImGui::Spacing();
@@ -4139,10 +4243,11 @@ static void DrawEnergyTab(void)
     }
 
     ImGui::Spacing();
-    const char *kModes[WR_HUD_MODE_COUNT] = {
+    const char *kModes[] = {
         "net energy", "carried %", "spent / banked", "gained / lost",
-        "strafe quality"
+        "strafe quality", "turn rate vs ideal", "net energy + strafe"
     };
+    WR_TABLE_IS_FULL(kModes, WR_HUD_MODE_COUNT);
     if (g_energy.hudMode < 0 || g_energy.hudMode >= WR_HUD_MODE_COUNT)
         g_energy.hudMode = 0;
     ImGui::Combo("Crosshair shows", &g_energy.hudMode, kModes,
@@ -4184,6 +4289,40 @@ static void DrawEnergyTab(void)
             "rolling number and your own drawn line stays uncoloured. Demo lines "
             "do not have the problem: their velocity is what Momentum recorded.\n\n"
             "Read it as a rolling average, never as a verdict on this instant.");
+    }
+
+    if (g_energy.hudMode == WR_HUD_TURN ||
+        g_energy.hudMode == WR_HUD_NET_STRAFE)
+    {
+        ImGui::SameLine();
+        HelpMarker(
+            "Your turn rate against the one Source's own AirAccelerate says you "
+            "want, with the ideal in blue and yours graded red to green.\n\n"
+            "\"net energy + strafe\" is the same pair on the second line, under "
+            "the net energy figure, so you get both at once.\n\n"
+            "THE GRADE IS DERIVED, NOT CHOSEN. With c = dot(velocity, wishdir), "
+            "one tick of air acceleration adds a = min(accel*maxspeed*tick, "
+            "30 - c) and gains 2ac + a^2 in speed-squared. Whenever the 30-unit "
+            "wishspeed cap is the binding one -- true of every surf "
+            "configuration; at 150 and 250 the other term is 562 -- that "
+            "collapses to exactly 900 - c^2, and in steady state your turn ratio "
+            "r fixes c at 30(1 - r). So the fraction of the available gain you "
+            "are getting is 1 - (1 - r)^2. Full green is r = 1; it falls to zero "
+            "both at r = 0, where you are not turning, and at r = 2, where you "
+            "have turned so far that your keys are pointing behind you.\n\n"
+            "Checked twice. Against a literal transcription of AirAccelerate it "
+            "recovers the simulated gain to 0.012%. Against 4.3 million real "
+            "airborne ticks the measured speed gain peaks where this says it "
+            "should -- at r = 0.85 to 0.95 -- and falls away on both sides.\n\n"
+            "It sits BELOW the curve everywhere, and that is correct: this is "
+            "the gain your turn rate makes AVAILABLE, not the gain you took. "
+            "Pointing at the right rate is necessary and not sufficient.\n\n"
+            "Airborne only. On a ramp the surface turns your velocity far faster "
+            "than air acceleration could, so the comparison would be against the "
+            "wrong physics. It also goes neutral if air accelerate is set low "
+            "enough that acceleration binds instead of the wishspeed cap -- "
+            "around 32 at these settings -- because the turn rate is then fixed "
+            "by the server rather than by how well you are pointing.");
     }
 
     KeyBindCombo("Next mode", &g_hudCycleKey);
@@ -4726,16 +4865,162 @@ static void DrawEnergyTab(void)
                "Which is why the ideal turn SLOWS as you speed up. The same 30 "
                "units a tick buys a smaller and smaller angle, and a rate that "
                "was right at 1000 u/s is far too fast at 3000.\n\n"
-               "Airborne only, and that restriction is the whole reason this can "
-               "be shown at all. On a ramp the surface turns your velocity far "
-               "faster than air acceleration ever could -- measured, that fires "
-               "on a tenth to a quarter of the samples of RECORD-class runs, "
-               "which is why turn rate was rejected as an efficiency metric and "
-               "dE/dt used instead. In the air there is nothing else doing the "
-               "turning.\n\n"
+               "It works on ramps too, and the number there is NOT the flat one. "
+               "A surf ramp is air movement as far as the engine is concerned -- "
+               "you are only 'on the ground' above a normal z of 0.7 -- so "
+               "AirAccelerate runs every tick you are riding one. What changes is "
+               "that the surface then clips your velocity, and the clip turns you "
+               "as well. Working that through, the ideal comes out as "
+               "|g(1 - wn^2) + G*nz*wn| / speed against g / speed in the air, "
+               "where wn is how much your wishdir points into the ramp.\n\n"
+               "That is a big difference, not a correction: on a 53-degree ramp "
+               "ridden across the fall line the ideal is 55% of the flat one "
+               "strafing one way and 17% the other. Showing the flat number there "
+               "would be worse than showing nothing, which is why this refused to "
+               "answer on ramps until the map reader could supply a real surface "
+               "normal. Where it has none, it still says so -- and it now says "
+               "WHICH none: \"map not read\" if the reader is switched off, "
+               "\"map part read\" if this level has geometry that could not be "
+               "built, \"not a ramp\" if what you are against is a wall or a "
+               "floor, and \"no lift yet\" if the surface is barely holding you. "
+               "Those were one string once, and the one that mattered was the "
+               "one it fitted worst.\n\n"
                "It reads from the gravity, air-accelerate and max-speed settings "
                "on this tab, because nothing here reads a cvar. If your server "
                "runs something other than 150 and 250, set them or ignore this.");
+
+    // The colour controls sit under the checkbox that turns the row on, but they
+    // govern the crosshair modes as well -- one rule for the same comparison
+    // wherever it is drawn.
+    ImGui::SetNextItemWidth(150.0f);
+    const char *kStrafeColour[] = {
+        "a window I set", "the physics grade"
+    };
+    WR_TABLE_IS_FULL(kStrafeColour, WR_STRAFE_COLOUR_COUNT);
+    if (g_energy.strafeColour < 0 ||
+        g_energy.strafeColour >= WR_STRAFE_COLOUR_COUNT)
+        g_energy.strafeColour = 0;
+    ImGui::Combo("Colour from", &g_energy.strafeColour, kStrafeColour,
+                 WR_STRAFE_COLOUR_COUNT);
+    ImGui::SameLine();
+    HelpMarker("What decides red-to-green.\n\n"
+               "THE PHYSICS GRADE is 1 - (1 - r)^2 out of AirAccelerate, r being "
+               "your turn rate over the ideal. It is exact, and it is harsh: it "
+               "reaches zero at twice the ideal rate, and the ideal falls as you "
+               "speed up -- about 115 deg/s at 1000 u/s and 44 at 2600. So at "
+               "speed an ordinary correction really is off the scale and really "
+               "is costing you, and the readout really is red for minutes at a "
+               "time. Correct, and hard to watch.\n\n"
+               "A WINDOW I SET colours by how far the two numbers are apart, "
+               "against a tolerance you choose. It claims nothing about the "
+               "physics -- it decides how much slack the colour gives before it "
+               "starts complaining, which is a preference and yours to make.\n\n"
+               "The percentage beside the numbers is the physics grade either "
+               "way, so nothing is hidden by turning the colour down.");
+
+    if (g_energy.strafeColour == WR_STRAFE_COLOUR_BAND)
+    {
+        ImGui::SetNextItemWidth(150.0f);
+        const char *kStrafeBand[] = {
+            "deg/s", "% of ideal"
+        };
+        WR_TABLE_IS_FULL(kStrafeBand, WR_STRAFE_BAND_COUNT);
+        if (g_energy.strafeBand < 0 ||
+            g_energy.strafeBand >= WR_STRAFE_BAND_COUNT)
+            g_energy.strafeBand = 0;
+        ImGui::Combo("Measured in", &g_energy.strafeBand, kStrafeBand,
+                     WR_STRAFE_BAND_COUNT);
+        ImGui::SameLine();
+        HelpMarker("DEG/S is a fixed window: 30 means green until your turn rate "
+                   "is 30 deg/s off the ideal, at every speed. Simple, and "
+                   "proportionally much looser when you are quick -- the ideal is "
+                   "only about 44 deg/s at 2600 u/s, so 30 either side of it is "
+                   "most of the range.\n\n"
+                   "% OF IDEAL scales with it, so 25% is equally strict at every "
+                   "speed. Harder to think in, fairer across a run.");
+
+        ImGui::SetNextItemWidth(160.0f);
+        const bool pct = (g_energy.strafeBand == WR_STRAFE_BAND_PERCENT);
+        ImGui::SliderFloat("Full red at", &g_energy.strafeTolerance,
+                           5.0f, pct ? 60.0f : 120.0f,
+                           pct ? "%.0f %%" : "%.0f deg/s",
+                           ImGuiSliderFlags_AlwaysClamp);
+    }
+
+    // The same bool as the one on the Display tab. It governs this readout and
+    // the strafe bar as much as it governs the lines, and over there it is
+    // nested inside a line-colouring mode -- so somebody who needs it could not
+    // reach it without first changing a setting they were not asking about.
+    ImGui::Checkbox("Blue/orange instead of red/green",
+                    &g_render.effColourblind);
+    ImGui::SameLine();
+    HelpMarker("Swaps the whole red-to-green scale for orange-to-blue, here and "
+               "on the demo lines, which are the same ramp deliberately.\n\n"
+               "The same tick-box appears on the Display tab under efficiency "
+               "colouring. It is one setting shown twice, not two.");
+
+    ImGui::Checkbox("Show the percentage", &g_energy.showStrafePercent);
+    ImGui::SameLine();
+    HelpMarker("The physics grade as a number, whatever the colour is doing.\n\n"
+               "It is not a rating out of a hundred. With the 30-unit wishspeed "
+               "cap binding -- true of every surf configuration -- one tick adds "
+               "exactly 900 - c^2 to your speed SQUARED, best at c = 0. This is "
+               "that over 900: the literal fraction of the best possible gain "
+               "this tick could have given you. 82% means you took 82% of what "
+               "was on the table.\n\n"
+               "It goes blank where the grade has no meaning -- low "
+               "sv_airaccelerate, where the acceleration binds instead of the "
+               "cap and the turn rate is set by the server rather than by you.");
+
+    ImGui::Checkbox("Show which way to correct", &g_energy.showStrafeArrow);
+    ImGui::SameLine();
+    HelpMarker("A ^ when you should turn faster and a v when you should turn "
+               "slower, with nothing shown inside a quarter of the tolerance so "
+               "it does not flicker at every small correction.\n\n"
+               "The big crosshair figure uses the same two glyphs for the energy "
+               "trend, so this one is always printed tight against the strafe "
+               "number rather than at the end of the line.");
+
+    ImGui::Checkbox("Strafe bar above the crosshair", &g_energy.showStrafeBar);
+    ImGui::SameLine();
+    HelpMarker("The same comparison as the number, drawn as a bar you can read "
+               "without looking at it.\n\n"
+               "Centre is the IDEAL, not zero. The fill leans LEFT when you "
+               "should turn faster and RIGHT when you should turn slower -- the "
+               "same sense as the ^ and v above, because two cues for one thing "
+               "must never point different ways. A gauge running from zero to "
+               "the ideal was the alternative and it is worse here: half its "
+               "width goes on rates nobody strafes at, and overshoot has "
+               "nowhere to go, so turning far too fast would look exactly like "
+               "turning perfectly.\n\n"
+               "Full deflection is the tolerance above, and the colour is the "
+               "same one the number uses, so the bar cannot disagree with them. "
+               "The two faint uprights mark where the arrow goes quiet. An "
+               "arrowhead past the end means you are further off than the bar "
+               "can show, rather than the bar quietly sitting at maximum.\n\n"
+               "It sits above the crosshair because that is where your eyes "
+               "already are on a hard ramp -- and because below is taken: the "
+               "board grade flashes there.\n\n"
+               "It fades rather than vanishing when there is nothing to grade. "
+               "Something that disappears between one frame and the next reads "
+               "as a glitch, and on a ramp lip the phase readout flickers.");
+    if (g_energy.showStrafeBar)
+    {
+        ImGui::Indent();
+        ImGui::SliderFloat("Bar width", &g_energy.strafeBarWidth, 0.0f, 600.0f,
+                           g_energy.strafeBarWidth < 1.0f ? "auto"
+                                                          : "%.0f px");
+        ImGui::SliderFloat("Bar thickness", &g_energy.strafeBarHeight, 2.0f,
+                           24.0f, "%.0f px");
+        ImGui::SliderFloat("Bar height above centre", &g_energy.strafeBarRise,
+                           -200.0f, 300.0f, "%.0f px");
+        ImGui::SameLine();
+        HelpMarker("Negative puts it below the crosshair. Around -46 it will "
+                   "land on the board flash, which is why the default is "
+                   "above.");
+        ImGui::Unindent();
+    }
+
     ImGui::Checkbox("Say what you are touching", &g_energy.showPhase);
     ImGui::SameLine();
     HelpMarker("A row on the corner block reading in the air / on a ramp / on "
@@ -4763,6 +5048,140 @@ static void DrawEnergyTab(void)
                "on its own fires at the apex of every jump -- it cannot here, "
                "because an apex is free flight and the question is never "
                "reached.");
+    ImGui::Checkbox("Grade my own boards", &g_energy.showBoard);
+    ImGui::SameLine();
+    HelpMarker("The same grade a demo line's boards get, applied to yours -- as a "
+               "flash under the crosshair the moment you land, and as a row on "
+               "the corner block holding the last one.\n\n"
+               "It is NOT the demo detector run live. That one searches a whole "
+               "recorded path for the air-to-contact transition and recovers the "
+               "ramp's normal from the velocity change across it, and neither "
+               "half is available here: there is no future to look at, and a "
+               "normal recovered from one instant of a camera-differenced "
+               "velocity is far worse than the same recovery on demo data.\n\n"
+               "So it uses better inputs for the same grade. The transition comes "
+               "from the live phase readout, which the .bsp took to 98.3%. The "
+               "normal is read STRAIGHT OUT OF THE MAP -- exact, where a demo's "
+               "is recovered to about 1.2 degrees. The arriving speed is taken "
+               "from a tenth of a second before the landing, because the phase "
+               "test reads a 0.10 s window and the speed at the instant it fires "
+               "is already partly clipped.\n\n"
+               "Which is why this needs the map. Where the level is not held "
+               "completely there is no normal to project against and the row "
+               "says so instead of guessing. That used to read \"anything using "
+               "displacements\", which was false: displacements are read on BSP "
+               "19, 20 and 21, and 597 of the 626 maps here that have them are "
+               "complete.\n\n"
+               "The loss is PROJECTED, not subtracted. Source's clip is an "
+               "orthogonal projection, so losing 1 - sin(approach) of your speed "
+               "is the engine's own arithmetic rather than an estimate. "
+               "Subtracting two measured speeds cannot work here: a board costs "
+               "4-23 u/s and the speed is already moving 7-12 u/s per tick from "
+               "gravity and the ramp, so the difference measures the ride.");
+    ImGui::SliderFloat("Board flash", &g_energy.boardFlashSeconds, 0.5f, 10.0f,
+                       "%.1f s");
+
+    // Applies to demo-line board labels as well, not just your own -- one unit
+    // for the word "board" wherever it appears.
+    ImGui::SetNextItemWidth(170.0f);
+    const char *kBoardUnit[] = {
+        "speed (3D)", "speed (horizontal)", "energy", "x y z"
+    };
+    WR_TABLE_IS_FULL(kBoardUnit, WR_BOARD_UNIT_COUNT);
+    if (g_energy.boardUnit < 0 || g_energy.boardUnit >= WR_BOARD_UNIT_COUNT)
+        g_energy.boardUnit = 0;
+    ImGui::Combo("Board shows", &g_energy.boardUnit, kBoardUnit,
+                 WR_BOARD_UNIT_COUNT);
+    ImGui::SameLine();
+    HelpMarker("What a board's cost is written in. These are not four estimates "
+               "of one thing -- they are one identity read off four ways.\n\n"
+               "Source's clip does exactly dv = -(v.n)n, so everything follows "
+               "from how hard you went into the plane and which way the plane "
+               "faces:\n\n"
+               "SPEED (3D) is the whole vector, which is what surf HUDs quote.\n\n"
+               "SPEED (HORIZONTAL) is the xy part alone. On a shallow ramp most "
+               "of the bite is vertical, so this is much the smaller number and "
+               "the one that matches a speedometer.\n\n"
+               "ENERGY is the same loss as a height, comparable with the rest of "
+               "this HUD, and it is exactly (v.n)^2 / 2g -- a clip moves you "
+               "nowhere, so none of it is potential.\n\n"
+               "X Y Z is the change per axis, signed. Read the signs: a clip "
+               "pushes along its own normal, so z is usually POSITIVE. The board "
+               "took speed and handed back height, which is the trade a board "
+               "is.");
+
+    ImGui::Checkbox("Say how close to perfect", &g_energy.boardPercent);
+    ImGui::SameLine();
+    HelpMarker("The share of your arriving speed the clip left you, as a "
+               "percentage. 100% is velocity exactly parallel to the ramp, which "
+               "is the one board there is no improving on.\n\n"
+               "This is sin(approach) written out, so it is the same projection "
+               "the grade uses and not a second opinion about it.");
+
+    ImGui::SetNextItemWidth(170.0f);
+    ImGui::SliderInt("Board decimals", &g_energy.boardDecimals, 0, 3);
+    ImGui::SameLine();
+    HelpMarker("How many places the cost is printed to. The percentage and the "
+               "angle always take one more, because the cost is derived from "
+               "them and the derivative between them is nearly four.\n\n"
+               "Whole units were losing real information. A board at 2500 u/s "
+               "costs 10 to 15, so rounding to whole numbers is 3-5% of "
+               "quantisation on the figure itself -- and a whole DEGREE of "
+               "approach hides about 1.9 u/s of cost at 85 degrees, which is a "
+               "sixth of the board.\n\n"
+               "Two is the default and it is what a SOLVED entry earns: where "
+               "the map offers the ramp's plane, the arriving velocity is "
+               "worked out from where your arc actually crossed it rather than "
+               "sampled a tenth of a second early. Where it falls back to the "
+               "estimate -- the Diagnostics tab says which -- the second place "
+               "is not really yours, and three never is.");
+
+    // WHY THE LAST LANDING PRODUCED NOTHING, and how often each reason has.
+    //
+    // Reported as boards that "sometimes don't report numbers". They were being
+    // refused, by one of ten tests, silently -- so the readout looked broken
+    // while working exactly as written. The corner row now names the last one;
+    // this is the same information as a count, which is what turns "sometimes"
+    // into something a player can report and a developer can act on.
+    if (ImGui::TreeNode("Why boards were not reported"))
+    {
+        ImGui::TextDisabled("Since this map loaded. Counted per landing, not "
+                            "per frame.");
+        int total = 0;
+        for (int i = WR_BOARD_WHY_NONE + 1; i < WR_BOARD_WHY__COUNT; i++)
+            total += WrEnergyBoardWhyCount(i);
+        if (total == 0)
+        {
+            ImGui::TextDisabled("Nothing has been refused.");
+        }
+        else
+        {
+            for (int i = WR_BOARD_WHY_NONE + 1; i < WR_BOARD_WHY__COUNT; i++)
+            {
+                const int c = WrEnergyBoardWhyCount(i);
+                if (c > 0)
+                    ImGui::Text("%5d   %s", c, WrEnergyBoardWhyName(i));
+            }
+        }
+        ImGui::Separator();
+        ImGui::Text("last: %s", WrEnergyBoardWhyName(WrEnergyBoardWhy()));
+        ImGui::Text("entry: %s", WrEnergyBoardExact()
+                        ? "solved against the map's own plane"
+                        : "estimated from the camera");
+        ImGui::SameLine();
+        HelpMarker("\"Not a ramp\" is the one worth acting on. It means the "
+                   "surface nearest your feet was a wall or a floor rather "
+                   "than something rideable -- which happens on a side entry, "
+                   "and the corner row prints the n.z it saw so you can tell "
+                   "which of the two it was.\n\n"
+                   "\"Nothing to touch\" means the map had no polygon within 24 "
+                   "units of where your feet were taken to be. If that one is "
+                   "large, the eye height on the Physics tab is the first thing "
+                   "to check: it is a setting, not a read, so it is 64 whether "
+                   "or not you were crouched.");
+        ImGui::TreePop();
+    }
+
     ImGui::Checkbox("Compare against the fastest enabled run nearby",
                     &g_energy.compareToRun);
     ImGui::SliderFloat("Compare radius", &g_energy.compareRadius, 64.0f, 4096.0f,
@@ -4778,10 +5197,25 @@ static void DrawEnergyTab(void)
                "which sits about 64 units higher. Stand on the start pad next "
                "to a line's beginning: if the gap sits at a constant offset, "
                "this is the knob that nulls it.");
+    // All three feed the DRAWN LINES as well as the live readout, and until now
+    // only the readout noticed them move. The efficiency colours are measured
+    // against a ceiling built from all three, and the air/contact split against
+    // gravity, both at load -- so a slider dragged here left every line on
+    // screen coloured against numbers that were no longer on this page.
+    //
+    // On deactivation rather than on the drag, for the reason the efficiency
+    // window slider gives: the rebuild is a full pass over every point of every
+    // loaded run, which is a preview nobody wants at 200 fps.
+    bool physEdited = false;
     ImGui::SliderFloat("Gravity", &g_energy.gravity, 200.0f, 1600.0f, "%.0f");
+    physEdited |= ImGui::IsItemDeactivatedAfterEdit();
     ImGui::SliderFloat("Air accelerate", &g_energy.airAccelerate, 5.0f, 1000.0f,
                        "%.0f");
+    physEdited |= ImGui::IsItemDeactivatedAfterEdit();
     ImGui::SliderFloat("Max speed", &g_energy.maxSpeed, 100.0f, 500.0f, "%.0f");
+    physEdited |= ImGui::IsItemDeactivatedAfterEdit();
+    if (physEdited)
+        WrPathRefreshDerived();
     ImGui::SameLine();
     HelpMarker(
         "sv_airaccelerate and sv_maxspeed. Settings, not reads -- WrLines "
@@ -4952,7 +5386,8 @@ static void DrawEnergyTab(void)
         "mid-pack run flips which way it leans. The line above it names who.");
     if (g_energy.showBar)
     {
-        const char *kBar[WR_BAR_MODE_COUNT] = { "energy", "horizontal speed" };
+        const char *kBar[] = { "energy", "horizontal speed" };
+        WR_TABLE_IS_FULL(kBar, WR_BAR_MODE_COUNT);
         if (g_energy.barMode < 0 || g_energy.barMode >= WR_BAR_MODE_COUNT)
             g_energy.barMode = 0;
         ImGui::Combo("Bar measures", &g_energy.barMode, kBar, WR_BAR_MODE_COUNT);
@@ -5040,6 +5475,71 @@ static void DrawDiagnosticsTab(void)
 
     if (ImGui::Button("Re-scan"))
         WrScanRestart();
+    ImGui::SameLine();
+    ImGui::TextDisabled("read-only; cannot affect the game");
+
+    // --- the player's own origin and velocity -------------------------------
+    //
+    // The second reader of game memory, and the one that decides how many
+    // digits of a board are real. It is separated out here rather than folded
+    // into the matrix rows above because a player needs to be able to see
+    // WHICH of the two answered: the numbers mean different things.
+    ImGui::SeparatorText("The player's own position and velocity");
+
+    Vec3 pOrg, pVel;
+    const bool pHaveOrg = WrPlayerOrigin(&pOrg);
+    const bool pHaveVel = WrPlayerVelocity(&pVel);
+
+    if (pHaveOrg && pHaveVel)
+        ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "%s",
+                           WrPlayerStatus());
+    else if (WrPlayerBusy() || WrPlayerCandidates() > 0)
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "%s",
+                           WrPlayerStatus());
+    else
+        ImGui::TextDisabled("%s", WrPlayerStatus());
+
+    if (pHaveOrg)
+        ImGui::Text("origin      %.2f  %.2f  %.2f", pOrg.x, pOrg.y, pOrg.z);
+    if (pHaveVel)
+        ImGui::Text("velocity    %.2f  %.2f  %.2f   (%.2f u/s)",
+                    pVel.x, pVel.y, pVel.z, WrLength(pVel));
+
+    const float eye = WrPlayerEyeHeight();
+    if (eye > 0.0f)
+        ImGui::Text("eye height  %.2f  (measured, not the %.0f setting)", eye,
+                    g_energy.eyeHeight);
+    else
+        ImGui::TextDisabled("eye height  using the %.0f setting",
+                            g_energy.eyeHeight);
+
+    ImGui::Text("boards      %s", WrEnergyTrueVelocityLive()
+                    ? "graded on the game's own velocity"
+                    : "graded on the camera estimate");
+    ImGui::SameLine();
+    HelpMarker("Everything live in this tool is normally derived from one "
+               "thing: the camera solved out of the matrix above. Position is "
+               "that camera, velocity is that camera differenced over 40 ms, "
+               "and your feet are that camera less a SETTING.\n\n"
+               "That chain carries error nothing downstream can remove. The eye "
+               "height is 64 whether or not you are crouched, and Source ducks "
+               "to 28 -- so a crouched player's feet were being taken 36 units "
+               "too low, against a map search radius of 24. The duck itself "
+               "lerps into the velocity as if you had moved. View bob rides on "
+               "top of both.\n\n"
+               "The game holds all three exactly. This finds them the same way "
+               "the matrix is found and under the same rules: ReadProcessMemory "
+               "on our own process, never a write, never a call into game code. "
+               "A candidate is believed only after it has predicted the camera "
+               "for ninety frames running -- during which a surfer has moved "
+               "thousands of units through several turns, so there is no "
+               "passing it by coincidence.\n\n"
+               "It is allowed to find nothing. Everything keeps working on the "
+               "camera estimate; the numbers are simply worth fewer decimals, "
+               "which is what the board decimals setting is for.");
+
+    if (ImGui::Button("Look again##player"))
+        WrPlayerRescan();
     ImGui::SameLine();
     ImGui::TextDisabled("read-only; cannot affect the game");
 
@@ -5264,10 +5764,10 @@ static void DrawDiagnosticsTab(void)
     // WrCursorUpdate is misbehaving is to make the machine that has the problem
     // say so. Four numbers, one screenshot, no round trip per guess.
     {
-        bool followsOs = false, showing = false;
+        bool followsOs = false, showing = false, moveArmed = false;
         int stale = 0;
         double rawAge = -1.0;
-        WrCursorDiag(&followsOs, &showing, &stale, &rawAge);
+        WrCursorDiag(&followsOs, &showing, &stale, &rawAge, &moveArmed);
 
         ImGui::Text("cursor      %s", followsOs ? "following the OS pointer"
                                                 : "virtual (raw mouse deltas)");
@@ -5277,6 +5777,12 @@ static void DrawDiagnosticsTab(void)
             ImGui::Text("            raw input never arrived");
         else
             ImGui::Text("            raw input %.1f s ago", rawAge);
+        // The age above is NOT what decides this, and saying so here is the
+        // point: it used to be, and a second of stillness then let a warp
+        // message throw the pointer to the middle of the screen.
+        ImGui::Text("            WM_MOUSEMOVE fallback %s",
+                    moveArmed ? "ARMED (no raw input since this panel opened)"
+                              : "off (raw input is working)");
         if (!WrWndProcInstalled())
             ImGui::TextDisabled("            (window procedure not installed -- "
                                 "no panel is open)");

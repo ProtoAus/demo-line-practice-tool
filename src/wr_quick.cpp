@@ -1477,28 +1477,42 @@ static void DrawColourRow(void)
 {
     ImGui::SeparatorText("Colour");
 
-    static const char *kNames[WR_LINE_MODE_COUNT] = {
-        "off", "speed", "energy", "energy (relative)", "efficiency"
+    // Sized by the initialiser, NOT by the enum, with the count checked below.
+    //
+    // It was written the other way round -- kNames[WR_LINE_MODE_COUNT] with five
+    // strings in it -- and when WR_LINE_PHASE was added the sixth slot became a
+    // silent NULL. The loop under it counts to the enum, so it handed that NULL
+    // to RadioButton, which hashes its label to make an ID, and ImHashStr walks
+    // the string without a null check. The quick panel crashed the game on the
+    // first frame it drew, every single time, from inside imgui.cpp.
+    //
+    // Both halves of the fix are here on purpose: WR_TABLE_IS_FULL makes the
+    // next omission a build error, and WrLabel means that if one ever gets past
+    // it anyway the widget reads "?" instead of closing the game.
+    static const char *kNames[] = {
+        "off", "speed", "energy", "energy (relative)", "efficiency", "phase"
     };
+    WR_TABLE_IS_FULL(kNames, WR_LINE_MODE_COUNT);
     ImGui::TextDisabled("along the line");
     ImGui::SameLine();
     for (int i = 0; i < WR_LINE_MODE_COUNT; i++)
     {
         ImGui::SameLine();
-        if (ImGui::RadioButton(kNames[i], g_render.lineColour == i))
+        if (ImGui::RadioButton(WrLabel(kNames[i]), g_render.lineColour == i))
             g_render.lineColour = i;
     }
 
-    static const char *kRank[WR_RANK_MODE_COUNT] = {
+    static const char *kRank[] = {
         "off", "by placing", "by time"
     };
+    WR_TABLE_IS_FULL(kRank, WR_RANK_MODE_COUNT);
     ImGui::TextDisabled("whole run");
     ImGui::SameLine();
     for (int i = 0; i < WR_RANK_MODE_COUNT; i++)
     {
         ImGui::SameLine();
         char id[48];
-        _snprintf_s(id, sizeof(id), _TRUNCATE, "%s##rank", kRank[i]);
+        _snprintf_s(id, sizeof(id), _TRUNCATE, "%s##rank", WrLabel(kRank[i]));
         if (ImGui::RadioButton(id, g_render.rankColour == i))
             g_render.rankColour = i;
     }

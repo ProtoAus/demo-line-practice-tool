@@ -41,6 +41,7 @@
 #include "wr_quick.h"
 #include "wr_update.h"
 #include "wr_bspload.h"
+#include "wr_player.h"
 
 #include "imgui.h"
 
@@ -87,6 +88,13 @@ void WrIdleTick(void)
         // from the old map is ramps from somewhere else, at plausible angles,
         // in plausible places. See wr_bspload.h.
         WrBspLoadOnMapChanged(map);
+
+        // Same reasoning, different object. The address that held the player's
+        // origin belonged to an entity in the old level, and after a load it
+        // holds whatever the allocator put there -- which may still be three
+        // finite floats. It has to be forgotten deliberately rather than left
+        // to fail its own test.
+        WrPlayerOnMapChanged();
     }
 
     // Feeds the run store a few files per frame, so a 125-run map does not stall
@@ -118,12 +126,41 @@ void WrIdleTick(void)
     Vec3 cam;
     if (WrCameraOrigin(&cam))
     {
+        // ASK THE GAME FOR ITS OWN NUMBERS FIRST, because everything below is
+        // better if it answers. Read-only, proved before it is believed, and
+        // allowed to fail -- see wr_player.h. When it has nothing, every line
+        // after this one behaves exactly as it did before it existed.
+        WrPlayerTick(cam, dt);
+
+        Vec3 trueOrigin, trueVel;
+        const bool haveOrigin = WrPlayerOrigin(&trueOrigin);
+        const bool haveVel = WrPlayerVelocity(&trueVel);
+        WrEnergySetTruePlayer(haveOrigin ? &trueOrigin : 0,
+                              haveVel ? &trueVel : 0,
+                              WrPlayerEyeHeight());
+
         // The live trail is recorded at the FEET, not the eye. Demo runs store
         // the player origin, so recording the camera put our own line about 64
         // units above a demo line of the identical trajectory -- close enough to
         // look deliberate and wrong enough to be useless for comparison.
-        Vec3 feet = cam;
-        feet.z -= g_energy.eyeHeight;
+        //
+        // Where the origin has been read it is used directly, which matters
+        // most for the map query below: the eye height is a SETTING, fixed at
+        // 64, and Source's ducked view offset is 28 -- so a crouched player was
+        // asking about a point 36 units below their feet, against a search
+        // radius of 24. The answer could only be "nothing there".
+        Vec3 feet;
+        if (haveOrigin)
+        {
+            feet = trueOrigin;
+        }
+        else
+        {
+            feet = cam;
+            // Still better than the setting when the eye height alone is known.
+            const float eye = WrPlayerEyeHeight();
+            feet.z -= (eye > 0.0f) ? eye : g_energy.eyeHeight;
+        }
 
         // The energy sampler keeps the raw camera. Its anchor is a camera height
         // too, so the offset cancels there and must not be applied twice.
@@ -133,6 +170,43 @@ void WrIdleTick(void)
         // the wrong speed on the point it is attached to.
         WrEnergySample(cam, dt);
         WrEnergyTickArrow(dt);
+
+        // Ask the map whether there is anything for the player to be touching,
+        // so the phase readout stops inventing surfaces in mid-air. One
+        // grid-accelerated query a frame; see WrEnergyPhase for what it is
+        // worth and WrBspLoadGeometryComplete for when it may be believed.
+        {
+            int touch = WR_GEOM_UNKNOWN;
+            float nrm[3] = { 0.0f, 0.0f, 0.0f };
+            float ramp[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            float rampDist = -1.0f, nearDist = -1.0f;
+            bool haveNrm = false;
+            if (WrBspLoadGeometryComplete())
+            {
+                // The same query, now also returning the plane it found. That
+                // normal is what makes a LIVE board gradeable: read out of the
+                // map rather than recovered from a second difference of the
+                // camera. See WrEnergyBoard.
+                //
+                // And a second answer beside it: the nearest surface that could
+                // be RIDDEN. The touch verdict has to stay on nearest-of-any,
+                // which is what its 98.3% was measured with, but a board graded
+                // against the wall it landed beside is no board at all -- see
+                // WrBspLoadNearestEx.
+                const float d = WrBspLoadNearestEx(feet, WR_BSP_TOUCH_RADIUS,
+                                                   nrm, ramp, &rampDist);
+                touch = (d >= 0.0f) ? WR_GEOM_TOUCHING : WR_GEOM_NOTHING;
+                haveNrm = (d >= 0.0f);
+                nearDist = d;
+            }
+            WrEnergySetGeometryTouch(touch, haveNrm ? nrm : 0,
+                                     rampDist >= 0.0f ? ramp : 0, rampDist,
+                                     nearDist);
+        }
+
+        // Boards last, because it reads the phase, and the phase is not settled
+        // for this frame until the line above has run.
+        WrEnergyTickBoards(dt);
 
         // Save-locs BEFORE the clock, and that ordering is a fix rather than a
         // preference. The other way round, loading an untimed save-loc restored

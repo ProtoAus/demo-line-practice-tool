@@ -24,6 +24,7 @@ void WrBspLoadDefaults(void)
     g_bspLoad.drawAlpha     = 0.55f;
     g_bspLoad.maxDrawPolys  = 96;
     g_bspLoad.drawFill      = false;
+    g_bspLoad.drawClip      = true;
     g_bspLoad.showAhead     = false;
     g_bspLoad.aheadDistance = 2048.0f;
 }
@@ -137,7 +138,16 @@ static DWORD WINAPI LoadThread(LPVOID)
             // them. A level whose .bsp was never in momentum\maps is ordinary
             // and gets a flat sentence; a file that is there and refused is
             // worth reporting, and its refusal names the lump.
-            state = (strstr(err, "no map file named") != NULL)
+            //
+            // This used to test for "no map file named", which WrBspReadRaw only
+            // ever says when it is handed an EMPTY PATH -- and the path here is
+            // built from two non-empty strings, so it never was. A missing map
+            // took the other branch and was reported in warning orange as
+            // "Would not read it: could not open the map file", i.e. as a bug in
+            // this reader rather than as a map you do not have. The whole
+            // WR_BSPLOAD_MISSING arm was unreachable.
+            state = (strstr(err, "could not open the map file") != NULL ||
+                     strstr(err, "no map file named") != NULL)
                         ? WR_BSPLOAD_MISSING : WR_BSPLOAD_REFUSED;
         }
         else
@@ -428,25 +438,15 @@ const char *WrBspLoadMapName(void)
 // Coverage
 // ---------------------------------------------------------------------------
 
-// The threshold below which the panel shouts rather than mentions.
-//
-// Not a round number pulled out of the air. Across the library model 0 owns
-// 84.1% of brushes with p10 at 68.7%, so two thirds is comfortably inside the
-// ordinary range and nothing normal trips this. What does trip it is a map like
-// bhop_slope_v2 at 3.6%, which is the case this exists for.
-#define WR_BSP_THIN_OWNED 0.55f
-
-// And separately: a map can be fully world-owned and still have almost no
-// surfable brush geometry, because its ramps are displacements. 51 maps in the
-// library are like that. There is no ratio to test -- a bhop map legitimately
-// has no surf band at all -- so this only fires where the panel already knows
-// the map is a surf map, and the caller decides that.
+// WR_BSP_THIN_OWNED and both predicates now live in wr_bsp.h, taking a WrBspMap
+// rather than reaching for the loaded one. They are properties of a map, and the
+// switch this reader's whole live behaviour turns on had no test coverage in any
+// harness while it was trapped in here behind a loader lookup. These two remain
+// because every caller in the panel wants the current map and should not have to
+// say so.
 bool WrBspLoadCoverageThin(void)
 {
-    const WrBspMap *m = WrBspLoadCurrent();
-    if (!m || m->brushTotal <= 0)
-        return false;
-    return (float)m->brushWorld / (float)m->brushTotal < WR_BSP_THIN_OWNED;
+    return WrBspCoverageThin(WrBspLoadCurrent());
 }
 
 bool WrBspLoadCoverage(char *line, int cap)
@@ -480,14 +480,122 @@ bool WrBspLoadCoverage(char *line, int cap)
         return false;
     }
 
-    float pct = m->brushTotal ? 100.0f * (float)m->brushWorld
+    const int haveBrushes = m->brushWorld + m->entBrushes;
+    float pct = m->brushTotal ? 100.0f * (float)haveBrushes
                               / (float)m->brushTotal : 0.0f;
+
+    // The clip share is spelled out rather than folded in. It used to be folded
+    // in, and on a map like surf_ethereal -- where two thirds of the world
+    // brushes are clip-only -- that meant the sentence said several hundred were
+    // in the surf band while the drawing query was refusing almost all of them.
+    char clip[64];
+    clip[0] = '\0';
+    if (m->surfClipPolys > 0)
+        _snprintf_s(clip, sizeof(clip), _TRUNCATE,
+                    " (%d of those are clip brushes)", m->surfClipPolys);
+
+    // "4 displacements skipped" is what this used to say on surf_kvas, and it
+    // reads as 99.995% complete while meaning the exact opposite: those 4 were
+    // the switch that turned the live map query off for the whole level. Say how
+    // many of how many, and say that what is missing is missing from every
+    // number in this same sentence.
+    char disp[160];
+    disp[0] = '\0';
+    if (m->dispPolys > 0 || m->dispDropped > 0)
+        _snprintf_s(disp, sizeof(disp), _TRUNCATE,
+                    " %d displacement triangles; %d of %d displacements were "
+                    "not built at all and are missing from every number above.",
+                    m->dispPolys, m->dispDropped, m->dispTotal);
+
     _snprintf_s(line, cap, _TRUNCATE,
-                "%d of %d brushes belong to the world (%.0f%%), %d of those "
-                "solid; %d faces, %d in the surf band.",
-                m->brushWorld, m->brushTotal, pct, m->brushSolid,
-                m->polyCount, m->surfPolys);
+                "%d of %d brushes read (%.0f%%): %d the world's and %d from %d "
+                "solid entities, %d of them solid; %d faces, %d in the surf "
+                "band%s.%s",
+                haveBrushes, m->brushTotal, pct, m->brushWorld, m->entBrushes,
+                m->entModels, m->brushSolid, m->polyCount, m->surfPolys,
+                clip, disp);
     return true;
+}
+
+float WrBspLoadNearestEx(const Vec3 &feet, float radius, float *outNormal,
+                         float *outRampPlane, float *outRampDist)
+{
+    if (outRampDist) *outRampDist = -1.0f;
+
+    const WrBspMap *m = WrBspLoadCurrent();
+    if (!m || m->polyCount <= 0)
+        return -1.0f;
+    if (!(radius > 0.0f))
+        radius = WR_BSP_TOUCH_RADIUS;
+
+    const float p[3] = { feet.x, feet.y, feet.z };
+    int poly = -1, ramp = -1;
+    float dist = 0.0f, rampDist = -1.0f;
+    if (!WrBspNearestFaceEx(m, p, radius, &poly, &dist, &ramp, &rampDist))
+        return -1.0f;
+
+    if (outNormal && poly >= 0 && poly < m->polyCount)
+    {
+        const float *pl = m->polys[poly].plane;
+        outNormal[0] = pl[0];
+        outNormal[1] = pl[1];
+        outNormal[2] = pl[2];
+    }
+
+    // All four floats of the ramp's plane, not three. The fourth is what lets
+    // the board solve WHEN the surface was crossed instead of guessing an
+    // instant -- see WrEnergyTickBoards. It is free here and unavailable later.
+    if (outRampPlane && ramp >= 0 && ramp < m->polyCount)
+    {
+        const float *pl = m->polys[ramp].plane;
+        outRampPlane[0] = pl[0];
+        outRampPlane[1] = pl[1];
+        outRampPlane[2] = pl[2];
+        outRampPlane[3] = pl[3];
+    }
+    if (outRampDist && ramp >= 0)
+        *outRampDist = rampDist;
+
+    return dist;
+}
+
+float WrBspLoadNearest(const Vec3 &feet, float radius, float *outNormal)
+{
+    return WrBspLoadNearestEx(feet, radius, outNormal, 0, 0);
+}
+
+bool WrBspLoadGeometryComplete(void)
+{
+    return WrBspGeometryComplete(WrBspLoadCurrent());
+}
+
+// Does this map use displacements, which are not read at all?
+//
+// Beside WrBspLoadCoverageThin rather than inside the sentence above, because it
+// is a different KIND of gap and the panel should be able to colour it. Every
+// number in that sentence is about brushes that were counted; a displacement was
+// never counted, so no percentage there can move when a map is full of them.
+//
+// Over half the maps in the library have some and 51 are built almost entirely
+// out of them, where this reader draws nearly nothing -- which on screen is
+// indistinguishable from a map with no ramps in it. That has to be said rather
+// than discovered. It is one directory entry's length: WrBspRaw::dispInfoBytes.
+bool WrBspLoadHasDisplacements(void)
+{
+    const WrBspMap *m = WrBspLoadCurrent();
+    return m && m->hasDisplacements;
+}
+
+bool WrBspLoadDisplacementsMissing(void)
+{
+    // Having displacements is no longer a problem; having ones that could not
+    // be built still is. Both causes land here: a BSP v25, whose face and
+    // dispinfo layouts this reader does not know, and a map dense enough to hit
+    // the build budget.
+    const WrBspMap *m = WrBspLoadCurrent();
+    if (!m || !m->hasDisplacements)
+        return false;
+    return m->dispPolys <= 0 || m->dispDropped > 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -517,3 +625,4 @@ bool WrBspLoadAhead(const Vec3 &from, const Vec3 &dir, float maxDist,
     if (inBandOut) *inBandOut = WrBspIsSurfBand(p[2]);
     return true;
 }
+

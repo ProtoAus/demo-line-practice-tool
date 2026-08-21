@@ -80,7 +80,7 @@ bool WrCursorFollowsOS(void);
 // still while the mouse moved, and how long since raw input last arrived
 // (negative meaning it never has).
 void WrCursorDiag(bool *followsOs, bool *cursorShowing, int *staleFrames,
-                  double *rawAgeSeconds);
+                  double *rawAgeSeconds, bool *moveFallbackArmed);
 
 // True when the loaded d3d11.dll is DXVK rather than the system one -- which
 // includes every Proton install, where DXVK's d3d11.dll lives in the prefix's

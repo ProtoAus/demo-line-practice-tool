@@ -66,8 +66,14 @@
 #     difference of positions, which is always available and always consistent.
 #   - It does not touch the game install. Reads only; writes only under --out.
 #   - It has no zstd support unless the "zstandard" package is installed. That
-#     affects ~142 of 4035 shipped demos (the very largest); they are reported as
-#     skipped rather than guessed at.
+#     affects 317 of 6585 demos on the machine this was last measured on, and the
+#     share is GROWING -- it was ~142 of 4035, and it is no longer only the very
+#     largest. They are reported as skipped rather than guessed at.
+#
+#     Install it before running tests\parity.ps1. Without it the port, which
+#     links zstd, reads demos this cannot, and the gate has nothing to compare
+#     them against for 5% of the library. parity.ps1 refuses to start rather than
+#     let that look like a result.
 #
 # USAGE
 #   python wrpath_extract.py --list

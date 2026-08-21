@@ -128,6 +128,13 @@ enum
 // normal.z is below 0.7, which is what makes a surf ramp a surf ramp, so the
 // same number is what separates WR_PHASE_RAMP from WR_PHASE_GROUND here rather
 // than a taste of ours.
+//
+// THE COMPARISON IS STRICT ON THE FLOOR SIDE. TryPlayerMove writes
+// `if (pm.plane.normal[2] > 0.7) blocked |= 1;` -- so a plane at EXACTLY 0.7 is
+// not a floor to the engine, and must not be ground here either. See
+// WrPhaseFromNz, which is the only place this is compared. A measure-zero
+// difference that costs one character to get exactly right, and the comment
+// above claims this number comes from Source.
 #define WR_PHASE_STANDABLE 0.7f
 
 // A position step larger than this is not motion, it is a teleport -- a fail
@@ -251,6 +258,24 @@ static inline bool WrPhaseNormal(const float vIn[3], const float vOut[3],
 // player riding right now" away from a transition, and because measuring it
 // honestly is more useful than removing it. A caller who has a transition
 // available should use WrPhaseNormal at the transition instead.
+//
+// EXCEPT FOR ONE QUESTION, WHERE THIS IS STILL THE BEST ANSWER THERE IS, and it
+// had to be measured to be believed because the paragraphs above read as though
+// nothing should ever call this. The question is RAMP OR GROUND for a whole
+// ride -- one verdict, held across every point of a segment, which is what
+// wr_path.cpp's FindPhase colours a line with. Both estimators scored on the
+// same segments against the same .bsp faces:
+//
+//     24,789 segments                 fit 94.7% right, entry tick 81.5%
+//     the 1,801 whose entry impulse   fit 93.7% right, entry tick 93.9%
+//     clears 300 u/s
+//
+// Being worse by angle and better by verdict is not a contradiction. The verdict
+// is one bit either side of nz = 0.7, and this fit's error is largely in
+// HEADING, which does not move nz at all -- measured separately at the same
+// time: 1.97 degrees of heading against 2.55 of slope on a single hard tick. A
+// single tick puts its error into the whole vector, nz included. So: angles from
+// a transition, verdicts from the ride, and the two do not compete.
 //
 // WHY THIS IS NOT AN EIGENVECTOR SOLVE
 //
@@ -378,11 +403,23 @@ static inline float WrPhaseSurfaceAngle(const float n[3])
     return (float)(acos(nz) * 57.2957795131);
 }
 
+// Which phase a contact is, given nothing but the vertical component of its
+// normal -- because that is genuinely all this ever depended on. Source's own
+// standable test is a comparison against n.z and nothing else, and spelling that
+// out lets a caller who has only read a plane's z out of a file ask the question
+// without assembling a vector to be ignored.
+// `<=` and not `<`: the engine's floor test is strict (`normal[2] > 0.7`), so a
+// plane at exactly 0.7 is a ramp to Source and now to us. See WR_PHASE_STANDABLE.
+static inline int WrPhaseFromNz(float nz)
+{
+    if (nz < 0.0f) nz = -nz;
+    return (nz <= WR_PHASE_STANDABLE) ? WR_PHASE_RAMP : WR_PHASE_GROUND;
+}
+
 // Which phase a contact is, given its normal.
 static inline int WrPhaseFromNormal(const float n[3])
 {
-    float nz = n[2] < 0.0f ? -n[2] : n[2];
-    return (nz < WR_PHASE_STANDABLE) ? WR_PHASE_RAMP : WR_PHASE_GROUND;
+    return WrPhaseFromNz(n[2]);
 }
 
 // ---------------------------------------------------------------------------
@@ -400,6 +437,8 @@ struct WrBoardStats
     float approachDeg;          // angle off the normal, folded to [0, 90]
     float rampDeg;              // the ramp's own tilt from horizontal
     float intoPlane;            // how hard the ramp was hit, u/s
+    float normal[3];            // the plane, so the cost can be re-expressed
+    float velIn[3];             // and the arriving velocity, for the same reason
     unsigned char grade;
 };
 
@@ -421,8 +460,20 @@ enum
 // constraint: lossPct == 1 - sin(approach) exactly, so 85 deg implies 0.38% and
 // 80 deg implies 1.52%. The pair is kept anyway because they come apart once a
 // measurement has noise in it, which ours does.
-static const float WR_GRADE_LOSS[WR_GRADE_COUNT]  = { 0.005f, 0.015f, 0.03f, 0.05f, 1.0f };
-static const float WR_GRADE_ANGLE[WR_GRADE_COUNT] = { 85.0f,  80.0f,  75.0f, 60.0f, 0.0f };
+//
+// Sized by the initialiser and checked against the enum. A short table here
+// would not crash the way a short label table does -- it would quietly grade
+// every board in the new bottom class as needing 0% loss at 0 degrees, which is
+// worse, because nothing would ever say so.
+static const float WR_GRADE_LOSS[]  = { 0.005f, 0.015f, 0.03f, 0.05f, 1.0f };
+static const float WR_GRADE_ANGLE[] = { 85.0f,  80.0f,  75.0f, 60.0f, 0.0f };
+// Spelled out rather than using wr_common.h's WR_TABLE_IS_FULL, because this
+// header includes math.h and nothing else on purpose -- the test harnesses
+// compile it on its own, the same arrangement as wr_scale.h and wr_stress.h.
+static_assert(sizeof(WR_GRADE_LOSS) / sizeof(WR_GRADE_LOSS[0]) == WR_GRADE_COUNT,
+              "WR_GRADE_LOSS is missing entries for WR_GRADE_COUNT");
+static_assert(sizeof(WR_GRADE_ANGLE) / sizeof(WR_GRADE_ANGLE[0]) == WR_GRADE_COUNT,
+              "WR_GRADE_ANGLE is missing entries for WR_GRADE_COUNT");
 
 // Above this speed the loss threshold is relaxed, because a given geometry costs
 // proportionally more the faster you arrive. A grading convention, not physics:
@@ -456,6 +507,81 @@ static inline const char *WrPhaseGradeName(unsigned char g)
 
 // Fill in a board from the velocities either side of the contact and the normal
 // recovered from it. False when there is nothing worth reporting.
+//
+// THE LOSS IS PROJECTED, NOT SUBTRACTED, AND THAT IS THE WHOLE POINT
+//
+// The obvious way to measure what a board cost is |vIn| - |vOut|. This did that,
+// and it was wrong: a player reported every board on screen reading "-0" while
+// its grade and its approach angle both varied, which cannot be true of the same
+// event -- an entry 57 degrees off the normal MUST shed 1 - sin(57) = 16% of its
+// speed, and 16% of anything is not zero.
+//
+// Measured over 27,508 boards in 2,247 runs, four ways of asking:
+//
+//     loss measured   |v[i]|   - |v[i+1]|      p50   4.1 u/s    (what shipped)
+//     loss wide       |v[i-1]| - |v[i+2]|      p50  13.3 u/s
+//     loss clean      |v[i-1]| - |v[i+1]|      p50   0.0 u/s
+//     loss projected  s0 * (1 - sin(approach)) p50  22.7 u/s
+//
+// 37.2% of boards printed as "-0". Note "clean" -- the pair the smear argument
+// says should be exact -- is the WORST of them, which is what killed the smear
+// explanation and found the real one:
+//
+//     speed change per tick with NO clip in it, at the same 27,508 events
+//         in the air just before    p50  +7.1 u/s
+//         on the ramp just after    p50 -11.6 u/s
+//
+// A board costs 4-23 u/s. The background it sits on moves 7-12 u/s PER TICK, in
+// opposite directions either side of the event. Differencing two speeds measures
+// the sum of the clip and the ride, and here the ride is the larger term -- so
+// the sign of the answer is set by which ticks you happened to pick. That is not
+// a precision problem that a better pair of indices fixes. It is the wrong
+// instrument.
+//
+// THE ONE ASSUMPTION, WRITTEN DOWN BECAUSE EVERYTHING BELOW RESTS ON IT
+//
+// ClipVelocity is an orthogonal projection only at overbounce exactly 1, and a
+// surf ramp does NOT take the branch that hard-codes 1. TryPlayerMove splits on
+// the same 0.7:
+//
+//     if (planes[i][2] > 0.7)  ClipVelocity(..., 1)                    floor
+//     else                     ClipVelocity(..., 1 + sv_bounce
+//                                                * (1 - surfaceFriction))  wall
+//
+// A ramp is n.z < 0.7 by definition, so every board goes through the SECOND
+// line. It still comes to 1.0, twice over: sv_bounce is 0 by default, and
+// m_surfaceFriction is 1 outside the deadstrafe window -- either alone is enough
+// to kill the term. But it is a default and not a law, and a server running
+// sv_bounce non-zero would make every loss here read low without anything
+// looking wrong.
+//
+// Left as arithmetic rather than parameterised: there is no evidence sv_bounce is
+// ever anything but 0, nothing in this tool reads a cvar to find out, and adding
+// an overbounce term to match a hypothesis would be inventing precision. The
+// honest thing is to say what is assumed and where it would break.
+//
+// The same document confirms the projection from the other side. ClipVelocity's
+// third step is
+//
+//     adjust = DotProduct(out, normal); if (adjust < 0) out -= normal * adjust;
+//
+// which is a no-op at overbounce 1, because `out` is already free of any
+// component along the normal. A correction that never fires is a statement that
+// the first two steps were an exact projection.
+//
+// The projection is the right one, and it is exact rather than approximate:
+// Source's PM_ClipVelocity is backoff = dot(v, n) * overbounce with overbounce 1
+// for surfing, which is an orthogonal projection and nothing else. So
+// lossPct == 1 - sin(approach) is an identity of the engine's own arithmetic --
+// the note above WR_GRADE_LOSS has said so all along -- and the only question is
+// whether the normal is good enough to lean on. It is, twice over:
+// bsp_sweep --verify-normals puts it p50 1.19 deg from the plane read out of the
+// .bsp, and moving which ticks it is recovered from shifts the approach angle by
+// p50 0.26 deg. The angle is the solid input here; the speed difference never
+// was.
+//
+// vOut is still required and still read, for intoPlane's sign check and because
+// a caller with no outgoing sample has no board. It no longer sets the loss.
 static inline bool WrPhaseBoard(const float vIn[3], const float vOut[3],
                                 const float n[3], WrBoardStats *out)
 {
@@ -466,20 +592,156 @@ static inline bool WrPhaseBoard(const float vIn[3], const float vOut[3],
     float s1 = (float)sqrt(vOut[0] * vOut[0] + vOut[1] * vOut[1] + vOut[2] * vOut[2]);
     if (!(s0 > 1e-3f))
         return false;
+    if (!(s1 >= 0.0f))
+        return false;
 
-    float dot = (vIn[0] * n[0] + vIn[1] * n[1] + vIn[2] * n[2]) / s0;
-    if (dot < 0.0f) dot = -dot;
-    if (dot > 1.0f) dot = 1.0f;
+    // Orient the plane towards whoever arrived on it.
+    //
+    // A BSP normal points whichever way the brush side was written and the file
+    // does not say which side a player is on, so this used to fold the sign away
+    // with an abs and keep the unsigned angle -- which is all a grade needs. It
+    // is not all a PER-AXIS readout needs: dv = -(v.n)n, and with the sign of n
+    // unknown, the sign of every component of that is unknown too.
+    //
+    // The velocity settles it without any help from the map. You cannot arrive on
+    // a surface while travelling away from it, so the physical case is v.n < 0,
+    // and the normal that satisfies it is the one pointing back at the player.
+    // Flipping to that leaves the angle exactly as it was and makes
+    // dv = intoPlane * normal come out right in all three components.
+    // IN DOUBLE, AND THAT IS NOT FUSSINESS.
+    //
+    // Everything a surfer cares about lives between 85 and 90 degrees, where
+    // dot is under 0.09 and the whole grade is dot^2. A float32 dot product of
+    // three terms with operands around 2500 carries an absolute error of order
+    // 1e-4, which at 89 degrees is 0.6% of dot and so 1.2% of lossPct -- larger
+    // than the difference between a good board and a great one, arriving from
+    // nothing but the width of the arithmetic. The inputs are float32 and stay
+    // that way; it is the CANCELLATION that needs the room.
+    const double d0 = (double)s0;
+    const double rawDot = ((double)vIn[0] * n[0] + (double)vIn[1] * n[1] +
+                           (double)vIn[2] * n[2]) / d0;
+    const float orient = (rawDot > 0.0) ? -1.0f : 1.0f;
+    const float no[3] = { n[0] * orient, n[1] * orient, n[2] * orient };
+
+    double dot = -(rawDot * orient);        // |rawDot|, by construction
+    if (dot < 0.0) dot = 0.0;
+    if (dot > 1.0) dot = 1.0;
+
+    // sin(approach), straight from the dot rather than through acos and back --
+    // the round trip costs accuracy exactly where the grade is decided, up at
+    // 85 degrees where sin is flattest.
+    const double dot2 = dot * dot;
+    const double sinA = sqrt(1.0 - dot2);
+
+    // AND THE LOSS WITHOUT SUBTRACTING TWO NUMBERS THAT ARE NEARLY EQUAL.
+    //
+    //     1 - sqrt(1 - x)  ==  x / (1 + sqrt(1 - x))
+    //
+    // an identity, not an approximation. The left side is what this used to
+    // compute: at a 99.5%-perfect board sinA is 0.995 and `1 - sinA` throws
+    // away most of the significant bits of the one quantity the whole readout
+    // is about. The right side has no subtraction in it at all and is exact for
+    // every board, including the glancing ones a good surfer spends their time
+    // on. The same rearrangement carries `loss`, since loss is s0 * lossPct.
+    const double lossPct = dot2 / (1.0 + sinA);
 
     out->speedIn = s0;
-    out->speedOut = s1;
-    out->loss = (s0 > s1) ? (s0 - s1) : 0.0f;
-    out->lossPct = out->loss / s0;
+    out->speedOut = (float)(d0 * sinA);   // what the clip leaves, not what came next
+    out->loss = (float)(d0 * lossPct);
+    out->lossPct = (float)lossPct;
     out->approachDeg = (float)(acos(dot) * 57.2957795131);
     out->rampDeg = WrPhaseSurfaceAngle(n);
-    out->intoPlane = dot * s0;
+    out->intoPlane = (float)(dot * d0);
+    out->normal[0] = no[0];
+    out->normal[1] = no[1];
+    out->normal[2] = no[2];
+    out->velIn[0] = vIn[0];
+    out->velIn[1] = vIn[1];
+    out->velIn[2] = vIn[2];
     out->grade = WrPhaseGrade(out->lossPct, out->approachDeg, s0);
     return true;
+}
+
+// THE SAME BOARD, IN WHICHEVER UNITS YOU WANTED IT
+//
+// PM_ClipVelocity with overbounce 1 is an orthogonal projection, so the change
+// it makes to your velocity is exactly
+//
+//     dv = -(v.n) n                          and (v.n) is `intoPlane`
+//
+// which means the cost in any unit at all is a line of arithmetic on one number
+// and the plane, rather than a separate measurement with its own error. A clip
+// changes no height, so the energy form is the kinetic term alone.
+//
+// Signs: every one of these is returned POSITIVE for a loss, because all four
+// readouts print it behind a minus sign of their own.
+static inline float WrBoardLoss3D(const WrBoardStats *b)
+{
+    return b->loss;
+}
+
+static inline float WrBoardLossHorizontal(const WrBoardStats *b)
+{
+    // |v_h| before, minus |v_h| after. With the normal oriented back at the
+    // player, v.n is -intoPlane, so v' = v + intoPlane * n -- and only the
+    // horizontal part of that lands here, which is why this is not just the 3D
+    // figure scaled. On a shallow ramp most of the bite is vertical and the
+    // horizontal loss is much the smaller number.
+    //
+    // Written as a difference of SQUARES over a sum, for the reason spelled out
+    // at lossPct above: `before` and `after` differ by well under a unit out of
+    // thousands on a shallow ramp, so subtracting them directly leaves almost
+    // no significant bits in the answer. The squares differ by a quantity with
+    // no cancellation in it, and dividing by the sum recovers the difference
+    // exactly:  a - b == (a^2 - b^2) / (a + b).
+    const double hx = b->velIn[0], hy = b->velIn[1];
+    const double k = b->intoPlane;
+    const double nx = b->normal[0], ny = b->normal[1];
+    const double ox = hx + k * nx;
+    const double oy = hy + k * ny;
+    const double before = sqrt(hx * hx + hy * hy);
+    const double after = sqrt(ox * ox + oy * oy);
+    const double sum = before + after;
+    if (!(sum > 1e-9))
+        return 0.0f;
+    const double diffSq = -2.0 * k * (hx * nx + hy * ny)
+                        - k * k * (nx * nx + ny * ny);
+    return (float)(diffSq / sum);
+}
+
+static inline float WrBoardLossEnergy(const WrBoardStats *b, float gravity)
+{
+    // E = z + |v|^2/2g and the clip does not move you, so dE is the kinetic part
+    // alone: (|v|^2 - |v'|^2)/2g, and |v|^2 - |v'|^2 is exactly (v.n)^2.
+    if (gravity < 1.0f)
+        gravity = 1.0f;
+    return (b->intoPlane * b->intoPlane) / (2.0f * gravity);
+}
+
+// What the clip did to each component of the velocity, signed, as a change and
+// not as a loss: dv = -(v.n)n = +intoPlane * n once n points back at the player.
+//
+// The signs are worth reading rather than folding away. A clip PUSHES you along
+// its normal, so on a ramp the z here is usually positive -- the board gave you
+// height while taking speed, which is the whole trade a board is.
+static inline void WrBoardDeltaAxes(const WrBoardStats *b, float out[3])
+{
+    out[0] = b->intoPlane * b->normal[0];
+    out[1] = b->intoPlane * b->normal[1];
+    out[2] = b->intoPlane * b->normal[2];
+}
+
+// How close to a board that cost nothing, as a percentage.
+//
+// 100% is velocity exactly parallel to the plane, which is the only board there
+// is no such thing as improving on. This is `sinA` by another name: the share of
+// the arriving speed the clip leaves behind.
+static inline float WrBoardPerfectPct(const WrBoardStats *b)
+{
+    float pct = (1.0f - b->lossPct) * 100.0f;
+    if (pct < 0.0f) pct = 0.0f;
+    if (pct > 100.0f) pct = 100.0f;
+    return pct;
 }
 
 // The two filters that stop ordinary surfing being reported as a board.

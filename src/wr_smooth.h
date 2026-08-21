@@ -141,10 +141,27 @@ static inline void WrVelPush(WrVelWindow *w, float x, float y, float z, float dt
 // free fall, purely because v was measured 20 ms before z. Taking both at the
 // midpoint makes E exact under constant acceleration, at the cost of a 20 ms
 // display lag that is invisible next to the 300 ms output filter.
+//
+// `midLead`, when asked for, is how far the returned midpoint position is
+// BEHIND the instant the velocity refers to, in seconds.
+//
+// It exists because the two are not quite the same moment. The velocity refers
+// to the exact centre of the window; the position is the nearest stored sample
+// to it, which can be half a frame away -- 8 ms at 60 fps, and at 1000 u/s that
+// is eight units of position paired with a velocity from somewhere else. For
+// the energy figure that is invisible next to the output filter, which is why
+// it was never worth fixing. For a board it is not: the whole measurement is a
+// crossing of a plane by a trajectory, and the trajectory is built from exactly
+// this pair. A caller that cares can advance the position by `midLead` along
+// the velocity and have the two describe one instant again.
 static inline bool WrVelEstimate(const WrVelWindow *w, float window,
                                  float *vx, float *vy, float *vz,
-                                 float *mx, float *my, float *mz)
+                                 float *mx, float *my, float *mz,
+                                 float *midLead = 0)
 {
+    if (midLead)
+        *midLead = 0.0f;
+
     if (w->count < 2)
         return false;
 
@@ -212,6 +229,7 @@ static inline bool WrVelEstimate(const WrVelWindow *w, float window,
         if (mx) *mx = w->x[best];
         if (my) *my = w->y[best];
         if (mz) *mz = w->z[best];
+        if (midLead) *midLead = tMid - w->t[best];
     }
     return true;
 }

@@ -1140,6 +1140,73 @@ static void TestGrid(void)
               "a point 20 units above the ramp along z is 12 off the face");
         Check(got && WrBspIsSurfBand(m.polys[poly].plane[2]),
               "and the face it names is the ramp");
+
+        // ...AND THE RAMP IS OFFERED SEPARATELY, because "nearest" and
+        // "rideable" are not the same question.
+        //
+        // Reported as boards that sometimes produce no numbers, from landings
+        // taken at the side of a ramp. The nearest polygon of any facing is the
+        // right answer for "am I touching something" and it is what the 98.3%
+        // was measured with, so it may not move -- but a board graded against
+        // the wall the player landed beside is no board at all, and there was
+        // no second candidate to fall back to. So the same walk now reports
+        // both.
+        int rp = -1;
+        float rd = -1.0f;
+        Check(WrBspNearestFaceEx(&m, above, 64.0f, 0, 0, &rp, &rd) &&
+              rp == poly && fabs(rd - d) < 1e-4,
+              "where the nearest IS the ramp, both answers are the same one");
+
+        // Sweep for a point where they genuinely disagree, rather than guessing
+        // one out of the fixture's coordinates. The sweep also counts them, so
+        // the assertions below cannot quietly become vacuous if the fixture
+        // changes shape.
+        int diverged = 0, checked = 0;
+        bool everWrong = false, alwaysBand = true, alwaysFurther = true;
+        bool plainMoved = false;
+        for (int ix = -40; ix <= 40 && !everWrong; ix++)
+            for (int iz = -40; iz <= 40; iz++)
+            {
+                const float p[3] = { 90.0f + ix * 4.0f, 0.0f,
+                                     150.0f + iz * 4.0f };
+                int a1 = -1, r1 = -1;
+                float d1 = 0.0f, dr1 = -1.0f;
+                if (!WrBspNearestFaceEx(&m, p, 24.0f, &a1, &d1, &r1, &dr1))
+                    continue;
+                checked++;
+
+                // The plain answer must be bit-identical to the old query.
+                int a2 = -1;
+                float d2 = 0.0f;
+                if (!WrBspNearestFace(&m, p, 24.0f, &a2, &d2) ||
+                    a2 != a1 || d2 != d1)
+                    plainMoved = true;
+
+                if (r1 < 0 || r1 == a1)
+                    continue;
+                diverged++;
+                if (!WrBspIsRampPlane(m.polys[r1].plane[2]))
+                    alwaysBand = false;
+                if (dr1 < d1 - 1e-4f)
+                    alwaysFurther = false;
+                if (WrBspIsRampPlane(m.polys[a1].plane[2]))
+                    everWrong = true;   // then the plain one WAS rideable
+            }
+
+        printf("      %d of %d sampled points had a nearer face that is not "
+               "the ramp\n", diverged, checked);
+        Check(!plainMoved,
+              "the touch answer is untouched -- the same polygon, the same "
+              "distance, everywhere");
+        Check(diverged > 0,
+              "the fixture really does put a non-ramp face nearer, somewhere");
+        Check(alwaysBand,
+              "and every ramp candidate offered is inside the ramp band");
+        Check(alwaysFurther,
+              "never nearer than the nearest -- it is a second choice, not a "
+              "different measurement");
+        Check(!everWrong,
+              "they only differ where the nearest face was not rideable");
     }
 
     WrBspFreeMap(&m);
@@ -1155,6 +1222,66 @@ static void TestGrid(void)
 // the caller will be a worker thread whose result is published under a lock,
 // and a struct holding four live pointers and three nulls is exactly the shape
 // that gets published anyway by a caller checking the wrong field.
+
+// The switch this reader's whole live behaviour turns on, which had no test at
+// all until it moved somewhere a test could reach it.
+//
+// It decides whether the game may be told "there is no surface there". A false
+// answer used to be read as something much larger -- dllmain stopped ASKING the
+// map -- and on surf_kvas that took the ramp strafe ideal and the live boards
+// away for a whole level over 4 unbuilt displacements out of 756. No fixture:
+// WrBspMap is a plain struct and each clause is worth pinning on its own.
+static void TestGeometryComplete(void)
+{
+    printf("\nmay absence be used as evidence\n");
+
+    WrBspMap m;
+    memset(&m, 0, sizeof(m));
+    Check(!WrBspGeometryComplete(0), "no map at all is not complete");
+    Check(!WrBspGeometryComplete(&m), "and neither is one with no polygons");
+
+    // surf_kvas's real census, both sides of the fix.
+    m.polyCount       = 87238;
+    m.brushTotal      = 2741;
+    m.brushWorld      = 2404;
+    m.entBrushes      = 42;
+    m.hasDisplacements = true;
+    m.dispTotal       = 756;
+    m.dispPolys       = 74784;
+    m.dispDropped     = 0;
+    Check(WrBspGeometryComplete(&m),
+          "surf_kvas, every displacement built -- complete");
+
+    m.dispDropped = 4;
+    m.dispDropBy[WR_DISP_DROP_CORNER] = 4;
+    m.dispPolys   = 74272;
+    Check(!WrBspGeometryComplete(&m),
+          "the same map missing 4 of 756 -- NOT complete, which is the veto");
+    Check(WrBspDispWorstDrop(&m) == WR_DISP_DROP_CORNER,
+          "and the cause is named rather than recovered arithmetically");
+
+    // A v25 map: displacements declared, none built.
+    m.dispDropped = 0;
+    m.dispDropBy[WR_DISP_DROP_CORNER] = 0;
+    m.dispPolys   = 0;
+    Check(!WrBspGeometryComplete(&m),
+          "a map whose displacements produced nothing is not complete");
+
+    // Ownership, with entity brushes counted. bhop_slope_v2 gives the world 48
+    // of 1,351 brushes and is complete only because the rest are func_*.
+    memset(&m, 0, sizeof(m));
+    m.polyCount  = 1000;
+    m.brushTotal = 1161;
+    m.brushWorld = 579;
+    Check(!WrBspGeometryComplete(&m),
+          "49.9% owned and no entity brushes -- thin, as surf_greensway is");
+
+    m.brushTotal = 1351;
+    m.brushWorld = 48;
+    m.entBrushes = 1200;
+    Check(WrBspGeometryComplete(&m),
+          "3.6% world-owned but 92% once entities count -- not thin");
+}
 
 static void TestNoPartialSuccess(void)
 {
@@ -1199,6 +1326,7 @@ int main(void)
     TestBuild();
     TestTriggerCounterfactual();
     TestGrid();
+    TestGeometryComplete();
     TestNoPartialSuccess();
 
     // Tidy up. Leaving these behind would be harmless and would also mean a

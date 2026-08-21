@@ -202,6 +202,52 @@ bool WrPathIsAscii(const char *s);
 // theoretical.
 void WrFileStem(const char *path, char *out, int cap);
 
+// A widget label that came from data rather than from a literal.
+//
+// ImGui makes a widget's ID by hashing its label, and ImHashStr walks the
+// string with no null check whatsoever. So one NULL name reaching one
+// Selectable takes the entire game down with an access violation reading
+// address zero, from inside a third-party header, with our own frame nowhere
+// near the top of the stack.
+//
+// That is not a hypothetical. It happened twice in one afternoon, and placing
+// it needed a Sentry minidump, the PE exception table, and a hand-decoded
+// `movzx r8d, byte ptr [rcx]`. WrCrashFilter now names such a fault directly;
+// this stops it being raised in the first place.
+//
+// Empty is folded in with null on purpose. An empty label is legal and hashes
+// to the seed, which means every empty label in a window is the SAME ID -- and
+// ImGui's answer to that is the "2 visible items with conflicting ID" box.
+//
+// Literals do not need this. Anything out of a file, a leaderboard, Steam, or a
+// getter that can fail does.
+static inline const char *WrLabel(const char *s)
+{
+    return (s && *s) ? s : "?";
+}
+
+// The other half of that story, and the half that would have prevented it.
+//
+// WrLabel turns a null label into "?" at runtime. This turns the commonest way
+// one gets created into a BUILD ERROR:
+//
+//     static const char *kNames[WR_LINE_MODE_COUNT] = { "off", "speed" };
+//
+// C++ zero-fills the initialisers you did not write, so the day somebody adds a
+// value to WrLineColour, that table silently grows a run of NULLs -- no warning
+// at /W3, /W4 or /Wall -- and the loop next to it, which counts to the same
+// enum, hands one straight to ImGui. That is exactly what took the game down:
+// WR_LINE_PHASE was added at one end and wr_quick.cpp's five-entry table was
+// not, so the quick panel crashed on the first frame it drew, every time.
+//
+// Used as WR_TABLE_IS_FULL(kNames, WR_LINE_MODE_COUNT) directly under the
+// table. It needs the array's size to be IMPLICIT -- `*kNames[] = {...}` -- or
+// there is nothing to compare against and it can only ever pass.
+#define WR_TABLE_IS_FULL(arr, count) \
+    static_assert((int)(sizeof(arr) / sizeof((arr)[0])) == (int)(count), \
+                  #arr " is missing entries for " #count \
+                  " -- the enum grew and this table did not")
+
 // ---------------------------------------------------------------------------
 // The clock
 // ---------------------------------------------------------------------------

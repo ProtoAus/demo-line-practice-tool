@@ -20,7 +20,18 @@ cd /d "%~dp0"
 rem WrLines never unloads (see dllmain.cpp), so while the game is running the
 rem loaded wrlines.dll cannot be overwritten. Catch that here rather than let the
 rem linker report it 30 seconds later as a bare LNK1104.
-tasklist /FI "IMAGENAME eq momentum.exe" 2>nul | find /I "momentum.exe" >nul
+rem FULLY QUALIFIED, both of them, and that is not decoration.
+rem
+rem This line is `tasklist | find`, and a bare `find` is whatever comes first on
+rem PATH. On a machine with msys2 or Git for Windows -- which is most machines
+rem that build this, and certainly this one -- that is the Unix find, which reads
+rem /I as a path, prints "find: '/I': No such file or directory", and exits 1.
+rem The guard then decides the game is not running, the build carries on, and the
+rem linker fails thirty seconds later with a bare
+rem     LINK : fatal error LNK1104: cannot open file 'wrlines.dll'
+rem which is exactly the message this check exists to replace. Same for tasklist,
+rem which msys does not ship but a PATH can still shadow.
+"%SystemRoot%\System32\tasklist.exe" /FI "IMAGENAME eq momentum.exe" 2>nul | "%SystemRoot%\System32\find.exe" /I "momentum.exe" >nul
 if not errorlevel 1 (
     echo [!] momentum.exe is running, and wrlines.dll is loaded inside it.
     echo     The DLL never unloads by design, so it cannot be replaced while the
@@ -101,6 +112,12 @@ rem which is what lets tests\test_bsp.exe and tests\bsp_sweep.exe link it with
 rem nothing else attached. wr_bspload.cpp is the half that knows a game is
 rem running, and the tests do not build it.
 set "SRC=%SRC% %S%\wr_bsp.cpp %S%\wr_bspload.cpp"
+rem wr_player.cpp is the second reader of game memory, after wr_scan.cpp, and it
+rem is held to the same rules: ReadProcessMemory on our own process, no writes,
+rem no calls into game code, and nothing believed until it has predicted
+rem something independently known for ninety frames running. It is allowed to
+rem find nothing -- every caller keeps a camera-derived fallback.
+set "SRC=%SRC% %S%\wr_player.cpp"
 rem wr_sha256.cpp is written out rather than linked from BCrypt or ADVAPI32 on
 rem purpose: either of those would add a seventh import and break the claim the
 rem README makes about this list. wr_sha256.h has the argument in full.
@@ -157,7 +174,14 @@ rem leaderboard fetcher. It is called from src\wr_http.cpp and from nowhere
 rem else -- the README, HOW TO USE.txt, src\wr_board.h, docs\how-it-works.md
 rem and the $expected list in .github\workflows\release.yml all name the same
 rem list, and the CI assert fails the build if this line and that one disagree.
+rem /MAP is here for one reason: wr_log.cpp's exception filter reports a crash as
+rem "wrlines.dll+0x19FBD", because at the moment of the fault it has no symbols
+rem and cannot safely go looking for any. wrlines.map turns that number back into
+rem a function name with nothing installed -- no debugger, no PDB reader. It costs
+rem nothing in the image (the linker emits a side file and changes no byte of the
+rem DLL) and it is gitignored, so it stays a local build artefact.
 link /nologo /DLL /DEBUG /OPT:REF /OPT:ICF /PDBALTPATH:%%_PDB%% ^
+     /MAP:wrlines.map ^
      /OUT:wrlines.dll *.obj wrlines.res ^
      user32.lib gdi32.lib shell32.lib dxguid.lib winhttp.lib
 if errorlevel 1 ( echo. & echo [!] link FAILED & exit /b 1 )

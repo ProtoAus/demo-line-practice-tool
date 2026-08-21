@@ -426,6 +426,141 @@ int main(void)
     }
 
     // -----------------------------------------------------------------------
+    //
+    // A BOARD ON A RAMP THE ENTRY TICK CALLS A FLOOR.
+    //
+    // This is the case that was silently costing 30% of every board the tool
+    // drew, and it is a regression test rather than a measurement: the fixture
+    // is built so that the two normal estimators land on OPPOSITE SIDES of the
+    // 0.7 that separates a ramp from a floor.
+    //
+    //   the ride      velocity kept exactly in a plane whose nz is 0.65, so the
+    //                 fit over the segment recovers a ramp
+    //   the entry     clipped against that ramp AND against a flat lip in the
+    //                 same tick, which is what landing on a join does. The
+    //                 recovered impulse is the sum, so it points more steeply up
+    //                 than the ramp does and reads as a floor.
+    //
+    // The old gate asked the entry tick and threw the board away. The test
+    // asserts BOTH halves -- that the entry normal really is over 0.7, so the
+    // fixture still exercises what it claims to, and that a board comes out
+    // anyway.
+    printf("\na board on a ramp whose entry tick reads as a floor\n");
+    {
+        const double g = 800.0;
+        const double nz = 0.65;
+        const double nx = -sqrt(1.0 - nz * nz);      // -0.7599...
+        const double n[3] = { nx, 0.0, nz };
+
+        const int nAir = 8;                          // clear air before it
+        const int nRide = 40;
+        const int total = nAir + nRide + 2;
+
+        WrDpPoint *bp = (WrDpPoint *)calloc((size_t)total, sizeof(WrDpPoint));
+
+        // Free flight, arriving with a real into-plane component.
+        double v[3] = { 900.0, 0.0, -260.0 };
+        double pos[3] = { 0.0, 0.0, 6000.0 };
+        for (int i = 0; i < nAir; i++)
+        {
+            bp[i].x = pos[0]; bp[i].y = pos[1]; bp[i].z = pos[2];
+            bp[i].vx = v[0];  bp[i].vy = v[1];  bp[i].vz = v[2];
+            for (int k = 0; k < 3; k++) pos[k] += v[k] * kTick;
+            v[2] -= g * kTick;
+        }
+
+        // The entry tick: this point still carries the airborne velocity, and
+        // the NEXT one carries the result of the double clip.
+        const int iEntry = nAir;
+        bp[iEntry].x = pos[0]; bp[iEntry].y = pos[1]; bp[iEntry].z = pos[2];
+        bp[iEntry].vx = v[0];  bp[iEntry].vy = v[1];  bp[iEntry].vz = v[2];
+
+        // Clip fully out of the ramp, then take a little more off vertically --
+        // the lip. Gravity for the tick is included, and WrPhaseNormal subtracts
+        // it back out, so what is left is the sum of the two impulses.
+        const double into = v[0] * n[0] + v[1] * n[1] + v[2] * n[2];
+        double vr[3];
+        for (int k = 0; k < 3; k++) vr[k] = v[k] - into * n[k];
+        const double lip = 150.0;                    // the second plane's share
+        vr[2] += lip;
+        // Put it back in the ramp plane for the ride, which is what makes the
+        // FIT see 0.65 while the entry impulse does not.
+        const double drift = vr[0] * n[0] + vr[1] * n[1] + vr[2] * n[2];
+        for (int k = 0; k < 3; k++) vr[k] -= drift * n[k];
+
+        for (int k = 0; k < 3; k++) pos[k] += v[k] * kTick;
+        for (int k = 0; k < 3; k++) v[k] = vr[k];
+
+        // The ride: gravity projected into the plane, so v . n stays zero and
+        // every sample lies in the ramp.
+        const double gdotn = -g * n[2];
+        double ap[3];
+        for (int k = 0; k < 3; k++) ap[k] = (k == 2 ? -g : 0.0) - gdotn * n[k];
+        for (int i = 0; i < nRide + 2; i++)
+        {
+            const int j = iEntry + 1 + i;
+            if (j >= total) break;
+            bp[j].x = pos[0]; bp[j].y = pos[1]; bp[j].z = pos[2];
+            bp[j].vx = v[0];  bp[j].vy = v[1];  bp[j].vz = v[2];
+            for (int k = 0; k < 3; k++) pos[k] += v[k] * kTick;
+            for (int k = 0; k < 3; k++) v[k] += ap[k] * kTick;
+        }
+
+        // What the two estimators say, computed here with the shipped header so
+        // the claim above is checked rather than asserted.
+        const float vIn[3]  = { (float)bp[iEntry].vx, (float)bp[iEntry].vy,
+                                (float)bp[iEntry].vz };
+        const float vOut[3] = { (float)bp[iEntry + 1].vx, (float)bp[iEntry + 1].vy,
+                                (float)bp[iEntry + 1].vz };
+        float entry[3] = { 0, 0, 0 };
+        const bool gotEntry = WrPhaseNormal(vIn, vOut, (float)kTick, (float)g, entry);
+        const float entryNz = entry[2] < 0.0f ? -entry[2] : entry[2];
+
+        Check(gotEntry, "the fixture's entry tick yields a normal at all");
+        Check(entryNz > WR_PHASE_STANDABLE,
+              "and that normal reads as a FLOOR -- which is what used to veto it");
+
+        char bpath[MAX_PATH];
+        _snprintf_s(bpath, sizeof(bpath), _TRUNCATE, "%s\\demo0003.wrpath", dir);
+        WrPathWriteArgs ba;
+        FillArgs(&ba, bpath, bp, mk, 0);
+        ba.points = bp;
+        ba.pointCount = total;
+        ba.markerCount = 0;
+        char berr[256] = "";
+        Check(WrPathWrite(&ba, berr, sizeof(berr)) > 0, "the fixture writes");
+
+        DeleteFileA(out);
+        WrPathLoadMap(TEST_MAP);
+        int bguard = 0;
+        while (WrPathLoading(NULL, NULL) && ++bguard < 10000)
+            WrPathLoadTick();
+        WrPathLoadTick();
+
+        const WrRun *br = WrRunCount() ? WrRunAt(0) : NULL;
+        Check(br != NULL, "and loads back");
+        if (br)
+        {
+            Check(br->phase != NULL && br->phase[iEntry] == WR_PHASE_RAMP,
+                  "the fit over the ride calls it a ramp");
+            Check(br->boardCount >= 1,
+                  "and a board is reported, though the entry tick said floor");
+            if (br->boardCount >= 1)
+                Check(br->boards[0].pointIndex == iEntry,
+                      "at the tick the ride began");
+        }
+
+        DeleteFileA(bpath);
+        free(bp);
+
+        // Put the original fixture back for anything downstream.
+        WrPathWriteArgs ra;
+        FillArgs(&ra, out, pts, mk, 3);
+        char rerr[256] = "";
+        WrPathWrite(&ra, rerr, sizeof(rerr));
+    }
+
+    // -----------------------------------------------------------------------
     printf("\nfixed-width fields, the way the reference's _fixed() fills them\n");
     {
         unsigned char f[16];

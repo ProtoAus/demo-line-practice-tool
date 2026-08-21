@@ -389,6 +389,20 @@ static void ReadFixed(char *dst, int dstLen, const unsigned char *src, int srcLe
         if (dst[i] == '\0') { dst[i] = '\0'; break; }
 }
 
+// WR_DIP_MIN_GAP_SECONDS expressed in this run's own points.
+//
+// Clamped at both ends because the tick comes out of somebody else's file: two
+// points is the least that can mean "separate", and 256 is far past any tick
+// interval WrMtvParseFixed's gate lets through.
+static int DipGapPoints(const WrRun *run)
+{
+    float tick = run->tickInterval;
+    if (!(tick > 1e-5f))
+        tick = 0.015f;
+    int n = (int)(WR_DIP_MIN_GAP_SECONDS / tick + 0.5f);
+    return n < 2 ? 2 : (n > 256 ? 256 : n);
+}
+
 // Bottoms of ramps: where the path stops falling and starts climbing.
 //
 // Detected on the stored velocity's z sign change rather than on position, so a
@@ -403,12 +417,14 @@ static void FindDips(WrRun *run)
     if (run->pointCount < 8)
         return;
 
+    const int minGap = DipGapPoints(run);
+
     // Two passes: count, then fill. Dips are rare (tens per run) so allocating
     // for the worst case would waste far more than the second walk costs.
     for (int pass = 0; pass < 2; pass++)
     {
         int n = 0;
-        int last = -WR_DIP_MIN_GAP;
+        int last = -minGap;
         float peakZ = run->points[0].pos.z;      // highest point since climbing
         float lowZ = run->points[0].pos.z;       // lowest since we started down
         bool falling = false;
@@ -434,7 +450,7 @@ static void FindDips(WrRun *run)
             {
                 // Turned upward. Was the descent deep enough, and are we far
                 // enough from the previous dip to be a separate feature?
-                if ((peakZ - lowZ) >= WR_DIP_MIN_DROP && (i - last) >= WR_DIP_MIN_GAP)
+                if ((peakZ - lowZ) >= WR_DIP_MIN_DROP && (i - last) >= minGap)
                 {
                     if (pass == 1 && run->dips)
                         run->dips[n] = i;
@@ -480,10 +496,12 @@ static void FindPeaks(WrRun *run)
     if (run->pointCount < 8)
         return;
 
+    const int minGap = DipGapPoints(run);
+
     for (int pass = 0; pass < 2; pass++)
     {
         int n = 0;
-        int last = -WR_DIP_MIN_GAP;
+        int last = -minGap;
         float lowZ = run->points[0].pos.z;       // lowest point since falling
         float peakZ = run->points[0].pos.z;      // highest since we started up
         bool rising = false;
@@ -507,7 +525,7 @@ static void FindPeaks(WrRun *run)
             }
             else if (rising)
             {
-                if ((peakZ - lowZ) >= WR_DIP_MIN_DROP && (i - last) >= WR_DIP_MIN_GAP)
+                if ((peakZ - lowZ) >= WR_DIP_MIN_DROP && (i - last) >= minGap)
                 {
                     if (pass == 1 && run->peaks)
                         run->peaks[n] = i;
@@ -1082,6 +1100,12 @@ static void FindEfficiency(WrRun *run)
     free(run->eff);
     run->eff = NULL;
     run->effWindow = win;
+
+    // Stamped before any early return, so a run too short to have an eff array
+    // is still recorded as up to date and does not get retried every frame.
+    run->builtGravity = g_energy.gravity;
+    run->builtAirAccel = g_energy.airAccelerate;
+    run->builtMaxSpeed = g_energy.maxSpeed;
     if (run->pointCount < win * 2 + 1)
         return;
     run->eff = (signed char *)malloc((size_t)run->pointCount);
@@ -1104,8 +1128,7 @@ static void FindEfficiency(WrRun *run)
     float ceiling = WrAirPowerCeilingEx(g_energy.gravity, run->tickInterval,
                                         g_energy.airAccelerate, g_energy.maxSpeed,
                                         1.0f);
-    float dt = run->tickInterval * (float)(win * 2);
-    if (!(dt > 1e-5f))
+    if (!(run->tickInterval > 1e-5f))
         return;
 
     // A centred difference, so the figure belongs to the point it is drawn at
@@ -1124,6 +1147,30 @@ static void FindEfficiency(WrRun *run)
                 break;
             }
         if (spans)
+            continue;
+
+        // The span the two points actually claim, not the one the window would
+        // have if every point between them were present. Normally identical --
+        // the extractor writes t = index * tickInterval, so a difference of
+        // 2*win indices IS 2*win ticks -- but LoadOne drops any point whose
+        // position fails WrSaneVec and compacts the array over it, and after
+        // that the indices are closer together than the times are. Dividing by
+        // the nominal window there overstates the rate by exactly the ratio it
+        // was short by. FindPhase has always taken its interval this way; this
+        // is the same correction, one function later.
+        //
+        // What this deliberately does NOT do is apply run->timeScale. That is a
+        // whole-run ratio and the fault it measures is local: wr_path.h records
+        // that the RATE of the stored clock is right to a median slope of 1.0000
+        // over 115 runs, and what goes wrong is individual missing ticks, not
+        // drift. Stretching every window in the run to make the endpoints meet
+        // would spread one local gap over everything. The tick-drop signature
+        // was looked for directly -- a missing tick in free flight should read
+        // as a downward push of very close to a whole g -- and it is not there:
+        // over 1.25 million intervals only 0.79% push downward at all, and they
+        // do not cluster at multiples of g. So timeScale stays a test.
+        float dt = run->points[b].t - run->points[a].t;
+        if (!(dt > 1e-5f))
             continue;
 
         float ea = WrEnergyOf(run->points[a].pos, run->points[a].vel);
@@ -1164,6 +1211,36 @@ static void FindEfficiency(WrRun *run)
 #define PHASE_BOARD_WINDOW     6    // and of the next this many...
 #define PHASE_BOARD_STICK      4    // ...at least this many stay in contact
 
+// The normal at the tick a contact segment BEGINS, when it begins out of clear
+// air -- and false when it does not, which is the useful half of the answer.
+//
+// One function because two callers below need exactly this and they must not be
+// able to disagree about what a transition is. It is also the accurate one:
+// measured against the .bsp's own planes over 39 maps and 2,294 runs
+// (tests\bsp_sweep.exe --verify-normals), a normal recovered here reads a median
+// of 1.19 degrees off the file's, and 0.64 on slope alone. A fit over the whole
+// ride reads 6.76. So anything wanting a normal asks here first and falls back
+// second, rather than the other way round.
+//
+// The reason the transition is the good place is physical rather than
+// statistical: arriving out of free flight means exactly one surface is acting,
+// so (a - g) is that surface's normal force and nothing else. Mid-ride, a corner
+// or a seam has two surfaces pushing at once and their sum is not a plane.
+static bool PhaseEntryNormal(const WrRun *run, int i, float g, float out[3])
+{
+    if (i < PHASE_BOARD_AIR_BEFORE || i + 1 >= run->pointCount)
+        return false;
+    for (int k = 1; k <= PHASE_BOARD_AIR_BEFORE; k++)
+        if (run->phase[i - k] != WR_PHASE_AIR)
+            return false;
+
+    const WrPoint &a = run->points[i], &b = run->points[i + 1];
+    const float h = b.t - a.t;
+    const float vIn[3]  = { a.vel.x, a.vel.y, a.vel.z };
+    const float vOut[3] = { b.vel.x, b.vel.y, b.vel.z };
+    return WrPhaseNormal(vIn, vOut, h, g, out);
+}
+
 static void FindPhase(WrRun *run)
 {
     free(run->phase);
@@ -1171,6 +1248,11 @@ static void FindPhase(WrRun *run)
     run->phase = NULL;
     run->boards = NULL;
     run->boardCount = 0;
+
+    // Before the early returns, for the reason FindEfficiency gives. A run with
+    // no usable gravity records the gravity it declined to use, so it is not
+    // reconsidered until that number moves.
+    run->builtGravity = g_energy.gravity;
 
     if (run->pointCount < 8)
         return;
@@ -1201,6 +1283,20 @@ static void FindPhase(WrRun *run)
     unsigned char *broken = (unsigned char *)calloc((size_t)run->pointCount, 1);
     if (!broken)
         return;
+
+    // Scratch, not stored on the run: |nz| of the normal pass two fitted, at the
+    // first index of each contact segment, and -1 where pass two had none.
+    //
+    // Pass three needs it, and the reason is the whole argument below this one.
+    // Freed with broken at the end -- WrRun's footprint does not change.
+    float *segNz = (float *)malloc(sizeof(float) * (size_t)run->pointCount);
+    if (!segNz)
+    {
+        free(broken);
+        return;
+    }
+    for (int k = 0; k < run->pointCount; k++)
+        segNz[k] = -1.0f;
     for (int k = 0; k < run->breakCount; k++)
         if (run->breaks[k] >= 0 && run->breaks[k] < run->pointCount)
             broken[run->breaks[k]] = 1;
@@ -1231,8 +1327,31 @@ static void FindPhase(WrRun *run)
     }
 
     // Pass two: fit a plane to each run of contact and reclassify it. While a
-    // player rides a surface every velocity lies IN it, so a segment gives a far
-    // better normal than any one tick of it does.
+    // player rides a surface every velocity lies IN it, so a segment gives a
+    // better answer than any one tick of it does.
+    //
+    // AND THE OBVIOUS OBJECTION TO THAT WAS TRIED AND LOST. wr_phase.h retracts
+    // the fit's accuracy claim -- measured against the .bsp's own planes it
+    // reads 6.76 degrees off, where a single tick at a board reads 1.19 -- so
+    // using the board's normal here instead looks like a free correctness win.
+    // It is not, and the measurement is in bsp_sweep --verify-normals, which now
+    // scores both estimators on the SAME segments against the SAME faces:
+    //
+    //     24,789 segments      the fit 94.7% right, the entry tick 81.5%
+    //     of those, the 1,801  the fit 93.7% right, the entry tick 93.9%
+    //     whose entry impulse
+    //     clears 300 u/s
+    //
+    // The two questions are not the same question. An ANGLE is a vector and a
+    // whole-ride VERDICT is one bit either side of nz = 0.7, and the fit's error
+    // is mostly in heading, which does not move nz at all. A single tick's error
+    // moves the whole normal. So the fit is worse at the thing wr_phase.h
+    // measures and better at the thing this loop decides, and restricting to
+    // hard entries only buys a tie -- on 7% of segments.
+    //
+    // The entry normal is still the right answer for a board's own numbers,
+    // which is what pass three uses it for. It is the wrong answer for a colour
+    // that has to hold for a hundred consecutive points.
     for (int i = 0; i + 1 < run->pointCount; )
     {
         if (run->phase[i] != WR_PHASE_GROUND) { i++; continue; }
@@ -1240,6 +1359,9 @@ static void FindPhase(WrRun *run)
         int j = i;
         while (j + 1 < run->pointCount && run->phase[j] == WR_PHASE_GROUND)
             j++;
+
+        float nrm[3];
+        bool have = false;
 
         int m = j - i + 1;
         if (m >= 4 && m <= 4096)
@@ -1254,15 +1376,23 @@ static void FindPhase(WrRun *run)
                     vs[3 * k + 1] = v.y;
                     vs[3 * k + 2] = v.z;
                 }
-                float nrm[3];
-                if (WrPhaseFitNormal(vs, m, nrm))
-                {
-                    unsigned char ph = (unsigned char)WrPhaseFromNormal(nrm);
-                    for (int k = i; k < j; k++)
-                        run->phase[k] = ph;
-                }
+                have = WrPhaseFitNormal(vs, m, nrm);
                 free(vs);
             }
+        }
+
+        // Only where the fit could not answer at all -- 7 segments in 38,934
+        // across this library. Strictly additive: it fires where there was
+        // previously no verdict, never in place of one.
+        if (!have)
+            have = PhaseEntryNormal(run, i, g, nrm);
+
+        if (have)
+        {
+            unsigned char ph = (unsigned char)WrPhaseFromNormal(nrm);
+            for (int k = i; k < j; k++)
+                run->phase[k] = ph;
+            segNz[i] = nrm[2] < 0.0f ? -nrm[2] : nrm[2];
         }
         i = j;
     }
@@ -1279,11 +1409,11 @@ static void FindPhase(WrRun *run)
             if (run->phase[i] != WR_PHASE_RAMP && run->phase[i] != WR_PHASE_GROUND)
                 continue;
 
-            bool airBefore = true;
-            for (int k = 1; k <= PHASE_BOARD_AIR_BEFORE; k++)
-                if (run->phase[i - k] != WR_PHASE_AIR)
-                    airBefore = false;
-            if (!airBefore)
+            // Clear air before, and the normal at the moment of arrival. Both
+            // come from the same function pass two used, so the two passes
+            // cannot end up with different ideas of where a ride began.
+            float nrm[3];
+            if (!PhaseEntryNormal(run, i, g, nrm))
                 continue;
 
             int stick = 0;
@@ -1294,18 +1424,59 @@ static void FindPhase(WrRun *run)
                 continue;
 
             const WrPoint &a = run->points[i], &b = run->points[i + 1];
-            float h = b.t - a.t;
             float vIn[3] = { a.vel.x, a.vel.y, a.vel.z };
             float vOut[3] = { b.vel.x, b.vel.y, b.vel.z };
-            float nrm[3];
-            if (!WrPhaseNormal(vIn, vOut, h, g, nrm))
-                continue;
 
             // Only ramps. A landing on a floor is not a board, and neither is
             // clipping a wall -- the lower bound is what keeps near-vertical
             // geometry out of a readout about surfing.
-            float nz = nrm[2] < 0.0f ? -nrm[2] : nrm[2];
-            if (nz < WR_PHASE_MIN_RAMP_NZ || nz > WR_PHASE_STANDABLE)
+            //
+            // THE TWO BOUNDS ASK DIFFERENT ESTIMATORS, AND THAT IS THE POINT.
+            //
+            // The upper one -- is this a floor rather than a ramp -- used to be
+            // read off nrm, the entry tick's normal recovered from one impulse.
+            // That is the estimator the essay above pass two already says is the
+            // wrong one for a whole-segment verdict, and here it was deciding
+            // whether a board existed at all. Measured on surf_fiellu against
+            // the map's own brush faces (bsp_sweep --verify-normals), over the
+            // 860 segments where both estimators could be asked:
+            //
+            //     the fit over the ride   99.8% right
+            //     the tick at the entry   57.8% right
+            //     they agreed              57.6% of the time
+            //     angle error, p50         1.46 deg against 16.12
+            //
+            // That map's ramps sit at nz 0.657, four hundredths under the 0.7
+            // that separates a ramp from a floor, so an entry tick scattering
+            // +-16 degrees lands above the line about half the time -- and every
+            // one of those was a board that was detected, graded, and then
+            // thrown away. One run of Nobort's found three boards on thirteen
+            // ramps ridden. Across 2,258 runs and 100,193 contact segments the
+            // upper bound alone was costing 8,414 boards, 30% on top of every
+            // board this tool has ever drawn.
+            //
+            // The lower one -- is this a wall -- still asks the entry tick, and
+            // deliberately. NOTHING HAS MEASURED EITHER ESTIMATOR ON THAT
+            // QUESTION: --verify-normals scores ramp against ground, not ramp
+            // against wall, and switching a bound on the strength of a
+            // measurement of a different bound is how a plausible number gets
+            // shipped. Asking the fit there as well would have taken back 2,867
+            // of the boards this change adds, and there is no evidence saying
+            // whether those 2,867 are walls or fit failures. So it is left
+            // exactly as it was until something can say.
+            //
+            // Net across the corpus: 8,414 gained, 2,202 lost, none of the
+            // losses to the wall bound. The 2,202 are segments where the fit
+            // says floor and the entry tick says ramp -- which is the case the
+            // fit is 99.8% right about, so losing them is the change working.
+            //
+            // The entry normal still GRADES the board, which is what the
+            // measurement says it is good at: restricted to hard entries out of
+            // free flight it reads 1.69 degrees off the file, 0.82 on slope. It
+            // is only being taken off the one question it answers badly.
+            const float nzEntry = nrm[2] < 0.0f ? -nrm[2] : nrm[2];
+            const float nzFloor = (segNz[i] >= 0.0f) ? segNz[i] : nzEntry;
+            if (nzEntry < WR_PHASE_MIN_RAMP_NZ || nzFloor > WR_PHASE_STANDABLE)
                 continue;
 
             WrBoardStats s;
@@ -1341,6 +1512,7 @@ static void FindPhase(WrRun *run)
         }
     }
 
+    free(segNz);
     free(broken);
 }
 
@@ -1476,12 +1648,26 @@ float WrRunTimeAt(const WrRun *run, int index)
     return (run->points[index].t - run->points[from].t) * run->timeScale;
 }
 
-void WrPathRefreshEfficiency(void)
+void WrPathRefreshDerived(void)
 {
     int want = WrClampI(g_wrEffWindow, 1, 64);
     for (int i = 0; i < g_runCount; i++)
-        if (g_runs[i].effWindow != want)
-            FindEfficiency(&g_runs[i]);
+    {
+        WrRun *r = &g_runs[i];
+
+        // The phase split needs only gravity; the efficiency ceiling needs all
+        // three. Tested separately so that moving the air-accelerate slider does
+        // not re-walk every run's phase for no reason -- a full store is
+        // millions of points and this runs inside Present.
+        const bool physMoved = (r->builtGravity   != g_energy.gravity) ||
+                               (r->builtAirAccel  != g_energy.airAccelerate) ||
+                               (r->builtMaxSpeed  != g_energy.maxSpeed);
+
+        if (r->builtGravity != g_energy.gravity)
+            FindPhase(r);
+        if (r->effWindow != want || physMoved)
+            FindEfficiency(r);
+    }
 }
 
 void WrEnableBestNearby(int count, float radius)

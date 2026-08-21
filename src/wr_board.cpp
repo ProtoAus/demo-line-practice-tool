@@ -7,10 +7,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-static const char *kGamemodes[WR_GAMEMODE_COUNT] = {
+static const char *kGamemodes[] = {
     "surf", "bhop", "bhop (HL1)", "climb (Mom)", "climb (KZT)", "climb (16)",
     "RJ", "SJ", "ahop", "conc", "defrag CPM", "defrag VQ3", "defrag VTG"
 };
+WR_TABLE_IS_FULL(kGamemodes, WR_GAMEMODE_COUNT);
 
 const char *WrGamemodeName(int mode)
 {

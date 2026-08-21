@@ -870,6 +870,789 @@ int main(void)
             Check(p.z < z0 + 400.0f && p.z > 0.0f, "the position is a real height");
     }
 
+    printf("\nthe strafe quality curve survives a literal AirAccelerate\n");
+    {
+        // CGameMovement::AirAccelerate, written out from its description with
+        // nothing simplified -- in particular wishspd is capped at 30 and used
+        // ONLY for addspeed, while accelspeed is computed from the UNCAPPED
+        // wishspeed. Getting those two the wrong way round is the single most
+        // common error in reimplementations of this function, so the test copy
+        // has to keep them apart on its own rather than call ours.
+        //
+        // The names are the surf community's terms of art and are kept so this
+        // can be checked line by line against any description of the function.
+        // It is a reimplementation of the arithmetic, not a copy of anybody's
+        // source -- the same standard wr_stress.h applies to strafe-analyzer.
+        struct Sim
+        {
+            static float Accel(float vel[3], const float wishdir[3],
+                               float wishspeed, float accel, float tick,
+                               float friction)
+            {
+                float wishspd = wishspeed;
+                if (wishspd > 30.0f)                 // GetAirSpeedCap()
+                    wishspd = 30.0f;
+                float currentspeed = vel[0] * wishdir[0] + vel[1] * wishdir[1] +
+                                     vel[2] * wishdir[2];
+                float addspeed = wishspd - currentspeed;
+                if (addspeed <= 0.0f)
+                    return 0.0f;
+                float accelspeed = accel * wishspeed * tick * friction;
+                if (accelspeed > addspeed)
+                    accelspeed = addspeed;
+                for (int i = 0; i < 3; i++)
+                    vel[i] += accelspeed * wishdir[i];
+                return accelspeed;
+            }
+        };
+
+        const float tick = 0.015f, accel = 150.0f, maxSpeed = 250.0f;
+        const float V = 1000.0f;
+        const float idealPerSec =
+            WrPerfectStrafeDegrees(V, tick, accel, maxSpeed) / tick;
+
+        Check(WrAirCapBinds(tick, accel, maxSpeed, 1.0f),
+              "at surf settings the wishspeed cap is what binds");
+
+        float worstGain = 0.0f, worstQual = 0.0f;
+        for (int k = 0; k <= 30; k++)
+        {
+            const float c = (float)k;               // dot(velocity, wishdir)
+            const float sinT = c / V;
+            const float cosT = sqrtf(1.0f - sinT * sinT);
+            const float wishdir[3] = { sinT, cosT, 0.0f };
+            float vel[3] = { V, 0.0f, 0.0f };
+
+            Sim::Accel(vel, wishdir, maxSpeed, accel, tick, 1.0f);
+
+            // ONE: the gain collapses to 900 - c^2.
+            const float d2 = vel[0] * vel[0] + vel[1] * vel[1] + vel[2] * vel[2]
+                           - V * V;
+            const float eGain = fabsf(d2 - (900.0f - c * c));
+            if (eGain > worstGain) worstGain = eGain;
+
+            // THREE: the turn the simulation actually produced, put through the
+            // shipped quality function, against the gain fraction it actually
+            // got. Nothing here tells WrStrafeQuality what c was.
+            const float turned = atan2f(vel[1], vel[0]) * 57.2957795131f / tick;
+            const float q = WrStrafeQuality(turned, idealPerSec);
+            const float eQual = fabsf(q - d2 / 900.0f);
+            if (eQual > worstQual) worstQual = eQual;
+        }
+
+        printf("     worst gain error %.4f units^2, worst quality error %.5f\n",
+               worstGain, worstQual);
+        Check(worstGain < 0.5f,
+              "the per-tick gain really is 900 - c^2 when the cap binds");
+        Check(worstQual < 0.01f,
+              "and 1 - (1-r)^2 recovers the gain fraction from the turn alone");
+
+        // The far side: turning twice as fast is exactly as bad as not turning.
+        Check(fabsf(WrStrafeQuality(0.0f, idealPerSec)) < 1e-6f,
+              "not turning at all scores zero");
+        Check(fabsf(WrStrafeQuality(2.0f * idealPerSec, idealPerSec)) < 1e-6f,
+              "and so does turning twice as fast");
+        Check(WrStrafeQuality(idealPerSec, idealPerSec) > 0.999f,
+              "the ideal rate scores one");
+        Check(WrStrafeQuality(0.8f * idealPerSec, idealPerSec) > 0.95f,
+              "and the old +-20% band is still the top few percent");
+
+        // The regime with no answer, rather than a bad answer.
+        Check(!WrAirCapBinds(1.0f / 64.0f, 12.0f, 250.0f, 0.25f),
+              "CS:GO KZ in a deadstrafe period is the other regime");
+    }
+
+    printf("\nthe generalised quality curve is the old one where it should be\n");
+    {
+        // WrStrafeQuality is now WrStrafeQualityEx with cScale = 30, and the
+        // whole point of normalising before squaring rather than after is that
+        // this is exact rather than close. Bit-for-bit, across the range.
+        int same = 0, total = 0;
+        for (int i = 0; i <= 400; i++)
+        {
+            const float r = (float)i * 0.005f;      // 0 .. 2
+            const float ideal = 137.0f;
+            const float got = r * ideal;
+            const float a = WrStrafeQuality(got, ideal);
+            const float b = WrStrafeQualityEx(got, ideal, WR_AIR_WISHSPEED);
+            total++;
+            if (memcmp(&a, &b, sizeof(float)) == 0)
+                same++;
+        }
+        printf("     %d of %d identical to the bit\n", same, total);
+        Check(same == total,
+              "cScale = 30 reproduces the flat formula exactly, not nearly");
+
+        // And a bigger scale is strictly harsher, which is the claim the ramp
+        // case rests on.
+        const float q30 = WrStrafeQualityEx(0.7f * 100.0f, 100.0f, 30.0f);
+        const float q46 = WrStrafeQualityEx(0.7f * 100.0f, 100.0f, 46.0f);
+        Check(q46 < q30, "a plane that turns you for you grades a slip harder");
+    }
+
+    printf("\nthe ramp ideal is Source's own clip, not the flat one\n");
+    {
+        // ONE TICK OF SURF, written out: AirAccelerate, then gravity, then
+        // PM_ClipVelocity against the ramp -- in that order, which is the order
+        // TryPlayerMove runs them. Then the horizontal rotation that produced,
+        // against WrPerfectStrafeDegreesOnPlane's closed form.
+        //
+        // The velocity starts IN the plane, because that is what riding a ramp
+        // means; a surfer's v.n is zero to within the tick.
+        const float tick = 0.015f;
+        const float gravity = 800.0f;
+        const float nrm[3] = { 0.8f, 0.0f, 0.6f };      // nz 0.6, a ~53 deg ramp
+        const float speed = 1000.0f;
+
+        float worst = 0.0f;
+        for (int side = 0; side < 2; side++)
+        {
+            const float s = side ? -1.0f : 1.0f;
+
+            // v along +y, which is perpendicular to the normal's horizontal
+            // part, so v.n = 0 and wn = +-0.8: riding across the fall line.
+            float vel[3] = { 0.0f, speed, 0.0f };
+            const float wsh[3] = { s, 0.0f, 0.0f };
+
+            const float gain = WrAirGainPerTick(tick, WR_AIR_ACCEL_DEFAULT,
+                                                WR_MAXSPEED_DEFAULT);
+            float v[3] = { vel[0] + gain * wsh[0],
+                           vel[1] + gain * wsh[1],
+                           vel[2] + gain * wsh[2] };
+            v[2] -= gravity * tick;
+
+            // PM_ClipVelocity, overbounce 1: an orthogonal projection.
+            const float d = v[0] * nrm[0] + v[1] * nrm[1] + v[2] * nrm[2];
+            v[0] -= d * nrm[0];
+            v[1] -= d * nrm[1];
+            v[2] -= d * nrm[2];
+
+            const float simulated = fabsf(atan2f(v[0], v[1]));   // rad this tick
+            const float wn = wsh[0] * nrm[0] + wsh[1] * nrm[1] + wsh[2] * nrm[2];
+            const float closed =
+                WrPerfectStrafeDegreesOnPlane(speed, tick, WR_AIR_ACCEL_DEFAULT,
+                                              WR_MAXSPEED_DEFAULT, gravity,
+                                              nrm, wn) / 57.2957795131f;
+
+            const float err = fabsf(simulated - closed);
+            if (err > worst) worst = err;
+            printf("     wn %+.1f  simulated %.9f  closed form %.9f  (%.1f%% of air)\n",
+                   wn, simulated, closed, 100.0f * closed / (gain / speed));
+        }
+
+        printf("     worst disagreement %.2e rad\n", worst);
+        Check(worst < 1e-5f,
+              "the closed form reproduces a literal clipped tick");
+
+        // The flat function is this one on a plane you are not touching.
+        const float flat = WrPerfectStrafeDegrees(speed, tick,
+                                                  WR_AIR_ACCEL_DEFAULT,
+                                                  WR_MAXSPEED_DEFAULT);
+        const float viaPlane =
+            WrPerfectStrafeDegreesOnPlane(speed, tick, WR_AIR_ACCEL_DEFAULT,
+                                          WR_MAXSPEED_DEFAULT, gravity, 0, 0.0f);
+        Check(fabsf(flat - viaPlane) < 1e-6f,
+              "and with no plane at all it IS the flat function");
+
+        // The size of the thing. If these ever came out close to each other the
+        // ramp case would not have been worth the trouble.
+        const float nUp[3] = { 0.8f, 0.0f, 0.6f };
+        const float into = WrPerfectStrafeDegreesOnPlane(speed, tick,
+                                                         WR_AIR_ACCEL_DEFAULT,
+                                                         WR_MAXSPEED_DEFAULT,
+                                                         gravity, nUp, -0.8f);
+        const float away = WrPerfectStrafeDegreesOnPlane(speed, tick,
+                                                         WR_AIR_ACCEL_DEFAULT,
+                                                         WR_MAXSPEED_DEFAULT,
+                                                         gravity, nUp, 0.8f);
+        Check(into < flat * 0.35f && away < flat * 0.75f,
+              "a ramp's ideal is a fraction of the flat one, both ways round");
+        Check(into < away * 0.5f,
+              "and which way you strafe changes it by more than a factor of two");
+    }
+
+    printf("\na board can be quoted in any unit and stay the same board\n");
+    {
+        // Arriving at 1200 u/s into the same 53-degree ramp, 20 degrees off
+        // parallel, so there is a real board to take apart.
+        const float nrm[3] = { 0.8f, 0.0f, 0.6f };
+        const float sinA = 0.34202014f;                 // sin(20 deg)
+        const float cosA = 0.93969262f;
+        const float s0 = 1200.0f;
+
+        // v = s0 * (parallel * cos + (-n) * sin): 20 degrees INTO the plane.
+        const float par[3] = { 0.0f, 1.0f, 0.0f };      // in-plane, v.n = 0
+        float vIn[3];
+        for (int k = 0; k < 3; k++)
+            vIn[k] = s0 * (par[k] * cosA - nrm[k] * sinA);
+
+        float vOut[3] = { vIn[0], vIn[1], vIn[2] };
+
+        WrBoardStats b;
+        Check(WrPhaseBoard(vIn, vOut, nrm, &b), "the board is measured");
+
+        printf("     %.1f u/s in, %.0f deg approach, %.1f%% of perfect\n",
+               b.speedIn, b.approachDeg, WrBoardPerfectPct(&b));
+
+        Check(fabsf(b.approachDeg - 70.0f) < 0.05f,
+              "20 degrees into the plane is 70 off the normal");
+        Check(fabsf(WrBoardPerfectPct(&b) - 100.0f * cosA) < 0.05f,
+              "and it keeps cos(20 deg) of its speed");
+
+        // The normal is stored pointing back at whoever arrived, whichever way
+        // the file had it. Both signs in, one sign out.
+        float flipped[3] = { -nrm[0], -nrm[1], -nrm[2] };
+        WrBoardStats b2;
+        Check(WrPhaseBoard(vIn, vOut, flipped, &b2), "and again with n flipped");
+        Check(fabsf(b.normal[0] - b2.normal[0]) < 1e-6f &&
+              fabsf(b.normal[2] - b2.normal[2]) < 1e-6f,
+              "the stored normal is oriented, so the axes cannot come out mirrored");
+        Check(fabsf(b.loss - b2.loss) < 1e-3f, "and the grade is unchanged by it");
+
+        // Every unit is the same clip read differently, so they have to agree
+        // with the vector the clip actually produced.
+        float clipped[3];
+        const float d = vIn[0] * nrm[0] + vIn[1] * nrm[1] + vIn[2] * nrm[2];
+        for (int k = 0; k < 3; k++)
+            clipped[k] = vIn[k] - d * nrm[k];
+
+        float delta[3];
+        WrBoardDeltaAxes(&b, delta);
+        for (int k = 0; k < 3; k++)
+            Check(fabsf((vIn[k] + delta[k]) - clipped[k]) < 1e-2f,
+                  "the per-axis change reconstructs the clipped velocity");
+
+        const float hIn = sqrtf(vIn[0] * vIn[0] + vIn[1] * vIn[1]);
+        const float hOut = sqrtf(clipped[0] * clipped[0] +
+                                 clipped[1] * clipped[1]);
+        Check(fabsf(WrBoardLossHorizontal(&b) - (hIn - hOut)) < 1e-2f,
+              "the horizontal figure is the horizontal speed it really lost");
+
+        const float e = (s0 * s0 - (clipped[0] * clipped[0] +
+                                    clipped[1] * clipped[1] +
+                                    clipped[2] * clipped[2])) / (2.0f * 800.0f);
+        Check(fabsf(WrBoardLossEnergy(&b, 800.0f) - e) < 1e-2f,
+              "and the energy figure is the kinetic term it really lost");
+
+        // A board that costs nothing is 100%, exactly.
+        float par2[3] = { 0.0f, s0, 0.0f };
+        WrBoardStats perfect;
+        Check(WrPhaseBoard(par2, par2, nrm, &perfect), "a parallel arrival");
+        Check(fabsf(WrBoardPerfectPct(&perfect) - 100.0f) < 1e-3f,
+              "costs nothing and says so");
+        Check(WrBoardLossEnergy(&perfect, 800.0f) < 1e-3f,
+              "in energy as well");
+    }
+
+    printf("\nyour own board is graded, and it does not read as free\n");
+    {
+        // The live board detector, driven end to end without a game: free fall
+        // into a 53-degree ramp, with the map's answer pushed in the way
+        // dllmain does it.
+        //
+        // The numeric assertions are on the INVARIANT rather than on a
+        // hand-computed grade, because the moment of detection depends on how
+        // the 0.10 s phase window fills and pinning that would make this a test
+        // of the frame rate. What must hold is that the loss is the projection
+        // of the speed onto the plane -- which is the whole fix, and the exact
+        // thing that was reading zero.
+        const float n[3] = { 0.8f, 0.0f, 0.6f };     // nz 0.6, a ramp not a floor
+        const float dt = 1.0f / 200.0f;
+        const float g = 800.0f;
+
+        // Free fall, then an exact orthogonal clip and a slide down the plane.
+        const Vec3 p0 = WrVec(0.0f, 0.0f, 4000.0f);
+        const Vec3 v0 = WrVec(500.0f, 0.0f, -600.0f);
+        const float tHit = 0.5f;
+
+        // v at the moment of contact, and what the clip leaves of it.
+        const Vec3 vHit = WrVec(v0.x, v0.y, v0.z - g * tHit);
+        const float d = vHit.x * n[0] + vHit.y * n[1] + vHit.z * n[2];
+        const Vec3 vC = WrVec(vHit.x - d * n[0], vHit.y - d * n[1],
+                              vHit.z - d * n[2]);
+        // Gravity with its into-plane part removed: the acceleration of a slide.
+        const float gn = -g * n[2];
+        const Vec3 aC = WrVec(-gn * n[0], -gn * n[1], -g - gn * n[2]);
+        const Vec3 pHit = WrVec(p0.x + v0.x * tHit,
+                                p0.y + v0.y * tHit,
+                                p0.z + v0.z * tHit - 0.5f * g * tHit * tHit);
+
+        // Run it twice: once with the map answering, once with it silent.
+        for (int withMap = 1; withMap >= 0; withMap--)
+        {
+            WrEnergyDefaults();
+            WrEnergyReset();
+
+            bool sawEarly = false;
+            for (int i = 0; i < 300; i++)
+            {
+                const float t = i * dt;
+                Vec3 p;
+                if (t < tHit)
+                    p = WrVec(p0.x + v0.x * t, p0.y + v0.y * t,
+                              p0.z + v0.z * t - 0.5f * g * t * t);
+                else
+                {
+                    const float s = t - tHit;
+                    p = WrVec(pHit.x + vC.x * s + 0.5f * aC.x * s * s,
+                              pHit.y + vC.y * s + 0.5f * aC.y * s * s,
+                              pHit.z + vC.z * s + 0.5f * aC.z * s * s);
+                }
+
+                WrEnergySample(p, dt);
+                if (withMap)
+                    WrEnergySetGeometryTouch(t < tHit ? WR_GEOM_NOTHING
+                                                      : WR_GEOM_TOUCHING,
+                                             t < tHit ? 0 : n);
+                else
+                    WrEnergySetGeometryTouch(WR_GEOM_UNKNOWN);
+                WrEnergyTickBoards(dt);
+
+                // Nothing may be reported while still in free flight.
+                if (t < tHit - 0.05f && WrEnergyBoard(0, 0))
+                    sawEarly = true;
+            }
+
+            WrBoardStats b;
+            float age = 0.0f;
+            const bool got = WrEnergyBoard(&b, &age);
+
+            if (withMap)
+            {
+                Check(WrEnergyBoardAvailable(),
+                      "with the map answering, live boards are offered");
+                Check(!sawEarly, "and nothing was called a board during the fall");
+                Check(got, "the landing was found and graded");
+                if (got)
+                {
+                    const float sinA =
+                        (float)sin(b.approachDeg / 57.2957795131);
+                    const float pred = b.speedIn * (1.0f - sinA);
+                    printf("     %s  -%.1f u/s at %.1f deg  (projection says "
+                           "%.1f)\n", WrPhaseGradeName(b.grade), b.loss,
+                           b.approachDeg, pred);
+                    Check(b.loss > 5.0f,
+                          "it cost something, which is the defect that started "
+                          "this");
+                    Check(fabsf(b.loss - pred) < 0.5f,
+                          "and the cost is the projection onto the plane");
+                    Check(b.approachDeg > 60.0f && b.approachDeg < 89.0f,
+                          "the approach angle is the one the trajectory had");
+                    Check(b.rampDeg > 45.0f && b.rampDeg < 62.0f,
+                          "and the ramp is read at its real tilt");
+                }
+            }
+            else
+            {
+                Check(!WrEnergyBoardAvailable(),
+                      "with no map, live boards are not offered");
+                Check(!got, "and none is invented from the kinematics alone");
+            }
+        }
+    }
+
+    printf("\nthe arriving velocity is SOLVED against the plane, not guessed\n");
+    {
+        // WHAT THE TEST ABOVE DOES NOT CHECK, AND WHY THAT MATTERED.
+        //
+        // It asserts `loss` is the projection of whatever vIn the detector
+        // happened to fetch. That is true by construction inside WrPhaseBoard,
+        // so it would pass with the velocity taken from a completely wrong
+        // instant -- and the velocity WAS taken from a wrong instant: a fixed
+        // 0.10 s before a detector whose own lag is not fixed, with no
+        // correction for the gravity that acted in between.
+        //
+        // This one knows the right answer. The trajectory is analytic, so the
+        // velocity at contact is exact, and so is the loss it must produce.
+        const float n[3] = { 0.8f, 0.0f, 0.6f };
+        const float g = 800.0f;
+        const Vec3 p0 = WrVec(0.0f, 0.0f, 4000.0f);
+        const Vec3 v0 = WrVec(500.0f, 0.0f, -600.0f);
+        const float tHit = 0.5f;
+
+        const Vec3 vHit = WrVec(v0.x, v0.y, v0.z - g * tHit);
+        const Vec3 pHit = WrVec(p0.x + v0.x * tHit, p0.y + v0.y * tHit,
+                                p0.z + v0.z * tHit - 0.5f * g * tHit * tHit);
+        const float plane[4] = { n[0], n[1], n[2],
+                                 n[0] * pHit.x + n[1] * pHit.y + n[2] * pHit.z };
+
+        const float sHit = WrLength(vHit);
+        const float dotHit =
+            fabsf(vHit.x * n[0] + vHit.y * n[1] + vHit.z * n[2]) / sHit;
+        const float lossTrue = sHit * (1.0f - sqrtf(1.0f - dotHit * dotHit));
+        const float degTrue = (float)(acos(dotHit) * 57.2957795131);
+
+        const float d = vHit.x * n[0] + vHit.y * n[1] + vHit.z * n[2];
+        const Vec3 vC = WrVec(vHit.x - d * n[0], vHit.y - d * n[1],
+                              vHit.z - d * n[2]);
+        const float gn = -g * n[2];
+        const Vec3 aC = WrVec(-gn * n[0], -gn * n[1], -g - gn * n[2]);
+
+        printf("     the trajectory really loses %.3f u/s at %.3f deg\n",
+               lossTrue, degTrue);
+
+        // Three frame rates, because the old walk returned the first sample
+        // PAST the mark rather than the sample AT it -- so its answer moved
+        // with dt, and a board read differently at 60 fps and at 300.
+        const float fps[3] = { 60.0f, 144.0f, 300.0f };
+        float solved[3], guessed[3];
+
+        for (int mode = 0; mode < 2; mode++)      // 0 = solved, 1 = old way
+        {
+            for (int k = 0; k < 3; k++)
+            {
+                const float dt = 1.0f / fps[k];
+                WrEnergyDefaults();
+                WrEnergyReset();
+                // Camera and feet at the same point, so the fixture is about
+                // the board arithmetic and not about the eye offset.
+                g_energy.eyeHeight = 0.0f;
+                g_energy.gravity = g;
+
+                for (int i = 0; i < (int)(1.5f * fps[k]); i++)
+                {
+                    const float t = i * dt;
+                    Vec3 p;
+                    if (t < tHit)
+                        p = WrVec(p0.x + v0.x * t, p0.y + v0.y * t,
+                                  p0.z + v0.z * t - 0.5f * g * t * t);
+                    else
+                    {
+                        const float s = t - tHit;
+                        p = WrVec(pHit.x + vC.x * s + 0.5f * aC.x * s * s,
+                                  pHit.y + vC.y * s + 0.5f * aC.y * s * s,
+                                  pHit.z + vC.z * s + 0.5f * aC.z * s * s);
+                    }
+                    WrEnergySample(p, dt);
+                    const bool touching = (t >= tHit);
+                    WrEnergySetGeometryTouch(touching ? WR_GEOM_TOUCHING
+                                                      : WR_GEOM_NOTHING,
+                                             touching ? n : 0,
+                                             (touching && mode == 0) ? plane : 0,
+                                             touching ? 0.0f : -1.0f);
+                    WrEnergyTickBoards(dt);
+                }
+
+                WrBoardStats b;
+                float age = 0.0f;
+                const float v = WrEnergyBoard(&b, &age) ? b.loss : -1.0f;
+                if (mode == 0) solved[k] = v; else guessed[k] = v;
+
+                if (mode == 0)
+                    printf("     %3.0f fps  solved %.3f  (err %+.3f)   "
+                           "%s\n", fps[k], v, v - lossTrue,
+                           WrEnergyBoardExact() ? "entry solved"
+                                                : "entry NOT solved");
+            }
+        }
+        printf("     the fixed lookback, same runs: %.3f  %.3f  %.3f\n",
+               guessed[0], guessed[1], guessed[2]);
+
+        float worst = 0.0f, spread = 0.0f;
+        for (int k = 0; k < 3; k++)
+        {
+            const float e = fabsf(solved[k] - lossTrue);
+            if (e > worst) worst = e;
+            for (int j = 0; j < 3; j++)
+            {
+                const float s = fabsf(solved[k] - solved[j]);
+                if (s > spread) spread = s;
+            }
+        }
+        Check(solved[0] > 0.0f && solved[1] > 0.0f && solved[2] > 0.0f,
+              "a board is found at every frame rate");
+        Check(worst < 0.5f,
+              "and its cost is the trajectory's real one, not the projection "
+              "of a velocity from the wrong instant");
+        Check(spread < 0.25f,
+              "the same landing reads the same at 60, 144 and 300 fps");
+
+        // The point of keeping the old path in the fixture: it says how much
+        // the fix was worth, rather than asserting that it was worth something.
+        float oldWorst = 0.0f;
+        for (int k = 0; k < 3; k++)
+        {
+            const float e = fabsf(guessed[k] - lossTrue);
+            if (e > oldWorst) oldWorst = e;
+        }
+        printf("     worst error   solved %.3f   fixed lookback %.3f u/s\n",
+               worst, oldWorst);
+        Check(worst < oldWorst,
+              "and it is closer than reaching back a fixed distance was");
+    }
+
+    printf("\nboards are graded on the game's own velocity when it is offered\n");
+    {
+        // The same landing, with the pair a proved memory read would supply.
+        // What this checks is the PLUMBING -- that a pushed-in velocity reaches
+        // the board and displaces the camera estimate -- not the scan, which
+        // needs a game and lives in wr_player.cpp.
+        const float n[3] = { 0.8f, 0.0f, 0.6f };
+        const float g = 800.0f;
+        const float dt = 1.0f / 200.0f;
+        const Vec3 p0 = WrVec(0.0f, 0.0f, 4000.0f);
+        const Vec3 v0 = WrVec(500.0f, 0.0f, -600.0f);
+        const float tHit = 0.5f;
+        const Vec3 vHit = WrVec(v0.x, v0.y, v0.z - g * tHit);
+        const Vec3 pHit = WrVec(p0.x + v0.x * tHit, p0.y + v0.y * tHit,
+                                p0.z + v0.z * tHit - 0.5f * g * tHit * tHit);
+        const float plane[4] = { n[0], n[1], n[2],
+                                 n[0] * pHit.x + n[1] * pHit.y + n[2] * pHit.z };
+        const float sHit = WrLength(vHit);
+        const float dotHit =
+            fabsf(vHit.x * n[0] + vHit.y * n[1] + vHit.z * n[2]) / sHit;
+        const float lossTrue = sHit * (1.0f - sqrtf(1.0f - dotHit * dotHit));
+
+        const float d = vHit.x * n[0] + vHit.y * n[1] + vHit.z * n[2];
+        const Vec3 vC = WrVec(vHit.x - d * n[0], vHit.y - d * n[1],
+                              vHit.z - d * n[2]);
+        const float gn = -g * n[2];
+        const Vec3 aC = WrVec(-gn * n[0], -gn * n[1], -g - gn * n[2]);
+
+        WrEnergyDefaults();
+        WrEnergyReset();
+        g_energy.eyeHeight = 64.0f;     // deliberately WRONG for this fixture
+        g_energy.gravity = g;
+
+        bool everTrue = false;
+        for (int i = 0; i < 300; i++)
+        {
+            const float t = i * dt;
+            Vec3 p, v;
+            if (t < tHit)
+            {
+                p = WrVec(p0.x + v0.x * t, p0.y + v0.y * t,
+                          p0.z + v0.z * t - 0.5f * g * t * t);
+                v = WrVec(v0.x, v0.y, v0.z - g * t);
+            }
+            else
+            {
+                const float s = t - tHit;
+                p = WrVec(pHit.x + vC.x * s + 0.5f * aC.x * s * s,
+                          pHit.y + vC.y * s + 0.5f * aC.y * s * s,
+                          pHit.z + vC.z * s + 0.5f * aC.z * s * s);
+                v = WrVec(vC.x + aC.x * s, vC.y + aC.y * s, vC.z + aC.z * s);
+            }
+
+            // The camera sits 64 above the origin, as it would in a game. The
+            // eye height setting is right here; the point is that the pushed
+            // pair is used INSTEAD of it, so the ring holds exact feet.
+            const Vec3 cam = WrVec(p.x, p.y, p.z + 64.0f);
+            WrEnergySetTruePlayer(&p, &v, 64.0f);
+            if (WrEnergyTrueVelocityLive())
+                everTrue = true;
+            WrEnergySample(cam, dt);
+            const bool touching = (t >= tHit);
+            WrEnergySetGeometryTouch(touching ? WR_GEOM_TOUCHING
+                                              : WR_GEOM_NOTHING,
+                                     touching ? n : 0, touching ? plane : 0,
+                                     touching ? 0.0f : -1.0f);
+            WrEnergyTickBoards(dt);
+        }
+
+        WrBoardStats b;
+        float age = 0.0f;
+        const bool got = WrEnergyBoard(&b, &age);
+        Check(everTrue, "the pushed pair is accepted");
+        Check(got, "the landing is still found");
+        if (got)
+        {
+            printf("     -%.4f u/s against a true %.4f\n", b.loss, lossTrue);
+            Check(fabsf(b.loss - lossTrue) < 0.05f,
+                  "and the cost comes out to a hundredth of a unit");
+        }
+
+        // Nonsense is refused rather than trusted. A scan that has latched onto
+        // the wrong address must not be able to put a garbage board on screen.
+        const Vec3 mad = WrVec(1e9f, 0.0f, 0.0f);
+        const Vec3 ok = WrVec(0.0f, 0.0f, 0.0f);
+        WrEnergySetTruePlayer(&ok, &mad, 64.0f);
+        Check(!WrEnergyTrueVelocityLive(),
+              "a velocity past every sanity bound is not believed");
+        WrEnergySetTruePlayer(&ok, 0, 64.0f);
+        Check(!WrEnergyTrueVelocityLive(),
+              "and an origin without a velocity is not used half-way");
+    }
+
+    printf("\na refusal names the test that refused it\n");
+    {
+        WrEnergyDefaults();
+        WrEnergyReset();
+        Check(WrEnergyBoardWhy() == WR_BOARD_WHY_NONE,
+              "nothing has been refused before anything has happened");
+
+        for (int i = 0; i < WR_BOARD_WHY__COUNT; i++)
+            Check(WrEnergyBoardWhyName(i) != 0 &&
+                  WrEnergyBoardWhyName(i)[0] != '\0',
+                  i == 0 ? "every cause has a phrase" : "");
+        Check(strcmp(WrEnergyBoardWhyName(-1), "?") == 0 &&
+              strcmp(WrEnergyBoardWhyName(WR_BOARD_WHY__COUNT), "?") == 0,
+              "and an index off either end is a question mark, not a crash");
+
+        // A wall, hit out of sustained air, on a map that is answering. Every
+        // gate passes except the ramp band -- which used to end in silence.
+        //
+        // The fall has to actually STOP at the contact, not merely be declared
+        // over: the phase readout is vertical acceleration against gravity and
+        // the map may only veto a contact, never invent one. A trajectory that
+        // goes on falling at exactly -g is airborne no matter what the geometry
+        // says, which is the whole design of the one-sided veto.
+        const float wall[3] = { 1.0f, 0.0f, 0.0f };
+        const float dt = 1.0f / 200.0f;
+        const float tHitW = 0.5f;
+        const float zHitW = 4000.0f - 0.5f * 800.0f * tHitW * tHitW;
+        g_energy.gravity = 800.0f;
+        g_energy.eyeHeight = 0.0f;
+        for (int i = 0; i < 200; i++)
+        {
+            const float t = i * dt;
+            const bool touching = (t >= tHitW);
+            const Vec3 p = touching
+                ? WrVec(1000.0f * t, 0.0f, zHitW)
+                : WrVec(1000.0f * t, 0.0f, 4000.0f - 0.5f * 800.0f * t * t);
+            WrEnergySample(p, dt);
+            WrEnergySetGeometryTouch(touching ? WR_GEOM_TOUCHING
+                                              : WR_GEOM_NOTHING,
+                                     touching ? wall : 0);
+            WrEnergyTickBoards(dt);
+        }
+        Check(!WrEnergyBoard(0, 0), "a wall is not graded as a board");
+        Check(WrEnergyBoardWhy() == WR_BOARD_WHY_NOT_RAMP,
+              "and the refusal says so instead of going quiet");
+        Check(WrEnergyBoardWhyCount(WR_BOARD_WHY_NOT_RAMP) >= 1,
+              "the tally counted it");
+        Check(WrEnergyBoardWhyCount(WR_BOARD_WHY_NOT_RAMP) < 20,
+              "once per landing, not once per frame -- which is what makes the "
+              "number readable");
+        Check(fabsf(WrEnergyBoardWhyNz() - 0.0f) < 1e-4f,
+              "and it carries the n.z it actually saw, so a wall and a floor "
+              "can be told apart");
+    }
+
+    printf("\na ramp across the room is not the ramp you landed on\n");
+    {
+        // Preferring the ramp candidate fixes the side-entry defect and can
+        // introduce a smaller one in the other direction: a FLOOR landing with
+        // a rideable plane somewhere in range would be graded against a surface
+        // nobody touched -- a board invented where the old code stayed quiet.
+        // Both directions are pinned here, because a fix that only ever adds
+        // boards is not obviously a fix.
+        const float floorN[3] = { 0.0f, 0.0f, 1.0f };
+        const float rampN[3] = { 0.8f, 0.0f, 0.6f };
+        const float dt = 1.0f / 200.0f;
+        const float tHit = 0.5f;
+        const float zHit = 4000.0f - 0.5f * 800.0f * tHit * tHit;
+        const float rampPlane[4] = { rampN[0], rampN[1], rampN[2],
+                                     rampN[0] * 0.0f + rampN[2] * zHit };
+
+        for (int far_ = 0; far_ < 2; far_++)
+        {
+            WrEnergyDefaults();
+            WrEnergyReset();
+            g_energy.eyeHeight = 0.0f;
+            g_energy.gravity = 800.0f;
+
+            for (int i = 0; i < 200; i++)
+            {
+                const float t = i * dt;
+                const bool touching = (t >= tHit);
+                const Vec3 p = touching
+                    ? WrVec(1000.0f * t, 0.0f, zHit)
+                    : WrVec(1000.0f * t, 0.0f,
+                            4000.0f - 0.5f * 800.0f * t * t);
+                WrEnergySample(p, dt);
+                // A floor one unit away, and a ramp either just beside it or
+                // most of the search radius off.
+                WrEnergySetGeometryTouch(touching ? WR_GEOM_TOUCHING
+                                                  : WR_GEOM_NOTHING,
+                                         touching ? floorN : 0,
+                                         touching ? rampPlane : 0,
+                                         touching ? (far_ ? 22.0f : 3.0f) : -1.0f,
+                                         touching ? 1.0f : -1.0f);
+                WrEnergyTickBoards(dt);
+            }
+
+            const bool got = WrEnergyBoard(0, 0);
+            if (far_)
+            {
+                Check(!got,
+                      "a ramp 22 units away, with a floor at 1, is not what "
+                      "was landed on");
+                Check(WrEnergyBoardWhy() == WR_BOARD_WHY_NOT_RAMP,
+                      "and the refusal is the floor's, named");
+            }
+            else
+            {
+                Check(got,
+                      "a ramp 3 units away, at a junction the hull straddles, "
+                      "still grades");
+            }
+        }
+    }
+
+    printf("\nthe last board does not outlive its own ramp\n");
+    {
+        // WrEnergyBoard's header always promised an age cap and the code never
+        // had one, so the corner row went on describing a ramp two ramps back
+        // for the rest of the level.
+        const float n[3] = { 0.8f, 0.0f, 0.6f };
+        const float dt = 1.0f / 200.0f;
+        WrEnergyDefaults();
+        WrEnergyReset();
+        g_energy.eyeHeight = 0.0f;
+        g_energy.gravity = 800.0f;
+
+        const Vec3 p0 = WrVec(0.0f, 0.0f, 4000.0f);
+        const Vec3 v0 = WrVec(500.0f, 0.0f, -600.0f);
+        const float tHit = 0.5f;
+        const Vec3 vHit = WrVec(v0.x, v0.y, v0.z - 800.0f * tHit);
+        const Vec3 pHit = WrVec(p0.x + v0.x * tHit, p0.y + v0.y * tHit,
+                                p0.z + v0.z * tHit - 0.5f * 800.0f * tHit * tHit);
+        const float d = vHit.x * n[0] + vHit.y * n[1] + vHit.z * n[2];
+        const Vec3 vC = WrVec(vHit.x - d * n[0], vHit.y - d * n[1],
+                              vHit.z - d * n[2]);
+        const float gn = -800.0f * n[2];
+        const Vec3 aC = WrVec(-gn * n[0], -gn * n[1], -800.0f - gn * n[2]);
+
+        for (int i = 0; i < 200; i++)
+        {
+            const float t = i * dt;
+            Vec3 p;
+            if (t < tHit)
+                p = WrVec(p0.x + v0.x * t, p0.y + v0.y * t,
+                          p0.z + v0.z * t - 0.5f * 800.0f * t * t);
+            else
+            {
+                const float s = t - tHit;
+                p = WrVec(pHit.x + vC.x * s + 0.5f * aC.x * s * s,
+                          pHit.y + vC.y * s + 0.5f * aC.y * s * s,
+                          pHit.z + vC.z * s + 0.5f * aC.z * s * s);
+            }
+            WrEnergySample(p, dt);
+            const bool touching = (t >= tHit);
+            WrEnergySetGeometryTouch(touching ? WR_GEOM_TOUCHING
+                                              : WR_GEOM_NOTHING,
+                                     touching ? n : 0);
+            WrEnergyTickBoards(dt);
+        }
+
+        float age = 0.0f;
+        Check(WrEnergyBoard(0, &age), "the board is there");
+        Check(WrEnergyBoard(0, 0, 20.0f), "and a 20 s caller still sees it");
+
+        // Age it without moving: the phase readout goes quiet, the clock does
+        // not.
+        for (int i = 0; i < 5000; i++)
+            WrEnergyTickBoards(dt);
+        Check(WrEnergyBoard(0, &age) && age > 24.0f,
+              "twenty-five seconds later it is still on record");
+        Check(!WrEnergyBoard(0, 0, 20.0f),
+              "but a caller that asked for twenty is no longer shown it");
+        Check(WrEnergyBoard(0, 0, 0.0f),
+              "and zero still means \"however old it is\", for callers that "
+              "want the record rather than the readout");
+    }
+
     printf("\n%s\n\n", g_failures ? "SOME CHECKS FAILED" : "all checks passed");
     return g_failures ? 1 : 0;
 }

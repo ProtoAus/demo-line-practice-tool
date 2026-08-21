@@ -75,6 +75,32 @@ static inline bool WrBspIsSurfBand(float nz)
     return nz >= WR_BSP_BAND_LO && nz <= WR_BSP_BAND_HI;
 }
 
+// AND THE |n.z| VERSION, WHICH IS NOT THE SAME QUESTION.
+//
+// The one above answers "may this be drawn as a ramp", and there the sign is
+// load-bearing: a ceiling is not something anybody rides. This one answers "is
+// this the plane a board should be graded against", and there the sign carries
+// no information at all, for two separate reasons.
+//
+// A displacement triangle's normal is a cross product of its grid winding
+// (wr_bsp.cpp, the disp builder) and nothing orients it, so half of a
+// displacement ramp can come out facing down while being the surface you are
+// standing on. Refusing those would refuse displacement ramps at random.
+//
+// And a board does not need the sign anyway: the two faces of one plane make
+// the same angle with an incoming velocity, and WrPhaseBoard orients the normal
+// towards whoever arrived on it before it grades anything.
+//
+// This is the same test WrEnergyTickBoards already applies to the normal it is
+// handed. It is written here so the query that CHOOSES the polygon and the gate
+// that later JUDGES it cannot drift apart -- picking a wall and then refusing it
+// is how a real board becomes silence.
+static inline bool WrBspIsRampPlane(float nz)
+{
+    const float a = nz < 0.0f ? -nz : nz;
+    return a >= WR_BSP_BAND_LO && a <= WR_BSP_BAND_HI;
+}
+
 // Tilt from horizontal, in degrees. 0 is a floor, 90 a wall. Unlike
 // WrPhaseSurfaceAngle this does NOT fold the sign, because here we know which
 // way the surface faces and a ceiling is not a ramp.
@@ -112,6 +138,110 @@ static inline float WrBspSurfaceAngle(const float n[3])
 // a brush edge, so clipping it against the real sides leaves a sliver or
 // nothing.
 #define WR_BSP_MIN_AREA 1.0f
+
+// ---------------------------------------------------------------------------
+// Which corner a displacement grid starts at
+// ---------------------------------------------------------------------------
+
+// How far startPosition may sit from the corner it names, as a fraction of the
+// base quad's own longest separation, squared.
+//
+// RELATIVE TO THE QUAD, AND THAT IS A FIX RATHER THAN A LOOSENING. The rule
+// this replaces was "within 0.25 square units", written on the premise -- stated
+// in the comment it replaced -- that vbsp copies startPosition out of the corner
+// itself, so a real match is exact to floating point. Measured over the library
+// that premise is false: of 172,759 displacements across 1,304 maps only
+// 134,883 (78.1%) match a corner exactly, 172,671 are inside 0.25, and 88 are
+// not. Worst miss 10.67 units, surf_simpsons2 disp 158 and 170.
+//
+// Those 88 are 0.051% of the library and they were expensive out of all
+// proportion: they fall on 16 maps, and a single one of them switched the live
+// map query off for that whole level, because WrBspGeometryComplete refuses any
+// map that dropped a displacement. surf_kvas dropped 4 of 756 and lost two
+// ~290,000 sq unit ramp faces out of an otherwise fully built ramp complex --
+// which on screen was the strafe readout saying "no surface" on every ramp.
+//
+// The absolute cut was judging a quantity that scales with the face. surf_kvas's
+// base quads are 512x704 and 833x605 units, so its one-unit miss is 0.12% of the
+// diagonal and the face was thrown away for it. Against the quad's own diagonal
+// all 172,759 pass with 2.7x headroom: the worst real case in the library is
+// 1.42e-05 of diagSq, 0.376% of its own diagonal, on surf_happyhands3 disp 476.
+//
+// AND IT IS STILL THE STRIDE CHECK IT WAS WRITTEN TO BE, which is the half that
+// had to be measured before this could be relaxed. Re-read the whole library
+// with startPosition taken four bytes late -- exactly the "the struct prefix
+// moved and these fields are not where this thinks" failure the test exists for
+// -- and this rule refuses 172,793 of 172,801, passing only the same 8
+// degenerate coincidences the 0.25 rule also passes. Eight against eight: the
+// anti-stride property is not weakened at all. Under that wrong read the worst
+// case is 4.46e+07 of diagSq, twelve orders of magnitude clear of the worst
+// correct one, so the two populations do not touch.
+#define WR_DISP_CORNER_SLACK 1e-4f
+
+// Rotate the base quad so the corner startPosition names is first.
+//
+// ddispinfo_t's startPosition is a POINT, not an index, and it is one of the
+// four corners of the face's winding. Getting this wrong does not produce
+// nonsense, it produces a surface rotated a quarter turn on its own base, which
+// is exactly the kind of plausible-looking wrong answer this reader refuses to
+// ship -- so the match is checked rather than assumed.
+//
+// `slackOut` receives bestD / diagSq, the quantity the cut is applied to.
+// `marginOut` receives secondD / bestD, how far the chosen corner beat the
+// runner-up. That second one is not decoration: relaxing the cut is only safe
+// while the CHOICE of corner stays unambiguous, and it is measured to be --
+// 244,868x to 954,273x on the four surf_kvas cases, and never below 9.0x
+// anywhere in the library (surf_epiphany disp 508). A future vbsp with more
+// distorted base quads could close that gap, so test_bspgeom asserts on it and
+// that degrades loudly rather than silently.
+static inline bool WrBspDispBaseCorner(const float quad[4][3],
+                                       const float startPos[3],
+                                       int *baseOut, float *slackOut,
+                                       float *marginOut)
+{
+    int base = 0;
+    float bestD = 1e30f, secondD = 1e30f;
+    for (int k = 0; k < 4; k++)
+    {
+        float d = 0.0f;
+        for (int a = 0; a < 3; a++)
+        {
+            const float e = quad[k][a] - startPos[a];
+            d += e * e;
+        }
+        if (d < bestD)      { secondD = bestD; bestD = d; base = k; }
+        else if (d < secondD) secondD = d;
+    }
+
+    // The longest of all SIX pairwise separations, not the two diagonals. A
+    // degenerate winding can put the longest span on an edge, and a cut that
+    // shrank to nothing there would refuse a face for being thin rather than
+    // for being the wrong face.
+    float diagSq = 0.0f;
+    for (int i = 0; i < 4; i++)
+        for (int j = i + 1; j < 4; j++)
+        {
+            float d = 0.0f;
+            for (int a = 0; a < 3; a++)
+            {
+                const float e = quad[i][a] - quad[j][a];
+                d += e * e;
+            }
+            if (d > diagSq) diagSq = d;
+        }
+
+    if (baseOut)   *baseOut   = base;
+    if (slackOut)  *slackOut  = (diagSq > 0.0f) ? bestD / diagSq : 1e30f;
+    if (marginOut) *marginOut = (bestD > 0.0f) ? secondD / bestD : 1e30f;
+
+    // A quad with no extent is not a quad. Refused by name rather than divided
+    // by: 0/0 here would accept every startPosition ever written, and the
+    // refusal would silently turn into its opposite.
+    if (!(diagSq > 0.0f))
+        return false;
+
+    return bestD <= WR_DISP_CORNER_SLACK * diagSq;
+}
 
 // A plane is float[4]: normal in 0..2, distance in 3, so a point is INSIDE the
 // half-space when dot(v, n) - dist <= 0. That is Source's convention and the

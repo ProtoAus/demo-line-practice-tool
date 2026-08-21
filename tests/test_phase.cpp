@@ -245,6 +245,132 @@ int main(void)
     }
 
     // -----------------------------------------------------------------------
+    printf("\nand it still holds at the angles a good surfer actually rides\n");
+    {
+        // THE REGIME NOTHING TESTED. The sweep above starts at a 30 u/s entry
+        // and works towards a wall; every assertion in this file lives between
+        // 60 and 89 degrees. A competitive board is 88 to 89.9, and that is
+        // exactly where the arithmetic was worst:
+        //
+        //   dot is under 0.02 there, and it was a float32 dot product of three
+        //   terms with operands around 2500 -- an absolute error of order 1e-4,
+        //   which is half a percent OF DOT and so a percent of the grade.
+        //
+        //   lossPct was 1.0f - sinA with sinA above 0.9997, which is a
+        //   subtraction that keeps a handful of bits of a quantity the whole
+        //   readout is about.
+        //
+        // The reference is computed in double AND in a form with no
+        // cancellation in it: with phi the angle from the PLANE rather than
+        // from the normal, 1 - sin(90 - phi) == 1 - cos(phi) == 2 sin^2(phi/2).
+        const double nd[3] = { 0.6, 0.0, 0.8 };
+        const float n2[3] = { (float)nd[0], (float)nd[1], (float)nd[2] };
+        const double along[3] = { -nd[2], 0.0, nd[0] };
+        const double s0 = 2500.0;
+
+        double worstRel = 0.0, worstDeg = 0.0, worstOld = 0.0;
+        bool ok = true;
+        for (int k = 0; k <= 60; k++)
+        {
+            // 0.05 to 5 degrees off the surface: 89.95 down to 85 off the
+            // normal.
+            const double phi = (0.05 + k * (5.0 - 0.05) / 60.0) * 0.0174532925199433;
+            const double sp = sin(phi), cp = cos(phi);
+
+            float vIn[3];
+            for (int a = 0; a < 3; a++)
+                vIn[a] = (float)(s0 * (along[a] * cp - nd[a] * sp));
+
+            float vOut[3];
+            Clip(vIn, n2, vOut);
+
+            WrBoardStats b;
+            if (!WrPhaseBoard(vIn, vOut, n2, &b)) { ok = false; break; }
+
+            const double sHalf = sin(phi * 0.5);
+            const double lossTrue = 2.0 * sHalf * sHalf;    // 1 - cos(phi)
+            const double degTrue = 90.0 - phi * 57.2957795130823;
+
+            const double rel = fabs(b.lossPct - lossTrue) / lossTrue;
+            if (rel > worstRel) worstRel = rel;
+            const double dd = fabs(b.approachDeg - degTrue);
+            if (dd > worstDeg) worstDeg = dd;
+
+            // The arithmetic as it stood, on the same inputs, so the claim that
+            // this was worth changing is a measurement in the output of the
+            // test rather than an assertion in a comment. float32 throughout,
+            // and lossPct as the subtraction 1 - sinA.
+            const float s0f = sqrtf(vIn[0] * vIn[0] + vIn[1] * vIn[1] +
+                                    vIn[2] * vIn[2]);
+            float dotf = (vIn[0] * n2[0] + vIn[1] * n2[1] + vIn[2] * n2[2]) / s0f;
+            if (dotf < 0.0f) dotf = -dotf;
+            const float sinAf = sqrtf(1.0f - dotf * dotf);
+            const double oldLoss = 1.0f - sinAf;
+            const double relOld = fabs(oldLoss - lossTrue) / lossTrue;
+            if (relOld > worstOld) worstOld = relOld;
+        }
+
+        printf("    85 to 89.95 deg: worst relative error in lossPct %.2e, "
+               "worst angle error %.2e deg\n", worstRel, worstDeg);
+        printf("    the same sweep through the old float32 arithmetic: %.2e\n",
+               worstOld);
+        Check(worstRel < worstOld,
+              "and it is better than the arithmetic it replaced, measured on "
+              "the same inputs rather than argued for");
+        Check(ok, "every entry in the band grades");
+        // 1e-4 relative is roughly float32's own resolution on the INPUTS,
+        // which is the floor: vIn and the plane are both float32 and always
+        // will be. What is being asserted is that nothing between them adds to
+        // it. The line above prints what the previous arithmetic did on the
+        // identical inputs, and it is 9.6e-2 -- so at the angles a good board
+        // is actually made at, a tenth of the reported cost was coming from
+        // the width of a float rather than from the ramp.
+        Check(worstRel < 1e-4,
+              "the cost is right to a hundredth of a percent of itself, where "
+              "it used to lose a percent to the arithmetic alone");
+        Check(worstDeg < 1e-3,
+              "and the approach angle to a thousandth of a degree");
+    }
+
+    // -----------------------------------------------------------------------
+    printf("\nthe horizontal cost survives the same cancellation\n");
+    {
+        // |v_h| before minus |v_h| after, where the two differ by well under a
+        // unit out of thousands. Written as a difference of squares over a sum,
+        // which is an identity and not an approximation -- see wr_phase.h.
+        const float n3[3] = { 0.6f, 0.0f, 0.8f };
+        bool ok = true;
+        double worst = 0.0;
+        for (int k = 1; k <= 40; k++)
+        {
+            const double into = -2.0 * k;               // a gentle board
+            const double along[3] = { -0.8, 0.0, 0.6 };
+            const double s = 2500.0;
+            float vIn[3];
+            for (int a = 0; a < 3; a++)
+                vIn[a] = (float)(along[a] * s + n3[a] * into);
+            float vOut[3];
+            Clip(vIn, n3, vOut);
+
+            WrBoardStats b;
+            if (!WrPhaseBoard(vIn, vOut, n3, &b)) { ok = false; break; }
+
+            // The straightforward form, in double, from the same inputs.
+            const double hx = vIn[0], hy = vIn[1];
+            const double ox = hx + (double)b.intoPlane * b.normal[0];
+            const double oy = hy + (double)b.intoPlane * b.normal[1];
+            const double ref = sqrt(hx * hx + hy * hy) - sqrt(ox * ox + oy * oy);
+            const double got = WrBoardLossHorizontal(&b);
+            const double rel = fabs(got - ref) / (fabs(ref) + 1e-9);
+            if (rel > worst) worst = rel;
+        }
+        printf("    worst relative error against a double reference: %.2e\n",
+               worst);
+        Check(ok, "every entry grades");
+        Check(worst < 1e-5, "and the horizontal figure matches it");
+    }
+
+    // -----------------------------------------------------------------------
     printf("\ngrading\n");
     {
         // A near-parallel entry is a good board; a head-on one is not.

@@ -111,7 +111,7 @@ built by a public GitHub Actions runner from a tagged commit, with a
 [build provenance attestation](https://github.com/ProtoAus/demo-line-practice-tool/attestations):
 
 ```
-gh attestation verify demo-line-practice-tool-v0.9.5.zip --repo ProtoAus/demo-line-practice-tool
+gh attestation verify demo-line-practice-tool-v1.0.0.zip --repo ProtoAus/demo-line-practice-tool
 ```
 
 **If Defender quarantines it, please report the false positive.** It is the only thing that actually
@@ -207,9 +207,18 @@ for byte.
 
 ## How it works
 
-There is no entity access here and no game API: it finds the camera by scanning memory for the
-world-to-screen matrix, reads run paths out of the game's own `.mtv` demos, and projects the lines
-itself. The long version is in **[docs/how-it-works.md](docs/how-it-works.md)**.
+No game API is called and no game code is ever executed. It finds the camera by scanning memory for
+the world-to-screen matrix, reads run paths out of the game's own `.mtv` demos, and projects the
+lines itself.
+
+It also looks for the player's own origin and velocity the same way — `ReadProcessMemory` on its own
+process, nothing written, nothing called — because the alternative was inferring both from camera
+motion, and that carries errors nothing downstream can remove: the eye height is a setting rather
+than a read, so a crouched player's feet were taken 36 units too low, and the crouch itself lerps
+into the velocity as though you had moved. Nothing is believed until it has predicted the camera for
+ninety frames running, and it is allowed to find nothing — everything keeps working on the camera
+estimate, and the Diagnostics tab says which is in use. The long version is in
+**[docs/how-it-works.md](docs/how-it-works.md)**.
 
 ## Licence
 

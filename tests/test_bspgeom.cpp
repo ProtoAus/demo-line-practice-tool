@@ -361,6 +361,108 @@ int main(void)
               "a ray that misses the grid entirely does not start");
     }
 
+    // -----------------------------------------------------------------------
+    printf("\nthe corner a displacement grid starts at\n");
+    {
+        // A 512x704 quad, the size surf_kvas's really are.
+        float big[4][3] = {
+            { -13759.5f, 2303.230f, -4416.0f },
+            { -13759.5f, 2816.000f, -4416.0f },
+            { -13759.5f, 2816.000f, -3712.0f },
+            { -13759.5f, 2303.232f, -3712.0f },
+        };
+
+        bool allFour = true, allBase = true, allMargin = true;
+        for (int k = 0; k < 4; k++)
+        {
+            int base = -1;
+            float slack = -1.0f, margin = -1.0f;
+            if (!WrBspDispBaseCorner(big, big[k], &base, &slack, &margin))
+                allFour = false;
+            if (base != k)
+                allBase = false;
+            if (!(margin > 100.0f))
+                allMargin = false;
+        }
+        Check(allFour, "startPosition exactly on a corner is accepted");
+        Check(allBase, "and the quad is rotated so THAT corner is index 0");
+        Check(allMargin, "each time by a margin, never a near-tie");
+
+        // THE REGRESSION, with the numbers off the map that reported it.
+        // surf_kvas disp 468: startPosition sits 1.04 units from the corner it
+        // plainly belongs to -- 0.12% of a 704-unit diagonal -- and the shipped
+        // 0.25-square-unit rule threw the whole face away for it, which threw
+        // the whole LEVEL's live geometry away with it.
+        {
+            float start[3] = { -13758.5f, 2303.5f, -4416.0f };
+            int base = -1;
+            float slack = -1.0f, margin = -1.0f;
+            const bool ok = WrBspDispBaseCorner(big, start, &base, &slack,
+                                                &margin);
+            printf("    slack %.3g of diagSq, margin %.0fx, base %d\n",
+                   slack, margin, base);
+            Check(ok, "a corner a unit out on a 704-unit quad is accepted");
+            Check(base == 0, "and it is the corner it obviously belongs to");
+            Check(slack > 0.0f && slack < WR_DISP_CORNER_SLACK,
+                  "inside the cut rather than on it");
+            Check(margin > 100.0f,
+                  "with the runner-up nowhere near -- the choice is not close");
+            Check(!(1.0f * 1.0f + 0.27f * 0.27f <= 0.25f),
+                  "and the rule this replaced really did refuse it");
+        }
+
+        // AND IT DID NOT BECOME NO RULE AT ALL. The same absolute miss on a
+        // small quad must still be refused, or "relative" would just mean
+        // "off".
+        {
+            float small[4][3] = {
+                { 0.0f,  0.0f, 0.0f }, { 16.0f,  0.0f, 0.0f },
+                { 16.0f, 16.0f, 0.0f }, { 0.0f, 16.0f, 0.0f },
+            };
+            float start[3] = { 1.0f, 0.27f, 0.0f };
+            int base = -1;
+            Check(!WrBspDispBaseCorner(small, start, &base, 0, 0),
+                  "the same one-unit miss on a 16-unit quad is REFUSED");
+
+            float centre[3] = { 8.0f, 8.0f, 0.0f };
+            Check(!WrBspDispBaseCorner(small, centre, &base, 0, 0),
+                  "and the quad's own centre names no corner");
+        }
+
+        // THE ANTI-STRIDE CASE, which is what this test has always been for: a
+        // moved struct prefix reads startPosition out of the wrong bytes, and
+        // no rotation of the quad may accept the result.
+        {
+            float wrong[3] = { 1.0e6f, -2.5e5f, 7.0e4f };
+            int base = -1;
+            bool any = false;
+            for (int r = 0; r < 4; r++)
+            {
+                float rot[4][3];
+                for (int k = 0; k < 4; k++)
+                    for (int a = 0; a < 3; a++)
+                        rot[k][a] = big[(r + k) & 3][a];
+                if (WrBspDispBaseCorner(rot, wrong, &base, 0, 0))
+                    any = true;
+            }
+            Check(!any, "a startPosition from the wrong bytes is refused, "
+                        "at every rotation");
+        }
+
+        // 0/0 would accept every startPosition ever written, which is the
+        // refusal turning into its opposite.
+        {
+            float flat[4][3] = {
+                { 5.0f, 5.0f, 5.0f }, { 5.0f, 5.0f, 5.0f },
+                { 5.0f, 5.0f, 5.0f }, { 5.0f, 5.0f, 5.0f },
+            };
+            float far2[3] = { 900.0f, 900.0f, 900.0f };
+            int base = -1;
+            Check(!WrBspDispBaseCorner(flat, far2, &base, 0, 0),
+                  "a quad with no extent is refused, not divided by");
+        }
+    }
+
     printf("\n");
     if (g_failures)
     {

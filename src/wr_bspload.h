@@ -117,6 +117,13 @@ struct WrBspLoadSettings
     // the whole tool exists to show.
     bool drawFill;
 
+    // Draw the ramps that are playerclip brushes -- collision with no material.
+    // On a displacement-built map these are usually the only thing this reader
+    // has, so without them the panel reports a surf-band count and the screen
+    // stays empty. Pushed into g_wrBspDrawClip, which is where the query reads
+    // it. Outlined only, and dimmer, since nothing there is visible in game.
+    bool drawClip;
+
     // The "what is ahead" readout: trace where the camera is looking and say
     // what angle the first surface is at. A row on the corner block, so it
     // follows that block's own toggle.
@@ -193,6 +200,24 @@ bool WrBspLoadCoverage(char *line, int cap);
 // warning colour rather than in passing.
 bool WrBspLoadCoverageThin(void);
 
+// And the other kind of gap: this map uses displacements. Separate from the
+// coverage sentence because none of that sentence's numbers can express it -- a
+// displacement is not a brush that was skipped, it is a surface that was never
+// in the count.
+bool WrBspLoadHasDisplacements(void);
+
+// Does this map have displacement geometry this reader could NOT build?
+//
+// The question that used to be worth asking was whether a map had displacements
+// at all, because none of them were read. They are read now, on BSP 19, 20 and
+// 21, so the useful question is what is still missing. Three causes, and
+// WrBspDispWorstDrop names which: a v25 map, whose face and displacement layouts
+// are not known here; a map dense enough to exhaust WR_DISP_BUDGET; and a
+// displacement refused one at a time. The third was 88 refusals on 16 maps and
+// is now zero across the library -- see WR_DISP_CORNER_SLACK for what it was and
+// what it cost.
+bool WrBspLoadDisplacementsMissing(void);
+
 // ---------------------------------------------------------------------------
 // The queries, wrapped
 // ---------------------------------------------------------------------------
@@ -204,5 +229,79 @@ bool WrBspLoadCoverageThin(void);
 // and how far away it is. False when nothing is loaded or nothing is ahead.
 bool WrBspLoadAhead(const Vec3 &from, const Vec3 &dir, float maxDist,
                     float *angleDeg, float *distOut, bool *inBandOut);
+
+// IS THE PLAYER TOUCHING ANYTHING? The distance to the nearest map surface, or
+// a negative number when nothing is loaded or nothing is within `radius`.
+//
+// This is the one query whose SMALL answer is the interesting one, and the one
+// whose absence has to be gated -- see WrBspLoadGeometryComplete. It is not a
+// downward ray: a surf ramp is 45-60 degrees, a player hull rests against it on
+// its side, and straight down from the origin goes past the ramp to the floor
+// far below. Distance to the nearest polygon of any facing is the question that
+// matches "am I touching something", and WrBspNearestFace measures to the
+// POLYGON rather than to its plane for exactly that reason.
+//
+// `feet` is the player origin: live that is the camera less g_energy.eyeHeight,
+// which is a SETTING and not a read, so it is 64 whether or not you are ducking.
+//
+// `outNormal`, when given, receives that polygon's unit plane normal. It is the
+// same lookup and the same cost -- the plane was already fetched to measure the
+// distance -- and it is what lets a LIVE board be graded off the map's own
+// geometry rather than off a second difference of the camera. See
+// WrEnergyBoard: the whole reason a live board can be graded at all is that the
+// normal no longer has to be recovered from the velocity change.
+float WrBspLoadNearest(const Vec3 &feet, float radius, float *outNormal = 0);
+
+// THE SAME QUERY, ALSO HANDING BACK THE BEST RAMP CANDIDATE.
+//
+// The return value and `outNormal` are exactly what WrBspLoadNearest gives, and
+// they must stay that way: the touch verdict above rests on the R = 24 sweep,
+// and that sweep was run against "nearest of any facing".
+//
+// `outRampPlane` receives FOUR floats -- normal in 0..2 and the plane's own
+// distance in 3 -- for the nearest polygon inside the ramp band, and
+// `outRampDist` how far away it was, or -1 when the map offered none. Both are
+// for the live board, which needs a plane it could actually have ridden rather
+// than whichever surface happened to be closest to a point derived from the
+// camera, and needs the fourth float to work out when it crossed that plane.
+float WrBspLoadNearestEx(const Vec3 &feet, float radius, float *outNormal,
+                         float *outRampPlane, float *outRampDist);
+
+// May absence be used as evidence on this map?
+//
+// True only when a map is loaded, world ownership is not thin, and every
+// displacement in the file was actually BUILT. That last clause is the one that
+// does the work: over half of maps have displacements, they are read on BSP 19,
+// 20 and 21, and on a map where some were not built a query that finds nothing
+// has found nothing only in the part that exists. Measured, on maps that use
+// them, using absence anyway reads 83.2% against 93.6% for leaving it alone --
+// so this is not caution, it is the difference between helping and hurting.
+//
+// SAY WHAT A FALSE ANSWER MEANS, because it was read as something larger and
+// that cost a whole map. It means a caller that wanted to say "there is no
+// surface there" falls back to the kinematic answer that shipped alone. It does
+// not mean the map is unusable, and it was never meant to mean the map may not
+// be ASKED -- dllmain read it that way, and on surf_kvas four unbuilt
+// displacements out of 756 took the ramp strafe ideal and the live boards with
+// them for the whole level. The predicate itself is WrBspGeometryComplete in
+// wr_bsp.h, which takes a map and is testable without a loader.
+bool WrBspLoadGeometryComplete(void);
+
+// Inside this and the player is touching something; outside and they are not.
+//
+// Swept rather than reasoned about. A player hull is 32 wide, so contact puts a
+// surface about 16 units from the origin sideways -- but the origin is
+// recovered from a camera, the view bob rides on top of it, and these polygons
+// are clipped brush sides rather than the hull the engine collided. Measured on
+// brush-only maps at the shipped window and tolerance:
+//
+//     R = 16   89.1%  (miss 10.8  fake 0.1)
+//     R = 24   98.3%  (miss  1.3  fake 0.4)
+//     R = 32   98.0%  (miss  1.2  fake 0.8)
+//     R = 48   97.2%  (miss  1.1  fake 1.7)
+//
+// Flat from 24 to 48 and falling off a cliff below 16, so 24 is the near edge of
+// a plateau rather than a peak somebody tuned to.
+#define WR_BSP_TOUCH_RADIUS 24.0f
 
 #endif // WR_BSPLOAD_H
