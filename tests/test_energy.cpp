@@ -32,9 +32,11 @@
 // dragging the whole memory scanner into a unit test. Everything else it needs
 // (WrLength, WrDist, WrSaneVec, WrLogf) is in wr_log.cpp, which links cleanly:
 // WrLogf is a no-op until WrLogInit runs, so the test writes no log file.
+static Vec3 g_testForward = { 1.0f, 0.0f, 0.0f };
+
 bool WrCameraForward(Vec3 *out)
 {
-    if (out) *out = WrVec(1.0f, 0.0f, 0.0f);
+    if (out) *out = g_testForward;
     return true;
 }
 
@@ -104,6 +106,65 @@ static float ChainStep(Chain *c, float x, float y, float z, float dt,
 
 int main(void)
 {
+    printf("\nthe practice readout defaults are immediate and actionable\n");
+    {
+        WrEnergyDefaults();
+        Check(g_energy.showHud, "the crosshair readout starts on");
+        Check(g_energy.hudMode == WR_HUD_TURN,
+              "and starts on turn rate versus ideal");
+        Check(!g_energy.compareToRun,
+              "nearby-run comparison starts off");
+        Check(!g_energy.showBar, "the comparison bar starts off");
+        Check(!g_energy.showReferenceStrafeBar,
+              "the nearby run's strafe bar starts off");
+        Check(fabsf(g_energy.strafeBarSensitivity - 1.0f) < 1e-6f,
+              "the strafe bar starts at literal 1x sensitivity");
+        Check(fabsf(g_energy.velWindowSeconds - 0.020f) < 1e-6f &&
+              fabsf(g_energy.velTau - 0.030f) < 1e-6f &&
+              fabsf(g_energy.speedTau - 0.050f) < 1e-6f &&
+              fabsf(g_energy.smoothSeconds - 0.12f) < 1e-6f,
+              "the camera fallback starts on the Snappy preset");
+    }
+
+    printf("\na proved player pair needs no velocity smoothing\n");
+    {
+        WrEnergyDefaults();
+        WrEnergyReset();
+        const Vec3 origin = WrVec(100.0f, 200.0f, 300.0f);
+        const Vec3 velocity = WrVec(1200.0f, -400.0f, 250.0f);
+        const Vec3 camera = WrVec(origin.x, origin.y,
+                                  origin.z + g_energy.eyeHeight);
+        WrEnergySetTruePlayer(&origin, &velocity, 64.0f);
+        WrEnergySample(camera, 1.0f / 200.0f);
+
+        Vec3 feet, sampledVelocity;
+        const float expectedEnergy = WrEnergyOf(camera, velocity);
+        Check(WrEnergyValid(), "one exact sample is immediately valid");
+        Check(fabsf(WrEnergySpeed() - WrLength(velocity)) < 1e-4f,
+              "speed is the game's value on that same frame");
+        Check(fabsf(WrEnergyNow() - expectedEnergy) < 1e-4f,
+              "energy is built from the exact position/velocity pair");
+        WrEnergyAnchorToFeet(origin);
+        const float expectedRelative = expectedEnergy - camera.z;
+        Check(fabsf(WrEnergyRelative() - expectedRelative) < 1e-4f,
+              "the displayed energy is neither smoothed nor bucketed");
+        Check(WrEnergySampleAt(&feet, &sampledVelocity) &&
+              WrDist(feet, origin) < 1e-4f &&
+              WrDist(sampledVelocity, velocity) < 1e-4f,
+              "the live recorder receives that exact pair too");
+
+        // The default crosshair mode is turn rate versus ideal. Its view angle
+        // still has to be differenced, but on the exact-player path the result
+        // must not ease through the old 120 ms display EMA.
+        const float oneDegree = 0.01745329252f;
+        g_testForward = WrVec(cosf(oneDegree), sinf(oneDegree), 0.0f);
+        WrEnergySetTruePlayer(&origin, &velocity, 64.0f);
+        WrEnergySample(camera, 0.010f);
+        Check(fabsf(WrEnergyYawRate() - 100.0f) < 0.1f,
+              "turn rate also updates without the display EMA");
+        g_testForward = WrVec(1.0f, 0.0f, 0.0f);
+    }
+
     printf("\na ballistic arc against a fixed anchor is a flat line\n");
     {
         // Straight off a platform: 900 u/s forward, 268 u/s up (a Source jump),
@@ -310,6 +371,48 @@ int main(void)
         Check(dead12 < full12 * 0.7f,
               "at airaccel 12 it lowers it by a third, as the KZ community "
               "reports");
+
+        const float accel150 = WrAirAccelerationPerTickEx(
+            0.015f, 150.0f, 250.0f, 1.0f);
+        const float deadAccel150 = WrAirAccelerationPerTickEx(
+            0.015f, 150.0f, 250.0f, 0.25f);
+        Check(fabsf(accel150 - 562.5f) < 1e-5f &&
+              fabsf(deadAccel150 - 140.625f) < 1e-5f,
+              "the live stress display exposes 562.5 -> 140.6 per tick");
+        Check(fabsf(deadAccel150 / WR_AIR_WISHSPEED - 4.6875f) < 1e-5f,
+              "and reports 4.69x headroom above the 30-unit cap");
+
+        const float duckWish = WrAirWishSpeed(250.0f, true);
+        Check(fabsf(duckWish - 85.0f) < 1e-5f,
+              "Momentum crouch scales the uncapped wishspeed to 34 percent");
+        Check(WrAirSurfaceFriction(-1.0f) == 1.0f &&
+              WrAirSurfaceFriction(0.0f) == 1.0f,
+              "falling and the apex keep normal air friction");
+        Check(WrAirSurfaceFriction(0.01f) == 0.25f &&
+              WrAirSurfaceFriction(140.0f) == 0.25f &&
+              WrAirSurfaceFriction(140.01f) == 1.0f,
+              "deadstrafe is exactly the 0 < vz <= 140 window");
+
+        const float normalIdeal = WrPerfectStrafeDegreesEx(
+            2000.0f, 0.015f, 150.0f, 250.0f, 1.0f);
+        const float crouchDeadIdeal = WrPerfectStrafeDegreesEx(
+            2000.0f, 0.015f, 150.0f, duckWish, 0.25f);
+        Check(fabsf(normalIdeal - crouchDeadIdeal) < 1e-6f,
+              "at surf settings crouch plus deadstrafe still reaches the cap");
+        Check(WrPerfectStrafeDegreesEx(2000.0f, 1.0f / 64.0f, 12.0f,
+                                       duckWish, 0.25f) < normalIdeal,
+              "at low airaccelerate the same state lowers the true ideal turn");
+
+        WrEnergyDefaults();
+        WrEnergyReset();
+        const Vec3 org = WrVec(0.0f, 0.0f, 0.0f);
+        const Vec3 vel = WrVec(1000.0f, 0.0f, 100.0f);
+        WrEnergySetTruePlayer(&org, &vel, 28.0f);
+        Check(WrEnergyCrouched(),
+              "the measured 28-unit view offset identifies a crouched surfer");
+        WrEnergySetTruePlayer(&org, &vel, 64.0f);
+        Check(!WrEnergyCrouched(),
+              "the measured 64-unit view offset identifies standing");
     }
 
     printf("\nturn rate alone would fire on perfect play, which is why it is not\n"
@@ -504,75 +607,39 @@ int main(void)
         Check(!WrEnergyTakeRestart(), "and reading that clears it");
     }
 
-    printf("\na paused camera holds the readout instead of draining it\n");
+    printf("\na stationary camera no longer pauses exact numbers\n");
     {
-        // Reported while watching demos: "when you pause, the numbers start to
-        // freak out and rise or fall". Feeding a stopped camera in reads as the
-        // player having instantaneously stopped dead, so the entire kinetic
-        // term drains out over the output filter's time constant.
         WrEnergyDefaults();
         WrEnergyReset();
 
         const float dt = 1.0f / 200.0f;
-        const float z0 = 2000.0f, speed = 2400.0f;
-        for (int i = 0; i < 100; i++)
-            WrEnergySample(WrVec(0.0f, 0.0f, z0), dt);
-        WrEnergyAnchorToFeet(WrVec(0.0f, 0.0f, z0 - 64.0f));
+        const Vec3 origin = WrVec(200.0f, 300.0f, 1900.0f);
+        const Vec3 camera = WrVec(origin.x, origin.y,
+                                  origin.z + g_energy.eyeHeight);
+        Vec3 velocity = WrVec(2400.0f, 0.0f, 0.0f);
+        WrEnergySetTruePlayer(&origin, &velocity, 64.0f);
+        WrEnergySample(camera, dt);
+        WrEnergyAnchorToFeet(origin);
 
-        // Fly flat and fast until the reading is settled. `frozen` must be the
-        // LAST position actually fed, not the next one along, or the pause does
-        // not begin until a frame later.
-        float t = 0.0f;
-        Vec3 frozen = WrVec(0.0f, 0.0f, z0);
-        for (int i = 0; i < 400; i++, t += dt)
+        // Repeat the same origin long enough to trip the stale-matrix hint. The
+        // hint must no longer return from the sampler or freeze its outputs.
+        for (int i = 0; i < 20; i++)
         {
-            frozen = WrVec(speed * t, 0.0f, z0);
-            WrEnergySample(frozen, dt);
+            WrEnergySetTruePlayer(&origin, &velocity, 64.0f);
+            WrEnergySample(camera, dt);
         }
+        Check(WrEnergyCameraStill(),
+              "repeated position remains available only as a matrix hint");
 
-        float before = WrEnergyRelative();
-        float gBefore = WrEnergyGained(), lBefore = WrEnergyLost();
-
-        // Pause: the identical position, for three seconds of frames.
-        float lo = 1e9f, hi = -1e9f;
-        for (int i = 0; i < 600; i++)
-        {
-            WrEnergySample(frozen, dt);
-            float r = WrEnergyRelative();
-            if (r < lo) lo = r;
-            if (r > hi) hi = r;
-        }
-        printf("     before %.0f, over a 3 s pause %.0f..%.0f, held=%s\n",
-               before, lo, hi, WrEnergyHeld() ? "yes" : "no");
-        Check(WrEnergyHeld(), "the hold engages");
-        Check(fabsf(hi - before) < 1.0f && fabsf(lo - before) < 1.0f,
-              "and the figure does not move at all across the pause");
-        Check(WrEnergyGained() == gBefore && WrEnergyLost() == lBefore,
-              "the accumulators bank nothing for time nobody played");
-
-        // Resume from where it stopped, at the same speed.
-        float worstStep = 0.0f;
-        float prev = before;
-        for (int i = 0; i < 200; i++, t += dt)
-        {
-            WrEnergySample(WrVec(speed * t, 0.0f, z0), dt);
-            float r = WrEnergyRelative();
-            float step = fabsf(r - prev);
-            if (step > worstStep) worstStep = step;
-            prev = r;
-        }
-        printf("     worst single-frame step on resume %.1f, settled at %.0f\n",
-               worstStep, prev);
-        Check(!WrEnergyHeld(), "and releases as soon as the camera moves");
-        // The ring's own clock does not advance during the hold, so the first
-        // difference after it spans real positions over a real interval with
-        // the pause simply excised. If that were not true this would step by
-        // the whole kinetic term.
-        Check(worstStep < 20.0f, "with no step, because the pause is excised");
-        Check(fabsf(prev - before) < 20.0f, "and the same value it paused at");
+        velocity = WrVec(1801.0f, 0.0f, 0.0f);
+        WrEnergySetTruePlayer(&origin, &velocity, 64.0f);
+        WrEnergySample(camera, dt);
+        const float expected = WrEnergyOf(camera, velocity) - camera.z;
+        Check(fabsf(WrEnergyRelative() - expected) < 1e-3f,
+              "a changed exact value appears immediately at the same position");
     }
 
-    printf("\na moving camera is never held, however slowly it moves\n");
+    printf("\na moving camera is never described as still\n");
     {
         WrEnergyDefaults();
         WrEnergyReset();
@@ -587,9 +654,9 @@ int main(void)
             WrEnergySample(WrVec(0.4f * t, 0.0f,
                                  1000.0f + 1.2f * sinf(t * 12.0f * 6.28318f) +
                                  0.3f * Noise()), dt);
-            if (WrEnergyHeld()) everHeld = true;
+            if (WrEnergyCameraStill()) everHeld = true;
         }
-        Check(!everHeld, "bit-identical is the test, so a live camera never holds");
+        Check(!everHeld, "bit-identical is the test, so a live camera stays live");
     }
 
     printf("\na save-loc load into motion does not spike\n");
@@ -954,6 +1021,16 @@ int main(void)
               "and so does turning twice as fast");
         Check(WrStrafeQuality(idealPerSec, idealPerSec) > 0.999f,
               "the ideal rate scores one");
+        float ratio = 0.0f;
+        Check(WrStrafeRatioFromAirDelta(0.0f, 2000.0f, 30.0f, 0.0f,
+                                        &ratio) && fabsf(ratio - 1.0f) < 1e-6f,
+              "a perpendicular demo acceleration reconstructs the ideal bar");
+        Check(WrStrafeRatioFromAirDelta(15.0f, 2000.0f, 15.0f, 0.0f,
+                                        &ratio) && fabsf(ratio - 0.5f) < 1e-6f,
+              "acceleration ahead of velocity reconstructs under-turning");
+        Check(WrStrafeRatioFromAirDelta(-15.0f, 2000.0f, 15.0f, 0.0f,
+                                        &ratio) && fabsf(ratio - 1.5f) < 1e-6f,
+              "acceleration behind it reconstructs over-turning");
         Check(WrStrafeQuality(0.8f * idealPerSec, idealPerSec) > 0.95f,
               "and the old +-20% band is still the top few percent");
 
@@ -1457,7 +1534,12 @@ int main(void)
         Check(got, "the landing is still found");
         if (got)
         {
-            printf("     -%.4f u/s against a true %.4f\n", b.loss, lossTrue);
+            printf("     -%.4f u/s against a true %.4f; entry "
+                   "(%.2f %.2f %.2f), wanted (%.2f %.2f %.2f), %s\n",
+                   b.loss, lossTrue,
+                   b.velIn[0], b.velIn[1], b.velIn[2],
+                   vHit.x, vHit.y, vHit.z,
+                   WrEnergyBoardExact() ? "solved" : "looked back");
             Check(fabsf(b.loss - lossTrue) < 0.05f,
                   "and the cost comes out to a hundredth of a unit");
         }

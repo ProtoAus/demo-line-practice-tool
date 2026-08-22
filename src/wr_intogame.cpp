@@ -360,6 +360,34 @@ bool WrIntoGameGamePathAt(WrIntoGameWhere where, const char *map, int mapId,
 bool WrIntoGameWatchCommand(const char *map, int mapId, const char *hash,
                             char *out, int outLen)
 {
+    if (!out || outLen < 8)
+        return false;
+
+    // A fetched replay normally exists in TWO places after Watch is pressed:
+    // WrLines' own cache and the local game tree it was just copied into.
+    // WrIntoGameSourceOf intentionally reports our cache first for provenance,
+    // so using that answer here made the second post-copy lookup see OURS again
+    // and claim that the game had no path. Probe the only two game-visible
+    // destinations directly before falling back to the player's non-hash local
+    // recording case below.
+    if (HashLooksSane(hash))
+    {
+        const WrIntoGameWhere places[2] = { WR_INTO_LOCAL, WR_INTO_ONLINE };
+        for (int i = 0; i < 2; i++)
+        {
+            char disk[MAX_PATH], gamePath[MAX_PATH];
+            if (!WrIntoGamePathAt(places[i], map, mapId, hash, disk,
+                                  sizeof(disk)) ||
+                !FileThere(disk) ||
+                !WrIntoGameGamePathAt(places[i], map, mapId, hash, gamePath,
+                                      sizeof(gamePath)))
+                continue;
+            _snprintf_s(out, (size_t)outLen, _TRUNCATE,
+                        "mom_tv_replay_watch \"%s\"", gamePath);
+            return true;
+        }
+    }
+
     char path[MAX_PATH];
     WrIntoGameSource src = WrIntoGameSourceOf(map, mapId, hash, path,
                                               sizeof(path));

@@ -62,6 +62,7 @@ struct Saveloc
     bool fromCps;       // a real save-loc, not an entry from "startmarks"
     float ourTime;      // seconds, or -1 when we have never timed it
     int ordinal;        // among entries sharing this position, in file order
+    int gameIndex;      // index in Momentum's cps list; -1 for a startmark
     bool suspect;       // time came from a v1 sidecar
     bool byHand;        // time was typed in rather than stamped on creation
 
@@ -80,6 +81,8 @@ static char g_map[72] = {0};
 static Saveloc g_locs[MAX_SAVELOCS];
 static int g_count = 0;
 static int g_timed = 0;
+static int g_current = -1;       // Momentum's exact current `cur` cps index
+static volatile LONG g_loadSerial = 0;
 static char g_status[160] = "not looked yet";
 
 static long long g_mtime = 0;
@@ -184,9 +187,10 @@ static const char *SidecarPath(const char *map)
 // the field is both universally available and unambiguous. See WrEnergySeed.
 
 static bool ParseFile(const char *path, const char *map, Saveloc *out,
-                      int maxOut, int *count)
+                      int maxOut, int *count, int *current)
 {
     *count = 0;
+    if (current) *current = -1;
 
     FILE *f = NULL;
     if (fopen_s(&f, path, "r") != 0 || !f)
@@ -207,6 +211,7 @@ static bool ParseFile(const char *path, const char *map, Saveloc *out,
     // PREVIOUS one's velocity. Which is the worst possible failure: a plausible
     // number, from the wrong place, with nothing on screen to say so.
     int blockIndex = -1;
+    int entryGameIndex = -1;
 
     // Which section of the map's block we are inside: "cps", or "startmarks".
     //
@@ -241,6 +246,21 @@ static bool ParseFile(const char *path, const char *map, Saveloc *out,
             // "startmarks". One level further in is an entry.
             if (inMap && depth == mapDepth + 1)
                 strncpy_s(section, sizeof(section), pendingKey, _TRUNCATE);
+            // The numbered block one level inside `cps` is the index exposed by
+            // Momentum's `cur` field. Unlike position, this distinguishes two
+            // save states made at the exact same respawn point.
+            if (inMap && depth == mapDepth + 2)
+            {
+                entryGameIndex = -1;
+                if (_stricmp(section, "cps") == 0)
+                {
+                    char *end = NULL;
+                    long v = strtol(pendingKey, &end, 10);
+                    if (end && end != pendingKey && *end == '\0' &&
+                        v >= 0 && v <= 1000000)
+                        entryGameIndex = (int)v;
+                }
+            }
             pendingKey[0] = '\0';
             blockIndex = -1;        // a new block owns nothing yet
             continue;
@@ -251,6 +271,8 @@ static bool ParseFile(const char *path, const char *map, Saveloc *out,
                 break;                  // finished this map's block
             if (inMap && depth == mapDepth + 1)
                 section[0] = '\0';
+            if (inMap && depth == mapDepth + 2)
+                entryGameIndex = -1;
             depth--;
             pendingKey[0] = '\0';
             blockIndex = -1;
@@ -285,7 +307,15 @@ static bool ParseFile(const char *path, const char *map, Saveloc *out,
         val[n] = '\0';
         pendingKey[0] = '\0';
 
-        if (inMap && _stricmp(key, "pos") == 0)
+        if (inMap && depth == mapDepth && _stricmp(key, "cur") == 0)
+        {
+            char *end = NULL;
+            long v = strtol(val, &end, 10);
+            if (current && end && end != val && *end == '\0' &&
+                v >= -1 && v <= 1000000)
+                *current = (int)v;
+        }
+        else if (inMap && _stricmp(key, "pos") == 0)
         {
             // Cleared first, so a commit that fails cannot leave a later "vel"
             // pointing at the previous record. That matters past maxOut, where
@@ -310,6 +340,8 @@ static bool ParseFile(const char *path, const char *map, Saveloc *out,
                     out[*count].pos = p;
                     out[*count].ourTime = -1.0f;
                     out[*count].fromCps = (_stricmp(section, "cps") == 0);
+                    out[*count].gameIndex = out[*count].fromCps
+                                                ? entryGameIndex : -1;
                     blockIndex = *count;
                     (*count)++;
                 }
@@ -340,9 +372,10 @@ static bool ParseFile(const char *path, const char *map, Saveloc *out,
     return true;
 }
 
-static bool ParseGameFile(const char *map, Saveloc *out, int maxOut, int *count)
+static bool ParseGameFile(const char *map, Saveloc *out, int maxOut,
+                          int *count, int *current)
 {
-    return ParseFile(GamePath(), map, out, maxOut, count);
+    return ParseFile(GamePath(), map, out, maxOut, count, current);
 }
 
 static void AssignOrdinals(Saveloc *locs, int count);
@@ -363,7 +396,7 @@ bool WrSavelocParseFile(const char *path, const char *map,
         return false;
 
     int n = 0;
-    bool ok = ParseFile(path, map, tmp, maxOut, &n);
+    bool ok = ParseFile(path, map, tmp, maxOut, &n, NULL);
     if (ok)
     {
         AssignOrdinals(tmp, n);
@@ -376,6 +409,7 @@ bool WrSavelocParseFile(const char *path, const char *map,
             out[i].fromCps = tmp[i].fromCps;
             out[i].seconds = tmp[i].ourTime;
             out[i].ordinal = tmp[i].ordinal;
+            out[i].gameIndex = tmp[i].gameIndex;
         }
         *count = n;
     }
@@ -516,10 +550,10 @@ static void SaveSidecar(const char *map, const Saveloc *locs, int count)
     fprintf(f, "# flags: 1 = time typed in by hand, 2 = energy columns mean something\n");
     for (int i = 0; i < count; i++)
     {
-        // Zero is refused. The clock only starts once you leave the anchor, so
-        // 0.000 can only mean it was stamped before the clock ran -- and every
-        // 0.000 already on disk came from exactly that bug, then restored itself
-        // for ever afterwards.
+        // Zero is refused. Stamping is enabled only while Momentum says its
+        // timer is RUNNING, so 0.000 means the save arrived before a meaningful
+        // run tick -- and every old 0.000 on disk came from that bug, then
+        // restored itself for ever afterwards.
         if (locs[i].ourTime <= 0.0f)
             continue;
         int flags = 0;
@@ -576,7 +610,9 @@ static DWORD WINAPI ReadThread(LPVOID)
 
     static Saveloc found[MAX_SAVELOCS];
     int n = 0;
-    bool ok = map[0] && ParseGameFile(map, found, MAX_SAVELOCS, &n);
+    int current = -1;
+    bool ok = map[0] &&
+              ParseGameFile(map, found, MAX_SAVELOCS, &n, &current);
 
     int timed = 0;
     if (ok)
@@ -604,6 +640,20 @@ static DWORD WINAPI ReadThread(LPVOID)
 
     if (ok)
     {
+        // A rewrite that keeps the same cps table and names a current slot is
+        // Momentum loading/selecting a save state. Creation and overwrite both
+        // change the table; deletion changes its size. This event reaches the
+        // timer even when loading the current slot again moves the player zero
+        // units and leaves the timer entity otherwise continuous.
+        bool sameRows = sameMap && readOnceBefore && n == g_count;
+        for (int i = 0; sameRows && i < n; i++)
+        {
+            if (found[i].fromCps != g_locs[i].fromCps ||
+                found[i].gameIndex != g_locs[i].gameIndex ||
+                WrDist(found[i].pos, g_locs[i].pos) >= 0.5f)
+                sameRows = false;
+        }
+
         bool firstForMap = !readOnceBefore || !sameMap;
 
         // Carry forward times for save-locs that are still there, so a re-read
@@ -650,7 +700,8 @@ static DWORD WINAPI ReadThread(LPVOID)
             // and would otherwise be stamped with the clock as though the player
             // had just made a save-loc there.
             if (!matched && !firstForMap && sameMap && found[i].fromCps &&
-                g_stampValid && g_stampClock > 0.0f)
+                found[i].gameIndex == current && g_stampValid &&
+                g_stampClock > 0.0f)
             {
                 found[i].ourTime = g_stampClock;
                 found[i].suspect = false;
@@ -664,9 +715,9 @@ static DWORD WINAPI ReadThread(LPVOID)
                 }
                 timed++;
                 dirty = true;
-                WrLogf("saveloc: a NEW save-loc at (%.0f %.0f %.0f) stamped with "
-                       "%.2fs", found[i].pos.x, found[i].pos.y, found[i].pos.z,
-                       g_stampClock);
+                WrLogf("saveloc: NEW save-loc %d at (%.0f %.0f %.0f) stamped "
+                       "with %.2fs", current + 1, found[i].pos.x,
+                       found[i].pos.y, found[i].pos.z, g_stampClock);
                 _snprintf_s(g_recent, sizeof(g_recent), _TRUNCATE,
                             "save-loc saved at %.2fs", g_stampClock);
                 NoteNow();
@@ -676,6 +727,9 @@ static DWORD WINAPI ReadThread(LPVOID)
 
         memcpy(g_locs, found, sizeof(Saveloc) * (size_t)n);
         g_count = n;
+        g_current = current;
+        if (sameRows && current >= 0)
+            InterlockedIncrement(&g_loadSerial);
         InterlockedIncrement(&g_generation);
         g_timed = timed;
         _snprintf_s(g_status, sizeof(g_status), _TRUNCATE,
@@ -686,6 +740,7 @@ static DWORD WINAPI ReadThread(LPVOID)
     {
         g_count = 0;
         g_timed = 0;
+        g_current = -1;
         strcpy_s(g_status, sizeof(g_status),
                  "no savedlocs.txt, or none for this map");
     }
@@ -731,7 +786,9 @@ void WrSavelocRefresh(const char *map, float elapsed, bool running)
 
         // Captured HERE, not when the read finishes. The read is on a background
         // thread and takes as long as it takes; the clock that belongs to a new
-        // save-loc is the one at the instant the file changed.
+        // save-loc is the one at the instant the file changed. dllmain reads the
+        // game timer first, so this is the current game tick rather than the
+        // previous rendered frame.
         //
         // And captured only on a real change, never on the retry below: a retry
         // happens some frames later, and re-reading the clock then would stamp
@@ -792,11 +849,29 @@ static bool MatchWithin(const Vec3 &pos, float radius, WrSavelocHit *out)
 {
     if (!g_csReady)
         return false;
-    bool found = false;
     EnterCriticalSection(&g_cs);
+    int chosen = -1;
     float bestD = radius * radius;
+
+    // Momentum writes the exact active cps slot to `cur`. Prefer it whenever
+    // it agrees with the landing position. Position alone cannot distinguish
+    // two save states made at the same respawn point; the game index can.
     for (int i = 0; i < g_count; i++)
     {
+        if (!g_locs[i].fromCps || g_locs[i].gameIndex != g_current)
+            continue;
+        float dz = g_locs[i].pos.z - pos.z;
+        float dx = g_locs[i].pos.x - pos.x, dy = g_locs[i].pos.y - pos.y;
+        if (dz <= MATCH_VERTICAL && dz >= -MATCH_VERTICAL &&
+            dx * dx + dy * dy < bestD)
+            chosen = i;
+        break;
+    }
+
+    for (int i = 0; i < g_count; i++)
+    {
+        if (chosen >= 0)
+            break;
         float dz = g_locs[i].pos.z - pos.z;
         if (dz > MATCH_VERTICAL || dz < -MATCH_VERTICAL)
             continue;
@@ -805,33 +880,69 @@ static bool MatchWithin(const Vec3 &pos, float radius, WrSavelocHit *out)
         if (d < bestD)
         {
             bestD = d;
-            if (out)
-            {
-                // Copied out under the lock. The background reader memcpy's over
-                // the whole array, so a pointer into it would be a pointer into
-                // something being rewritten.
-                out->pos = g_locs[i].pos;
-                out->vel = g_locs[i].vel;
-                out->haveVel = g_locs[i].haveVel;
-                // fromCps and ordinal were the two fields this used to leave
-                // alone, on callers that declare the hit uninitialised -- so
-                // anyone who read them got stack garbage rather than an answer.
-                // Nothing did until the exact matcher below wanted fromCps.
-                out->fromCps = g_locs[i].fromCps;
-                out->ordinal = g_locs[i].ordinal;
-                out->seconds = g_locs[i].ourTime;
-                out->suspect = g_locs[i].suspect;
-                out->byHand = g_locs[i].byHand;
-                out->haveEnergy = g_locs[i].haveEnergy;
-                out->gained = g_locs[i].gained;
-                out->lost = g_locs[i].lost;
-                out->peak = g_locs[i].peak;
-            }
-            found = true;
+            chosen = i;
         }
     }
+
+    if (chosen >= 0 && out)
+    {
+        // Copied out under the lock. The background reader memcpy's over the
+        // whole array, so a pointer into it would be a pointer into something
+        // being rewritten.
+        out->pos = g_locs[chosen].pos;
+        out->vel = g_locs[chosen].vel;
+        out->haveVel = g_locs[chosen].haveVel;
+        out->fromCps = g_locs[chosen].fromCps;
+        out->ordinal = g_locs[chosen].ordinal;
+        out->gameIndex = g_locs[chosen].gameIndex;
+        out->seconds = g_locs[chosen].ourTime;
+        out->suspect = g_locs[chosen].suspect;
+        out->byHand = g_locs[chosen].byHand;
+        out->haveEnergy = g_locs[chosen].haveEnergy;
+        out->gained = g_locs[chosen].gained;
+        out->lost = g_locs[chosen].lost;
+        out->peak = g_locs[chosen].peak;
+    }
     LeaveCriticalSection(&g_cs);
-    return found;
+    return chosen >= 0;
+}
+
+bool WrSavelocCurrent(WrSavelocHit *out)
+{
+    if (!g_csReady)
+        return false;
+    bool ok = false;
+    EnterCriticalSection(&g_cs);
+    for (int i = 0; g_current >= 0 && i < g_count; i++)
+    {
+        if (!g_locs[i].fromCps || g_locs[i].gameIndex != g_current)
+            continue;
+        if (out)
+        {
+            out->pos = g_locs[i].pos;
+            out->vel = g_locs[i].vel;
+            out->haveVel = g_locs[i].haveVel;
+            out->fromCps = true;
+            out->ordinal = g_locs[i].ordinal;
+            out->gameIndex = g_locs[i].gameIndex;
+            out->seconds = g_locs[i].ourTime;
+            out->suspect = g_locs[i].suspect;
+            out->byHand = g_locs[i].byHand;
+            out->haveEnergy = g_locs[i].haveEnergy;
+            out->gained = g_locs[i].gained;
+            out->lost = g_locs[i].lost;
+            out->peak = g_locs[i].peak;
+        }
+        ok = true;
+        break;
+    }
+    LeaveCriticalSection(&g_cs);
+    return ok;
+}
+
+unsigned int WrSavelocLoadSerial(void)
+{
+    return (unsigned int)InterlockedCompareExchange(&g_loadSerial, 0, 0);
 }
 
 bool WrSavelocMatch(const Vec3 &pos, WrSavelocHit *out)
@@ -868,9 +979,19 @@ void WrSavelocInstallForTest(const WrSavelocHit *rows, int n)
         g_locs[i].fromCps = rows[i].fromCps;
         g_locs[i].ourTime = rows[i].seconds;
         g_locs[i].ordinal = rows[i].ordinal;
+        g_locs[i].gameIndex = rows[i].gameIndex;
         if (rows[i].seconds >= 0.0f)
             g_timed++;
     }
+    g_current = -1;
+    LeaveCriticalSection(&g_cs);
+}
+
+void WrSavelocSetCurrentForTest(int gameIndex)
+{
+    EnsureCs();
+    EnterCriticalSection(&g_cs);
+    g_current = gameIndex;
     LeaveCriticalSection(&g_cs);
 }
 

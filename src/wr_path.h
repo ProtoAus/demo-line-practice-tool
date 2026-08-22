@@ -173,7 +173,7 @@ struct WrRun
     // extractor writes t = index * tick_interval from index 0. So points[0] is
     // somewhere in the approach, and everything that read it as t = 0 was off by
     // about three quarters of a second: the graph's origin and energy zero, the
-    // live anchor, and the clock.
+    // live energy anchor, and the comparison run's time origin.
     //
     // An OFFSET rather than a re-sliced array, on purpose. breaks, dips, peaks,
     // eff and markers[].pointIndex all index points[], and every one of them
@@ -449,14 +449,14 @@ extern int g_wrEffWindow;
 // changed and a full pass over every point when something has.
 //
 // It was WrPathRefreshEfficiency and it watched one input. There are four, and
-// three of them are on the Energy tab rather than the Display tab, which is
+// three of them are on the HUD settings tab rather than Line settings, which is
 // exactly why the staleness was invisible: the slider you moved and the lines
 // that went stale were not on the same page.
 void WrPathRefreshDerived(void);
 
 // Live self-recording. Feed it the player's FEET each frame, along with the
-// smoothed velocity and the run clock, so a live point carries the same three
-// things a demo point does and can be compared against one directly.
+// exact player velocity when available (camera fallback otherwise) and the run
+// clock, so a live point carries the same three things a demo point does.
 void WrLiveRecord(const Vec3 &pos, const Vec3 &vel, float elapsed);
 void WrLiveClear(void);
 

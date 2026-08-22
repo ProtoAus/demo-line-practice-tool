@@ -75,7 +75,12 @@ All but `INSERT` are rebindable, and the **About** tab lists them as they are cu
 ## Fair play
 
 This is an injected DLL. It **reads** memory rather than writing it, sets no cvars, runs no console
-commands, and never touches `sv_cheats` — but injected code may still invalidate a submitted run
+commands, and never touches `sv_cheats`. Since v1.2.0 there is one exception to "reads only", and it
+is worth naming: to show Momentum's own run clock rather than a stopwatch of its own, it calls the
+client's published read-only accessors — `GetAllClasses`, and the entity list's lookups — to find
+the timer entity and read two of its networked fields. Those return values; nothing is written, no
+game state changes, and a mismatch disables the reader rather than guessing. Injected code may still
+invalidate a submitted run
 under Momentum's own rules. **If you care about a run counting, don't have this loaded while you set
 it.**
 
@@ -141,14 +146,15 @@ screen rather than only compared.
 
 ## Your data
 
-Nothing leaves your machine unless you press a button that says it will. No telemetry, no analytics,
-no phone-home of any kind.
+There is no telemetry, no analytics and no phone-home of any kind. Opening **Board** on a new map
+reads the fastest 50 places on its main track; demo bodies are still downloaded only when you tick
+runs and press **Download**.
 
 The DLL fetches leaderboards itself, so `WINHTTP.dll` is one of its six imports. That comes to about
 120 lines in [src/wr_http.cpp](src/wr_http.cpp) which do GET and nothing else, two hosts —
 `api.momentum-mod.org` and `api.github.com`, plus the download links their own replies contained —
-no identifier of any kind sent, and no request that is not downstream of something you pressed.
-Demos are only ever downloaded because you ticked a run.
+no identifier of any kind sent. Board reads happen only when that tab is opened (never on a timer or
+at startup), and demos are only ever downloaded because you ticked a run.
 
 `api.github.com` is only ever asked one question, and only when you press **Check for updates** in
 the About tab: what the newest release is. There is no automatic check, no timer and no setting to
@@ -161,7 +167,7 @@ into Momentum's replay folder, and **take out** removes it again.
 It also **reads** one file out of the install that is not a demo: when the map changes, the map's own
 `.bsp`, read-only and shared, on a background thread, so it can show you the angle of a ramp before
 you reach it. That is ordinary file I/O and it makes no call into the game — but it is reading
-something, so it is a checkbox in **Display → The map's own geometry**, and turning it off frees what
+something, so it is a checkbox in **Line settings → The map's own geometry**, and turning it off frees what
 it read immediately.
 
 ## Updating

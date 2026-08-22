@@ -395,11 +395,24 @@ void WrImGuiFrame(void)
     if (WrMenuOpen())
     {
         WrStageBegin(WR_STAGE_UI);
-        if (WrPanelOpen(WR_PANEL_MAIN))
+        // Edit mode owns the screen until Done. Keeping the settings panel open
+        // behind it both covers useful drag space and lets that window affect
+        // which handle receives the mouse, so the panel deliberately disappears
+        // and returns on the frame after editing finishes.
+        if (WrHudEditorOpen())
+            WrHudEditorDraw();
+        else if (WrPanelOpen(WR_PANEL_MAIN))
             WrUiDraw();
-        if (WrPanelOpen(WR_PANEL_QUICK))
+        if (!WrHudEditorOpen() && WrPanelOpen(WR_PANEL_QUICK))
             WrQuickDraw();
         WrStageEnd(WR_STAGE_UI);
+    }
+    else if (WrHudEditorOpen())
+    {
+        // Closing the menu is also a natural way to finish editing. Leaving the
+        // mode latched would make the four drag windows unexpectedly return the
+        // next time Insert is pressed.
+        WrHudEditorSetOpen(false);
     }
 
     WrStageBegin(WR_STAGE_SUBMIT);

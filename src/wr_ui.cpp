@@ -151,10 +151,12 @@ static float s_nearRadius = 4096.0f;
 static bool s_nearOnly = false;
 
 static void WrSendForget(void);
+static void BoardOnMapChanged(const char *map);
 
 void WrUiOnMapChanged(const char *map)
 {
     strcpy_s(g_uiMap, sizeof(g_uiMap), map ? map : "");
+    BoardOnMapChanged(map);
     // Whatever the last send said was about a run on the map you have left.
     WrSendForget();
 }
@@ -198,48 +200,6 @@ static void FormatTime(double t, char *out, int outLen)
     else
         _snprintf_s(out, outLen, _TRUNCATE, "%.3f", secs);
 }
-
-// FormatTime read backwards: "1:02.310" or "62.31", either of which this panel
-// might have printed. Refuses anything it cannot read completely rather than
-// taking the leading digits, because a time that silently became 1 instead of
-// 1:02 would be indistinguishable from one that was entered that way.
-static bool ParseTime(const char *s, float *out)
-{
-    if (!s) return false;
-    while (*s == ' ' || *s == '\t') s++;
-    if (!*s) return false;
-
-    char *end = NULL;
-    double a = strtod(s, &end);
-    if (end == s || a < 0.0) return false;
-
-    double secs;
-    if (*end == ':')
-    {
-        const char *rest = end + 1;
-        char *end2 = NULL;
-        double b = strtod(rest, &end2);
-        if (end2 == rest || b < 0.0 || b >= 60.0) return false;
-        secs = a * 60.0 + b;
-        end = end2;
-    }
-    else
-    {
-        secs = a;
-    }
-
-    while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') end++;
-    if (*end) return false;                 // trailing rubbish
-    if (!(secs > 0.0) || secs > 100.0 * 3600.0) return false;
-    if (out) *out = (float)secs;
-    return true;
-}
-
-// Which save-loc row is having a time typed into it, if any. One at a time, so
-// one buffer.
-static int s_editLoc = -1;
-static bool s_editFocus = false;
-static char s_editBuf[32] = "";
 
 static ImVec4 UnpackColour(unsigned int c)
 {
@@ -481,9 +441,28 @@ static void WrWatchCmdFromRow(const char *map, int mapId, const char *hash,
         }
         if (!WrIntoGameWatchCommand(map, mapId, hash, cmd, sizeof(cmd)))
         {
-            strncpy_s(s_sendText, sizeof(s_sendText),
-                      "the copy went in but the game has no path for it -- "
-                      "please report this, it should not happen", _TRUNCATE);
+            char dst[MAX_PATH];
+            if (WrIntoGamePathAt(WR_INTO_LOCAL, map, mapId, hash, dst,
+                                 sizeof(dst)))
+            {
+                const DWORD attr = GetFileAttributesA(dst);
+                if (attr == INVALID_FILE_ATTRIBUTES)
+                    _snprintf_s(s_sendText, sizeof(s_sendText), _TRUNCATE,
+                                "the copy reported success, but %s is no longer "
+                                "readable (Windows error %lu) -- security "
+                                "software may have quarantined it", dst,
+                                (unsigned long)GetLastError());
+                else
+                    _snprintf_s(s_sendText, sizeof(s_sendText), _TRUNCATE,
+                                "the replay exists at %s, but its game-relative "
+                                "watch command could not be formed", dst);
+            }
+            else
+            {
+                strncpy_s(s_sendText, sizeof(s_sendText),
+                          "the copy succeeded, but the local replay path could "
+                          "not be formed", _TRUNCATE);
+            }
             s_sendBad = true;
             return;
         }
@@ -1457,28 +1436,33 @@ static float SeparatorHeight(void)
 #define WR_OUTPUT_HEIGHT 132.0f
 
 // The list pane above a fixed-height output box.
+//
+// Always return an exact positive height. A zero-height scrolling table asks
+// ImGui to infer the remainder from its parent, and the old 140 px floor could
+// make the parent itself scroll when the controls above grew by one line. Once
+// both the parent and the table scrolled, the table's last rows could sit below
+// the parent's reachable range. The list now owns precisely what is left in the
+// current frame, including when a ticked-download button or output pane appears.
 static float ListHeightAbove(bool showingOutput)
 {
-    if (!showingOutput)
-        return 0.0f;            // ImGui reads 0 as "take what is left"
-    return FillHeight(WR_OUTPUT_HEIGHT + SeparatorHeight(), 140.0f);
+    const float reserve = showingOutput
+        ? WR_OUTPUT_HEIGHT + SeparatorHeight() : 0.0f;
+    const float h = ImGui::GetContentRegionAvail().y - reserve;
+    return h > 1.0f ? h : 1.0f;
 }
 
-// Every map Momentum knows about, what we hold for it, and a way to get more.
+// Every map Momentum knows about, what we hold for it, and a way to open its
+// board.
 //
 // The listing costs nothing: the game caches the whole catalogue on disk and
-// wr_maps.h reads an index made from it. Fetching is the one part that reaches
-// outside this machine, and it is off until you turn it on.
-static bool g_fetchEnabled = false;
-static bool g_intoGame = false;         // also put downloads where the game looks
-static int g_fetchTop = 25;
-static int g_fetchTrackType = 0;
-static int g_fetchTrackNum = 1;
+// wr_maps.h reads an index made from it. Network and demo actions live on the
+// Board tab; keeping a second fetch path here is how the old browse button came
+// to disagree with the real board request.
 static char g_mapFilter[64] = {0};
 
 // Defined with the rest of the Board tab, below. Hands it a map and asks it to
 // come to the front, which is what the per-row "board" button does.
-static void BoardShow(const char *map, int trackType, int trackNum);
+static void BoardShow(const char *map);
 
 // The Maps table used to pass ImGuiTableFlags_Sortable and implement nothing:
 // no column carried a user id and TableGetSortSpecs was never called, so
@@ -1614,61 +1598,6 @@ static void DrawMapsTab(void)
                "row you want is one of the ones being hidden, and typing its "
                "name is exactly what brings it back.");
 
-    // --- fetching -----------------------------------------------------------
-    ImGui::SeparatorText("Download demos");
-    ImGui::Checkbox("Allow downloading", &g_fetchEnabled);
-    ImGui::SameLine();
-    HelpMarker(
-        "The second thing WrLines does that reaches outside your machine, and "
-        "like the Steam name lookup it is a checkbox you control.\n\n"
-        "It asks Momentum's public leaderboard for a map's top runs and "
-        "downloads only the ones you do not already have. That last part is "
-        "exact rather than approximate: a run's replay hash IS the demo's "
-        "filename, so asking for the top fifty of a map you have forty-nine of "
-        "downloads one file.\n\n"
-        "One request at a time, a pause between them, and only when you press "
-        "the button -- never on a map change, never in the background. Demos "
-        "land in wrlines_data\\demos, not in the game install, which stays "
-        "untouched.\n\n"
-        "The endpoint needs no account and no token. Momentum's terms say "
-        "nothing about automated access either way, so the pacing here is "
-        "manners rather than a rule: this is free community infrastructure.");
-
-    if (g_fetchEnabled)
-    {
-        ImGui::Checkbox("Also put them where the game can play them",
-                        &g_intoGame);
-        ImGui::SameLine();
-        HelpMarker(
-            "OFF BY DEFAULT, and the only thing WrLines ever writes into the "
-            "game install.\n\n"
-            "Downloads normally land in wrlines_data\\demos, which the game "
-            "knows nothing about -- so you can draw them as lines but not watch "
-            "them. With this on they are ALSO copied into "
-            "momentum\\momtv\\online\\<map id>, which is the game's own replay "
-            "folder, under the game's own filename: the replay hash, which is "
-            "what our copies are already named. There is no index file beside "
-            "them, so the game finds replays by scanning that folder.\n\n"
-            "A copy, not a move. Your own tree keeps its copy, so if the game "
-            "ever clears its cache your lines survive.\n\n"
-            "Honest limit: this puts the file exactly where the game keeps its "
-            "own downloads, but whether the in-game replay menu LISTS it or "
-            "only finds it already downloaded when you pick that run from the "
-            "leaderboard is not something this side can check. Worth trying "
-            "once and seeing.");
-        ImGui::SliderInt("Leaderboard places", &g_fetchTop, 5, 200);
-        ImGui::SetNextItemWidth(120.0f);
-        const char *kTracks[3] = { "main", "stage", "bonus" };
-        ImGui::Combo("Track", &g_fetchTrackType, kTracks, 3);
-        if (g_fetchTrackType != 0)
-        {
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(100.0f);
-            ImGui::InputInt("number", &g_fetchTrackNum);
-            if (g_fetchTrackNum < 1) g_fetchTrackNum = 1;
-        }
-    }
-
     // --- the list -----------------------------------------------------------
     //
     // Both counts are of THIS MACHINE. Neither is the leaderboard's, and the
@@ -1678,13 +1607,13 @@ static void DrawMapsTab(void)
     // about what exists.
     ImGui::TextDisabled("demos = .mtv files you hold    lines = .wrpath files "
                         "extracted from them, which is what draws");
-    ImGui::TextDisabled("Neither is the server's count -- that costs a request "
-                        "per map, so it is on the browse button.");
+    ImGui::TextDisabled("Neither is the server's count -- open Board to read "
+                        "the leaderboard for one map.");
 
     // The table and the output share what is left of the window, rather than
     // both being a fixed box with the rest of a maximised panel wasted under
-    // them. Browsing a leaderboard 200 places deep is the case that wants the
-    // room, so the map list takes every pixel the output box does not need.
+    // them. Rebuilding a large index is the case that can produce output here,
+    // so the map list takes every pixel the output box does not need.
     bool showOut = WrExtractRunning() || WrExtractLineCount() > 0;
     float tableH = ListHeightAbove(showOut);
 
@@ -1705,7 +1634,7 @@ static void DrawMapsTab(void)
         ImGui::TableSetupColumn("lines", ImGuiTableColumnFlags_WidthFixed,
                                 55.0f, MAPCOL_LINES);
         ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed |
-                                    ImGuiTableColumnFlags_NoSort, 230.0f);
+                                    ImGuiTableColumnFlags_NoSort, 62.0f);
         ImGui::TableHeadersRow();
 
         // Filter first, then sort the indices that survived -- the store keeps
@@ -1767,40 +1696,12 @@ static void DrawMapsTab(void)
                 ImGui::Text("%d", m->extracted);
 
             ImGui::TableNextColumn();
-            // Always offered, because it costs nothing: it only opens the
-            // board tab on this map, and whether anything is fetched there is
-            // a separate decision behind the same toggle.
+            // The Maps tab has one route to leaderboard work. The old browse
+            // and download buttons duplicated the Board tab with different
+            // request parameters, which is how one could fail while the other
+            // worked.
             if (ImGui::SmallButton("board"))
-                BoardShow(m->name, g_fetchTrackType, g_fetchTrackNum);
-            if (g_fetchEnabled && !WrExtractRunning())
-            {
-                WrExtractRequest req = {WR_JOB_FETCH};
-                strncpy_s(req.map, sizeof(req.map), m->name, _TRUNCATE);
-                req.mapId = m->id;
-                req.top = g_fetchTop;
-                req.trackType = g_fetchTrackType;
-                req.trackNum = g_fetchTrackNum;
-                req.intoGame = g_intoGame;
-
-                // Browse first, download second. One request, nothing written,
-                // and it prints the leaderboard's own total -- which is the
-                // only place that number can come from.
-                ImGui::SameLine();
-                if (ImGui::SmallButton("browse"))
-                {
-                    req.dryRun = true;
-                    WrExtractSubmit(&req);
-                    req.dryRun = false;
-                }
-                ImGui::SameLine();
-                if (ImGui::SmallButton("download"))
-                    WrExtractSubmit(&req);
-            }
-            else if (isHere && m->extracted < m->demos)
-            {
-                ImGui::SameLine();
-                ImGui::TextDisabled("extract in Runs");
-            }
+                BoardShow(m->name);
             ImGui::PopID();
         }
         ImGui::EndTable();
@@ -1915,6 +1816,22 @@ static void DrawDisplayTab(void)
 {
     ImGui::SeparatorText("Line");
     ImGui::SliderFloat("Thickness", &g_render.thickness, 0.5f, 10.0f, "%.1f px");
+    ImGui::SliderFloat("Vertical offset", &g_render.lineHeightOffset,
+                       -128.0f, 128.0f, "%+.0f u");
+    ImGui::SameLine();
+    HelpMarker(
+        "Moves the drawn paths and everything attached to them up or down "
+        "without changing their real coordinates or any physics. Demo paths "
+        "are recorded at the player's feet: +28 is roughly crouched eye level "
+        "and +64 is standing eye level.");
+    if (ImGui::SmallButton("feet##lineheight"))
+        g_render.lineHeightOffset = 0.0f;
+    ImGui::SameLine();
+    if (ImGui::SmallButton("crouch eye##lineheight"))
+        g_render.lineHeightOffset = 28.0f;
+    ImGui::SameLine();
+    if (ImGui::SmallButton("standing eye##lineheight"))
+        g_render.lineHeightOffset = 64.0f;
     ImGui::SliderFloat("Opacity", &g_render.alpha, 0.05f, 1.0f, "%.2f");
     ImGui::SliderFloat("Draw distance", &g_render.maxDrawDistance,
                        250.0f, 16000.0f, "%.0f u");
@@ -2460,7 +2377,7 @@ static void DrawDisplayTab(void)
             "lost its energy over the points around it. Rebuilt when you let go "
             "of the slider, because it is a pass over every point of every "
             "loaded run.");
-        // The SAME setting is offered on the Energy tab, beside the strafe
+        // The SAME setting is offered in HUD settings, beside the strafe
         // readout. It is not a duplicate by accident: it governs the strafe
         // colours and the strafe bar as well as the lines, and it lived here
         // only, nested inside a mode most people never select -- so a player
@@ -3432,6 +3349,7 @@ static int g_bFromRank = 1, g_bCount = 50, g_bSpread = 20;
 static bool g_bSelect[WR_BOARD_MAX];
 static bool g_bWantFocus = false;       // the Maps tab asked to come here
 static bool g_bLoaded = false;          // has this map/mode been asked for yet
+static bool g_bAutoFastest = false;     // new map waits for its first Board view
 static bool g_bFriendsOnly = false;
 static bool g_bRefilter = false;        // something other than the text changed
 
@@ -3598,20 +3516,43 @@ static int WriteFriendsFile(void)
     return n;
 }
 
-static void BoardShow(const char *map, int trackType, int trackNum)
+// Put a newly selected map on its main track and arm one top-50 read. Merely
+// changing maps does no I/O: DrawBoardTab is not called until the tab is open,
+// and that first view is the action that submits it.
+static void BoardUseMap(const char *map)
 {
     if (map && *map)
-        strcpy_s(g_bMap, sizeof(g_bMap), map);
-    g_bTrackType = trackType;
-    g_bTrackNum = trackNum < 1 ? 1 : trackNum;
+        strncpy_s(g_bMap, sizeof(g_bMap), map, _TRUNCATE);
+    else
+        g_bMap[0] = '\0';
+    const int defaultMode = WrGamemodeFromMapName(g_bMap);
+    if (defaultMode > 0)
+        g_bMode = defaultMode;
+    g_bTrackType = 0;
+    g_bTrackNum = 1;
     g_bLoaded = false;
+    g_bAutoFastest = g_bMap[0] != '\0';
+}
+
+static void BoardOnMapChanged(const char *map)
+{
+    BoardUseMap(map);
+}
+
+static void BoardShow(const char *map)
+{
+    // Focusing the same board again is not a new map and must not refresh it a
+    // second time. BoardUseMap has already armed it if this is the current map
+    // and its first Board visit has not happened yet.
+    if (map && *map && _stricmp(g_bMap, map) != 0)
+        BoardUseMap(map);
     g_bWantFocus = true;
 }
 
 // The five fetch buttons on this tab differ only in which window of the board
 // they ask for. They used to differ by formatting five different command-line
 // fragments, which is the same thing said less clearly.
-static void BoardRun(WrBoardFetchMode mode, int fromRank, int count, int spread)
+static bool BoardRun(WrBoardFetchMode mode, int fromRank, int count, int spread)
 {
     WrExtractRequest req = {WR_JOB_BOARD};
     strncpy_s(req.map, sizeof(req.map), g_bMap, _TRUNCATE);
@@ -3622,7 +3563,7 @@ static void BoardRun(WrBoardFetchMode mode, int fromRank, int count, int spread)
     req.fromRank = fromRank;
     req.count = count;
     req.spread = spread;
-    WrExtractSubmit(&req);
+    return WrExtractSubmit(&req);
 }
 
 static void DrawBoardTab(void)
@@ -3635,7 +3576,7 @@ static void DrawBoardTab(void)
         // Truncating, not asserting: g_levelName is 128 and this box is 72, and
         // strcpy_s answers an overlong name by killing the process.
         if (here && *here)
-            strncpy_s(g_bMap, sizeof(g_bMap), here, _TRUNCATE);
+            BoardUseMap(here);
     }
 
     ImGui::TextWrapped(
@@ -3647,6 +3588,19 @@ static void DrawBoardTab(void)
     ImGui::SetNextItemWidth(200.0f);
     if (ImGui::InputText("Map", g_bMap, sizeof(g_bMap)))
         g_bLoaded = false;
+    if (ImGui::IsItemDeactivatedAfterEdit())
+    {
+        // A typed map is a new board in exactly the same sense as pressing a
+        // map row: start it on main and fill the first page when the job slot is
+        // available. Waiting for edit completion prevents one request per
+        // partially typed name.
+        g_bTrackType = 0;
+        g_bTrackNum = 1;
+        const int defaultMode = WrGamemodeFromMapName(g_bMap);
+        if (defaultMode > 0)
+            g_bMode = defaultMode;
+        g_bAutoFastest = g_bMap[0] != '\0';
+    }
 
     // The default above only fires while the box is EMPTY, so one look at
     // somebody else's board and the way back is retyping your own map name.
@@ -3662,10 +3616,7 @@ static void DrawBoardTab(void)
     if (!canGoBack)
         ImGui::BeginDisabled();
     if (ImGui::Button("This map"))
-    {
-        strncpy_s(g_bMap, sizeof(g_bMap), standingIn, _TRUNCATE);
-        g_bLoaded = false;
-    }
+        BoardUseMap(standingIn);
     if (!canGoBack)
         ImGui::EndDisabled();
     if (canGoBack && ImGui::IsItemHovered())
@@ -3683,24 +3634,33 @@ static void DrawBoardTab(void)
     {
         g_bMode = modeIdx + 1;
         g_bLoaded = false;
+        g_bAutoFastest = false;
     }
     ImGui::SameLine();
-    HelpMarker("Momentum gives nearly every map a leaderboard in nearly every "
-               "mode -- all 546 surf maps in the local catalogue list twelve of "
-               "them -- and most of those boards are empty. So the mode cannot "
-               "be worked out from the map and has to be picked. If a fetch "
-               "comes back with no runs, this is the first thing to check.");
+    HelpMarker("A newly selected map starts on the discipline its name normally "
+               "declares: surf_, bhop_, rj_, sj_, ahop_, conc_ or defrag_. The "
+               "same rule drives the Delete-key quick board.\n\n"
+               "Momentum still gives nearly every map a leaderboard in nearly "
+               "every mode, and most are empty. Ambiguous families such as kz_ "
+               "have several valid modes, so this remains editable; if one of "
+               "those comes back empty, pick its intended climb mode here.");
 
     ImGui::SetNextItemWidth(120.0f);
     const char *kTracks[3] = { "main", "stage", "bonus" };
     if (ImGui::Combo("Track", &g_bTrackType, kTracks, 3))
+    {
         g_bLoaded = false;
+        g_bAutoFastest = false;
+    }
     if (g_bTrackType != 0)
     {
         ImGui::SameLine();
         ImGui::SetNextItemWidth(100.0f);
         if (ImGui::InputInt("number", &g_bTrackNum))
+        {
             g_bLoaded = false;
+            g_bAutoFastest = false;
+        }
         if (g_bTrackNum < 1)
             g_bTrackNum = 1;
     }
@@ -3730,6 +3690,16 @@ static void DrawBoardTab(void)
         g_bLoaded = true;
     }
 
+    // The first time Board is drawn for a newly selected map, populate the
+    // useful default immediately. This is deliberately after the cache load:
+    // cached rows can be shown while the refresh runs, and the completed fetch
+    // bumps the generation counter above so the merged cache is re-read.
+    if (g_bAutoFastest && !WrExtractRunning())
+    {
+        if (BoardRun(WR_BOARD_WINDOW, 1, 50, 0))
+            g_bAutoFastest = false;
+    }
+
     ImGui::TextDisabled("%s", WrBoardStatus());
     long long fetched = WrBoardFetched();
     if (fetched > 0)
@@ -3748,16 +3718,6 @@ static void DrawBoardTab(void)
 
     // --- fetching a window --------------------------------------------------
     ImGui::SeparatorText("Fetch part of the board");
-    ImGui::Checkbox("Allow downloading", &g_fetchEnabled);
-    ImGui::SameLine();
-    HelpMarker("The same switch as in the Maps tab -- one setting, offered in "
-               "both places so neither tab is a dead end.\n\n"
-               "Nothing here reaches the network until it is on, and then only "
-               "when a button is pressed. One request at a time, with a pause "
-               "between them: this is free community infrastructure.\n\n"
-               "Everything here is done inside the DLL and needs no Python -- "
-               "reading the board, and downloading the demos too.");
-    if (g_fetchEnabled)
     {
         bool busy = WrExtractRunning();
         if (busy)
@@ -3884,12 +3844,12 @@ static void DrawBoardTab(void)
 
     if (picked > 0)
     {
-        bool busy = WrExtractRunning() || !g_fetchEnabled;
+        bool busy = WrExtractRunning();
         if (busy)
             ImGui::BeginDisabled();
         char lbl[64];
         _snprintf_s(lbl, sizeof(lbl), _TRUNCATE, "Download %d ticked##dl", picked);
-        if (ImGui::Button(lbl))
+        if (ImGui::SmallButton(lbl))
         {
             // The whole selection, however big. It used to have to become a file
             // on the way out because it travelled on a command line; the request
@@ -3902,7 +3862,6 @@ static void DrawBoardTab(void)
                 req.gamemode = g_bMode;
                 req.trackType = g_bTrackType;
                 req.trackNum = g_bTrackNum;
-                req.intoGame = g_intoGame;
                 req.ranks = ranks;
                 req.rankCount = CollectPicks(ranks, picked);
                 if (req.rankCount > 0)
@@ -4020,7 +3979,10 @@ static void DrawBoardTab(void)
                     continue;
 
                 ImGui::TableNextRow();
-                ImGui::PushID(i);
+                // The stable replay identity scopes every row action. Hidden
+                // action suffixes below also keep the visible "watch" label
+                // separate from the table column's own generated ID.
+                ImGui::PushID(r->hash);
 
                 ImGui::TableNextColumn();
                 bool sel = g_bSelect[i];
@@ -4074,14 +4036,14 @@ static void DrawBoardTab(void)
                     // The path-based command works here for exactly the reason
                     // it works in Runs, and it needs no map id -- the local tree
                     // is named by the map.
-                    if (ImGui::SmallButton("watch"))
+                    if (ImGui::SmallButton("watch##board-watch"))
                         WrWatchCmdFromRow(WrBoardMap(), bMapId, r->hash,
                                           r->alias, WR_SEND_TAB_BOARD);
                     ImGui::SameLine();
 
                     if (WrIntoGameMine(bMapId, r->hash))
                     {
-                        if (ImGui::SmallButton("take out"))
+                        if (ImGui::SmallButton("take out##board-take-out"))
                         {
                             WrIntoGameRemoveOne(bMapId, r->hash);
                             WrSendForget();
@@ -4091,13 +4053,13 @@ static void DrawBoardTab(void)
                     {
                         if (bMapId > 0)
                         {
-                            if (ImGui::SmallButton("send"))
+                            if (ImGui::SmallButton("send##board-send"))
                                 WrSendFromRow(WR_INTO_ONLINE, WrBoardMap(),
                                               bMapId, r->hash, r->alias,
                                               WR_SEND_TAB_BOARD);
                             ImGui::SameLine();
                         }
-                        if (ImGui::SmallButton("local"))
+                        if (ImGui::SmallButton("local##board-local"))
                             WrSendFromRow(WR_INTO_LOCAL, WrBoardMap(), bMapId,
                                           r->hash, r->alias, WR_SEND_TAB_BOARD);
                     }
@@ -4126,8 +4088,14 @@ static void DrawBoardTab(void)
     }
 }
 
-static void DrawEnergyTab(void)
+// The old Energy page had gradually become two pages interleaved with each
+// other: live energy/timing information and every HUD/physics adjustment. Draw
+// them from one implementation so the controls keep their existing IDs and
+// settings, but expose them as two coherent tabs.
+static void DrawEnergyOrHudTab(bool settingsOnly)
 {
+    if (!settingsOnly)
+    {
     ImGui::TextWrapped(
         "Energy is how high you could still get if you redirected everything "
         "you have straight up, measured from the anchor:  E = height above the "
@@ -4250,10 +4218,16 @@ static void DrawEnergyTab(void)
                                "totals span a save-loc load");
     }
 
+    }
+
+    if (settingsOnly)
+    {
+    ImGui::SeparatorText("Crosshair mode and keys");
     ImGui::Spacing();
     const char *kModes[] = {
         "net energy", "carried %", "spent / banked", "gained / lost",
-        "strafe quality", "turn rate vs ideal", "net energy + strafe"
+        "strafe quality", "turn rate vs ideal", "net energy + strafe",
+        "air acceleration stress"
     };
     WR_TABLE_IS_FULL(kModes, WR_HUD_MODE_COUNT);
     if (g_energy.hudMode < 0 || g_energy.hudMode >= WR_HUD_MODE_COUNT)
@@ -4280,13 +4254,14 @@ static void DrawEnergyTab(void)
             "-- dE/dt -- against a ceiling of 37.5 energy units a second, which "
             "is the same at 500 u/s as at 3500 and the same on every angle of "
             "ramp. There is nothing about the geometry left to compensate for.\n\n"
-            "Nor does the deadstrafe period need compensating at these settings. "
-            "Source quarters your surface friction while you are airborne rising "
-            "SLOWER than 140 u/s over a ramp, but that only bites if it drops "
-            "acceleration below the 30 u/s wishspeed cap: at air accelerate 150 "
-            "it goes 562 to 141, still miles above it. Measured on the demos "
-            "here, p95 of energy gain is 38.07 inside that window across 69,916 "
-            "samples and 37.99 outside it across 795,096.\n\n"
+            "The ceiling now uses the same live movement state as Momentum. "
+            "Surf crouching scales the uncapped wishspeed to 34%, and "
+            "CategorizePosition quarters surface friction at 0 < vertical "
+            "speed <= 140 over no standable surface. At the default air "
+            "accelerate 150 even crouch plus that quarter still reaches the "
+            "30 u/s cap, so the visible ceiling correctly stays 37.5. At lower "
+            "air-accelerate values it falls instead of pretending the cap still "
+            "binds.\n\n"
             "WHY THE WINDOW IS SO LONG. Your velocity is estimated by "
             "differencing camera positions, and against a 37-unit ceiling that "
             "estimate is coarse. Simulated against twelve real runs: at 0.25 s "
@@ -4333,13 +4308,36 @@ static void DrawEnergyTab(void)
             "by the server rather than by how well you are pointing.");
     }
 
+    if (g_energy.hudMode == WR_HUD_STRESS)
+    {
+        ImGui::SameLine();
+        HelpMarker(
+            "Live AirAccelerate headroom against Source's 30 u/s wishspeed "
+            "cap. The large row is NORMAL -> CURRENT acceleration per game "
+            "tick. NORMAL uses standing wishspeed and full friction; CURRENT "
+            "applies Momentum's live crouch crop and deadstrafe friction.\n\n"
+            "At the usual surf values it reads 562.5 -> 140.6 during the "
+            "quarter-friction window. The smaller row says that 140.6 is still "
+            "4.69x the 30 cap, so the cap still binds and the available gain "
+            "has not fallen. Green means there is at least 1x cap available; "
+            "orange means acceleration itself has become the limit.\n\n"
+            "These are the engine's UNCLAMPED acceleration budgets, not the "
+            "speed you actually gain. AirAccelerate still applies at most the "
+            "remaining addspeed up to 30. The display therefore measures how "
+            "hard the server settings push against the cap, not how well the "
+            "player pressed a strafe.\n\n"
+            "Air accelerate and max speed below are settings because WrLines "
+            "does not alter or read cvars. The tick interval is read live from "
+            "Momentum's timer entity.");
+    }
+
     KeyBindCombo("Next mode", &g_hudCycleKey);
     KeyBindCombo("Previous mode", &g_hudCycleBackKey);
     ImGui::SameLine();
     HelpMarker("Page Down and Page Up switch the box's mode without opening this "
-               "panel, which is the only way it is useful mid-run. Two keys "
-               "rather than one, because there are five modes now and cycling "
-               "forward past the one you wanted means four more presses.\n\n"
+               "panel, which is the only way it is useful mid-run. Both "
+               "directions are available so passing the mode you wanted does "
+               "not require another full lap through the list.\n\n"
                "A list rather than a fixed key, because WrLines cannot see what "
                "you have bound. The key is read, not swallowed -- if it collides "
                "with something, the game still acts on it, so set this to (none) "
@@ -4357,6 +4355,10 @@ static void DrawEnergyTab(void)
                "It is the short way round everything this panel can do at "
                "length. Both can be open at once, and Escape closes both.");
 
+    }
+
+    if (!settingsOnly)
+    {
     // --- the anchor ---------------------------------------------------------
     ImGui::SeparatorText("Anchor");
     WrAnchorSource src = WrEnergyAnchorSource();
@@ -4379,14 +4381,11 @@ static void DrawEnergyTab(void)
                "second. So the zero point silently re-based itself at the top of "
                "every arc and stepped again on landing. The number was not "
                "noisy; its origin was moving.\n\n"
-               "Anchoring at the run's own first point also makes the clock "
-               "below exact, because their time and yours then start in the "
-               "same place.\n\n"
                "A teleport back to the anchor -- a fail trigger, or the restart "
-               "key -- is treated as a new attempt: the clock returns to zero "
-               "and the peak is forgotten. The anchor itself stays put. This is "
-               "the only way WrLines can see a restart at all, since it reads "
-               "the camera and nothing else.");
+               "key -- is treated as a new energy attempt: the peak is "
+               "forgotten and the live recording is split. The anchor itself "
+               "stays put. Timing is independent and follows Momentum's own "
+               "timer state and tick count.");
 
     if (ImGui::Button("Anchor here"))
         WrEnergyRearm();
@@ -4401,9 +4400,9 @@ static void DrawEnergyTab(void)
     ImGui::Checkbox("Notice when I leave the start", &g_start.enabled);
     ImGui::SameLine();
     HelpMarker(
-        "THIS IS NOT READING THE MAPPER'S ZONE. WrLines has no entity access, "
-        "no netvars, and no sight of the game's timer -- it knows a camera and "
-        "some files. It cannot see a trigger fire and it is not going to.\n\n"
+        "This fitted zone is still used for re-anchoring the energy display and "
+        "for separating live recordings into attempts. It does not start or "
+        "zero the clock: the clock now follows Momentum's networked timer.\n\n"
         "What it does instead: every loaded run knows where its own run began, "
         "so a map with two hundred runs carries two hundred independent "
         "observations of where the start is. The circle drawn in the world is "
@@ -4412,15 +4411,13 @@ static void DrawEnergyTab(void)
         "The circle only decides when you count as standing in the start. The "
         "moment that fires is crossing the LINE outward, because the recorded "
         "points sit on the way out of the zone rather than in the middle of it "
-        "-- firing on leaving the circle would start the clock late by the "
+        "-- treating the circle edge as the start would place it late by the "
         "radius divided by your speed, which is half a second at 500 u/s.\n\n"
         "It arms only when you are inside, on the ground and slow, so looping "
         "back over the line at speed mid-run cannot re-fire it.");
     if (g_start.enabled)
     {
         ImGui::Checkbox("Re-anchor", &g_start.autoAnchor);
-        ImGui::SameLine();
-        ImGui::Checkbox("Zero the clock", &g_start.autoZeroClock);
         ImGui::SameLine();
         ImGui::Checkbox("Draw it", &g_start.showZone);
 
@@ -4503,7 +4500,7 @@ static void DrawEnergyTab(void)
                     ImGui::SetTooltip(
                         "How far apart the recorded starts sit along the "
                         "crossing direction. At 1600 u/s that is about %.0f ms "
-                        "of uncertainty in when the clock zeroes.",
+                        "of spread in where the recorded starts sit.",
                         z->alongSpread / 1600.0f * 1000.0f);
 
                 ImGui::TableSetColumnIndex(4);
@@ -4556,51 +4553,21 @@ static void DrawEnergyTab(void)
         }
         ImGui::TextDisabled("%s", WrTimerWhyNot(tref));
     }
-    if (ImGui::Button(WrTimerRunning() ? "Stop" : "Start"))
-    {
-        if (WrTimerRunning()) WrTimerStop(); else WrTimerStart();
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Zero"))
-        WrTimerZero();
-    ImGui::SameLine();
-    if (WrTimerManual())
-        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "started by hand");
-    else if (WrTimerRunning())
-        ImGui::TextDisabled("running from the anchor");
-    else
-        ImGui::TextDisabled("leave the anchor, or press Start");
+    ImGui::TextDisabled("Read from Momentum's timer; there is no manual or "
+                        "movement-started fallback.");
 
     // --- save-locs ----------------------------------------------------------
     ImGui::SeparatorText("Save-locs");
     ImGui::TextDisabled("%s", WrSavelocStatus());
     ImGui::SameLine();
-    HelpMarker("Momentum's save-locs record where you were but not how long it "
-               "took to get there -- the file has a \"time\" field and it is "
-               "-1 in every one of the 3213 entries on this machine.\n\n"
-               "So WrLines keeps its own note, in wrlines_data\\savelocs. Load a "
-               "save-loc and the clock goes back to what it said when you made "
-               "it, so you can practise a map a section at a time and keep a "
-               "running total.\n\n"
-               "A time is recorded when a save-loc is CREATED. The first version "
-               "of this stamped the nearest untimed save-loc you were standing "
-               "near, which meant walking past one timed it -- that produced 111 "
-               "stamps on this machine and left surf_hades2 with twenty entries "
-               "at the spawn, each written by a different lap. Times from before "
-               "that fix are marked with a ? because a good one cannot be told "
-               "from a bad one; forget them and re-drive the route.\n\n"
-               "That rule leaves every save-loc made before WrLines existed "
-               "permanently untimed, and there is no way to work out what those "
-               "times were -- guessing from proximity is the bug above. So they "
-               "can be typed in: press \"set...\" on a row and enter either "
-               "1:02.31 or 62.31. A typed time is marked with a * so it is never "
-               "confused with a measured one.\n\n"
-               "Energy is a different story. The velocity a save-loc was made at "
-               "is in the game's OWN file, for every save-loc ever made, so "
-               "loading one starts the readout at the right number instead of "
-               "working it out again from scratch. That needs nothing from us "
-               "and works on save-locs from years ago.\n\n"
-               "Nothing is ever written into the game install.");
+    HelpMarker("When Momentum's timer is running, creating a save-loc stamps "
+               "that exact cps slot with the current game-timer value. Momentum's "
+               "`cur` field identifies the exact slot again on load, even when "
+               "several slots share one position. WrLines then resumes its "
+               "practice clock from the stamped value.\n\n"
+               "Times are kept only in wrlines_data\\savelocs. Nothing is written "
+               "into the game install. Save-locs created before this version "
+               "remain untimed; the tool will not guess a time for them.");
 
     {
         float age = 0.0f;
@@ -4630,124 +4597,12 @@ static void DrawEnergyTab(void)
         }
     }
 
-    int nLocs = WrSavelocCount();
-    // A re-read can shorten the list under an open edit box -- deleting a
-    // save-loc in game renumbers the rest -- and a row index left pointing past
-    // the end would sit there invisibly and commit to the wrong entry the next
-    // time the list grew.
-    if (s_editLoc >= nLocs)
-        s_editLoc = -1;
-    if (nLocs > 0)
-    {
-        if (ImGui::BeginTable("##savelocs", 4,
-                              ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders |
-                              ImGuiTableFlags_ScrollY,
-                              ImVec2(0.0f, 150.0f)))
-        {
-            ImGui::TableSetupScrollFreeze(0, 1);
-            ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 30.0f);
-            ImGui::TableSetupColumn("time", ImGuiTableColumnFlags_WidthFixed, 80.0f);
-            ImGui::TableSetupColumn("split", ImGuiTableColumnFlags_WidthFixed, 70.0f);
-            ImGui::TableSetupColumn("where", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableHeadersRow();
-
-            float prevTime = -1.0f;
-            for (int i = 0; i < nLocs; i++)
-            {
-                WrSavelocRow row;
-                if (!WrSavelocAt(i, &row))
-                    continue;
-                ImGui::TableNextRow();
-                ImGui::PushID(i);
-
-                ImGui::TableNextColumn();
-                ImGui::Text("%d", i + 1);
-
-                ImGui::TableNextColumn();
-                if (s_editLoc == i)
-                {
-                    // Typing one in. Accepts either form the panel itself
-                    // prints, so a split read off this table can be typed
-                    // straight back into it.
-                    ImGui::SetNextItemWidth(-1.0f);
-                    if (s_editFocus)
-                    {
-                        ImGui::SetKeyboardFocusHere();
-                        s_editFocus = false;
-                    }
-                    if (ImGui::InputTextWithHint("##settime", "m:ss.xx",
-                                                 s_editBuf, sizeof(s_editBuf),
-                                                 ImGuiInputTextFlags_EnterReturnsTrue))
-                    {
-                        float secs = 0.0f;
-                        if (ParseTime(s_editBuf, &secs))
-                            WrSavelocSetTime(i, secs);
-                        s_editLoc = -1;
-                    }
-                    else if (ImGui::IsKeyPressed(ImGuiKey_Escape))
-                    {
-                        s_editLoc = -1;
-                    }
-                }
-                else if (row.seconds >= 0.0f)
-                {
-                    char t[32];
-                    FormatTime(row.seconds, t, sizeof(t));
-                    // Three provenances, three appearances: stamped when the
-                    // save-loc was made, typed in by hand, or inherited from a
-                    // sidecar written before the stamping bug was fixed.
-                    if (row.suspect)
-                        ImGui::TextDisabled("%s ?", t);
-                    else if (row.byHand)
-                        ImGui::TextColored(ImVec4(0.75f, 0.85f, 1.0f, 1.0f),
-                                           "%s *", t);
-                    else
-                        ImGui::Text("%s", t);
-                    if (row.byHand && ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Typed in, not measured.");
-                }
-                else
-                {
-                    if (ImGui::SmallButton("set..."))
-                    {
-                        s_editLoc = i;
-                        s_editFocus = true;
-                        s_editBuf[0] = '\0';
-                    }
-                }
-
-                // Splits, so a chain of save-locs reads as a route rather than
-                // as a column of absolute times.
-                ImGui::TableNextColumn();
-                if (row.seconds >= 0.0f && prevTime >= 0.0f &&
-                    row.seconds > prevTime)
-                    ImGui::TextDisabled("+%.2f", row.seconds - prevTime);
-                else
-                    ImGui::TextDisabled(" ");
-                if (row.seconds >= 0.0f)
-                    prevTime = row.seconds;
-
-                ImGui::TableNextColumn();
-                ImGui::TextDisabled("%.0f %.0f %.0f", row.pos.x, row.pos.y,
-                                    row.pos.z);
-                if (row.seconds >= 0.0f)
-                {
-                    ImGui::SameLine();
-                    if (ImGui::SmallButton("forget"))
-                        WrSavelocForget(i);
-                }
-                ImGui::PopID();
-            }
-            ImGui::EndTable();
-        }
-        if (WrSavelocTimedCount() > 0 && ImGui::Button("Forget all times here"))
-            WrSavelocForgetAll();
-    }
-
     // --- the comparison -----------------------------------------------------
     ImGui::SeparatorText("Comparison");
-    const WrRun *ref = g_energy.compareToRun ? WrEnergyReferenceRun() : NULL;
-    if (!g_energy.compareToRun)
+    const bool wantsReference = g_energy.compareToRun ||
+                                g_energy.showReferenceStrafeBar;
+    const WrRun *ref = wantsReference ? WrEnergyReferenceRun() : NULL;
+    if (!wantsReference)
     {
         ImGui::TextDisabled("Off.");
     }
@@ -4765,45 +4620,41 @@ static void DrawEnergyTab(void)
         float gap = (WrEnergyNow() - g_energy.eyeHeight) - theirs;
         ImGui::Text("%s  (%s)", ref->player[0] ? ref->player : "?",
                     WrTrackName(ref));
-        ImGui::Text("their energy here  %.0f   gap %+.0f", theirs, gap);
+        if (g_energy.compareToRun)
+            ImGui::Text("their energy here  %.0f   gap %+.0f", theirs, gap);
+        if (g_energy.showReferenceStrafeBar)
+            ImGui::TextDisabled("their reconstructed air-strafe track is the "
+                                "lower bar");
         ImGui::TextDisabled("their line is %.0f units away, at point %d of %d",
                             ref->nearestDist, ref->nearestIndex, ref->pointCount);
     }
 
+    }
+
+    if (settingsOnly)
+    {
     ImGui::SeparatorText("Crosshair readout");
-    ImGui::Checkbox("Show beside the crosshair", &g_energy.showHud);
+    ImGui::Checkbox("Crosshair box", &g_energy.showHud);
     ImGui::SameLine();
-    HelpMarker("Off by default since v0.9.0, so a fresh install draws lines and "
-               "nothing else -- the lines are what people come for, and a box of "
-               "numbers appearing at the crosshair before anybody asked for one "
-               "is not.\n\n"
+    HelpMarker("On by default with turn rate versus ideal, so the first view is "
+               "an instruction you can act on while surfing.\n\n"
                "This is the glanceable readout; the corner block below is the "
                "detailed one and has END to itself. Turn either on here and it "
                "is remembered.");
-    ImGui::SetNextItemWidth(150.0f);
-    const char *kAlignX[3] = { "left of it", "centred on it", "right of it" };
-    if (g_energy.hudAlignX < 0 || g_energy.hudAlignX > 2)
-        g_energy.hudAlignX = WR_HUD_LEFT;
-    ImGui::Combo("Across", &g_energy.hudAlignX, kAlignX, 3);
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(150.0f);
-    const char *kAnchorY[3] = { "centred", "above", "below" };
-    if (g_energy.hudAnchorY < 0 || g_energy.hudAnchorY > 2)
-        g_energy.hudAnchorY = WR_HUD_CENTRE_Y;
-    ImGui::Combo("Down", &g_energy.hudAnchorY, kAnchorY, 3);
+
+    if (ImGui::Button(WrHudEditorOpen() ? "Finish editing HUD"
+                                        : "Customize / edit HUD"))
+        WrHudEditorSetOpen(!WrHudEditorOpen());
     ImGui::SameLine();
     HelpMarker(
-        "Which part of the block the offsets below place, and it used to be "
-        "neither of these: alignment was inferred from the sign of Offset X, so "
-        "the block could hang left or right of the crosshair but never sit "
-        "centred over it.\n\n"
-        "\"Above\" and \"below\" pin the edge nearest the crosshair rather than "
-        "the block's middle. That matters because the block grows and shrinks -- "
-        "the comparison row, the bar and the clock all come and go -- and "
-        "centred means every one of those nudges it up or down while you are "
-        "trying to read it.");
-    ImGui::SliderFloat("Offset X", &g_energy.hudOffsetX, -400.0f, 400.0f, "%.0f px");
-    ImGui::SliderFloat("Offset Y", &g_energy.hudOffsetY, -400.0f, 400.0f, "%.0f px");
+        "Shows all four movable HUD objects, including placeholders for ones "
+        "that are currently switched off. Drag any highlighted rectangle.\n\n"
+        "It snaps to the horizontal and vertical centre lines, and to a "
+        "16-pixel inset from every screen edge. The positions are saved with "
+        "the rest of your settings.\n\n"
+        "The crosshair box always uses its centre as the anchor now. The old "
+        "left/right/above/below choices are gone, so a position cannot change "
+        "meaning when the box gains another row.");
     ImGui::Checkbox("Show the run clock", &g_energy.showHudClock);
     ImGui::SameLine();
     HelpMarker(
@@ -4816,8 +4667,8 @@ static void DrawEnergyTab(void)
         "Off is not silent: with the clock hidden, a restore still borrows the "
         "row for about two seconds and then gives it back, so the one moment it "
         "matters is visible without a permanent row for it.\n\n"
-        "Grey means the clock is not running. It starts when you leave the "
-        "anchor and is not the game's own timer -- WrLines cannot read that.");
+        "Grey means Momentum's timer is not running. The row now starts on the "
+        "same tick as the in-game timer; there is no movement-started fallback.");
     ImGui::Checkbox("Show the speed line", &g_energy.showHudSpeed);
     ImGui::SameLine();
     HelpMarker(
@@ -4836,8 +4687,8 @@ static void DrawEnergyTab(void)
         "0 means as wide as the rows need, which is a fixed width per mode.\n\n"
         "Either way the compared player's NAME never sets the width -- it is cut "
         "to fit. It used to set it, and that was worse than untidy: the block is "
-        "positioned by its own width when centred or right-aligned, so it moved "
-        "as you passed between lines, and the lean bar's fill is a fraction of "
+        "positioned by its own width, so it moved as you passed between lines, "
+        "and the lean bar's fill is a fraction of "
         "the width, so the same energy gap drew a longer bar for a player with a "
         "longer name. A bar you read a comparison off cannot have a scale that "
         "depends on somebody's Steam name.\n\n"
@@ -4846,18 +4697,17 @@ static void DrawEnergyTab(void)
     ImGui::Checkbox("Dark plate behind it", &g_energy.hudBacking);
 
     ImGui::SeparatorText("Settings");
-    ImGui::Checkbox("Also show the corner block", &g_energy.showOverlay);
+    ImGui::Checkbox("Bottom-right box", &g_energy.showOverlay);
     ImGui::SameLine();
     HelpMarker("Off by default, and END turns it on and off without opening this "
                "panel.\n\n"
                "There was an edge-padding slider here. It was added for a block "
                "that looked cut off at the bottom of the screen and turned out "
-               "not to be, so it is gone again -- the padding is back to the 18 "
-               "pixels it always was. Both corner blocks are still clamped "
+               "not to be, so it is gone again. Both corner blocks are clamped "
                "inside the screen, which costs nothing and does nothing at all "
-               "unless a block genuinely would not fit.");
-    const char *corners[] = { "top left", "top right", "bottom left", "bottom right" };
-    ImGui::Combo("Corner", &g_energy.overlayCorner, corners, 4);
+               "unless a block genuinely would not fit. Its default is 16 "
+               "pixels from the bottom-right edge; use Customize / edit HUD "
+               "to put it anywhere else.");
     ImGui::Checkbox("Strafe rate against the ideal", &g_energy.showStrafe);
     ImGui::SameLine();
     HelpMarker("How fast your view is turning, against how fast it should be.\n\n"
@@ -4895,7 +4745,26 @@ static void DrawEnergyTab(void)
                "one it fitted worst.\n\n"
                "It reads from the gravity, air-accelerate and max-speed settings "
                "on this tab, because nothing here reads a cvar. If your server "
-               "runs something other than 150 and 250, set them or ignore this.");
+               "runs something other than 150 and 250, set them or ignore this. "
+               "The live target then applies Momentum's 34% crouch wishspeed "
+               "and its 0.25 friction window at 0 < vertical speed <= 140. At "
+               "default surf values those states still hit the 30 u/s cap, so "
+               "the target should not move merely because the state flag did.");
+
+    if (WrEnergyTrueVelocityLive())
+    {
+        const bool crouched = WrEnergyCrouched();
+        const float friction = WrEnergyAirFriction();
+        ImGui::TextDisabled("live air physics: %s, wishspeed %.1f, friction %.2f%s",
+                            crouched ? "crouched" : "standing",
+                            WrAirWishSpeed(g_energy.maxSpeed, crouched), friction,
+                            friction < 1.0f ? " (deadstrafe window)" : "");
+    }
+    else
+    {
+        ImGui::TextDisabled("live air physics: crouch state unavailable; "
+                            "assuming standing");
+    }
 
     // The colour controls sit under the checkbox that turns the row on, but they
     // govern the crosshair modes as well -- one rule for the same comparison
@@ -4955,7 +4824,7 @@ static void DrawEnergyTab(void)
                            ImGuiSliderFlags_AlwaysClamp);
     }
 
-    // The same bool as the one on the Display tab. It governs this readout and
+    // The same bool as the one on the Line settings tab. It governs this readout and
     // the strafe bar as much as it governs the lines, and over there it is
     // nested inside a line-colouring mode -- so somebody who needs it could not
     // reach it without first changing a setting they were not asking about.
@@ -4964,7 +4833,7 @@ static void DrawEnergyTab(void)
     ImGui::SameLine();
     HelpMarker("Swaps the whole red-to-green scale for orange-to-blue, here and "
                "on the demo lines, which are the same ramp deliberately.\n\n"
-               "The same tick-box appears on the Display tab under efficiency "
+               "The same tick-box appears on the Line settings tab under efficiency "
                "colouring. It is one setting shown twice, not two.");
 
     ImGui::Checkbox("Show the percentage", &g_energy.showStrafePercent);
@@ -5001,8 +4870,9 @@ static void DrawEnergyTab(void)
                "width goes on rates nobody strafes at, and overshoot has "
                "nowhere to go, so turning far too fast would look exactly like "
                "turning perfectly.\n\n"
-               "Full deflection is the tolerance above, and the colour is the "
-               "same one the number uses, so the bar cannot disagree with them. "
+               "At 1x sensitivity, full deflection is the tolerance above. "
+               "Sensitivity changes only how far the bar moves, while the "
+               "number, colour and correction arrow keep their literal values. "
                "The two faint uprights mark where the arrow goes quiet. An "
                "arrowhead past the end means you are further off than the bar "
                "can show, rather than the bar quietly sitting at maximum.\n\n"
@@ -5015,17 +4885,38 @@ static void DrawEnergyTab(void)
     if (g_energy.showStrafeBar)
     {
         ImGui::Indent();
-        ImGui::SliderFloat("Bar width", &g_energy.strafeBarWidth, 0.0f, 600.0f,
-                           g_energy.strafeBarWidth < 1.0f ? "auto"
-                                                          : "%.0f px");
-        ImGui::SliderFloat("Bar thickness", &g_energy.strafeBarHeight, 2.0f,
-                           24.0f, "%.0f px");
-        ImGui::SliderFloat("Bar height above centre", &g_energy.strafeBarRise,
-                           -200.0f, 300.0f, "%.0f px");
+        ImGui::Checkbox("Show the closest run beneath mine",
+                        &g_energy.showReferenceStrafeBar);
         ImGui::SameLine();
-        HelpMarker("Negative puts it below the crosshair. Around -46 it will "
-                   "land on the board flash, which is why the default is "
-                   "above.");
+        HelpMarker(
+            "Adds a second strafe track beneath yours for the fastest enabled "
+            "run inside the nearby comparison radius. Its small left rail uses "
+            "that run's line colour; yours is white.\n\n"
+            "Downloaded paths do not contain view angles or movement keys. In "
+            "free air, their horizontal velocity change is the acceleration "
+            "Source applied, which is enough to reconstruct whether the strafe "
+            "was under or over the ideal. On a ramp the collision removes part "
+            "of that evidence, so the reference track fades instead of "
+            "pretending an inferred velocity turn was mouse input.");
+        if (ImGui::TreeNodeEx("Fine tuning##strafe bar",
+                              ImGuiTreeNodeFlags_SpanAvailWidth))
+        {
+            ImGui::SliderFloat("Sensitivity", &g_energy.strafeBarSensitivity,
+                               0.25f, 4.0f, "%.2fx",
+                               ImGuiSliderFlags_AlwaysClamp);
+            ImGui::SameLine();
+            HelpMarker("How far the bar moves for the same turn-rate error. "
+                       "1x reaches full deflection at the tolerance above; "
+                       "2x reaches it at half that error. This does not alter "
+                       "the measured numbers, colour grade or correction arrow.");
+            ImGui::SliderFloat("Bar width", &g_energy.strafeBarWidth,
+                               0.0f, 600.0f,
+                               g_energy.strafeBarWidth < 1.0f ? "auto"
+                                                              : "%.0f px");
+            ImGui::SliderFloat("Bar thickness", &g_energy.strafeBarHeight,
+                               2.0f, 24.0f, "%.0f px");
+            ImGui::TreePop();
+        }
         ImGui::Unindent();
     }
 
@@ -5184,7 +5075,7 @@ static void DrawEnergyTab(void)
                    "which of the two it was.\n\n"
                    "\"Nothing to touch\" means the map had no polygon within 24 "
                    "units of where your feet were taken to be. If that one is "
-                   "large, the eye height on the Physics tab is the first thing "
+                   "large, the eye height in HUD settings is the first thing "
                    "to check: it is a setting, not a read, so it is 64 whether "
                    "or not you were crouched.");
         ImGui::TreePop();
@@ -5192,19 +5083,30 @@ static void DrawEnergyTab(void)
 
     ImGui::Checkbox("Compare against the fastest enabled run nearby",
                     &g_energy.compareToRun);
-    ImGui::SliderFloat("Compare radius", &g_energy.compareRadius, 64.0f, 4096.0f,
-                       "%.0f");
-    ImGui::SameLine();
-    HelpMarker("Momentum records a separate demo per stage, so without this the "
-               "comparison happily picks a run several thousand units away on "
-               "another stage and reports a confident, meaningless number.");
-    ImGui::SliderFloat("Eye height", &g_energy.eyeHeight, 0.0f, 96.0f, "%.0f");
-    ImGui::SameLine();
-    HelpMarker("Only affects the comparison. Their points are the player origin "
-               "-- your feet -- and WrLines only knows where your camera is, "
-               "which sits about 64 units higher. Stand on the start pad next "
-               "to a line's beginning: if the gap sits at a constant offset, "
-               "this is the knob that nulls it.");
+    if (g_energy.compareToRun || g_energy.showReferenceStrafeBar)
+    {
+        ImGui::Indent();
+        if (ImGui::TreeNodeEx("Fine tuning##nearby comparison",
+                              ImGuiTreeNodeFlags_SpanAvailWidth))
+        {
+            ImGui::SliderFloat("Compare radius", &g_energy.compareRadius,
+                               64.0f, 4096.0f, "%.0f");
+            ImGui::SameLine();
+            HelpMarker("Momentum records a separate demo per stage, so without "
+                       "a radius limit the comparison can pick a run several "
+                       "thousand units away on another stage and report a "
+                       "confident, meaningless number.");
+            ImGui::SliderFloat("Eye height", &g_energy.eyeHeight,
+                               0.0f, 96.0f, "%.0f");
+            ImGui::SameLine();
+            HelpMarker("Only affects the comparison. Their points are the "
+                       "player origin -- your feet -- and WrLines reads from "
+                       "the camera, normally about 64 units higher. Stand by a "
+                       "line's beginning and use this to remove a constant gap.");
+            ImGui::TreePop();
+        }
+        ImGui::Unindent();
+    }
     // All three feed the DRAWN LINES as well as the live readout, and until now
     // only the readout noticed them move. The efficiency colours are measured
     // against a ceiling built from all three, and the air/contact split against
@@ -5231,58 +5133,70 @@ static void DrawEnergyTab(void)
         "measured against.\n\n"
         "They also decide whether Source's deadstrafe period matters to you. "
         "CategorizePosition quarters your surface friction while you are "
-        "airborne rising slower than 140 u/s over a ramp, and AirAccelerate "
+        "airborne at 0 < vertical speed <= 140 over no standable surface, and AirAccelerate "
         "multiplies by it -- but that only bites if it drops the acceleration "
         "below the 30 u/s wishspeed cap. At air accelerate 150 the quartered "
         "value is still 141, so nothing changes; at CS:GO's 12 it falls to 12 "
-        "and the ceiling drops by a third. The crossover is around 32.\n\n"
+        "and the ceiling drops by a third. Momentum surf crouching separately "
+        "scales the uncapped wishspeed to 34%; WrLines combines both states "
+        "when computing the live strafe target and ceiling.\n\n"
         "Checked against the demos on disk: the 95th percentile of energy gain "
         "is 38.07 units/s across 69,916 samples inside that window and 37.99 "
         "across 795,096 outside it. No depression, exactly as the arithmetic "
         "predicts for these settings.");
     {
-        // The tick is NOT a constant. 482 of the 503 demos on disk are 0.015,
-        // but all 21 bhop_futile runs are 0.01 -- so take it from the run being
-        // compared against when there is one, and only fall back to the common
-        // value when there is not.
-        const WrRun *tr = WrEnergyReferenceRun();
-        float tick = (tr && tr->tickInterval > 1e-4f) ? tr->tickInterval : 0.015f;
+        // Live physics uses the game's interval_per_tick, read alongside the
+        // Momentum timer. A downloaded reference keeps its recorded tick in
+        // the separate path reconstruction.
+        const float tick = WrTimerTickInterval();
         float full = WrAirPowerCeilingEx(g_energy.gravity, tick,
                                          g_energy.airAccelerate,
                                          g_energy.maxSpeed, 1.0f);
         float dead = WrAirPowerCeilingEx(g_energy.gravity, tick,
                                          g_energy.airAccelerate,
                                          g_energy.maxSpeed, 0.25f);
-        if (dead < full - 0.05f)
+        const float duckDead = WrAirPowerCeilingEx(
+            g_energy.gravity, tick, g_energy.airAccelerate,
+            WrAirWishSpeed(g_energy.maxSpeed, true), 0.25f);
+        if (duckDead < full - 0.05f)
             ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
-                               "ceiling %.1f/s at %.0f tick, but %.1f/s while "
-                               "rising slowly over a ramp", full, 1.0f / tick,
-                               dead);
+                               "ceiling %.1f/s at %.0f tick; %.1f/s in the "
+                               "deadstrafe window, %.1f/s crouched there",
+                               full, 1.0f / tick, dead, duckDead);
         else
             ImGui::TextDisabled("ceiling %.1f energy/s at %.0f tick; the "
-                                "deadstrafe period does not reduce it here",
+                                "deadstrafe/crouch states do not reduce it here",
                                 full, 1.0f / tick);
-    }
-    ImGui::SeparatorText("Steadiness");
 
-    // Three presets in front of the sliders, because the reading passes through
-    // four filters and setting them one at a time means understanding all four.
-    // The lag figure is the honest one: half the difference window plus the
-    // output time constant.
+        const bool crouched = WrEnergyCrouched();
+        const float friction = WrEnergyAirFriction();
+        const float baseAccel = WrAirAccelerationPerTickEx(
+            tick, g_energy.airAccelerate, g_energy.maxSpeed, 1.0f);
+        const float liveAccel = WrAirAccelerationPerTickEx(
+            tick, g_energy.airAccelerate,
+            WrAirWishSpeed(g_energy.maxSpeed, crouched), friction);
+        ImGui::TextDisabled("air acceleration stress  %.1f -> %.1f per tick  "
+                            "(%.2fx the 30 cap)",
+                            baseAccel, liveAccel,
+                            liveAccel / WR_AIR_WISHSPEED);
+    }
+    ImGui::SeparatorText("Camera fallback steadiness");
+
+    // These controls have no effect while the proved player pair is live. They
+    // remain editable so a fallback can be configured before it is needed.
     float lag = g_energy.velWindowSeconds * 0.5f + g_energy.smoothSeconds;
-    ImGui::Text("Response");
+    ImGui::Text("Fallback response");
     ImGui::SameLine();
     HelpMarker(
-        "The readout is filtered four times over before you see it: the velocity "
-        "is differenced over a window, that velocity is smoothed, the speed is "
-        "smoothed again, and the energy figure is smoothed once more and then "
-        "rounded. Only one of those was adjustable, which is why it could still "
-        "feel slow with the smoothing slider already at its lowest.\n\n"
-        "SNAPPY costs noise, and not in a small way: the velocity comes from a "
-        "finite difference of camera positions, so halving the window doubles "
-        "the noise in it. It is the right choice for judging a ramp exit and the "
-        "wrong one for reading a number while standing still.\n\n"
-        "BALANCED is what every version before this one used, exactly.");
+        "These filters are used only if the game-memory player scan has not "
+        "proved an origin and velocity. In that fallback, velocity has to be "
+        "reconstructed from camera positions, so a short measurement window and "
+        "light filtering stop view bob and render timing from becoming fake "
+        "speed.\n\n"
+        "When Diagnostics reports exact game values, velocity, speed, energy, "
+        "turn rates and the displayed digits bypass these filters. Rolling "
+        "measurements such as energy per second still need a time span because "
+        "the span is the definition of the measurement, not cosmetic smoothing.");
     if (ImGui::Button("Snappy"))
     {
         g_energy.velWindowSeconds = 0.020f;
@@ -5310,49 +5224,54 @@ static void DrawEnergyTab(void)
         g_energy.quantiseStep = 10.0f;
     }
     ImGui::SameLine();
-    ImGui::TextDisabled("about %.0f ms behind", lag * 1000.0f);
+    if (WrEnergyTrueVelocityLive())
+        ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f),
+                           "exact game values; no filtering or sticky rounding");
+    else
+        ImGui::TextDisabled("camera fallback: about %.0f ms behind",
+                            lag * 1000.0f);
 
-    ImGui::SliderFloat("Smoothing", &g_energy.smoothSeconds, 0.05f, 1.0f, "%.2f s");
-    ImGui::SameLine();
-    HelpMarker("How long the headline figure takes to settle. The signal itself "
-               "cannot rise faster than about 37 units a second -- that is the "
-               "physical ceiling on what air strafing can add -- so a third of a "
-               "second of filtering costs at most a dozen units of lag and "
-               "removes almost all of the jitter.");
-    ImGui::SliderFloat("Velocity window", &g_energy.velWindowSeconds,
-                       0.010f, 0.200f, "%.3f s");
-    ImGui::SameLine();
-    HelpMarker(
-        "The window the velocity is differenced over, and the first thing in the "
-        "chain -- everything downstream inherits its lag and its noise.\n\n"
-        "It contributes about half its own length to the delay, so 40 ms costs "
-        "20 ms. Below about 20 ms a two-unit view bob starts reading as real "
-        "movement: over a single frame at 200 fps the same bob would come out as "
-        "400 u/s.");
-    ImGui::SliderFloat("Velocity smoothing", &g_energy.velTau, 0.005f, 0.400f,
-                       "%.3f s");
-    ImGui::SliderFloat("Speed smoothing", &g_energy.speedTau, 0.005f, 0.500f,
-                       "%.3f s");
-    ImGui::SliderFloat("Arrow window", &g_energy.trendSeconds, 0.3f, 2.0f, "%.2f s");
-    ImGui::SliderFloat("Arrow dead band", &g_energy.arrowBand, 0.0f, 60.0f, "%.0f");
-    ImGui::SameLine();
-    HelpMarker("How far the trend has to move before the arrow commits to a "
-               "direction at all. Under this it shows nothing, which is the "
-               "truthful answer when the change is smaller than the noise.");
-    ImGui::SliderFloat("Power window", &g_energy.powerSeconds, 0.05f, 1.5f, "%.2f s");
-    ImGui::SameLine();
-    HelpMarker("The window dE/dt is measured over, which is what the live "
-               "energy-per-second figure reads. A derivative of a noisy signal "
-               "is noise, so this one wants to be longer than it feels like it "
-               "should.");
-    ImGui::SliderFloat("Round to", &g_energy.quantiseStep, 0.0f, 25.0f, "%.0f");
-    ImGui::SameLine();
-    HelpMarker("Rounds the displayed figure, with hysteresis, so the last digit "
-               "stops churning. Zero shows the raw value.\n\n"
-               "Worth checking if the number feels sticky rather than slow: this "
-               "makes it wait until the value has moved three quarters of a step "
-               "before it redraws, which is a different complaint from lag and "
-               "has a different fix.");
+    // Presets are the ordinary interface. The individual stages are retained
+    // for diagnosis and unusual setups, but start collapsed so they do not turn
+    // a simple response choice into a page of filter theory.
+    if (ImGui::TreeNodeEx("Fine tuning", ImGuiTreeNodeFlags_SpanAvailWidth))
+    {
+        ImGui::SliderFloat("Energy smoothing (fallback)", &g_energy.smoothSeconds,
+                           0.05f, 1.0f, "%.2f s");
+        ImGui::SameLine();
+        HelpMarker("How long the fallback headline figure takes to settle.");
+        ImGui::SliderFloat("Velocity window (fallback)",
+                           &g_energy.velWindowSeconds,
+                           0.010f, 0.200f, "%.3f s");
+        ImGui::SameLine();
+        HelpMarker(
+            "The window used to reconstruct velocity from camera positions. "
+            "Shorter responds sooner but turns view bob and frame timing into "
+            "more noise.");
+        ImGui::SliderFloat("Velocity smoothing (fallback)", &g_energy.velTau,
+                           0.005f, 0.400f, "%.3f s");
+        ImGui::SliderFloat("Speed smoothing (fallback)", &g_energy.speedTau,
+                           0.005f, 0.500f, "%.3f s");
+        ImGui::SliderFloat("Round to (fallback)", &g_energy.quantiseStep,
+                           0.0f, 25.0f, "%.0f");
+        ImGui::SameLine();
+        HelpMarker("Keeps a noisy camera-derived figure from churning its last "
+                   "digit. Exact game values never use these sticky buckets.");
+
+        ImGui::SeparatorText("Rolling measurements");
+        ImGui::SliderFloat("Arrow window", &g_energy.trendSeconds,
+                           0.3f, 2.0f, "%.2f s");
+        ImGui::SliderFloat("Arrow dead band", &g_energy.arrowBand,
+                           0.0f, 60.0f, "%.0f");
+        ImGui::SameLine();
+        HelpMarker("How far the trend must move before the arrow commits to a "
+                   "direction.");
+        ImGui::SliderFloat("Power window", &g_energy.powerSeconds,
+                           0.05f, 1.5f, "%.2f s");
+        ImGui::SameLine();
+        HelpMarker("The span used by the live energy-per-second measurement.");
+        ImGui::TreePop();
+    }
     ImGui::SeparatorText("Where the comparison is reading");
     ImGui::Checkbox("Ring the point being compared", &g_energy.showComparePoint);
     ImGui::SameLine();
@@ -5419,13 +5338,30 @@ static void DrawEnergyTab(void)
     ImGui::TextWrapped(
         "For the loaded runs, exact -- the .wrpath files store a real velocity "
         "per point.");
-    ImGui::TextWrapped(
-        "For you, approximate. WrLines only knows where the camera is, so your "
-        "velocity is differenced from camera motion over a few frames and "
-        "smoothed. Expect a few percent of error and a slight lag on sharp "
-        "changes. The eye offset cancels out of the energy figure itself, since "
-        "the reference height is a camera height too -- it only shows up in the "
-        "comparison against a run, which is what the Eye height slider is for.");
+    if (WrEnergyTrueVelocityLive())
+        ImGui::TextWrapped(
+            "For you, the player scan is live: origin, velocity and eye height "
+            "come directly from Momentum. The displayed speed and energy bypass "
+            "the camera fallback filters, and crouch is detected from the live "
+            "eye offset (about 28 units crouched versus 64 standing).");
+    else
+        ImGui::TextWrapped(
+            "For you, the exact player scan is currently unavailable. WrLines "
+            "is reconstructing velocity from camera motion, so the fallback "
+            "steadiness controls above apply and crouch is assumed standing. "
+            "The Eye height slider supplies the missing feet offset for nearby "
+            "run comparisons.");
+    }
+}
+
+static void DrawEnergyTab(void)
+{
+    DrawEnergyOrHudTab(false);
+}
+
+static void DrawHudSettingsTab(void)
+{
+    DrawEnergyOrHudTab(true);
 }
 
 static const char *SourceName(WrResolveSource s)
@@ -5521,9 +5457,9 @@ static void DrawDiagnosticsTab(void)
         ImGui::TextDisabled("eye height  using the %.0f setting",
                             g_energy.eyeHeight);
 
-    ImGui::Text("boards      %s", WrEnergyTrueVelocityLive()
-                    ? "graded on the game's own velocity"
-                    : "graded on the camera estimate");
+    ImGui::Text("live values  %s", WrEnergyTrueVelocityLive()
+                    ? "game origin/velocity (exact, smoothing bypassed)"
+                    : "camera estimate (Snappy smoothing fallback)");
     ImGui::SameLine();
     HelpMarker("Everything live in this tool is normally derived from one "
                "thing: the camera solved out of the matrix above. Position is "
@@ -5543,8 +5479,9 @@ static void DrawDiagnosticsTab(void)
                "thousands of units through several turns, so there is no "
                "passing it by coincidence.\n\n"
                "It is allowed to find nothing. Everything keeps working on the "
-               "camera estimate; the numbers are simply worth fewer decimals, "
-               "which is what the board decimals setting is for.");
+               "Snappy camera fallback. Once both addresses are proved, the "
+               "main energy/speed values, live recorder and board grader all "
+               "use the exact pair directly; smoothing it would only add lag.");
 
     if (ImGui::Button("Look again##player"))
         WrPlayerRescan();
@@ -5875,7 +5812,7 @@ static void DrawDiagnosticsTab(void)
                "playing this counter will normally sit still. That is working "
                "as intended: the cost is small and, more importantly, the same "
                "every frame. If another overlay's frame limiter is still "
-               "unhappy, turning the energy readout off in the Energy tab makes "
+               "unhappy, turning the energy readout off in HUD settings makes "
                "Present a complete passthrough.");
 
     // --- is a world actually being rendered ----------------------------------
@@ -5902,9 +5839,9 @@ static void DrawDiagnosticsTab(void)
                "this the whole route stayed drawn over the menu, frozen in "
                "place.\n\n"
                "Standing perfectly still in a map produces an identical matrix "
-               "too, so the lines can pause while you are genuinely in the "
-               "world. They come back the moment you move. Raise this if that "
-               "bothers you.\n\n"
+               "too. It receives a five-minute grace period, so ordinary stops "
+               "do not hide the HUD or lines; if the safety cutoff eventually "
+               "fires, they return the moment you move.\n\n"
                "It is suspended entirely while this panel is open, since using "
                "the panel means standing still and the lines you are ticking on "
                "and off are the whole point. That hold is only taken if the "
@@ -6172,8 +6109,8 @@ static void DrawAboutTab(void)
     ImGui::BulletText("%-7s -  the corner block -- off by default",
                       WrUiKeyName(WrUiOverlayToggleKey()));
     ImGui::Spacing();
-    ImGui::TextDisabled("All four are rebindable -- the plate's in Display, the");
-    ImGui::TextDisabled("other three in Energy. They are READ, never swallowed,");
+    ImGui::TextDisabled("All four are rebindable -- the plate's in Line settings,");
+    ImGui::TextDisabled("the other three in HUD settings. They are READ, never swallowed,");
     ImGui::TextDisabled("so a collision means the game still acts on the key.");
 
     ImGui::SeparatorText("Settings");
@@ -6266,7 +6203,8 @@ void WrUiDraw(void)
                 if (ImGui::BeginTabItem("Board", NULL, bf))
                 { DrawBoardTab(); ImGui::EndTabItem(); }
             }
-            if (ImGui::BeginTabItem("Display"))    { DrawDisplayTab();     ImGui::EndTabItem(); }
+            if (ImGui::BeginTabItem("Line settings")){ DrawDisplayTab();   ImGui::EndTabItem(); }
+            if (ImGui::BeginTabItem("HUD settings")){ DrawHudSettingsTab();ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem("Energy"))     { DrawEnergyTab();      ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem("Graphs"))     { DrawGraphsTab();      ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem("Frame cap"))  { DrawFrameCapTab();    ImGui::EndTabItem(); }

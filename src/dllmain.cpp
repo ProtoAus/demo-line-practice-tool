@@ -208,33 +208,26 @@ void WrIdleTick(void)
         // for this frame until the line above has run.
         WrEnergyTickBoards(dt);
 
-        // Save-locs BEFORE the clock, and that ordering is a fix rather than a
-        // preference. The other way round, loading an untimed save-loc restored
-        // nothing and then stamped that save-loc with the PRE-load clock,
-        // permanently -- which is how entries reading 0.000 got onto disk, after
-        // which they restored as 0.000 for ever. It is handed the clock as it
-        // stands now, which is what a save-loc created this frame deserves.
-        WrSavelocRefresh(map, WrTimerElapsed(), WrTimerRunning());
+        // Timer first: a save created this frame must be stamped with this
+        // frame's authoritative Momentum tick, not the previous rendered
+        // frame's value. Loads can no longer be mistaken for creations here:
+        // wr_savelocs compares the table itself and Momentum's exact `cur` slot.
         WrTimerTick(cam, dt);
+        WrSavelocRefresh(map, WrTimerElapsed(), WrTimerRunning());
 
-        // Not while held: a paused demo would otherwise stamp the same point
-        // over and over with a clock that is not advancing. WrLiveRecord already
-        // ignores moves under two units, so this is belt and braces -- but it
-        // also keeps the recorder from being handed a velocity that is being
-        // deliberately frozen.
-        if (!WrEnergyHeld())
-        {
-            // The sampler's OWN pair, not this frame's feet and the smoothed
-            // velocity readout. Those describe two instants about 80 ms apart,
-            // and every energy computed from a live point -- the Graphs tab's
-            // live curve, any comparison against your own line -- was wrong by
-            // whatever the trajectory did in between. Measured: with a
-            // perfectly noiseless camera the resulting efficiency error was
-            // still larger than the signal. See WrEnergySampleAt.
-            Vec3 lvPos, lvVel;
-            if (WrEnergySampleAt(&lvPos, &lvVel))
-                WrLiveRecord(lvPos, lvVel, WrTimerElapsed());
-        }
+        // WrLiveRecord ignores moves under two units, so a stationary player or
+        // paused demo does not stamp duplicate points. The sampler itself no
+        // longer freezes merely because the camera origin repeats.
+        // The sampler's OWN pair, not this frame's feet and the smoothed
+        // velocity readout. Those describe two instants about 80 ms apart,
+        // and every energy computed from a live point -- the Graphs tab's
+        // live curve, any comparison against your own line -- was wrong by
+        // whatever the trajectory did in between. Measured: with a
+        // perfectly noiseless camera the resulting efficiency error was
+        // still larger than the signal. See WrEnergySampleAt.
+        Vec3 lvPos, lvVel;
+        if (WrEnergySampleAt(&lvPos, &lvVel))
+            WrLiveRecord(lvPos, lvVel, WrTimerElapsed());
     }
 
     // Notice a changed setting and write it once it has settled. Here rather

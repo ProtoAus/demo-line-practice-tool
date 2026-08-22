@@ -107,6 +107,8 @@ static void RegisterRender(void)
     WrSettingsFloat("line.fadeStartFraction", &g_render.fadeStartFraction,
                     0.0f, 1.0f);
     WrSettingsFloat("line.pixelTolerance", &g_render.pixelTolerance, 0.0f, 8.0f);
+    WrSettingsFloat("line.heightOffset", &g_render.lineHeightOffset,
+                    -256.0f, 256.0f);
     WrSettingsInt("line.pointBudget", &g_render.pointBudget, 1000, 4000000);
     WrSettingsInt("line.colourMode", &g_render.lineColour, 0,
                   WR_LINE_MODE_COUNT - 1);
@@ -150,6 +152,8 @@ static void RegisterRender(void)
     WrSettingsFloat("eff.noDataAlpha", &g_render.effNoDataAlpha, 0.0f, 1.0f);
     WrSettingsBool("eff.colourblind", &g_render.effColourblind);
     WrSettingsBool("eff.key", &g_render.lineKey);
+    WrSettingsFloat("layout.legendX", &g_render.legendPosX, 0.0f, 1.0f);
+    WrSettingsFloat("layout.legendY", &g_render.legendPosY, 0.0f, 1.0f);
 
     WrSettingsBool("pick.enabled", &g_render.pickEnabled);
     WrSettingsFloat("pick.radiusPx", &g_render.pickRadiusPx, 8.0f, 160.0f);
@@ -185,21 +189,25 @@ static void RegisterEnergy(void)
     WrSettingsFloat("strafe.tolerance", &g_energy.strafeTolerance, 5.0f, 120.0f);
     WrSettingsBool("strafe.percent", &g_energy.showStrafePercent);
     WrSettingsBool("strafe.arrow", &g_energy.showStrafeArrow);
-    // The bar takes its SCALE from strafe.tolerance above and has none of its
-    // own, so what is here is geometry only. Width 0 means "match the HUD
-    // block", which is the default and the reason the range starts there.
+    // Sensitivity is visual gain on the bar; 1 preserves the shared tolerance
+    // scale used by the number and arrow. Width 0 means "match the HUD block".
     WrSettingsBool("strafe.bar", &g_energy.showStrafeBar);
+    WrSettingsBool("strafe.referenceBar", &g_energy.showReferenceStrafeBar);
+    WrSettingsFloat("strafe.barSensitivity", &g_energy.strafeBarSensitivity,
+                    0.25f, 4.0f);
     WrSettingsFloat("strafe.barWidth", &g_energy.strafeBarWidth, 0.0f, 600.0f);
     WrSettingsFloat("strafe.barHeight", &g_energy.strafeBarHeight, 2.0f, 40.0f);
-    WrSettingsFloat("strafe.barRise", &g_energy.strafeBarRise, -400.0f, 400.0f);
+    WrSettingsFloat("strafe.barRise", &g_energy.strafeBarRise, -4000.0f, 4000.0f);
+    WrSettingsFloat("layout.strafeOffsetX", &g_energy.strafeBarOffsetX,
+                    -4000.0f, 4000.0f);
     WrSettingsBool("board.show", &g_energy.showBoard);
     WrSettingsFloat("board.flashSeconds", &g_energy.boardFlashSeconds, 0.5f, 10.0f);
     WrSettingsInt("board.unit", &g_energy.boardUnit, 0, WR_BOARD_UNIT_COUNT - 1);
     WrSettingsBool("board.percent", &g_energy.boardPercent);
     WrSettingsInt("board.decimals", &g_energy.boardDecimals, 0, 3);
     WrSettingsBool("hud.show", &g_energy.showHud);
-    WrSettingsFloat("hud.offsetX", &g_energy.hudOffsetX, -2000.0f, 2000.0f);
-    WrSettingsFloat("hud.offsetY", &g_energy.hudOffsetY, -2000.0f, 2000.0f);
+    WrSettingsFloat("hud.offsetX", &g_energy.hudOffsetX, -8000.0f, 8000.0f);
+    WrSettingsFloat("hud.offsetY", &g_energy.hudOffsetY, -8000.0f, 8000.0f);
     WrSettingsInt("hud.alignX", &g_energy.hudAlignX, 0, 2);
     WrSettingsInt("hud.anchorY", &g_energy.hudAnchorY, 0, 2);
     WrSettingsFloat("hud.scale", &g_energy.hudScale, 0.6f, 3.0f);
@@ -212,6 +220,8 @@ static void RegisterEnergy(void)
     WrSettingsBool("overlay.show", &g_energy.showOverlay);
     WrSettingsInt("overlay.corner", &g_energy.overlayCorner, 0, 3);
     WrSettingsFloat("overlay.margin", &g_energy.overlayMargin, 0.0f, 200.0f);
+    WrSettingsFloat("layout.overlayX", &g_energy.overlayPosX, 0.0f, 1.0f);
+    WrSettingsFloat("layout.overlayY", &g_energy.overlayPosY, 0.0f, 1.0f);
     WrSettingsFloat("overlay.scale", &g_energy.overlayScale, 0.5f, 3.0f);
 
     WrSettingsBool("compare.toRun", &g_energy.compareToRun);

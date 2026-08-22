@@ -67,6 +67,7 @@ struct WrSavelocHit
     bool fromCps;       // a real save-loc, not an entry from "startmarks"
     float seconds;
     int ordinal;        // among entries sharing this position, in file order
+    int gameIndex;      // Momentum's exact cps slot (`cur`); -1 for startmarks
     bool suspect;       // time came from a v1 sidecar and may be wrong
     bool byHand;        // time was typed in rather than stamped on creation
     bool haveEnergy;    // gained/lost/peak below mean something
@@ -80,19 +81,23 @@ bool WrSavelocMatch(const Vec3 &pos, WrSavelocHit *out);
 
 // The save-loc you are standing EXACTLY on, within about a unit horizontally.
 //
-// This exists because loading a save-loc is not an event the game tells anyone
-// about, and the only signal the tool had was its teleport detector -- a camera
-// jump of more than 400 units between two frames. Loading a save-loc you are
-// standing on or beside moves you far less than that, often not at all, so the
-// load was simply invisible and the clock kept counting. Momentum restores the
-// exact stored origin, so agreeing with one to within a unit in both x and y is
-// a far stronger statement than any distance test: at surf speed the camera
-// covers fifty units a frame.
+// Retained for the camera/energy harness and legacy positional checks. The
+// production clock does not call position an event: it uses the file rewrite
+// serial plus Momentum's exact `cur` slot below.
 //
 // Being here is not the event. ARRIVING here is, so the caller must fire on the
 // rising edge -- holding +mom_savestate_load parks you on the spot for as long
 // as the key is down.
 bool WrSavelocExactMatch(const Vec3 &pos, WrSavelocHit *out);
+
+// The exact cps slot Momentum currently names in the map's `cur` field. This is
+// the only reliable way to distinguish save states sharing one position.
+bool WrSavelocCurrent(WrSavelocHit *out);
+
+// Increments only when savedlocs.txt is rewritten with the same save-state
+// table and a valid `cur` slot. Creation, deletion and first map load do not
+// count. This supplies the load event that position alone cannot prove.
+unsigned int WrSavelocLoadSerial(void);
 
 // Our recorded time for the save-loc nearest `pos`, if there is one within a few
 // units. False when that save-loc has no recorded time -- which is the normal
@@ -151,6 +156,7 @@ bool WrSavelocParseFile(const char *path, const char *map,
 // standing on restores the clock" would be to restate the matcher in the
 // harness and watch it agree with itself.
 void WrSavelocInstallForTest(const WrSavelocHit *rows, int n);
+void WrSavelocSetCurrentForTest(int gameIndex);
 
 // The last thing that happened, for a moment, so a stamp or a restore is visible
 // somewhere other than the log. Empty when nothing recent.

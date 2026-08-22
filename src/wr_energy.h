@@ -81,12 +81,13 @@
 // For loaded runs, nothing: .wrpath stores a real velocity per point, so their
 // energy is exact.
 //
-// For you, live, the velocity is differenced from the camera position, because
-// that is the only thing WrLines knows about you -- the world-to-screen matrix
-// gives a camera, not a player. Differencing one frame at 200 fps turns a
-// two-unit view bob into a 400 u/s spike, so it is measured over a few frames
-// and smoothed. Expect the live number to be right to within a few percent and
-// to lag a fast change slightly.
+// Live prefers the game's own player origin and velocity once the read-only
+// scanner has proved both addresses. That pair is used directly: smoothing an
+// exact velocity would only make it late. Until the scan succeeds (and on a
+// build where it cannot), the fallback is still camera-derived. Differencing
+// one frame at 200 fps turns a two-unit view bob into a 400 u/s spike, so that
+// fallback is measured over a few frames and smoothed. Expect the fallback to
+// be right to within a few percent and to lag a fast change slightly.
 
 #ifndef WR_ENERGY_H
 #define WR_ENERGY_H
@@ -103,14 +104,11 @@ struct WrEnergySettings
     bool showHud;
     float hudOffsetX;       // from screen centre
     float hudOffsetY;
-    // Which part of the block the offset positions.
-    //
-    // Alignment used to be an unwritten side effect of the offset's SIGN --
-    // negative right-aligned it -- which meant there was no way to centre the
-    // block on the crosshair at all, and no way to sit it above without it
-    // creeping as rows came and went. Both are now said outright.
-    int hudAlignX;          // WrHudAlignX
-    int hudAnchorY;         // WrHudAnchorY
+    // Legacy anchor fields are still read from old settings files so they do
+    // not become "unknown" warnings. Layout now always positions the block by
+    // its centre and the drag editor writes the offsets above.
+    int hudAlignX;
+    int hudAnchorY;
     float hudScale;
     bool hudBacking;        // dark plate behind the text
     bool showHudClock;      // the run clock, as a fourth row
@@ -185,13 +183,20 @@ struct WrEnergySettings
     // ramp is never "how fast am I turning" -- it is "faster or slower than I
     // should be". That also puts the full width on the error instead of half.
     //
-    // It takes its scale from strafeBand and strafeTolerance, deliberately: the
-    // bar, the colour and the arrow are three renderings of one comparison, and
-    // a second tolerance setting is a way for them to disagree.
+    // Its base scale comes from strafeBand and strafeTolerance. Sensitivity is
+    // a visual gain on the bar alone: 1 is that shared scale, larger values move
+    // the fill further for the same error without changing the number, colour
+    // or correction arrow.
     bool showStrafeBar;
+    // A second track beneath yours for the fastest enabled run nearby. A stored
+    // path has no view angles, so this is reconstructed from its horizontal air
+    // acceleration and deliberately goes quiet on ramp-contact samples.
+    bool showReferenceStrafeBar;
+    float strafeBarSensitivity;
     float strafeBarWidth;   // pixels before hudScale; 0 tracks the HUD block
     float strafeBarHeight;
     float strafeBarRise;    // above the crosshair -- the flash owns 46 below it
+    float strafeBarOffsetX; // editor-controlled, from screen centre
 
     // GRADE YOUR OWN BOARDS, the same way a demo's are graded.
     //
@@ -229,12 +234,15 @@ struct WrEnergySettings
     // map; a camera estimate does not earn the second one.
     int boardDecimals;          // 0..3, applied to the cost
 
-    bool showOverlay;       // the corner block; ON by default
-    int overlayCorner;      // 0 TL, 1 TR, 2 BL, 3 BR
+    bool showOverlay;       // the detailed box; bottom-right by default
+    int overlayCorner;      // legacy settings-file compatibility; no UI
 
-    // How far a corner block is kept from the edge of the screen. Was a hard
-    // 18 and unclamped, so a block could and did hang off the bottom.
-    float overlayMargin;
+    float overlayMargin;    // legacy settings-file compatibility; layout is 16
+
+    // Position inside the 16-pixel-safe screen rectangle. 0 is the left/top
+    // edge, 1 the right/bottom edge, and .5 stays centred across resolutions.
+    float overlayPosX;
+    float overlayPosY;
 
     bool compareToRun;      // show the reference run's energy at your position
     float compareRadius;    // don't compare against a run this far from you
@@ -242,18 +250,16 @@ struct WrEnergySettings
 
     float overlayScale;     // the corner block had no scale control at all
 
-    // How hard the readout is filtered, in seconds. Exposed because "readable"
-    // is a matter of taste and the right answer differs between watching a ramp
-    // and standing still reading numbers.
-    float smoothSeconds;    // the headline figure
+    // Camera-estimate fallback only. A proved game origin/velocity pair bypasses
+    // all of these filters and display buckets.
+    float smoothSeconds;    // fallback headline figure
     float trendSeconds;     // window the arrow judges over
-    float quantiseStep;     // round the displayed figure to this
+    float quantiseStep;     // bucket the fallback display by this much
 
     // The rest of the filter chain, which used to be four #defines.
     //
-    // Reported as "the numbers feel slow", and the smoothing slider above was
-    // not the whole story: the reading is filtered four times over before it is
-    // shown, and only one of those stages was reachable. The full chain is
+    // If the player scan fails, the reading is filtered four times before it is
+    // shown. The full fallback chain is
     //
     //     velWindowSeconds   position differenced over a window -> velocity
     //     velTau             that velocity, smoothed  (vector and turn rates)
@@ -261,9 +267,7 @@ struct WrEnergySettings
     //     smoothSeconds      the energy figure itself
     //     quantiseStep       and then rounded, with 0.75-step hysteresis
     //
-    // and the end-to-end lag is about velWindowSeconds/2 + smoothSeconds. The
-    // defaults are the values those #defines held, so nothing moves until a
-    // slider does.
+    // and its end-to-end lag is about velWindowSeconds/2 + smoothSeconds.
     //
     // Shortening velWindowSeconds is not free: it is a finite difference, so
     // halving the window doubles the noise in the result. 40 ms was chosen
@@ -282,8 +286,8 @@ struct WrEnergySettings
     float gaugeSeconds;
     float arrowBand;        // trend inside +-this shows no arrow at all
 
-    // Anchor the readout to the start of the run being compared against, so its
-    // clock and yours start in the same place. Off means only manual anchors.
+    // Anchor the ENERGY readout to the compared run's start. Timing is read
+    // independently from Momentum. Off means only manual energy anchors.
     bool anchorToRunStart;
 
     // Which pair of numbers the crosshair readout is showing. The block stays
@@ -351,6 +355,7 @@ enum WrHudMode
     WR_HUD_STRAFE,      // how close to the physical best your strafing is
     WR_HUD_TURN,        // how fast you are turning, against how fast you should
     WR_HUD_NET_STRAFE,  // the first one, with the one above on the second line
+    WR_HUD_STRESS,      // uncapped air acceleration versus the 30 u/s cap
     WR_HUD_MODE_COUNT
 };
 
@@ -447,21 +452,16 @@ bool WrEnergyAnchorPos(Vec3 *out);   // false when there is no anchor
 
 // True once after a teleport that landed back at the anchor -- a fail trigger,
 // or the restart key. Reading it clears it, so exactly one caller may consume
-// it; that caller is WrTimerTick, which zeroes the clock for the new attempt.
-//
-// This is the only restart signal the tool has. WrLines reads the camera and
-// nothing else, so it cannot see a trigger fire, a key press, or a zone enter.
+// it; that caller is WrTimerTick, which separates live recordings into attempts
+// and clears any save-loc time offset. The displayed timer itself still follows
+// Momentum's state and tick value.
 bool WrEnergyTakeRestart(void);
 
-// True while the camera is not being written at all -- a paused demo, or the
-// game not simulating. Everything is frozen at its last real value rather than
-// draining toward zero, and the run clock stops with it.
-//
-// The test is bit-identical position, which is stronger than it looks: a camera
-// being updated every tick never repeats a float exactly, and one that is not
-// repeats it forever. A player standing still reads as held too, and that costs
-// nothing -- if the camera is not moving there is nothing to measure.
-bool WrEnergyHeld(void);
+// True after the camera origin has repeated for a short stretch. This is only a
+// hint for the stale-matrix safety net; it does not pause the sampler, HUD,
+// recorder, phase detection, or run clock. In particular, standing still no
+// longer freezes angle-derived values.
+bool WrEnergyCameraStill(void);
 
 // True once after ANY teleport, with where it landed. Same consume-once contract
 // as WrEnergyTakeRestart, and the same reason for living here: WrLines has one
@@ -562,9 +562,9 @@ float WrEnergyTrend(void);          // signed change over the last ~0.4 s
 // term at surf speeds is worth a hundred units of energy, so the dead band has
 // to widen with speed or the arrow strobes.
 int WrEnergyTrendDir(void);
-float WrEnergySpeed(void);          // smoothed |v|, units/second
+float WrEnergySpeed(void);          // exact |v|, or smoothed camera fallback
 float WrEnergyHorizontalSpeed(void);
-bool WrEnergyVelocity(Vec3 *out);   // smoothed velocity, for the world vector
+bool WrEnergyVelocity(Vec3 *out);   // exact velocity, or smoothed fallback
 
 // How fast you are turning, in degrees per second.
 //
@@ -585,10 +585,10 @@ float WrEnergyPower(void);
 // destroyed -- the same scale the demo lines are coloured on, so the two can
 // never disagree.
 //
-// `tickInterval` is the tick the ceiling is computed at; use the compared run's
-// when there is one, 0.015 otherwise. It is a parameter because the run store
-// lives on the other side of a link boundary from this file -- see the note in
-// the definition.
+// `tickInterval` is the tick the ceiling is computed at. For the live gauge,
+// pass the current game's interval_per_tick (0.015 if it cannot be read). It is
+// a parameter because the game-timer reader lives on the other side of a link
+// boundary from this arithmetic and because tests need to drive both tickrates.
 //
 // `noReading` comes back true when there is nothing honest to show: too little
 // history yet, or a rate too large to have come from a player, which is a map
@@ -685,6 +685,14 @@ void WrEnergySetTruePlayer(const Vec3 *origin, const Vec3 *velocity,
 // Is the live board being graded off the game's own velocity, or off the
 // camera estimate? The two do not deserve the same number of decimal places.
 bool WrEnergyTrueVelocityLive(void);
+
+// The two pieces of live AirAccelerate state that are not cvars. Crouch is
+// recovered from the measured view offset (64 standing, 28 ducked in the surf
+// family); friction is 0.25 only during Momentum's low-rising deadstrafe
+// window, otherwise 1. Both return the conservative normal state when the
+// player reader has not proved enough to tell.
+bool  WrEnergyCrouched(void);
+float WrEnergyAirFriction(void);
 
 // board gradeable -- see WrEnergyBoard.
 //

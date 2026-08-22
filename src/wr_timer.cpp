@@ -1,6 +1,7 @@
 // wr_timer.cpp  --  see wr_timer.h.
 
 #include "wr_timer.h"
+#include "wr_gametimer.h"
 #include "wr_energy.h"
 #include "wr_path.h"
 #include "wr_savelocs.h"
@@ -11,9 +12,7 @@
 #include <string.h>
 #include <stdio.h>
 
-// How far you have to leave the anchor before the clock starts. Small enough
-// that it starts the moment you actually move, large enough that standing on the
-// pad shuffling does not start it.
+// Legacy harness fallback only. Production never starts a clock from movement.
 #define START_UNITS 32.0f
 
 // There is no teleport test here any more. There used to be a second copy of
@@ -28,10 +27,25 @@
 static bool g_running = false;
 static float g_elapsed = 0.0f;
 
-// Started by hand rather than by leaving the anchor. Without this the clock is
-// dead whenever no run is enabled nearby -- which also silently disabled the
-// whole save-loc timing feature, since it only stamps while the clock runs.
+// Legacy harness state. Production has no manual timer controls.
 static bool g_manual = false;
+
+// The displayed practice clock is Momentum's networked run time plus this
+// offset. It is normally zero. Loading a save state changes it so the clock
+// resumes from the value WrLines stamped when that exact state was created.
+static bool g_gameResolved = false;
+static bool g_gameRunning = false;
+static bool g_prevGameRunning = false;
+static float g_gameSeconds = 0.0f;
+static float g_prevGameSeconds = 0.0f;
+static int g_prevGameTick = 0;
+static unsigned int g_gameIdentity = 0;
+static float g_gameTickInterval = 0.015f;
+static float g_gameBias = 0.0f;
+static bool g_setThisTick = false;
+static bool g_pendingGameLoad = false;
+static float g_pendingLoadAge = 0.0f;
+static unsigned int g_savelocLoadSerial = 0;
 
 // The save-loc we are currently sitting exactly on top of, and whether we were
 // sitting on one last frame. See the block in WrTimerTick: standing on a
@@ -86,6 +100,21 @@ void WrTimerReset(void)
     g_sinceRestart = 0.0f;
     g_holdZone = false;
     g_holdRadius = 0.0f;
+    g_gameResolved = false;
+    g_gameRunning = false;
+    g_prevGameRunning = false;
+    g_gameSeconds = g_prevGameSeconds = 0.0f;
+    g_prevGameTick = 0;
+    g_gameIdentity = 0;
+    g_gameTickInterval = 0.015f;
+    g_gameBias = 0.0f;
+    g_setThisTick = false;
+    g_pendingGameLoad = false;
+    g_pendingLoadAge = 0.0f;
+    g_savelocLoadSerial = WrSavelocLoadSerial();
+#ifndef WRLINES_TEST
+    WrGameTimerReset();
+#endif
 }
 
 void WrTimerStart(void)
@@ -110,6 +139,14 @@ bool WrTimerManual(void) { return g_manual; }
 
 void WrTimerSet(float seconds, const char *why)
 {
+    g_setThisTick = true;
+    g_pendingGameLoad = false;
+    g_pendingLoadAge = 0.0f;
+#ifndef WRLINES_TEST
+    if (!g_gameResolved || !g_gameRunning)
+        return;
+    g_gameBias = seconds - g_gameSeconds;
+#endif
     g_elapsed = seconds;
     g_running = true;
     WrLogf("timer: set to %.2fs (%s)", seconds, why ? why : "");
@@ -117,11 +154,58 @@ void WrTimerSet(float seconds, const char *why)
 
 bool WrTimerRunning(void) { return g_running; }
 float WrTimerElapsed(void) { return g_elapsed; }
+float WrTimerTickInterval(void) { return g_gameTickInterval; }
 
 void WrTimerTick(const Vec3 &cam, float dt)
 {
     if (!(dt > 0.0f) || dt > 0.5f)
         return;
+
+    g_setThisTick = false;
+
+#ifndef WRLINES_TEST
+    bool gameJumped = false;
+    bool gameReplaced = false;
+    WrGameTimerSample game;
+    bool hadIdentity = g_gameIdentity != 0;
+    g_gameResolved = WrGameTimerRead(&game);
+    if (g_gameResolved)
+    {
+        g_gameRunning = (game.state == 2); // Momentum TimerState::RUNNING
+        g_gameSeconds = (float)game.seconds;
+        g_gameTickInterval = game.tickInterval;
+        if (g_prevGameRunning && g_gameRunning &&
+            game.tick >= g_prevGameTick && g_prevGameTick > 0)
+        {
+            float expected = (game.tick - g_prevGameTick) * game.tickInterval;
+            float actual = g_gameSeconds - g_prevGameSeconds;
+            // Normal progression, including a new network snapshot, stays
+            // continuous to float precision. A save-state load may jump either
+            // backwards OR forwards, so compare against elapsed game ticks
+            // instead of looking only for a rewind.
+            gameJumped = fabsf(actual - expected) > game.tickInterval * 2.5f;
+        }
+        gameReplaced = hadIdentity && game.identity != g_gameIdentity;
+        g_gameIdentity = game.identity;
+        if (gameJumped || gameReplaced)
+        {
+            g_pendingGameLoad = true;
+            g_pendingLoadAge = 0.0f;
+        }
+    }
+    else
+    {
+        g_gameRunning = false;
+    }
+
+    unsigned int loadSerial = WrSavelocLoadSerial();
+    if (loadSerial != g_savelocLoadSerial)
+    {
+        g_savelocLoadSerial = loadSerial;
+        g_pendingGameLoad = true;
+        g_pendingLoadAge = 0.0f;
+    }
+#endif
 
     Vec3 anchor;
     bool haveAnchor = WrEnergyAnchorPos(&anchor);
@@ -224,6 +308,7 @@ void WrTimerTick(const Vec3 &cam, float dt)
         else if (!g_wasExact || WrDist(exact.pos, g_lastExact) > 0.5f)
         {
             g_lastExact = exact.pos;
+#ifdef WRLINES_TEST
             if (exact.seconds >= 0.0f)
             {
                 WrTimerSet(exact.seconds, "loaded a save-loc, without moving");
@@ -248,6 +333,7 @@ void WrTimerTick(const Vec3 &cam, float dt)
             // branch only runs when that did not fire.
             if (exact.haveVel)
                 WrEnergySeed(cam, exact.vel, "a save-loc loaded in place");
+#endif
         }
     }
     g_wasExact = exactNow;
@@ -284,8 +370,10 @@ void WrTimerTick(const Vec3 &cam, float dt)
             // same reason. This makes the clock agree with it.
             if (hit.seconds >= 0.0f && !restart)
             {
+#ifdef WRLINES_TEST
                 WrTimerSet(hit.seconds, "loaded a save-loc");
                 WrSavelocNoteRestore(hit.seconds);
+#endif
             }
             else if (hit.seconds >= 0.0f)
             {
@@ -312,13 +400,49 @@ void WrTimerTick(const Vec3 &cam, float dt)
         }
     }
 
+#ifndef WRLINES_TEST
+    // A load is signalled by a save-file rewrite with an unchanged cps table,
+    // or independently by a discontinuity/replacement in the authoritative
+    // timer. `cur` then names the exact slot, including duplicate positions.
+    // The file refresh is asynchronous, so keep the signal briefly.
+    if (g_pendingGameLoad && !restart && !g_setThisTick)
+    {
+        g_pendingLoadAge += dt;
+        WrSavelocHit hit;
+        if (WrSavelocCurrent(&hit))
+        {
+            float dx = hit.pos.x - cam.x, dy = hit.pos.y - cam.y;
+            float dz = hit.pos.z - cam.z;
+            if (dx * dx + dy * dy < 24.0f * 24.0f &&
+                dz < 96.0f && dz > -96.0f)
+            {
+                if (hit.seconds >= 0.0f)
+                {
+                    WrTimerSet(hit.seconds, "loaded the current save-loc");
+                    WrSavelocNoteRestore(hit.seconds);
+                }
+                else
+                {
+                    WrSavelocNoteNoTime();
+                    g_pendingGameLoad = false;
+                }
+                if (hit.haveVel)
+                    WrEnergySeed(cam, hit.vel, "the current save-loc");
+            }
+        }
+        if (g_pendingLoadAge > 1.0f)
+            g_pendingGameLoad = false;
+    }
+#endif
+
     if (restart)
     {
-        // A fail trigger, or the restart key. That is a new attempt rather than
-        // a continuation, so the clock goes back to zero and re-arms -- it will
-        // start again by itself when you leave the pad.
+        // A fail trigger, or the restart key. Clear a save-loc bias and split
+        // the live recording; Momentum remains authoritative for timer state.
         g_running = g_manual;   // a hand-started clock stays started
         g_elapsed = 0.0f;
+        g_gameBias = 0.0f;
+        g_pendingGameLoad = false;
 
         // And the attempt you just failed is worth keeping until the next one
         // begins. Left alone, the recorder wipes it on this very frame -- the
@@ -405,10 +529,12 @@ void WrTimerTick(const Vec3 &cam, float dt)
             WrEnergyAnchorToStartZone(WrStartZoneAnchor(crossed));
         if (g_start.autoZeroClock)
         {
+#ifdef WRLINES_TEST
             char why[64];
             _snprintf_s(why, sizeof(why), _TRUNCATE, "left the %s start",
                         WrTrackNameOf(crossed->trackType, crossed->trackNum));
             WrTimerSet(0.0f, why);
+#endif
         }
 
         // The new attempt starts here, so the old one stops being the answer.
@@ -418,8 +544,49 @@ void WrTimerTick(const Vec3 &cam, float dt)
         // would put the time axis into reverse.
         g_holdZone = false;
         WrLiveClear();
+#ifdef WRLINES_TEST
+        return;
+#endif
+    }
+
+#ifndef WRLINES_TEST
+    // Production has no movement/anchor fallback. If the game's timer cannot
+    // be read, the honest result is an unavailable clock, not a stopwatch that
+    // looks authoritative and starts at a guessed place.
+    if (!g_gameResolved)
+    {
+        g_running = false;
+        g_elapsed = 0.0f;
+        g_prevGameRunning = false;
         return;
     }
+
+    if (g_gameRunning)
+    {
+        // A genuine transition from primed to running is a new attempt. A
+        // save-state restore in the same frame has already called WrTimerSet
+        // and therefore owns the bias instead.
+        if (!g_prevGameRunning && !g_setThisTick)
+            g_gameBias = 0.0f;
+        g_running = true;
+        g_manual = false;
+        g_elapsed = g_gameSeconds + g_gameBias;
+        if (g_elapsed < 0.0f)
+            g_elapsed = 0.0f;
+    }
+    else
+    {
+        g_running = false;
+        g_manual = false;
+        g_elapsed = g_gameSeconds + g_gameBias;
+        if (g_elapsed < 0.0f)
+            g_elapsed = 0.0f;
+    }
+    g_prevGameRunning = g_gameRunning;
+    g_prevGameSeconds = g_gameSeconds;
+    g_prevGameTick = game.tick;
+    return;
+#endif
 
     if (!haveAnchor)
     {
@@ -429,8 +596,6 @@ void WrTimerTick(const Vec3 &cam, float dt)
         // because the zeroing happened again the next frame. A hand-started
         // clock now simply keeps running.
         if (!g_manual)
-            return;
-        if (WrEnergyHeld())
             return;
         g_elapsed += dt;
         return;
@@ -463,19 +628,17 @@ void WrTimerTick(const Vec3 &cam, float dt)
         return;
     }
 
-    // A paused demo must not accumulate time, or the you-versus-them delta is
-    // wrong by however long you sat looking at it. A player standing perfectly
-    // still mid-run reads the same way and their clock stops too, which is
-    // wrong -- but standing still mid-surf is not a thing that happens, and the
-    // alternative is the demo case being wrong every single time.
-    if (WrEnergyHeld())
-        return;
-
     g_elapsed += dt;
 }
 
 const char *WrTimerWhyNot(const WrRun *ref)
 {
+#ifndef WRLINES_TEST
+    if (!g_gameResolved)
+        return WrGameTimerStatus();
+    if (!g_running)
+        return "waiting for Momentum's in-game timer to start";
+#endif
     if (!ref)
         return "no run enabled near you";
     if (!g_running)

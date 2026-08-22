@@ -202,9 +202,19 @@ They are **read, never swallowed**, so a collision means the game still acts on 
   can be deleted from the panel. Described under **Watching what you download** below. The
   **watch** button puts a console command on your clipboard for you to paste; WrLines does not
   execute it.
-- **In its default configuration it makes zero calls into the game.** It hooks `Present` to
-  draw, reads memory read-only, and reads files — including, on a map change, the map's own
-  `.bsp`, read-only and shared, from the install directory it already reads demos out of.
+- **It calls into the game in exactly one place, and only to read.** Up to v1.1.0 the figure was
+  zero. v1.2.0 shows Momentum's authoritative run clock instead of a stopwatch fitted to your
+  movement, and there is no way to read a networked field without asking the client where it is:
+  `wr_gametimer.cpp` calls `CreateInterface` for `VClient018` and `VClientEntityList003`, then
+  their published accessors — `GetAllClasses`, `GetClientNetworkable`,
+  `GetClientNetworkableFromHandle`, `GetHighestEntityIndex` — to reach the local player's primary
+  timer, and looks its two fields up **by name** in the receive tables so an ordinary class-layout
+  change becomes a clean refusal rather than a wrong clock. Every one of those returns a value.
+  None of them changes game state, none is a cvar, a console command or a trace, and anything that
+  fails validation disables the reader and says so in Diagnostics. Everything else is unchanged:
+  it hooks `Present` to draw, reads memory read-only, and reads files — including, on a map
+  change, the map's own `.bsp`, read-only and shared, from the install directory it already reads
+  demos out of.
 - **The map reader takes brushes, displacements and solid brush entities, and says what it is
   missing.** Displacement surfaces are subdivided from their own lumps on BSP 19, 20, 21 and —
   since Strata published the struct — 25; `func_*` brushes are read with triggers named and

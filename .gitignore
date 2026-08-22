@@ -9,6 +9,12 @@
 *.ilk
 *.idb
 
+# A scratch build tree. tests\prodcheck\ is where a full production-configuration
+# compile is dropped to check that the harness defines have not changed what
+# ships. Everything in it is object code except wrlines.res, which *.obj above
+# does not catch -- so ignore the directory rather than chasing extensions.
+tests/prodcheck/
+
 # Demo recordings. The README's video is a YouTube link, so the capture it was
 # cut from is a working file rather than something to ship: a minute of gameplay
 # is tens of megabytes, git keeps it in the history of every clone for ever, and

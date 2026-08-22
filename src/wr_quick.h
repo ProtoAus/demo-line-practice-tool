@@ -76,13 +76,11 @@ struct WrQuickSettings
     // Consent to read the public leaderboard without a press, and the one real
     // change of posture this panel makes.
     //
-    // Everything else in this tool gates the network behind g_fetchEnabled,
-    // which defaults to false and RESETS EVERY LAUNCH -- nothing reaches the
-    // network without a press in that session. That is right for a panel you
-    // are already looking at and wrong for one whose whole promise is that it
-    // fills itself in. So this is the same fence moved: still off by default,
-    // still one explicit yes, but persisted, so it is one press ever rather
-    // than one press per session.
+    // The full Board tab reads its first page when somebody opens it on a new
+    // map. This quick page is different: it can fill while the full panel has
+    // never been opened, so it keeps its own persisted consent. Still off by
+    // default, still one explicit yes, but persisted, so it is one press ever
+    // rather than one press per session.
     //
     // It only ever covers reading a BOARD, and only for the leg you are looking
     // at, and only when nothing is cached for it. Demo bodies are never
@@ -292,12 +290,11 @@ static inline const char *WrQuickGiveUpReason(WrQuickAction a)
 // them are empty -- wr_board.h says so about the surf catalogue too. A list of
 // boards that MIGHT exist cannot pick the one that does.
 //
-// So the caller resolves in this order, most certain first:
+// So the caller resolves in this order:
 //
-//   1. a board already cached for this map -- the filename carries the mode, and
-//      it is the mode you already fetched, not a guess at all;
-//   2. a mode chosen for this map before, remembered in quickpicks.txt;
-//   3. this function;
+//   1. a mode chosen for this map before, remembered in quickpicks.txt;
+//   2. this function -- the map's conventional/default discipline;
+//   3. a cached board for ambiguous names, whose filename carries the mode;
 //   4. the g_quick.gamemode setting.
 //
 // WHY A PREFIX IS ENOUGH, AND WHERE IT STOPS. Momentum's map names are prefixed
@@ -307,17 +304,6 @@ static inline const char *WrQuickGiveUpReason(WrQuickAction a)
 // returns 0 -- "no opinion" -- rather than being confidently wrong two times in
 // three. Same for tricksurf, which has no mode in the enum at all.
 #define WR_QUICK_MODE_UNKNOWN 0
-
-static inline bool WrQuickHasPrefix(const char *s, const char *p)
-{
-    for (; *p; s++, p++)
-    {
-        const char a = (*s >= 'A' && *s <= 'Z') ? (char)(*s - 'A' + 'a') : *s;
-        if (a != *p)
-            return false;
-    }
-    return true;
-}
 
 // Pull the mode and the leg back out of a board cache filename.
 //
@@ -404,29 +390,7 @@ static inline bool WrQuickParseBoardName(const char *name, const char *map,
 // The gamemode a map's NAME implies, or WR_QUICK_MODE_UNKNOWN.
 static inline int WrQuickGamemodeGuess(const char *map)
 {
-    if (!map || !*map)
-        return WR_QUICK_MODE_UNKNOWN;
-
-    // Order does not matter here and that is a property worth keeping: no entry
-    // is a prefix of another, so exactly one can ever match and the table can be
-    // read as a set. Adding one that overlaps -- "df" beside "df_", say -- would
-    // quietly make this list order-dependent, which is the kind of thing that is
-    // discovered by a wrong answer rather than by reading.
-    struct { const char *prefix; int mode; } kByName[] = {
-        { "surf_",    1 },
-        { "bhop_",    2 },
-        { "rj_",      7 },
-        { "sj_",      8 },
-        { "ahop_",    9 },
-        { "conc_",   10 },
-        { "defrag_", 11 },
-        { "df_",     11 },
-    };
-    for (int i = 0; i < (int)(sizeof(kByName) / sizeof(kByName[0])); i++)
-        if (WrQuickHasPrefix(map, kByName[i].prefix))
-            return kByName[i].mode;
-
-    return WR_QUICK_MODE_UNKNOWN;
+    return WrGamemodeFromMapName(map);
 }
 
 #endif // WR_QUICK_H

@@ -435,6 +435,23 @@ int main(void)
         Check(strcmp(WrGamemodeName(14), "?") == 0, "so is 14");
     }
 
+    // -----------------------------------------------------------------------
+    printf("\nmap names select their default leaderboard\n");
+    {
+        Check(WrGamemodeFromMapName("surf_utopia") == 1, "surf_ selects surf");
+        Check(WrGamemodeFromMapName("BHOP_Hades") == 2,
+              "bhop_ selects bhop without caring about case");
+        Check(WrGamemodeFromMapName("rj_bhop_mix") == 7,
+              "only the prefix decides, not a word later in the name");
+        Check(WrGamemodeFromMapName("conc_speed") == 10,
+              "conc_ selects conc");
+        Check(WrGamemodeFromMapName("kz_cellblock") == 0,
+              "ambiguous climb maps still ask for a manual choice");
+        Check(WrGamemodeFromMapName("surfing") == 0,
+              "a partial prefix is not guessed");
+        Check(WrGamemodeFromMapName(NULL) == 0, "no map has no default");
+    }
+
     remove(kPath);
     printf("\n%s\n\n", g_failures ? "SOME CHECKS FAILED" : "all checks passed");
     return g_failures ? 1 : 0;

@@ -479,7 +479,7 @@ void WrStartTick(const Vec3 &cam, float dt, bool teleported)
 
     // A teleport moves you without moving through anything, so every edge this
     // machine watches for is meaningless across one. Reset rather than reason.
-    if (teleported || WrEnergyHeld())
+    if (teleported)
     {
         g_state = WR_START_AWAY;
         g_inZone = -1;

@@ -153,10 +153,37 @@
 // sv_air_max_wishspeed. The one Source constant this rests on.
 #define WR_AIR_WISHSPEED 30.0f
 
+// Momentum's surf-family HandleDuckingSpeedCrop scales the MOVEMENT COMMAND,
+// not mv->m_flMaxSpeed. AirMove therefore hands AirAccelerate 34% of the normal
+// uncapped wishspeed while duck is held (or the duck transition/flag is live).
+// This matters in the acceleration-limited regime; at the stock surf settings
+// both values still reach the 30 u/s air cap.
+#define WR_AIR_DUCK_MULTIPLIER 0.34f
+
+// Momentum's NON_JUMP_VELOCITY for non-TF2 modes. CategorizePosition skips its
+// ground trace above this speed; at 0 < vz <= 140 over no standable surface it
+// instead leaves the player airborne and quarters m_surfaceFriction.
+#define WR_DEADSTRAFE_MAX_RISE 140.0f
+
 // Defaults for the two cvars the ceiling depends on. Nothing here reads cvars,
 // so these are settings; surf servers run 150, and stock Source is 10.
 #define WR_AIR_ACCEL_DEFAULT 150.0f
 #define WR_MAXSPEED_DEFAULT 250.0f
+
+// The two live state adjustments AirAccelerate receives. Callers establish
+// that air movement is active before asking for the friction; ground friction
+// is a different equation and must not be fed into an air-strafe indicator.
+static inline float WrAirWishSpeed(float maxSpeed, bool crouched)
+{
+    if (maxSpeed < 0.0f) maxSpeed = 0.0f;
+    return crouched ? maxSpeed * WR_AIR_DUCK_MULTIPLIER : maxSpeed;
+}
+
+static inline float WrAirSurfaceFriction(float verticalSpeed)
+{
+    return (verticalSpeed > 0.0f &&
+            verticalSpeed <= WR_DEADSTRAFE_MAX_RISE) ? 0.25f : 1.0f;
+}
 
 // The most energy air strafing can add, in energy units per second.
 //
@@ -212,15 +239,23 @@ static inline float WrAirPowerCeiling(float gravity, float tickInterval)
 // 1 everywhere except the deadstrafe period described in the header, so this
 // changes no shipped number -- but two functions modelling one line of engine
 // code differently is how they come apart later.
-static inline float WrAirGainPerTickEx(float tickInterval, float airAccel,
-                                       float maxSpeed, float surfaceFriction)
+static inline float WrAirAccelerationPerTickEx(float tickInterval,
+                                                float airAccel,
+                                                float wishSpeed,
+                                                float surfaceFriction)
 {
     if (tickInterval < 1e-4f) tickInterval = 0.015f;
     if (airAccel < 0.0f) airAccel = 0.0f;
-    if (maxSpeed < 0.0f) maxSpeed = 0.0f;
+    if (wishSpeed < 0.0f) wishSpeed = 0.0f;
     if (surfaceFriction < 0.0f) surfaceFriction = 0.0f;
+    return airAccel * wishSpeed * tickInterval * surfaceFriction;
+}
 
-    float a = airAccel * maxSpeed * tickInterval * surfaceFriction;
+static inline float WrAirGainPerTickEx(float tickInterval, float airAccel,
+                                       float maxSpeed, float surfaceFriction)
+{
+    float a = WrAirAccelerationPerTickEx(tickInterval, airAccel, maxSpeed,
+                                         surfaceFriction);
     return (a > WR_AIR_WISHSPEED) ? WR_AIR_WISHSPEED : a;
 }
 
@@ -268,12 +303,29 @@ static inline bool WrAirCapBinds(float tickInterval, float airAccel,
 // gives 5.4 units and Source gives min(12 * 250 / 64, 30) = 30. Worth writing
 // down, because that is exactly the configuration somebody would reach for this
 // to check.
+static inline float WrPerfectStrafeDegreesEx(float speed, float tickInterval,
+                                             float airAccel, float wishSpeed,
+                                             float surfaceFriction);
+
 static inline float WrPerfectStrafeDegrees(float speed, float tickInterval,
                                            float airAccel, float maxSpeed)
 {
+    return WrPerfectStrafeDegreesEx(speed, tickInterval, airAccel, maxSpeed,
+                                    1.0f);
+}
+
+// The state-aware form. `wishSpeed` is the uncapped value AirMove passes after
+// crouch cropping; `surfaceFriction` is normally 1 and is 0.25 only in the
+// deadstrafe window. Keeping those separate is essential: the 30 u/s cap is
+// applied to wishspd, while both values below multiply the acceleration.
+static inline float WrPerfectStrafeDegreesEx(float speed, float tickInterval,
+                                             float airAccel, float wishSpeed,
+                                             float surfaceFriction)
+{
     if (speed < 1.0f)
         speed = 1.0f;
-    float gain = WrAirGainPerTick(tickInterval, airAccel, maxSpeed);
+    float gain = WrAirGainPerTickEx(tickInterval, airAccel, wishSpeed,
+                                     surfaceFriction);
     return (float)(atan2((double)gain, (double)speed) * 57.29577951308232);
 }
 
@@ -313,6 +365,15 @@ static inline float WrPerfectStrafeDegrees(float speed, float tickInterval,
 // `n` must point AWAY from the surface, out towards the player. wn's sign is
 // the whole difference between the two rows above, so an unoriented plane normal
 // gives a confidently wrong answer rather than a slightly wrong one.
+static inline float WrPerfectStrafeDegreesOnPlaneEx(float speed,
+                                                    float tickInterval,
+                                                    float airAccel,
+                                                    float wishSpeed,
+                                                    float surfaceFriction,
+                                                    float gravity,
+                                                    const float n[3],
+                                                    float wn);
+
 static inline float WrPerfectStrafeDegreesOnPlane(float speed,
                                                   float tickInterval,
                                                   float airAccel, float maxSpeed,
@@ -320,17 +381,32 @@ static inline float WrPerfectStrafeDegreesOnPlane(float speed,
                                                   const float n[3],
                                                   float wn)
 {
+    return WrPerfectStrafeDegreesOnPlaneEx(speed, tickInterval, airAccel,
+                                           maxSpeed, 1.0f, gravity, n, wn);
+}
+
+static inline float WrPerfectStrafeDegreesOnPlaneEx(float speed,
+                                                    float tickInterval,
+                                                    float airAccel,
+                                                    float wishSpeed,
+                                                    float surfaceFriction,
+                                                    float gravity,
+                                                    const float n[3],
+                                                    float wn)
+{
     if (speed < 1.0f)
         speed = 1.0f;
     if (tickInterval < 1e-4f)
         tickInterval = 0.015f;
     if (!n)
-        return WrPerfectStrafeDegrees(speed, tickInterval, airAccel, maxSpeed);
+        return WrPerfectStrafeDegreesEx(speed, tickInterval, airAccel,
+                                        wishSpeed, surfaceFriction);
 
     if (wn < -1.0f) wn = -1.0f;
     if (wn > 1.0f) wn = 1.0f;
 
-    const float g = WrAirGainPerTick(tickInterval, airAccel, maxSpeed);
+    const float g = WrAirGainPerTickEx(tickInterval, airAccel, wishSpeed,
+                                       surfaceFriction);
     const float G = gravity * tickInterval;
     float rot = g * (1.0f - wn * wn) + G * n[2] * wn;
     if (rot < 0.0f) rot = -rot;
@@ -443,6 +519,25 @@ static inline float WrStrafeQualityEx(float turnRate, float idealRate,
 static inline float WrStrafeQuality(float turnRate, float idealRate)
 {
     return WrStrafeQualityEx(turnRate, idealRate, WR_AIR_WISHSPEED);
+}
+
+// Reconstruct the turn-rate ratio represented by one tick of horizontal air
+// acceleration. A stored path has no view yaw, but dv points along wishdir;
+// therefore c = dot(v, wishdir), and in the wishspeed-capped regime the same
+// AirAccelerate identity used above gives r = 1 - c/ws.
+//
+// This is only an AIR identity. A ramp clips the result afterwards and destroys
+// the component this inversion needs, so callers must establish that separately.
+static inline bool WrStrafeRatioFromAirDelta(float vx, float vy,
+                                              float dvx, float dvy,
+                                              float *ratioOut)
+{
+    float d = sqrtf(dvx * dvx + dvy * dvy);
+    if (!(d > 0.05f) || !ratioOut)
+        return false;
+    float c = vx * (dvx / d) + vy * (dvy / d);
+    *ratioOut = 1.0f - c / WR_AIR_WISHSPEED;
+    return true;
 }
 
 // Past this much of the ceiling on the GAIN side, it was not the player -- it

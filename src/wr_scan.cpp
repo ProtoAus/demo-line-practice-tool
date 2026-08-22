@@ -23,7 +23,7 @@
 #include "wr_engine.h"
 #include "wr_probe.h"
 #include "wr_hook.h"
-#include "wr_energy.h"      // WrEnergyHeld: a paused demo is frozen on purpose
+#include "wr_energy.h"      // camera-still hint for stale-matrix grace
 #include "wr_log.h"
 
 #include <stdio.h>
@@ -1241,19 +1241,19 @@ void WrScanTick(void)
                 g_frozenSince = tick;
             g_frozenSeconds = (float)((double)(tick - g_frozenSince) / (double)QpcFreq());
 
-            // A PAUSED DEMO IS FROZEN ON PURPOSE.
+            // An unchanged matrix gets a longer grace period while the camera
+            // origin is still too. This no longer means any numeric readout or
+            // clock is paused; WrEnergyCameraStill is only a stale-matrix hint.
             //
-            // The energy sampler holds when the camera origin stops being
-            // written, which is exactly what pausing playback does -- and
-            // dropping the matrix underneath it would take every line and the
-            // whole readout off the screen a second and a half into a pause,
-            // which is when you are most likely to be looking at them.
+            // Dropping the matrix underneath a paused demo would take every line
+            // and the whole readout off the screen a second and a half into a
+            // pause, which is when you are most likely to be looking at them.
             //
             // Extended rather than suspended. The menu case this cutoff exists
             // for looks identical from here, so leaving it off forever would
             // reintroduce a dead route painted over the main menu; five minutes
             // is longer than any pause and still recovers by itself.
-            float limit = WrEnergyHeld() ? 300.0f : g_frozenLimit;
+            float limit = WrEnergyCameraStill() ? 300.0f : g_frozenLimit;
 
             if (g_frozenSeconds > limit && !g_holdForPanel)
             {

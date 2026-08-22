@@ -104,6 +104,8 @@ int main(void)
             Check(hits[0].vel.x != 9999.0f,
                   "predictedVel is not mistaken for vel");
             Check(hits[0].fromCps && hits[1].fromCps, "both are marked as cps");
+            Check(hits[0].gameIndex == 0 && hits[1].gameIndex == 1,
+                  "their exact Momentum cps indices are retained");
         }
     }
 
@@ -137,9 +139,34 @@ int main(void)
         {
             Check(hits[0].fromCps, "the save-loc is marked as one");
             Check(!hits[1].fromCps, "the startmark is not");
+            Check(hits[1].gameIndex == -1, "a startmark has no cps index");
             Check(!hits[1].haveVel,
                   "and it did NOT inherit the save-loc's 1500 u/s");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    printf("\nthe current cps index resolves duplicate positions exactly\n");
+    {
+        WrSavelocHit duplicate[2];
+        memset(duplicate, 0, sizeof(duplicate));
+        duplicate[0].pos = duplicate[1].pos = WrVec(100.0f, 200.0f, 300.0f);
+        duplicate[0].fromCps = duplicate[1].fromCps = true;
+        duplicate[0].gameIndex = 4;
+        duplicate[1].gameIndex = 9;
+        duplicate[0].seconds = 12.0f;
+        duplicate[1].seconds = 34.0f;
+        WrSavelocInstallForTest(duplicate, 2);
+        WrSavelocSetCurrentForTest(9);
+
+        WrSavelocHit got;
+        memset(&got, 0, sizeof(got));
+        Check(WrSavelocCurrent(&got) && got.gameIndex == 9 &&
+              got.seconds == 34.0f,
+              "the current slot is returned, not the first position match");
+        memset(&got, 0, sizeof(got));
+        Check(WrSavelocMatch(duplicate[0].pos, &got) && got.gameIndex == 9,
+              "the ordinary matcher also prefers the exact current slot");
     }
 
     // -----------------------------------------------------------------------

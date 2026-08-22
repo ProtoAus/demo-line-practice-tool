@@ -77,6 +77,8 @@ void WrRenderDefaults(void)
     g_render.effSaturation = 0.6f;
     g_render.effNeutralMix = 0.7f;
     g_render.effNoDataAlpha = 0.35f;
+    g_render.legendPosX = 0.0f;
+    g_render.legendPosY = 0.0f;
     g_render.pickRadiusPx = 48.0f;
     g_render.pickThickBoost = 1.8f;
     g_render.pickHoldSeconds = 0.35f;
@@ -189,12 +191,19 @@ int main(void)
         // failure rather than a clamp doing its job.
         g_render.thickness = 4.25f;
         g_render.alpha = 0.42f;
+        g_render.lineHeightOffset = 64.0f;
         g_render.lineColour = WR_LINE_EFFICIENCY;
         g_render.pickEnabled = true;
         g_render.liveColour = 0x12345678u;
         g_render.maxTags = 7;
         g_energy.hudMode = WR_HUD_STRAFE;
         g_energy.gaugeSeconds = 3.5f;
+        g_energy.strafeBarSensitivity = 2.25f;
+        g_energy.showReferenceStrafeBar = true;
+        g_energy.overlayPosX = 0.42f;
+        g_energy.overlayPosY = 0.61f;
+        g_render.legendPosX = 0.18f;
+        g_render.legendPosY = 0.27f;
         g_energy.showOverlay = true;
         g_energy.hudScale = 1.75f;
         g_start.showZone = true;
@@ -224,6 +233,8 @@ int main(void)
 
         Check(fabsf(g_render.thickness - 4.25f) < 1e-6f, "float came back");
         Check(fabsf(g_render.alpha - 0.42f) < 1e-6f, "and so did a second one");
+        Check(fabsf(g_render.lineHeightOffset - 64.0f) < 1e-6f,
+              "the visual line-height offset came back");
         Check(g_render.lineColour == WR_LINE_EFFICIENCY, "an enum came back");
         Check(g_render.pickEnabled, "a bool came back");
         Check(g_render.liveColour == 0x12345678u,
@@ -232,6 +243,16 @@ int main(void)
         Check(g_energy.hudMode == WR_HUD_STRAFE, "the crosshair mode came back");
         Check(fabsf(g_energy.gaugeSeconds - 3.5f) < 1e-6f,
               "the gauge window came back");
+        Check(fabsf(g_energy.strafeBarSensitivity - 2.25f) < 1e-6f,
+              "the strafe-bar sensitivity came back");
+        Check(g_energy.showReferenceStrafeBar,
+              "the nearby-run strafe bar came back");
+        Check(fabsf(g_energy.overlayPosX - 0.42f) < 1e-6f &&
+              fabsf(g_energy.overlayPosY - 0.61f) < 1e-6f,
+              "the detailed box position came back");
+        Check(fabsf(g_render.legendPosX - 0.18f) < 1e-6f &&
+              fabsf(g_render.legendPosY - 0.27f) < 1e-6f,
+              "the colour-key position came back");
         Check(g_energy.showOverlay, "the corner block came back");
         Check(fabsf(g_energy.hudScale - 1.75f) < 1e-6f, "the text scale came back");
         Check(g_start.showZone, "the start ring came back");
@@ -275,6 +296,7 @@ int main(void)
         Defaults();
         WriteFile_("line.thickness 9999\n"
                    "line.alpha -5\n"
+                   "line.heightOffset 9999\n"
                    "hud.mode 99\n"
                    "graph.maxSeries 100000\n"
                    "line.thickness2 4\n");
@@ -282,6 +304,8 @@ int main(void)
         Check(g_render.thickness <= 12.0f && g_render.thickness >= 0.5f,
               "a huge float is clamped to the slider's range");
         Check(g_render.alpha >= 0.05f, "and a negative one to its floor");
+        Check(g_render.lineHeightOffset <= 256.0f,
+              "the visual height offset is clamped too");
         Check(g_energy.hudMode >= 0 && g_energy.hudMode < WR_HUD_MODE_COUNT,
               "an out-of-range mode cannot index past the mode table");
         Check(g_gMaxSeries <= 32, "and an int is clamped too");

@@ -316,13 +316,12 @@ static int g_seedFrames = 0;
 #define SETTLE_TAUS 3.0f
 static float g_settleFor = 0.0f;
 
-// How long the camera must be bit-identical before the readout is held. Two
-// frames at any rate would do -- a moving camera never repeats a float -- but a
-// little more than that costs nothing and cannot be tripped by a single
-// duplicated update.
+// How long the camera must be bit-identical before it is described as still to
+// the matrix scanner. This is only a stale-matrix hint now: it never stops the
+// sampler, the HUD, the live recorder, or the run clock.
 #define HOLD_SECONDS 0.05f
 static float g_stillFor = 0.0f;
-static bool g_held = false;
+static bool g_cameraStill = false;
 static bool g_haveReading = false;  // a real velocity has been measured since
                                     // the last reset or teleport
 
@@ -376,7 +375,8 @@ static float g_viewTurn = 0.0f, g_velTurn = 0.0f, g_speedRate = 0.0f;
 static float g_yawTurn = 0.0f;
 static float g_yawSigned = 0.0f;
 
-// Displayed value, quantised with hysteresis so the last digit stops churning.
+// Displayed fallback values use hysteresis so their noisy last digit does not
+// churn. The exact-player path publishes the raw values directly.
 static float g_shown = 0.0f;
 static bool g_haveShown = false;
 static float g_zSmooth = 0.0f;
@@ -394,27 +394,16 @@ void WrEnergyDefaults(void)
 {
     g_energy.gravity = 800.0f;
 
-    // OFF by default as of v0.9.0, and this is a change of posture rather than
-    // a tweak.
-    //
-    // A first run should draw lines and nothing else. This is a box of numbers
-    // that appears beside the crosshair the moment the tool is injected, before
-    // anybody has asked for a readout or knows what "carried" means -- and the
-    // thing people install this for is the lines. Both boxes are now off until
-    // asked for, which at least makes the rule simple: the world gets drawn on,
-    // the screen does not.
-    //
-    // The cost is discoverability and it is real. The corner block has END; this
-    // has no key of its own, so it is found in the panel or not at all. Hence
-    // the note beside its checkbox in the Energy tab and the line in README.md.
-    // Anybody who already has it on keeps it: settings.cfg is read OVER these
-    // defaults, so only a fresh install is quiet.
-    g_energy.showHud = false;
-    g_energy.hudOffsetX = 72.0f;
+    // The glanceable readout is part of the default practice view. It starts on
+    // the actionable pair -- actual turn rate and the ideal -- instead of the
+    // general energy summary.
+    g_energy.showHud = true;
+    g_energy.hudOffsetX = 0.0f;
     g_energy.hudOffsetY = 0.0f;
-    // Left at a positive offset is exactly what the old sign trick did with a
-    // positive offset, so nothing moves for anyone who never touches these.
-    g_energy.hudAlignX = WR_HUD_LEFT;
+    // The editor moves the centre of the block. Directional edge anchors made
+    // the same saved position mean four different things and are no longer a
+    // user-facing choice.
+    g_energy.hudAlignX = WR_HUD_CENTRE_X;
     g_energy.hudAnchorY = WR_HUD_CENTRE_Y;
     g_energy.hudScale = 1.4f;
     g_energy.hudBacking = true;
@@ -428,27 +417,24 @@ void WrEnergyDefaults(void)
     g_energy.showOverlay = false;
     g_energy.overlayCorner = 3;
     g_energy.overlayScale = 1.0f;
-    // 18, which is where it was before v0.4.3 raised it to 24 for a cut-off
-    // block that turned out not to be cut off. The clamp in wr_render.cpp stays
-    // -- it costs nothing and it is a no-op whenever the block already fits.
-    g_energy.overlayMargin = 18.0f;
+    g_energy.overlayMargin = 16.0f;
+    g_energy.overlayPosX = 1.0f;
+    g_energy.overlayPosY = 1.0f;
 
-    g_energy.compareToRun = true;
+    g_energy.compareToRun = false;
     g_energy.compareRadius = 384.0f;
     g_energy.eyeHeight = 64.0f;
 
-    // 0.30 s reads as "settling towards a value" rather than "a number". Below
-    // about 0.15 the residual velocity noise is visible again; above about 0.5
-    // it lags a ramp exit enough to be misleading.
-    g_energy.smoothSeconds = 0.30f;
+    // Snappy preset. When the proved player-memory velocity is available the
+    // sampler bypasses these filters entirely; these values are the responsive
+    // fallback for the machines/builds where only the camera can be read.
+    g_energy.smoothSeconds = 0.12f;
     g_energy.trendSeconds = 0.75f;
     g_energy.quantiseStep = 5.0f;
 
-    // Exactly the values the #defines above held, so turning these into settings
-    // changes nothing until one is moved.
-    g_energy.velWindowSeconds = VEL_WINDOW_SECONDS;
-    g_energy.velTau = VEL_TAU;
-    g_energy.speedTau = SPEED_TAU;
+    g_energy.velWindowSeconds = 0.020f;
+    g_energy.velTau = 0.030f;
+    g_energy.speedTau = 0.050f;
     g_energy.powerSeconds = POWER_WINDOW;
     g_energy.showPhase = true;
     g_energy.showStrafe = false;
@@ -468,12 +454,15 @@ void WrEnergyDefaults(void)
     // sits above the crosshair rather than in the HUD block, so it is visible
     // even for the majority of players who never turn the block on.
     g_energy.showStrafeBar = true;
+    g_energy.showReferenceStrafeBar = false;
+    g_energy.strafeBarSensitivity = 1.0f;
     g_energy.strafeBarWidth = 0.0f;     // 0 = match the HUD block's width
     g_energy.strafeBarHeight = 7.0f;
     // Above the crosshair. Below it is spoken for: WR_BOARD_FLASH_DROP puts the
     // board grade at 46, and a strafe bar landing on top of a board flash would
     // hide the one readout that only exists for a tenth of a second.
     g_energy.strafeBarRise = 54.0f;
+    g_energy.strafeBarOffsetX = 0.0f;
 
     g_energy.showBoard = false;
     g_energy.boardFlashSeconds = 2.0f;
@@ -484,11 +473,11 @@ void WrEnergyDefaults(void)
     g_energy.gaugeSeconds = 2.0f;
     g_energy.arrowBand = ARROW_BAND;
     g_energy.anchorToRunStart = true;
-    g_energy.hudMode = WR_HUD_NET;
+    g_energy.hudMode = WR_HUD_TURN;
     g_energy.airAccelerate = WR_AIR_ACCEL_DEFAULT;
     g_energy.maxSpeed = WR_MAXSPEED_DEFAULT;
 
-    g_energy.showBar = true;
+    g_energy.showBar = false;
     g_energy.barMode = WR_BAR_ENERGY;
     // Measured across 28,243 matched samples on every map with at least ten
     // clean main-track runs: |energy gap| against the fastest run has a 90th
@@ -506,9 +495,9 @@ void WrEnergyDefaults(void)
 
 void WrEnergyCycleHudMode(int step)
 {
-    // Both directions, because there are six modes now and cycling forward past
-    // the one you wanted costs five more presses mid-ramp. The double modulus is
-    // the usual guard against C's truncating negative remainder.
+    // Both directions, because cycling forward past the mode you wanted costs a
+    // full lap mid-ramp. The double modulus is the usual guard against C's
+    // truncating negative remainder.
     int n = WR_HUD_MODE_COUNT;
     int m = g_energy.hudMode;
     if (m < 0 || m >= n)
@@ -589,7 +578,7 @@ void WrEnergyReset(void)
     g_havePos = false;
     g_haveReading = false;
     g_stillFor = 0.0f;
-    g_held = false;
+    g_cameraStill = false;
     g_restart = false;
     g_speed = 0.0f;
     g_peak = 0.0f;
@@ -753,7 +742,7 @@ static void Teleported(const Vec3 &pos)
     // about the one number here whose whole job is to be checkable.
     g_seedPending = false;
     g_stillFor = 0.0f;
-    g_held = false;
+    g_cameraStill = false;
     g_speedRate = g_viewTurn = g_velTurn = 0.0f;
     g_yawTurn = 0.0f;
     g_yawSigned = 0.0f;
@@ -909,7 +898,7 @@ bool WrEnergyTakeRestart(void)
     return r;
 }
 
-bool WrEnergyHeld(void) { return g_held; }
+bool WrEnergyCameraStill(void) { return g_cameraStill; }
 
 bool WrEnergyTakeTeleport(Vec3 *landedAt)
 {
@@ -947,66 +936,34 @@ void WrEnergySample(const Vec3 &pos, float dt)
     g_lastPos = pos;
     g_havePos = true;
 
-    // AN UNCHANGED CAMERA IS NOT A SAMPLE.
+    // A repeated camera used to return here and freeze every published number.
+    // That was necessary while velocity was inferred from camera motion: a
+    // paused demo otherwise looked like an instantaneous stop. It is actively
+    // wrong with the game's own origin/velocity pair -- the exact values remain
+    // meaningful, and returning here also prevents a changed view angle from
+    // updating the turn-rate readout while the player stands still.
     //
-    // Watching a demo, pausing it stops the camera dead while frames keep being
-    // presented. Feeding those frames in reads as "the player instantaneously
-    // stopped", so the whole kinetic term -- thousands of units at surf speed --
-    // drains out of the readout over the next third of a second, the arrow
-    // latches to falling, and the swing accumulator banks a leg on the pause and
-    // another on the unpause. That is the reported "the numbers freak out when
-    // you pause".
-    //
-    // Bit-identical is the test, not "nearly still". A camera that is being
-    // written every tick never repeats a float exactly; one that is not being
-    // written repeats it forever. Standing still in game reads as held too,
-    // which costs nothing -- if the camera is not moving there is genuinely
-    // nothing to measure, and the held value is the correct one.
-    //
-    // Nothing at all advances here, including the ring's own clock. That is what
-    // makes the resume seamless rather than a step: the window's newest sample
-    // is still the pre-pause one, so when movement resumes the next difference
-    // spans real positions over a real interval with the pause simply excised.
-    // The return is unconditional, and the timer only decides when to SAY so.
-    // Waiting even a few frames before skipping does not work: the velocity
-    // window is 40 ms, so eight identical frames at 200 fps fill it completely
-    // and the reading has already collapsed by the time any threshold fires.
-    // Measured on a scripted pause, arming over 50 ms lost 435 of 3595 units
-    // before the hold engaged.
-    //
-    // Skipping a lone repeated frame is right in its own terms anyway -- at a
-    // frame rate above the tick rate the camera genuinely has nothing new to
-    // say on some frames, and that is not a pause.
-    // Gated on already having a reading to hold, and that is not a detail. With
-    // no reading yet -- at spawn, for instance -- skipping repeats would stop the
-    // window ever filling, so a player standing perfectly still would never get a
-    // readout at all. In that state the repeats are pushed, the window fills with
-    // identical positions, and the honest answer falls out: zero velocity, energy
-    // is height alone.
-    //
-    // That used to be the answer after a save-loc load too, and it is no longer
-    // the right one: the file records the velocity being restored, so a frozen
-    // load has a real answer available where a spawn does not. That case is
-    // handled separately below, by the seed's own hold -- see SEED_MOVED_UNITS --
-    // because it exits on the camera MOVING rather than on a timer.
+    // Keep only the stillness fact for the stale-matrix safety net. Sampling,
+    // clocks, trends and recording all continue normally.
     if (g_haveReading && havePrev &&
         pos.x == prev.x && pos.y == prev.y && pos.z == prev.z)
     {
         g_stillFor += dt;
         if (g_stillFor >= HOLD_SECONDS)
-            g_held = true;
-        return;
+            g_cameraStill = true;
     }
-    g_stillFor = 0.0f;
-    g_held = false;
+    else
+    {
+        g_stillFor = 0.0f;
+        g_cameraStill = false;
+    }
 
     g_clock += dt;
 
-    // Counted here rather than beside the check, deliberately: this function has
-    // four early returns before the seed is judged -- a held camera, a save-loc
-    // still being held down, a window that cannot yet estimate, an insane speed
-    // -- and how many frames went by inside those is precisely what the log
-    // needs in order to explain a measurement of zero.
+    // Counted here rather than beside the check, deliberately: the camera
+    // fallback can still return while a save-loc is held, while its window is
+    // filling, or after an insane sample. How many frames passed is precisely
+    // what the rejection log needs in order to explain a measurement of zero.
     if (g_seedPending)
     {
         g_seedAge += dt;
@@ -1028,7 +985,7 @@ void WrEnergySample(const Vec3 &pos, float dt)
     // effects, both bad: the window filled with identical positions and the
     // readout collapsed to height-alone, and then the guard-rail compared the
     // file's velocity against that zero and threw out a seed that was right.
-    if (g_seedFrozen)
+    if (g_seedFrozen && !g_trueLive)
     {
         g_seedHeldFor += dt;
         if (WrDist(pos, g_seedAt) < SEED_MOVED_UNITS &&
@@ -1050,18 +1007,41 @@ void WrEnergySample(const Vec3 &pos, float dt)
         // is still inside the measurement.
         WrVelReset(&g_win);
     }
+    else if (g_seedFrozen)
+    {
+        // The exact player pair can judge the seed immediately even while the
+        // save-loc key is holding the origin still. Do not freeze a known value
+        // merely because the camera fallback would have had nothing to measure.
+        g_seedFrozen = false;
+    }
 
     WrVelPush(&g_win, pos.x, pos.y, pos.z, dt);
 
     float rx = 0.0f, ry = 0.0f, rz = 0.0f;
     float mx = 0.0f, my = 0.0f, mz = 0.0f;
     float midLead = 0.0f;
-    if (!WrVelEstimate(&g_win, g_energy.velWindowSeconds,
-                       &rx, &ry, &rz, &mx, &my, &mz, &midLead))
+    const bool haveCameraEstimate =
+        WrVelEstimate(&g_win, g_energy.velWindowSeconds,
+                      &rx, &ry, &rz, &mx, &my, &mz, &midLead);
+    if (!haveCameraEstimate && !g_trueLive)
         return;
 
-    Vec3 raw = WrVec(rx, ry, rz);
-    Vec3 mid = WrVec(mx, my, mz);
+    // Prefer the game's own proved pair. It is already the velocity we were
+    // trying to reconstruct, so putting it through a camera-difference window
+    // and two EMAs would add lag to an exact value without removing any error.
+    //
+    // Keep the energy on the historical eye-height basis: every run anchor is
+    // a player origin plus this same setting, and WrEnergySampleAt subtracts it
+    // back off when publishing feet. Using the measured crouched eye height
+    // here would make ducking look like losing 36 units of mechanical energy.
+    const bool exactPlayer = g_trueLive;
+    Vec3 raw = exactPlayer ? g_trueVel : WrVec(rx, ry, rz);
+    Vec3 mid = exactPlayer ? g_trueOrigin : WrVec(mx, my, mz);
+    if (exactPlayer)
+    {
+        mid.z += g_energy.eyeHeight;
+        midLead = 0.0f;
+    }
     if (!WrSaneVec(raw))
         return;
 
@@ -1146,12 +1126,33 @@ void WrEnergySample(const Vec3 &pos, float dt)
         }
     }
 
-    g_vel.x = WrEmaStep(&g_velX, raw.x, dt, g_energy.velTau);
-    g_vel.y = WrEmaStep(&g_velY, raw.y, dt, g_energy.velTau);
-    g_vel.z = WrEmaStep(&g_velZ, raw.z, dt, g_energy.velTau);
+    if (exactPlayer)
+    {
+        g_vel = raw;
+        // Keep the fallback filters warm. If the proved address disappears,
+        // the next camera-derived frame continues from the last true value
+        // instead of climbing out of zero.
+        WrEmaSeed(&g_velX, raw.x);
+        WrEmaSeed(&g_velY, raw.y);
+        WrEmaSeed(&g_velZ, raw.z);
+    }
+    else
+    {
+        g_vel.x = WrEmaStep(&g_velX, raw.x, dt, g_energy.velTau);
+        g_vel.y = WrEmaStep(&g_velY, raw.y, dt, g_energy.velTau);
+        g_vel.z = WrEmaStep(&g_velZ, raw.z, dt, g_energy.velTau);
+    }
 
     float instSpeed = WrLength(g_vel);
-    g_speed = WrEmaStep(&g_speedEma, instSpeed, dt, g_energy.speedTau);
+    if (exactPlayer)
+    {
+        g_speed = instSpeed;
+        WrEmaSeed(&g_speedEma, instSpeed);
+    }
+    else
+    {
+        g_speed = WrEmaStep(&g_speedEma, instSpeed, dt, g_energy.speedTau);
+    }
 
     g_valid = true;
     g_haveReading = true;
@@ -1173,7 +1174,16 @@ void WrEnergySample(const Vec3 &pos, float dt)
 
     // The headline figure is filtered here rather than at the point of display,
     // so the arrow, the peak and the plot all agree with what is on screen.
-    g_nowSmooth = WrEmaStep(&g_energyEma, g_now, dt, g_energy.smoothSeconds);
+    if (exactPlayer)
+    {
+        g_nowSmooth = g_now;
+        WrEmaSeed(&g_energyEma, g_now);
+    }
+    else
+    {
+        g_nowSmooth = WrEmaStep(&g_energyEma, g_now, dt,
+                                g_energy.smoothSeconds);
+    }
     WrTrendPush(&g_trend, g_nowSmooth, dt);
 
     // The strafe gauge's own ring, fed at about 20 Hz.
@@ -1247,7 +1257,16 @@ void WrEnergySample(const Vec3 &pos, float dt)
     // mid.z, not pos.z. Because an EMA is linear, subtracting it from the
     // filtered energy gives exactly the filtered kinetic term, so the budget
     // numbers agree with the headline figure rather than nearly agreeing.
-    g_zSmooth = WrEmaStep(&g_zEma, mid.z, dt, g_energy.smoothSeconds);
+    if (exactPlayer)
+    {
+        g_zSmooth = mid.z;
+        WrEmaSeed(&g_zEma, mid.z);
+    }
+    else
+    {
+        g_zSmooth = WrEmaStep(&g_zEma, mid.z, dt,
+                              g_energy.smoothSeconds);
+    }
 
     // While the filter is still converging on a fresh value, drag the pivot
     // along instead of measuring against it. Banking nothing is the correct
@@ -1274,7 +1293,16 @@ void WrEnergySample(const Vec3 &pos, float dt)
             float d = WrDot(WrNormalize(fwd), WrNormalize(g_lastFwd));
             d = WrClampF(d, -1.0f, 1.0f);
             float deg = acosf(d) * 57.2957795f;
-            g_viewTurn = WrEmaStep(&g_viewTurnEma, deg / dt, dt, TURN_TAU);
+            const float rate = deg / dt;
+            if (exactPlayer)
+            {
+                g_viewTurn = rate;
+                WrEmaSeed(&g_viewTurnEma, rate);
+            }
+            else
+            {
+                g_viewTurn = WrEmaStep(&g_viewTurnEma, rate, dt, TURN_TAU);
+            }
 
             // And the YAW rate on its own, which is the one that strafing is
             // about. The rate above is the full angle between two forward
@@ -1301,10 +1329,29 @@ void WrEnergySample(const Vec3 &pos, float dt)
             // Smoothing the signed rate also does the right thing through a
             // strafe switch: it crosses zero rather than staying high, which is
             // exactly when there is no meaningful strafe direction to report.
-            g_yawSigned = WrEmaStep(&g_yawSignedEma, dy / dt, dt, TURN_TAU);
+            const float signedRate = dy / dt;
+            if (exactPlayer)
+            {
+                g_yawSigned = signedRate;
+                WrEmaSeed(&g_yawSignedEma, signedRate);
+            }
+            else
+            {
+                g_yawSigned = WrEmaStep(&g_yawSignedEma, signedRate, dt,
+                                        TURN_TAU);
+            }
 
             if (dy < 0.0f) dy = -dy;
-            g_yawTurn = WrEmaStep(&g_yawTurnEma, dy / dt, dt, TURN_TAU);
+            const float yawRate = dy / dt;
+            if (exactPlayer)
+            {
+                g_yawTurn = yawRate;
+                WrEmaSeed(&g_yawTurnEma, yawRate);
+            }
+            else
+            {
+                g_yawTurn = WrEmaStep(&g_yawTurnEma, yawRate, dt, TURN_TAU);
+            }
         }
         g_lastFwd = fwd;
         g_haveFwd = true;
@@ -1322,15 +1369,32 @@ void WrEnergySample(const Vec3 &pos, float dt)
         {
             float d = WrClampF(WrDot(dir, g_lastVelDir), -1.0f, 1.0f);
             float deg = acosf(d) * 57.2957795f;
-            g_velTurn = WrEmaStep(&g_velTurnEma, deg / dt, dt, TURN_TAU);
+            const float rate = deg / dt;
+            if (exactPlayer)
+            {
+                g_velTurn = rate;
+                WrEmaSeed(&g_velTurnEma, rate);
+            }
+            else
+            {
+                g_velTurn = WrEmaStep(&g_velTurnEma, rate, dt, TURN_TAU);
+            }
         }
         g_lastVelDir = dir;
         g_haveVelDir = true;
     }
     if (dt > 1e-5f && g_haveLastSpeed)
     {
-        g_speedRate = WrEmaStep(&g_accelEma, (instSpeed - g_lastSpeedForRate) / dt,
-                                dt, ACCEL_TAU);
+        const float rate = (instSpeed - g_lastSpeedForRate) / dt;
+        if (exactPlayer)
+        {
+            g_speedRate = rate;
+            WrEmaSeed(&g_accelEma, rate);
+        }
+        else
+        {
+            g_speedRate = WrEmaStep(&g_accelEma, rate, dt, ACCEL_TAU);
+        }
     }
     g_lastSpeedForRate = instSpeed;
     g_haveLastSpeed = true;
@@ -1399,7 +1463,19 @@ float WrEnergyRelative(void)
     // zero. Better than measuring from the map origin and showing five figures.
     float ref = g_haveRef ? g_refZ : g_lastPos.z;
     float raw = g_nowSmooth - ref;
-    g_shown = WrQuantise(g_shown, raw, g_energy.quantiseStep, &g_haveShown);
+    if (g_trueLive)
+    {
+        // No temporal filter and no sticky display buckets on an exact value.
+        // The latter was not technically smoothing, but its 0.75-step hysteresis
+        // made the crosshair figure visibly pause and jump in five-unit steps.
+        g_shown = raw;
+        g_haveShown = true;
+    }
+    else
+    {
+        g_shown = WrQuantise(g_shown, raw, g_energy.quantiseStep,
+                             &g_haveShown);
+    }
     return g_shown;
 }
 
@@ -1428,8 +1504,9 @@ int WrEnergyTrendDir(void)
     // A fixed band, not one that grows with speed. The old band reached 159
     // units at 3500 u/s, which made the arrow blind exactly when it mattered --
     // it had to be that wide because it was judging an unfiltered value. The
-    // trend is now taken from the smoothed figure, which does not carry that
-    // noise, so 12 units is enough. WrArrowStep supplies the hysteresis.
+    // the camera-fallback trend is taken from its filtered figure. On the exact
+    // path there is no estimator noise to hide. WrArrowStep supplies the state
+    // hysteresis in either case.
     return g_arrow.shown;
 }
 
@@ -1506,11 +1583,11 @@ float WrEnergyPower(void)
 // and 8.5%. So this is one rolling number and the line stays uncoloured.
 //
 // The tick comes in as a parameter rather than being looked up here, and that is
-// a link constraint rather than taste: the tick that matters is the one the
-// COMPARED RUN was recorded at (482 of the 503 demos here are 0.015, but all 21
-// bhop_futile runs are 0.01), and WrEnergyReferenceRun lives in wr_render.cpp,
-// which six of the nine harnesses do not link. Passing it in also makes the
-// whole function drivable from a test.
+// a link constraint rather than taste: the live caller reads Momentum's current
+// interval_per_tick, while this arithmetic is linked into harnesses that have no
+// engine or timer reader. Passing it in also makes both tickrates directly
+// testable. Stored demo paths use their own recorded tick in their separate
+// derived-data path.
 float WrEnergyEta(float tickInterval, bool *noReading)
 {
     if (noReading)
@@ -1524,9 +1601,12 @@ float WrEnergyEta(float tickInterval, bool *noReading)
         return 0.0f;            // not enough history yet, e.g. just after a load
 
     float rate = d / span;
+    const float wishSpeed = WrAirWishSpeed(g_energy.maxSpeed,
+                                           WrEnergyCrouched());
+    const float friction = WrEnergyAirFriction();
     float ceiling = WrAirPowerCeilingEx(g_energy.gravity, tickInterval,
                                         g_energy.airAccelerate,
-                                        g_energy.maxSpeed, 1.0f);
+                                        wishSpeed, friction);
 
     // A booster is not perfect play, and reporting it as 0 would put it in the
     // same bucket as free flight. Asked first, exactly as wr_path.cpp does.
@@ -1574,8 +1654,17 @@ bool WrEnergyBudgetNow(WrEnergyBudget *out)
     // are the same number. `banked` is then derived, which makes all three add
     // up exactly whatever the quantiser does.
     float rawSpent = g_refZ - g_zSmooth;
-    g_shownSpent = WrQuantise(g_shownSpent, rawSpent, g_energy.quantiseStep,
-                              &g_haveShownSpent);
+    if (g_trueLive)
+    {
+        g_shownSpent = rawSpent;
+        g_haveShownSpent = true;
+    }
+    else
+    {
+        g_shownSpent = WrQuantise(g_shownSpent, rawSpent,
+                                  g_energy.quantiseStep,
+                                  &g_haveShownSpent);
+    }
 
     out->spent = g_shownSpent;
     out->wasted = -WrEnergyRelative();
@@ -1586,8 +1675,16 @@ bool WrEnergyBudgetNow(WrEnergyBudget *out)
     {
         float raw = (out->banked / rawSpent) * 100.0f;
         // A whole percent, with the same hysteresis the other figures get.
-        g_shownCarried = WrQuantise(g_shownCarried, raw, 1.0f,
-                                    &g_haveShownCarried);
+        if (g_trueLive)
+        {
+            g_shownCarried = raw;
+            g_haveShownCarried = true;
+        }
+        else
+        {
+            g_shownCarried = WrQuantise(g_shownCarried, raw, 1.0f,
+                                        &g_haveShownCarried);
+        }
         out->carried = g_shownCarried;
     }
     else
@@ -1677,7 +1774,7 @@ bool WrEnergyBudgetSpliced(void) { return g_spliced; }
 // WR_PHASE_UNKNOWN when there is no camera, or not enough history yet.
 int WrEnergyPhase(void)
 {
-    if (!g_valid || g_held)
+    if (!g_valid)
         return WR_PHASE_UNKNOWN;
 
     float span = 0.0f;
@@ -1812,6 +1909,35 @@ void WrEnergySetTruePlayer(const Vec3 *origin, const Vec3 *velocity,
 }
 
 bool WrEnergyTrueVelocityLive(void) { return g_trueLive; }
+
+bool WrEnergyCrouched(void)
+{
+    if (!(g_trueEye > 0.0f))
+        return false;
+
+    // Momentum surf uses a 64-unit standing view and 28-unit ducked view. The
+    // eye transition is measured live, so split those states halfway rather
+    // than treating a one-unit camera bob as a crouch. In air Momentum completes
+    // the hull transition immediately; the ambiguous middle is normally never
+    // sampled, and choosing normal there is the safe fallback.
+    float standing = g_energy.eyeHeight;
+    if (standing < 32.0f)
+        standing = 64.0f;
+    const float ducked = 28.0f;
+    return g_trueEye < (standing + ducked) * 0.5f;
+}
+
+float WrEnergyAirFriction(void)
+{
+    const int phase = WrEnergyPhase();
+    if (phase != WR_PHASE_AIR && phase != WR_PHASE_RAMP)
+        return 1.0f;
+
+    Vec3 vel;
+    if (!WrEnergyVelocity(&vel))
+        return 1.0f;
+    return WrAirSurfaceFriction(vel.z);
+}
 
 void WrEnergySetGeometryTouch(int state, const float *normal,
                               const float *rampPlane, float rampDist,
@@ -1998,7 +2124,12 @@ static bool WrBoardSolveEntry(const float plane[4], float gravity, Vec3 *velOut,
         // parabola and the solve integrates along it exactly.
         const float closing = -(v0.x * n[0] + v0.y * n[1] + v0.z * n[2]) * sgn;
         float need = BOARD_SOLVE_CLEAR;
-        if (closing > 0.0f)
+        // A camera-differenced velocity needs to be a whole difference window
+        // clear so the clip is not inside its own sample. The game's velocity
+        // is instantaneous and has no such window; imposing one on that path
+        // can skip the only clean bracket and force the less accurate fixed
+        // lookback fallback.
+        if (closing > 0.0f && !g_trueLive)
             need += closing * g_energy.velWindowSeconds * 1.5f;
         if (f0 <= need)
         {

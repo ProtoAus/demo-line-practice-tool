@@ -3,12 +3,9 @@
 // WHAT THIS IS NOT
 //
 // It is not a zone read. Momentum's start zones are mapper-tagged trigger
-// brushes and WrLines cannot see one: it has no entity list, no netvars, no
-// access to the game's timer, and no way to know a trigger fired. What it has is
-// a world-to-screen matrix found by scanning memory, a camera solved out of it,
-// and files on disk. That is the whole of it, and it is not going to change --
-// wr_engine.cpp records what happened the last time this tool called into the
-// engine.
+// brushes; this module fits an approximate practice region from downloaded run
+// starts. The real run clock is read separately in wr_gametimer.cpp, so this
+// fitted region never starts or zeroes the displayed timer.
 //
 // WHAT IT IS INSTEAD
 //
@@ -24,9 +21,8 @@
 // points[startIndex] is the position at the instant the game's timer started,
 // which is on the way OUT of the real zone rather than in the middle of it. Fit
 // a circle to those points and you have a circle centred on the exit, not on the
-// pad. Firing when you leave that circle would start the clock late by
-// radius/speed -- half a second at 256 units and 500 u/s, which is enormous
-// here.
+// pad. Treating the circle edge as the recorded start would be late by
+// radius/speed -- half a second at 256 units and 500 u/s.
 //
 // So the circle is only the ARMING region: it decides when you count as standing
 // in the start. The moment that fires is crossing the plane through those points,
@@ -37,9 +33,7 @@
 //   - It does not know the zone's shape, size, or direction. It knows where some
 //     clocks started and infers a point, a normal and a spread.
 //   - It cannot find the start of a track no loaded run covers.
-//   - It has no idea whether the GAME's timer is running. Practice mode, noclip
-//     and save-loc loads all put our clock and the real one out of step, and
-//     only ours is on screen. That was already true.
+//   - It does not infer or alter timer state. Momentum's timer is authoritative.
 //   - There is no matching finish detector, and there should not be: a finish is
 //     a line you cross once at speed, not a volume you wait in, so the same
 //     machinery would be far less reliable while looking equally confident.
@@ -112,7 +106,7 @@ struct WrStartSettings
 {
     bool enabled;
     bool autoAnchor;        // re-anchor the energy readout on the fire edge
-    bool autoZeroClock;     // and zero the run clock
+    bool autoZeroClock;     // legacy harness setting; production timer ignores it
     bool showZone;          // draw the ring, the arrow and the plane
     float radiusScale;      // stretch the fitted radius, for odd geometry
     float leaveSpeed;       // how fast you must be going for a crossing to count

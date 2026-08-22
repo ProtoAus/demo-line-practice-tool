@@ -79,6 +79,7 @@ void WrRenderDefaults(void)
     g_render.maxDrawDistance = 4000.0f;
     g_render.fadeStartFraction = 0.75f;
     g_render.pixelTolerance = 2.0f;
+    g_render.lineHeightOffset = 0.0f;
     // 256, not 8. Eight was chosen when a map's runs were whatever the game had
     // downloaded and the interesting ones were the top few; with a board you can
     // fetch in bulk, a cap of eight silently hides most of what you just asked
@@ -173,14 +174,13 @@ void WrRenderDefaults(void)
     g_render.peakLabel = WR_LABEL_ENERGY;
     g_render.markerLabel = WR_LABEL_TIME;
 
-    // Boards OFF by default. Twelve marks a run is a lot of furniture on a line
-    // somebody enabled to see a ROUTE, and this is a practice tool for one
-    // question at a time -- the same reason the corner block and the pick plate
-    // are off. The Lines tab names it and says what it is.
-    g_render.drawBoards = false;
+    // Board practice is the default view: mark every arrival and include the
+    // grade and approach angle, so the mark answers both where it happened and
+    // how well it was taken without another trip through Line settings.
+    g_render.drawBoards = true;
     g_render.maxBoardsPerRun = 24;
     g_render.boardLabels = true;
-    g_render.boardLabelDetail = false;
+    g_render.boardLabelDetail = true;
 
     g_render.drawVelocity = true;
     // Symmetric. Measured p60 of in-band eta is +0.589, and once the loss side
@@ -191,6 +191,8 @@ void WrRenderDefaults(void)
     g_render.effNoDataAlpha = 0.35f;
     g_render.effColourblind = false;
     g_render.lineKey = true;
+    g_render.legendPosX = 0.0f;
+    g_render.legendPosY = 0.0f;
 
     // OFF by default, and toggled with HOME without opening the panel. The plate
     // sits over the thing it is naming, which is the right place for it and the
@@ -350,6 +352,333 @@ static void WrClampToScreen(float *x, float *y, float w, float h, float m)
     if (*y < m) *y = m;
 }
 
+// The four user-placeable HUD objects. Their rectangles are recorded by the
+// real draw paths, so edit mode drags exactly what is on screen rather than a
+// second approximation of each layout.
+enum WrHudObject
+{
+    WR_HUD_OBJECT_CROSSHAIR = 0,
+    WR_HUD_OBJECT_OVERLAY,
+    WR_HUD_OBJECT_LEGEND,
+    WR_HUD_OBJECT_STRAFE,
+    WR_HUD_OBJECT_COUNT
+};
+
+struct WrHudRect
+{
+    float x, y, w, h;
+    bool valid;
+};
+
+static WrHudRect g_hudRect[WR_HUD_OBJECT_COUNT];
+static bool g_hudEditorOpen = false;
+static float g_hudDragStartX[WR_HUD_OBJECT_COUNT];
+static float g_hudDragStartY[WR_HUD_OBJECT_COUNT];
+
+#define WR_HUD_EDGE_MARGIN 16.0f
+#define WR_HUD_SNAP_DISTANCE 8.0f
+
+static void HudRectSet(int which, float x, float y, float w, float h)
+{
+    if (which < 0 || which >= WR_HUD_OBJECT_COUNT || w <= 0.0f || h <= 0.0f)
+        return;
+    g_hudRect[which].x = x;
+    g_hudRect[which].y = y;
+    g_hudRect[which].w = w;
+    g_hudRect[which].h = h;
+    g_hudRect[which].valid = true;
+}
+
+// A normalised position chooses between the two safe edge placements rather
+// than between raw screen pixels. Thus 0, .5 and 1 remain left/centre/right (or
+// top/centre/bottom) after a resolution change and the promised 16-pixel edge
+// inset stays 16 pixels.
+static void HudPlaceNormalised(float nx, float ny, float w, float h,
+                               float *x, float *y)
+{
+    nx = WrClampF(nx, 0.0f, 1.0f);
+    ny = WrClampF(ny, 0.0f, 1.0f);
+    const float aw = g_sw - w - WR_HUD_EDGE_MARGIN * 2.0f;
+    const float ah = g_sh - h - WR_HUD_EDGE_MARGIN * 2.0f;
+    *x = WR_HUD_EDGE_MARGIN + (aw > 0.0f ? aw * nx : 0.0f);
+    *y = WR_HUD_EDGE_MARGIN + (ah > 0.0f ? ah * ny : 0.0f);
+    WrClampToScreen(x, y, w, h, WR_HUD_EDGE_MARGIN);
+}
+
+static float HudNormalisedX(float x, float w)
+{
+    const float span = g_sw - w - WR_HUD_EDGE_MARGIN * 2.0f;
+    return span > 1.0f ? WrClampF((x - WR_HUD_EDGE_MARGIN) / span, 0.0f, 1.0f)
+                       : 0.0f;
+}
+
+static float HudNormalisedY(float y, float h)
+{
+    const float span = g_sh - h - WR_HUD_EDGE_MARGIN * 2.0f;
+    return span > 1.0f ? WrClampF((y - WR_HUD_EDGE_MARGIN) / span, 0.0f, 1.0f)
+                       : 0.0f;
+}
+
+bool WrHudEditorOpen(void) { return g_hudEditorOpen; }
+void WrHudEditorSetOpen(bool open) { g_hudEditorOpen = open; }
+
+static WrHudRect HudEditorRect(int which)
+{
+    if (which >= 0 && which < WR_HUD_OBJECT_COUNT && g_hudRect[which].valid)
+        return g_hudRect[which];
+
+    WrHudRect r = { 0.0f, 0.0f, 220.0f, 80.0f, true };
+    if (which == WR_HUD_OBJECT_CROSSHAIR)
+    {
+        r.w = 220.0f * g_energy.hudScale;
+        r.h = 78.0f * g_energy.hudScale;
+        r.x = g_sw * 0.5f + g_energy.hudOffsetX - r.w * 0.5f;
+        r.y = g_sh * 0.5f + g_energy.hudOffsetY - r.h * 0.5f;
+        WrClampToScreen(&r.x, &r.y, r.w, r.h, WR_HUD_EDGE_MARGIN);
+    }
+    else if (which == WR_HUD_OBJECT_OVERLAY)
+    {
+        r.w = 390.0f * g_energy.overlayScale;
+        r.h = 220.0f * g_energy.overlayScale;
+        HudPlaceNormalised(g_energy.overlayPosX, g_energy.overlayPosY,
+                           r.w, r.h, &r.x, &r.y);
+    }
+    else if (which == WR_HUD_OBJECT_LEGEND)
+    {
+        r.w = 420.0f * g_render.tagScale;
+        r.h = 175.0f * g_render.tagScale;
+        HudPlaceNormalised(g_render.legendPosX, g_render.legendPosY,
+                           r.w, r.h, &r.x, &r.y);
+    }
+    else
+    {
+        r.w = g_energy.strafeBarWidth * g_energy.hudScale;
+        if (r.w < 1.0f) r.w = 220.0f * g_energy.hudScale;
+        const float one = g_energy.strafeBarHeight * g_energy.hudScale;
+        const float gap = 3.0f * g_energy.hudScale;
+        r.h = g_energy.showReferenceStrafeBar ? one * 2.0f + gap : one;
+        r.x = g_sw * 0.5f + g_energy.strafeBarOffsetX - r.w * 0.5f;
+        r.y = g_sh * 0.5f - g_energy.strafeBarRise * g_energy.hudScale - one;
+        WrClampToScreen(&r.x, &r.y, r.w, r.h, WR_HUD_EDGE_MARGIN);
+    }
+    return r;
+}
+
+static void HudSnapRect(float *x, float *y, float w, float h,
+                        bool *snapX, bool *snapY)
+{
+    *snapX = false;
+    *snapY = false;
+    const float candidatesX[3] = {
+        WR_HUD_EDGE_MARGIN, (g_sw - w) * 0.5f,
+        g_sw - w - WR_HUD_EDGE_MARGIN
+    };
+    const float candidatesY[3] = {
+        WR_HUD_EDGE_MARGIN, (g_sh - h) * 0.5f,
+        g_sh - h - WR_HUD_EDGE_MARGIN
+    };
+    float best = WR_HUD_SNAP_DISTANCE + 1.0f;
+    for (int i = 0; i < 3; i++)
+    {
+        const float d = fabsf(*x - candidatesX[i]);
+        if (d < best) { best = d; if (d <= WR_HUD_SNAP_DISTANCE) *x = candidatesX[i]; }
+    }
+    *snapX = best <= WR_HUD_SNAP_DISTANCE;
+
+    best = WR_HUD_SNAP_DISTANCE + 1.0f;
+    for (int i = 0; i < 3; i++)
+    {
+        const float d = fabsf(*y - candidatesY[i]);
+        if (d < best) { best = d; if (d <= WR_HUD_SNAP_DISTANCE) *y = candidatesY[i]; }
+    }
+    *snapY = best <= WR_HUD_SNAP_DISTANCE;
+    WrClampToScreen(x, y, w, h, WR_HUD_EDGE_MARGIN);
+}
+
+static void HudApplyPosition(int which, const WrHudRect &r)
+{
+    if (which == WR_HUD_OBJECT_CROSSHAIR)
+    {
+        g_energy.hudAlignX = WR_HUD_CENTRE_X;
+        g_energy.hudAnchorY = WR_HUD_CENTRE_Y;
+        g_energy.hudOffsetX = r.x + r.w * 0.5f - g_sw * 0.5f;
+        g_energy.hudOffsetY = r.y + r.h * 0.5f - g_sh * 0.5f;
+    }
+    else if (which == WR_HUD_OBJECT_OVERLAY)
+    {
+        g_energy.overlayPosX = HudNormalisedX(r.x, r.w);
+        g_energy.overlayPosY = HudNormalisedY(r.y, r.h);
+    }
+    else if (which == WR_HUD_OBJECT_LEGEND)
+    {
+        g_render.legendPosX = HudNormalisedX(r.x, r.w);
+        g_render.legendPosY = HudNormalisedY(r.y, r.h);
+    }
+    else if (which == WR_HUD_OBJECT_STRAFE)
+    {
+        const float one = g_energy.strafeBarHeight * g_energy.hudScale;
+        g_energy.strafeBarOffsetX = r.x + r.w * 0.5f - g_sw * 0.5f;
+        g_energy.strafeBarRise = (g_sh * 0.5f - r.y - one) /
+                                 g_energy.hudScale;
+    }
+}
+
+static void HudResetPositions(void)
+{
+    g_energy.hudOffsetX = 0.0f;
+    g_energy.hudOffsetY = 0.0f;
+    g_energy.hudAlignX = WR_HUD_CENTRE_X;
+    g_energy.hudAnchorY = WR_HUD_CENTRE_Y;
+    g_energy.overlayPosX = 1.0f;
+    g_energy.overlayPosY = 1.0f;
+    g_render.legendPosX = 0.0f;
+    g_render.legendPosY = 0.0f;
+    g_energy.strafeBarOffsetX = 0.0f;
+    g_energy.strafeBarRise = 54.0f;
+}
+
+static bool HudObjectEnabled(int which)
+{
+    if (which == WR_HUD_OBJECT_CROSSHAIR) return g_energy.showHud;
+    if (which == WR_HUD_OBJECT_OVERLAY) return g_energy.showOverlay;
+    if (which == WR_HUD_OBJECT_LEGEND)
+    {
+        const bool lineMode = g_render.lineColour != WR_LINE_FLAT &&
+                              g_render.lineKey;
+        const bool rankMode = g_render.rankColour != WR_RANK_OFF &&
+                              g_render.rankLegend;
+        const bool mapMode = g_bspLoad.drawSurf && g_render.lineKey &&
+                             WrBspLoadCurrent();
+        return lineMode || rankMode || mapMode;
+    }
+    return g_energy.showStrafeBar;
+}
+
+static void HudEditorHandle(int which, const char *name)
+{
+    WrHudRect r = HudEditorRect(which);
+    const float expandX = 6.0f;
+    const float minHitH = 34.0f;
+    float hitY = r.y, hitH = r.h;
+    if (hitH < minHitH)
+    {
+        hitY -= (minHitH - hitH) * 0.5f;
+        hitH = minHitH;
+    }
+
+    char window[64];
+    _snprintf_s(window, sizeof(window), _TRUNCATE, "##wr_hud_drag_%d", which);
+    ImGui::SetNextWindowPos(ImVec2(r.x - expandX, hitY), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(r.w + expandX * 2.0f, hitH), ImGuiCond_Always);
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration |
+                             ImGuiWindowFlags_NoSavedSettings |
+                             ImGuiWindowFlags_NoMove |
+                             ImGuiWindowFlags_NoNav |
+                             ImGuiWindowFlags_NoBackground |
+                             ImGuiWindowFlags_NoBringToFrontOnFocus;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    if (ImGui::Begin(window, NULL, flags))
+    {
+        ImGui::InvisibleButton("##drag", ImVec2(r.w + expandX * 2.0f, hitH));
+        const bool hot = ImGui::IsItemHovered() || ImGui::IsItemActive();
+        if (hot)
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
+
+        // Remember the UNSNAPPED start of the drag. Adding each frame's mouse
+        // delta to last frame's snapped rectangle made a snap impossible to
+        // leave: every one-pixel movement started from the guide again and was
+        // immediately pulled back, so the user had to fling the mouse more than
+        // the entire snap radius in one frame. Total drag distance accumulates
+        // normally and eight pixels now releases a guide without a fight.
+        if (ImGui::IsItemActivated())
+        {
+            g_hudDragStartX[which] = r.x;
+            g_hudDragStartY[which] = r.y;
+        }
+
+        if (ImGui::IsItemActive() &&
+            ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.0f))
+        {
+            const ImVec2 d = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left,
+                                                       0.0f);
+            if (d.x != 0.0f || d.y != 0.0f)
+            {
+                r.x = g_hudDragStartX[which] + d.x;
+                r.y = g_hudDragStartY[which] + d.y;
+                bool snapX = false, snapY = false;
+                HudSnapRect(&r.x, &r.y, r.w, r.h, &snapX, &snapY);
+                HudApplyPosition(which, r);
+
+                ImDrawList *guide = ImGui::GetBackgroundDrawList();
+                const unsigned int gc = 0x8099DDFFu;
+                if (snapX)
+                    guide->AddLine(ImVec2(r.x + r.w * 0.5f, 0.0f),
+                                   ImVec2(r.x + r.w * 0.5f, g_sh), gc, 1.0f);
+                if (snapY)
+                    guide->AddLine(ImVec2(0.0f, r.y + r.h * 0.5f),
+                                   ImVec2(g_sw, r.y + r.h * 0.5f), gc, 1.0f);
+            }
+        }
+
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        const unsigned int border = hot ? 0xFFFFDD88u : 0xFF66CCFFu;
+        const unsigned int fill = HudObjectEnabled(which) ? 0x2633AAFFu
+                                                           : 0x18202020u;
+        dl->AddRectFilled(ImVec2(r.x, r.y), ImVec2(r.x + r.w, r.y + r.h),
+                          fill, 4.0f);
+        dl->AddRect(ImVec2(r.x, r.y), ImVec2(r.x + r.w, r.y + r.h),
+                    border, 4.0f, 0, hot ? 2.0f : 1.0f);
+
+        char label[64];
+        _snprintf_s(label, sizeof(label), _TRUNCATE, "%s%s",
+                    name, HudObjectEnabled(which) ? "" : " (off)");
+        ImVec2 ts = ImGui::CalcTextSize(label);
+        ImVec2 tp(r.x + (r.w - ts.x) * 0.5f,
+                  r.y + (r.h - ts.y) * 0.5f);
+        dl->AddText(ImVec2(tp.x + 1.0f, tp.y + 1.0f), 0xE0000000u, label);
+        dl->AddText(tp, 0xFFFFFFFFu, label);
+    }
+    ImGui::End();
+    ImGui::PopStyleVar();
+}
+
+void WrHudEditorDraw(void)
+{
+    if (!g_hudEditorOpen)
+        return;
+    ImGuiIO &io = ImGui::GetIO();
+    if (g_sw <= 0.0f || g_sh <= 0.0f)
+    {
+        g_sw = io.DisplaySize.x;
+        g_sh = io.DisplaySize.y;
+    }
+    if (g_sw <= 0.0f || g_sh <= 0.0f)
+        return;
+
+    HudEditorHandle(WR_HUD_OBJECT_CROSSHAIR, "Crosshair box");
+    HudEditorHandle(WR_HUD_OBJECT_OVERLAY, "Bottom-right box");
+    HudEditorHandle(WR_HUD_OBJECT_LEGEND, "Top-left box");
+    HudEditorHandle(WR_HUD_OBJECT_STRAFE, "Strafe bar(s)");
+
+    ImGui::SetNextWindowPos(ImVec2(g_sw * 0.5f, 18.0f), ImGuiCond_Always,
+                            ImVec2(0.5f, 0.0f));
+    ImGui::SetNextWindowBgAlpha(0.92f);
+    ImGuiWindowFlags flags = ImGuiWindowFlags_AlwaysAutoResize |
+                             ImGuiWindowFlags_NoSavedSettings |
+                             ImGuiWindowFlags_NoCollapse |
+                             ImGuiWindowFlags_NoNav;
+    if (ImGui::Begin("HUD edit mode##wr", NULL, flags))
+    {
+        ImGui::TextUnformatted("Drag a highlighted object. Centre and 16 px edges snap.");
+        if (ImGui::Button("Done"))
+            g_hudEditorOpen = false;
+        ImGui::SameLine();
+        if (ImGui::Button("Reset positions"))
+            HudResetPositions();
+    }
+    ImGui::End();
+}
+
 static inline float ClipW(const Vec3 &p)
 {
     return g_m->m[3][0] * p.x + g_m->m[3][1] * p.y + g_m->m[3][2] * p.z + g_m->m[3][3];
@@ -390,6 +719,16 @@ static bool Project(const Vec3 &p, ImVec2 *out)
     if (w < NEAR_W)
         return false;
     return ProjectKnownW(p, w, out);
+}
+
+// A replay stores the player's origin at their feet. Some players find the
+// route easier to follow when it is raised to their sightline, but changing the
+// actual points would corrupt energy, nearest-run matching and every derived
+// measurement. Keep the lift entirely inside the presentation layer instead.
+static inline Vec3 LineDisplayPos(Vec3 p)
+{
+    p.z += g_render.lineHeightOffset;
+    return p;
 }
 
 // Clip segment a->b against the w = NEAR_W plane in world space. Returns false
@@ -1151,8 +1490,8 @@ static void EmitPath(ImDrawList *dl, const WrPathDraw &d)
 
     for (int i = first; i + step < count; i += step)
     {
-        Vec3 a = pts[i].pos;
-        Vec3 b = pts[i + step].pos;
+        Vec3 a = LineDisplayPos(pts[i].pos);
+        Vec3 b = LineDisplayPos(pts[i + step].pos);
         g_statPoints++;
 
         while (bi < breakCount && breaks[bi] < i)
@@ -1619,11 +1958,12 @@ static void EmitTurns(ImDrawList *dl, const WrRun *run, bool tops)
             continue;
 
         const WrPoint *p = &run->points[idx];
-        if (WrDistSqr(p->pos, g_cam) > maxDistSqr)
+        const Vec3 displayPos = LineDisplayPos(p->pos);
+        if (WrDistSqr(displayPos, g_cam) > maxDistSqr)
             continue;
 
         ImVec2 s;
-        if (!Project(p->pos, &s))
+        if (!Project(displayPos, &s))
             continue;
         if (s.x < 0.0f || s.x > g_sw || s.y < 0.0f || s.y > g_sh)
             continue;
@@ -1793,11 +2133,12 @@ static void EmitBoards(ImDrawList *dl, const WrRun *run)
             continue;
 
         const WrPoint *p = &run->points[idx];
-        if (WrDistSqr(p->pos, g_cam) > maxDistSqr)
+        const Vec3 displayPos = LineDisplayPos(p->pos);
+        if (WrDistSqr(displayPos, g_cam) > maxDistSqr)
             continue;
 
         ImVec2 s;
-        if (!Project(p->pos, &s))
+        if (!Project(displayPos, &s))
             continue;
         if (s.x < 0.0f || s.x > g_sw || s.y < 0.0f || s.y > g_sh)
             continue;
@@ -1919,8 +2260,9 @@ static void EmitComparePoint(ImDrawList *dl)
         return;
 
     const Vec3 &p = ref->points[ref->nearestIndex].pos;
+    const Vec3 displayPos = LineDisplayPos(p);
     ImVec2 s;
-    if (!Project(p, &s))
+    if (!Project(displayPos, &s))
         return;
 
     unsigned int col = WithAlpha(WrRunColour(ref), 1.0f);
@@ -1931,7 +2273,7 @@ static void EmitComparePoint(ImDrawList *dl)
     {
         Vec3 a = g_cam;
         a.z -= (g_energy.eyeHeight - 36.0f);
-        Vec3 b = p;
+        Vec3 b = displayPos;
         ImVec2 pa, pb;
         if (ProjectSegment(a, b, &pa, &pb))
             dl->AddLine(pa, pb, WithAlpha(WrRunColour(ref), 0.35f), 1.0f);
@@ -1963,11 +2305,13 @@ static void EmitMarkers(ImDrawList *dl, const WrRun *run)
             mk->pointIndex < (unsigned int)run->startIndex)
             continue;
         Vec3 p = run->points[mk->pointIndex].pos;
-        if (WrDistSqr(p, g_cam) > g_render.maxDrawDistance * g_render.maxDrawDistance)
+        const Vec3 displayPos = LineDisplayPos(p);
+        if (WrDistSqr(displayPos, g_cam) >
+            g_render.maxDrawDistance * g_render.maxDrawDistance)
             continue;
 
         ImVec2 s;
-        if (!Project(p, &s))
+        if (!Project(displayPos, &s))
             continue;
         if (s.x < 0.0f || s.x > g_sw || s.y < 0.0f || s.y > g_sh)
             continue;
@@ -2034,7 +2378,7 @@ static void EmitMarkers(ImDrawList *dl, const WrRun *run)
 // whenever one exists.
 static inline float TagScore(const WrRun *run, int i, float want)
 {
-    const Vec3 &p = run->points[i].pos;
+    const Vec3 p = LineDisplayPos(run->points[i].pos);
     float s = fabsf(WrDist(p, g_cam) - want);
     if (ClipW(p) < NEAR_W)
         s += 1e6f;
@@ -2104,17 +2448,19 @@ static bool TagAnchor(WrRun *run, Vec3 *out)
     // exact crossing. Without this the anchor still steps by one point spacing,
     // which is small but visible on a fast strafe.
     Vec3 target = run->points[refined].pos;
-    float dHere = WrDist(target, g_cam);
+    float dHere = WrDist(LineDisplayPos(target), g_cam);
     int other = -1;
     if (refined + 1 < run->pointCount &&
-        (WrDist(run->points[refined + 1].pos, g_cam) - want) * (dHere - want) < 0.0f)
+        (WrDist(LineDisplayPos(run->points[refined + 1].pos), g_cam) - want) *
+            (dHere - want) < 0.0f)
         other = refined + 1;
     else if (refined - 1 >= 0 &&
-             (WrDist(run->points[refined - 1].pos, g_cam) - want) * (dHere - want) < 0.0f)
+             (WrDist(LineDisplayPos(run->points[refined - 1].pos), g_cam) - want) *
+                 (dHere - want) < 0.0f)
         other = refined - 1;
     if (other >= 0)
     {
-        float dOther = WrDist(run->points[other].pos, g_cam);
+        float dOther = WrDist(LineDisplayPos(run->points[other].pos), g_cam);
         float denom = dOther - dHere;
         if (fabsf(denom) > 1e-3f)
         {
@@ -2144,7 +2490,7 @@ static void EmitTag(ImDrawList *dl, WrRun *run)
         return;
 
     ImVec2 s;
-    if (!Project(anchor, &s))
+    if (!Project(LineDisplayPos(anchor), &s))
         return;
     if (s.x < -64.0f || s.x > g_sw + 64.0f || s.y < -32.0f || s.y > g_sh + 32.0f)
         return;
@@ -2329,14 +2675,18 @@ static bool WrTurnRates(float *gotOut, float *idealOut, float *qualOut,
         return false;
     }
 
-    // The compared run's own tick if there is one, else 0.015. 482 of the 503
-    // demos measured are 0.015 but every bhop_futile run is 0.01, so this is
-    // not a constant.
-    const WrRun *tr = WrEnergyReferenceRun();
-    const float tick = (tr && tr->tickInterval > 1e-4f) ? tr->tickInterval
-                                                        : 0.015f;
+    // This is live movement, so use the current game's interval_per_tick. The
+    // compared run keeps its own recorded tick in ReferenceTurnRates below.
+    const float tick = WrTimerTickInterval();
     const float speed = WrEnergyHorizontalSpeed();
     const float got = WrEnergyYawRate();
+
+    Vec3 vel;
+    if (!WrEnergyVelocity(&vel))
+        return false;
+    const float wishSpeed = WrAirWishSpeed(g_energy.maxSpeed,
+                                           WrEnergyCrouched());
+    const float friction = WrEnergyAirFriction();
 
     float ideal = 0.0f;
     float cScale = WR_AIR_WISHSPEED;
@@ -2350,9 +2700,7 @@ static bool WrTurnRates(float *gotOut, float *idealOut, float *qualOut,
         // yaw as atan2(y, x), so a positive rate is a turn to the left and the
         // wishdir is the left-hand perpendicular.
         float n[3];
-        Vec3 vel;
-        if (!WrEnergySurfaceNormal(n) || !WrEnergyVelocity(&vel) ||
-            speed < 1.0f)
+        if (!WrEnergySurfaceNormal(n) || speed < 1.0f)
         {
             // WHICH OF THE FOUR, because for a long time this said "no surface"
             // for all of them and the one that mattered was the one it fitted
@@ -2389,23 +2737,23 @@ static bool WrTurnRates(float *gotOut, float *idealOut, float *qualOut,
         const float wx = -vy * s, wy = vx * s;
         const float wn = wx * n[0] + wy * n[1];
 
-        ideal = WrPerfectStrafeDegreesOnPlane(speed, tick,
-                                              g_energy.airAccelerate,
-                                              g_energy.maxSpeed,
-                                              g_energy.gravity, n, wn) / tick;
+        ideal = WrPerfectStrafeDegreesOnPlaneEx(speed, tick,
+                                                g_energy.airAccelerate,
+                                                wishSpeed, friction,
+                                                g_energy.gravity, n, wn) / tick;
         cScale = WrStrafeCScale(g_energy.gravity, tick, n, wn);
     }
     else
     {
-        ideal = WrPerfectStrafeDegrees(speed, tick, g_energy.airAccelerate,
-                                       g_energy.maxSpeed) / tick;
+        ideal = WrPerfectStrafeDegreesEx(speed, tick, g_energy.airAccelerate,
+                                         wishSpeed, friction) / tick;
     }
 
     if (gotOut)   *gotOut = got;
     if (idealOut) *idealOut = ideal;
     if (qualOut)
         *qualOut = WrAirCapBinds(tick, g_energy.airAccelerate,
-                                 g_energy.maxSpeed, 1.0f)
+                                 wishSpeed, friction)
                  ? WrStrafeQualityEx(got, ideal, cScale) : -1.0f;
     if (whyOut)
         *whyOut = "";
@@ -2570,19 +2918,142 @@ static const char *StrafeArrow(float got, float ideal)
 // the whole width on the quantity being corrected and gives both directions
 // room.
 //
-// EVERYTHING ELSE IS BORROWED ON PURPOSE
+// EVERYTHING ELSE STARTS FROM THE SAME SCALE
 //
 // The scale is strafeBand and strafeTolerance, the colour is StrafeColour, and
-// the dead zone is StrafeArrow's. Not one of those is a new setting, because
-// the bar, the number's colour and the arrow are three renderings of a single
-// comparison and any independent knob is a way for them to contradict each
-// other on screen.
+// the dead zone is StrafeArrow's. The optional sensitivity is visual gain after
+// that shared comparison: it makes the shape react more or less without
+// changing what the number, colour or arrow claims.
 //
 // The look is the comparison lean bar's, for the same reason: a dark track, the
 // fill from the centre, the centre tick drawn last so the fill can never hide
 // where zero is, and an arrowhead past the end for overflow rather than a
 // silently pinned bar.
 #define WR_STRAFE_BAR_FADE 0.25f    // seconds to fade in and out of a refusal
+
+// A downloaded run does not contain view angles or movement keys. In free air,
+// however, its horizontal velocity change IS the acceleration AirAccelerate
+// added, so its direction recovers wishdir and c = dot(v, wishdir). While the
+// 30-unit wishspeed cap binds, the equivalent turn ratio is exactly 1-c/30: the
+// same ratio the live bar places around its ideal centre.
+//
+// This deliberately refuses ramp samples. A collision projects velocity onto a
+// plane after AirAccelerate and destroys the into-plane part needed to invert
+// the input. Showing a confident bar there would be reconstructing mouse input
+// the file simply does not contain.
+static bool ReferenceTurnRates(const WrRun *run, float *gotOut,
+                               float *idealOut, float *qualOut)
+{
+    if (!run || !run->points || !run->phase || run->pointCount < 2)
+        return false;
+    int i = run->nearestIndex;
+    if (i <= 0 || i >= run->pointCount)
+        return false;
+    if (run->phase[i - 1] != WR_PHASE_AIR || run->phase[i] != WR_PHASE_AIR)
+        return false;
+
+    // The step itself must be real. A fail-trigger gap can have AIR on either
+    // side while still carrying no duration or acceleration between them.
+    for (int k = 0; k < run->breakCount; k++)
+        if (run->breaks[k] == i - 1)
+            return false;
+
+    const WrPoint &a = run->points[i - 1];
+    const WrPoint &b = run->points[i];
+    const float tick = run->tickInterval > 1e-4f ? run->tickInterval : 0.015f;
+    const float dt = b.t - a.t;
+    if (!(dt > 1e-5f) || dt > tick * 1.25f)
+        return false;       // only one real game tick is exactly invertible
+    // Stored paths do not carry duck buttons. Only reconstruct where even the
+    // weakest relevant branch -- crouched, plus the point's deadstrafe
+    // friction -- still reaches the 30 u/s cap. Then the inversion is exact
+    // regardless of whether the runner was actually crouched.
+    const float friction = WrAirSurfaceFriction(a.vel.z);
+    const float worstWish = WrAirWishSpeed(g_energy.maxSpeed, true);
+    if (!WrAirCapBinds(tick, g_energy.airAccelerate,
+                       worstWish, friction))
+        return false;
+
+    const float dvx = b.vel.x - a.vel.x;
+    const float dvy = b.vel.y - a.vel.y;
+    const float dv = sqrtf(dvx * dvx + dvy * dvy);
+    if (dv < 0.05f)
+        return false;       // coasting says nothing about the held strafe
+
+    // Reject boosters and other horizontal pushes. Over a compressed chord the
+    // most player acceleration can add scales with the number of game ticks.
+    const float ticks = dt / tick;
+    const float maxDv = WrAirGainPerTickEx(tick, g_energy.airAccelerate,
+                                           worstWish, friction) * ticks;
+    if (!(maxDv > 0.0f) || dv > maxDv * 1.35f + 0.5f)
+        return false;
+
+    const float speed = sqrtf(a.vel.x * a.vel.x + a.vel.y * a.vel.y);
+    if (speed < 32.0f)
+        return false;
+
+    const float ideal = WrPerfectStrafeDegreesEx(speed, tick,
+                                                  g_energy.airAccelerate,
+                                                  worstWish, friction) / tick;
+    if (!(ideal > 1e-3f))
+        return false;
+    float ratio = 0.0f;
+    if (!WrStrafeRatioFromAirDelta(a.vel.x, a.vel.y, dvx, dvy, &ratio))
+        return false;
+    if (ratio < 0.0f)
+        ratio = 0.0f;
+    const float got = ideal * ratio;
+
+    if (gotOut) *gotOut = got;
+    if (idealOut) *idealOut = ideal;
+    if (qualOut) *qualOut = WrStrafeQuality(got, ideal);
+    return true;
+}
+
+static void DrawStrafeTrack(ImDrawList *dl, float x0, float y, float w, float h,
+                            float frac, float deadFrac, unsigned int col,
+                            float alpha, bool over, unsigned int identity)
+{
+    const float x1 = x0 + w;
+    const float cx = x0 + w * 0.5f;
+    dl->AddRectFilled(ImVec2(x0, y), ImVec2(x1, y + h),
+                      WithAlpha(0x00000000u, 0.31f * alpha), 2.0f);
+
+    const float ex = cx + frac * w * 0.5f;
+    const float fx0 = (ex < cx) ? ex : cx;
+    const float fx1 = (ex < cx) ? cx : ex;
+    const unsigned int fill = WithAlpha(col, alpha);
+    dl->AddRectFilled(ImVec2(fx0, y), ImVec2(fx1, y + h), fill, 2.0f);
+
+    if (deadFrac > 0.01f)
+    {
+        const float dx = deadFrac * w * 0.5f;
+        const unsigned int g = WithAlpha(0xFFB0B0B0u, 0.35f * alpha);
+        dl->AddRectFilled(ImVec2(cx - dx - 0.5f, y),
+                          ImVec2(cx - dx + 0.5f, y + h), g);
+        dl->AddRectFilled(ImVec2(cx + dx - 0.5f, y),
+                          ImVec2(cx + dx + 0.5f, y + h), g);
+    }
+
+    dl->AddRectFilled(ImVec2(cx - 0.5f, y - 1.0f),
+                      ImVec2(cx + 0.5f, y + h + 1.0f),
+                      WithAlpha(0xFFB0B0B0u, alpha));
+
+    // A small identity rail: white for you, the run's own line colour for the
+    // reference underneath. It distinguishes the two without putting text on
+    // a seven-pixel instrument.
+    dl->AddRectFilled(ImVec2(x0 - 5.0f, y), ImVec2(x0 - 2.0f, y + h),
+                      WithAlpha(identity, alpha), 1.0f);
+
+    if (over)
+    {
+        const float t = h * 0.6f;
+        const float tipX = (frac > 0.0f) ? (x1 + t) : (x0 - t);
+        const float baseX = (frac > 0.0f) ? x1 : x0;
+        dl->AddTriangleFilled(ImVec2(baseX, y), ImVec2(baseX, y + h),
+                              ImVec2(tipX, y + h * 0.5f), fill);
+    }
+}
 
 static void EmitStrafeBar(ImDrawList *dl)
 {
@@ -2602,13 +3073,31 @@ static void EmitStrafeBar(ImDrawList *dl)
     static unsigned int sCol = 0xFFCCCCCCu;
     static bool sOver = false;
 
+    static float sRefAlpha = 0.0f;
+    static float sRefFrac = 0.0f;
+    static float sRefDeadFrac = 0.25f;
+    static unsigned int sRefCol = 0xFFCCCCCCu;
+    static unsigned int sRefIdentity = 0xFFCCCCCCu;
+    static bool sRefOver = false;
+
+    const WrRun *ref = g_energy.showReferenceStrafeBar
+                     ? WrEnergyReferenceRun() : NULL;
+    float refGot = 0.0f, refIdeal = 0.0f, refQual = -1.0f;
+    const bool haveRef = ReferenceTurnRates(ref, &refGot, &refIdeal, &refQual);
+
     const float dt = ImGui::GetIO().DeltaTime;
     const float step = (WR_STRAFE_BAR_FADE > 1e-3f) ? dt / WR_STRAFE_BAR_FADE : 1.0f;
     sAlpha += have ? step : -step;
     if (sAlpha < 0.0f) sAlpha = 0.0f;
     if (sAlpha > 1.0f) sAlpha = 1.0f;
-    if (sAlpha <= 0.0f)
-        return;
+    if (!g_energy.showReferenceStrafeBar)
+        sRefAlpha = 0.0f;
+    else
+    {
+        sRefAlpha += haveRef ? step : -step;
+        if (sRefAlpha < 0.0f) sRefAlpha = 0.0f;
+        if (sRefAlpha > 1.0f) sRefAlpha = 1.0f;
+    }
 
     if (have)
     {
@@ -2619,7 +3108,9 @@ static void EmitStrafeBar(ImDrawList *dl)
         const float tol = (g_energy.strafeTolerance > 1e-3f)
                         ? g_energy.strafeTolerance : 1e-3f;
 
-        sFrac = err / tol;
+        const float sensitivity = WrClampF(g_energy.strafeBarSensitivity,
+                                            0.25f, 4.0f);
+        sFrac = err / tol * sensitivity;
         sOver = (sFrac > 1.0f || sFrac < -1.0f);
         sFrac = WrClampF(sFrac, -1.0f, 1.0f);
         sCol = StrafeColour(got, ideal, qual, 0xFFCCCCCCu);
@@ -2629,7 +3120,27 @@ static void EmitStrafeBar(ImDrawList *dl)
         // recomputing half of it from an `ideal` that no longer exists.
         const float deadDeg = StrafeDeadbandDeg(ideal);
         const float deadAxis = pct ? deadDeg / ideal * 100.0f : deadDeg;
-        sDeadFrac = WrClampF(deadAxis / tol, 0.0f, 1.0f);
+        sDeadFrac = WrClampF(deadAxis / tol * sensitivity, 0.0f, 1.0f);
+    }
+
+    if (haveRef)
+    {
+        const bool pct = (g_energy.strafeBand == WR_STRAFE_BAND_PERCENT);
+        const float err = pct ? (refGot / refIdeal - 1.0f) * 100.0f
+                              : (refGot - refIdeal);
+        const float tol = (g_energy.strafeTolerance > 1e-3f)
+                        ? g_energy.strafeTolerance : 1e-3f;
+        const float sensitivity = WrClampF(g_energy.strafeBarSensitivity,
+                                            0.25f, 4.0f);
+        sRefFrac = err / tol * sensitivity;
+        sRefOver = (sRefFrac > 1.0f || sRefFrac < -1.0f);
+        sRefFrac = WrClampF(sRefFrac, -1.0f, 1.0f);
+        sRefCol = StrafeColour(refGot, refIdeal, refQual, 0xFFCCCCCCu);
+        sRefIdentity = WrRunColour(ref);
+
+        const float deadDeg = StrafeDeadbandDeg(refIdeal);
+        const float deadAxis = pct ? deadDeg / refIdeal * 100.0f : deadDeg;
+        sRefDeadFrac = WrClampF(deadAxis / tol * sensitivity, 0.0f, 1.0f);
     }
 
     const float scale = g_energy.hudScale;
@@ -2643,43 +3154,19 @@ static void EmitStrafeBar(ImDrawList *dl)
         w = (g_energy.hudWidth > 1.0f) ? g_energy.hudWidth * scale : 220.0f * scale;
     }
     const float h = g_energy.strafeBarHeight * scale;
-    const float cx = g_sw * 0.5f;
+    const float cx = g_sw * 0.5f + g_energy.strafeBarOffsetX;
     const float x0 = cx - w * 0.5f;
-    const float x1 = cx + w * 0.5f;
     const float y = g_sh * 0.5f - g_energy.strafeBarRise * scale - h;
+    const float gap = 3.0f * scale;
+    const float totalH = g_energy.showReferenceStrafeBar ? h * 2.0f + gap : h;
+    HudRectSet(WR_HUD_OBJECT_STRAFE, x0, y, w, totalH);
 
-    dl->AddRectFilled(ImVec2(x0, y), ImVec2(x1, y + h),
-                      WithAlpha(0x00000000u, 0.31f * sAlpha), 2.0f);
-
-    const float ex = cx + sFrac * w * 0.5f;
-    const float fx0 = (ex < cx) ? ex : cx;
-    const float fx1 = (ex < cx) ? cx : ex;
-    const unsigned int fill = WithAlpha(sCol, sAlpha);
-    dl->AddRectFilled(ImVec2(fx0, y), ImVec2(fx1, y + h), fill, 2.0f);
-
-    // The dead zone, as a pair of faint uprights rather than a colour. Inside
-    // it the arrow prints nothing, and a bar that still leans where the arrow
-    // has gone quiet is the two of them disagreeing.
-    if (sDeadFrac > 0.01f)
-    {
-        const float dx = sDeadFrac * w * 0.5f;
-        const unsigned int g = WithAlpha(0xFFB0B0B0u, 0.35f * sAlpha);
-        dl->AddRectFilled(ImVec2(cx - dx - 0.5f, y), ImVec2(cx - dx + 0.5f, y + h), g);
-        dl->AddRectFilled(ImVec2(cx + dx - 0.5f, y), ImVec2(cx + dx + 0.5f, y + h), g);
-    }
-
-    // Centre last, so the fill never hides the ideal it is measured from.
-    dl->AddRectFilled(ImVec2(cx - 0.5f, y - 1.0f), ImVec2(cx + 0.5f, y + h + 1.0f),
-                      WithAlpha(0xFFB0B0B0u, sAlpha));
-
-    if (sOver)
-    {
-        const float t = h * 0.6f;
-        const float tipX = (sFrac > 0.0f) ? (x1 + t) : (x0 - t);
-        const float baseX = (sFrac > 0.0f) ? x1 : x0;
-        dl->AddTriangleFilled(ImVec2(baseX, y), ImVec2(baseX, y + h),
-                              ImVec2(tipX, y + h * 0.5f), fill);
-    }
+    if (sAlpha > 0.0f)
+        DrawStrafeTrack(dl, x0, y, w, h, sFrac, sDeadFrac, sCol, sAlpha,
+                        sOver, 0xFFFFFFFFu);
+    if (g_energy.showReferenceStrafeBar && sRefAlpha > 0.0f)
+        DrawStrafeTrack(dl, x0, y + h + gap, w, h, sRefFrac, sRefDeadFrac,
+                        sRefCol, sRefAlpha, sRefOver, sRefIdentity);
 }
 
 
@@ -2723,7 +3210,7 @@ static void EmitEnergyHud(ImDrawList *dl)
     WrEnergyBudget bud;
     bool haveBudget = WrEnergyBudgetNow(&bud);
 
-    if (!WrEnergyHaveRef())
+    if (!WrEnergyHaveRef() && g_energy.hudMode != WR_HUD_STRESS)
     {
         // Say so rather than print the number. With no anchor the reference is
         // wherever you are standing, so the relative figure is zero by
@@ -2786,9 +3273,7 @@ static void EmitEnergyHud(ImDrawList *dl)
             // two signals disagree on purpose: on a ramp you can be strafing at
             // very nearly the physical maximum while your total energy falls,
             // because the ramp is taking more than you can put in.
-            const WrRun *tr = WrEnergyReferenceRun();
-            float tick = (tr && tr->tickInterval > 1e-4f) ? tr->tickInterval
-                                                          : 0.015f;
+            const float tick = WrTimerTickInterval();
             bool noReading = false;
             float eta = WrEnergyEta(tick, &noReading);
 
@@ -2888,6 +3373,44 @@ static void EmitEnergyHud(ImDrawList *dl)
             wideBig = "-99999 v";
             wideSub = "9999/s ^  ";
             wideSub2 = "ideal 9999/s  100%";
+            break;
+        }
+
+        case WR_HUD_STRESS:
+        {
+            // The left number is the ordinary standing/full-friction budget.
+            // The right one is what AirAccelerate receives this instant after
+            // Momentum's crouch crop and deadstrafe surface friction. Neither
+            // is the applied gain: Source clamps that at 30. Their ratio to 30
+            // is precisely the headroom the user asked to watch.
+            const float tick = WrTimerTickInterval();
+            const bool crouched = WrEnergyCrouched();
+            const float friction = WrEnergyAirFriction();
+            const float wishSpeed = WrAirWishSpeed(g_energy.maxSpeed,
+                                                   crouched);
+            const float base = WrAirAccelerationPerTickEx(
+                tick, g_energy.airAccelerate, g_energy.maxSpeed, 1.0f);
+            const float live = WrAirAccelerationPerTickEx(
+                tick, g_energy.airAccelerate, wishSpeed, friction);
+            const float ratio = live / WR_AIR_WISHSPEED;
+
+            const char *state = "standing";
+            if (crouched && friction < 1.0f)
+                state = "duck + deadstrafe";
+            else if (crouched)
+                state = "crouched";
+            else if (friction < 1.0f)
+                state = "deadstrafe";
+            else if (!WrEnergyTrueVelocityLive())
+                state = "standing assumed";
+
+            _snprintf_s(big, sizeof(big), _TRUNCATE, "%.1f -> %.1f",
+                        base, live);
+            _snprintf_s(sub, sizeof(sub), _TRUNCATE, "%.2fx 30 cap  %s",
+                        ratio, state);
+            bigCol = (ratio >= 1.0f) ? 0xFF80FF80u : 0xFF33BFFFu;
+            wideBig = "50000.0 -> 50000.0";
+            wideSub = "1666.67x 30 cap  duck + deadstrafe";
             break;
         }
 
@@ -3096,25 +3619,15 @@ static void EmitEnergyHud(ImDrawList *dl)
               (haveCmp ? mCmp.y : 0.0f) +
               (haveClk ? mClk.y : 0.0f) + barH;
 
-    // Where the offset puts the block, said outright.
-    //
-    // Alignment used to be inferred from the offset's sign, so the block could
-    // only hang left or right of the crosshair and never sit centred over it.
-    // The vertical was worse: it always straddled the offset, so the edge
-    // nearest the crosshair moved every time the comparison row, the bar or the
-    // clock appeared -- exactly when you least want it to.
-    float x = g_sw * 0.5f + g_energy.hudOffsetX;
-    if (g_energy.hudAlignX == WR_HUD_RIGHT)       x -= w;
-    else if (g_energy.hudAlignX == WR_HUD_CENTRE_X) x -= w * 0.5f;
+    // One invariant position model: the offsets move the block's centre. The
+    // old left/right and above/below edge anchors made one pair of coordinates
+    // mean four different locations and are superseded by the drag editor.
+    float x = g_sw * 0.5f + g_energy.hudOffsetX - w * 0.5f;
+    float y = g_sh * 0.5f + g_energy.hudOffsetY - h * 0.5f;
+    WrClampToScreen(&x, &y, w, h, WR_HUD_EDGE_MARGIN);
+    HudRectSet(WR_HUD_OBJECT_CROSSHAIR, x, y, w, h);
 
-    float y = g_sh * 0.5f + g_energy.hudOffsetY;
-    if (g_energy.hudAnchorY == WR_HUD_ABOVE)      y -= h;
-    else if (g_energy.hudAnchorY != WR_HUD_BELOW) y -= h * 0.5f;
-
-    // Rows still right-align their text within the block when the block itself
-    // is right-aligned; centred and left both read from the left edge, which is
-    // what a column of numbers wants.
-    bool rightAlign = (g_energy.hudAlignX == WR_HUD_RIGHT);
+    bool rightAlign = false;
 
     if (g_energy.hudBacking)
     {
@@ -3162,26 +3675,18 @@ static void EmitEnergyHud(ImDrawList *dl)
         rows[n].col = cmpCol; rows[n].col2 = cmpCol; n++;
     }
 
-    // Held reads as dimmed, never as blank and never as hidden. A readout that
-    // silently stops is indistinguishable from one that is stuck, which is the
-    // exact complaint the fail-trigger latch produced.
-    bool held = WrEnergyHeld();
-
     for (int i = 0; i < n; i++)
     {
         ImFont *f = (i == 0) ? fBig : fSub;
         float tx = rightAlign ? (x + w - rows[i].width) : x;
-        unsigned int col = held ? MixColour(rows[i].col, 0.45f, 0.45f, 0.45f, 0.55f)
-                                : rows[i].col;
+        unsigned int col = rows[i].col;
         dl->AddText(f, rows[i].size, ImVec2(tx + 1.0f, ty + 1.0f), 0xC0000000u,
                     rows[i].s);
         dl->AddText(f, rows[i].size, ImVec2(tx, ty), col, rows[i].s);
         if (rows[i].s2)
         {
             const float tx2 = tx + rows[i].width1;
-            unsigned int c2 = held ? MixColour(rows[i].col2, 0.45f, 0.45f,
-                                               0.45f, 0.55f)
-                                   : rows[i].col2;
+            unsigned int c2 = rows[i].col2;
             dl->AddText(f, rows[i].size, ImVec2(tx2 + 1.0f, ty + 1.0f),
                         0xC0000000u, rows[i].s2);
             dl->AddText(f, rows[i].size, ImVec2(tx2, ty), c2, rows[i].s2);
@@ -3205,8 +3710,7 @@ static void EmitEnergyHud(ImDrawList *dl)
                           2.0f);
         float ex = cx + barFrac * w * 0.5f;
         float x0 = (ex < cx) ? ex : cx, x1 = (ex < cx) ? cx : ex;
-        unsigned int bc = held ? MixColour(cmpCol, 0.45f, 0.45f, 0.45f, 0.55f)
-                               : cmpCol;
+        unsigned int bc = cmpCol;
         dl->AddRectFilled(ImVec2(x0, by), ImVec2(x1, by + bh), bc, 2.0f);
         // Centre tick, drawn last so the fill never hides where zero is.
         dl->AddRectFilled(ImVec2(cx - 0.5f, by - 1.0f),
@@ -3226,16 +3730,6 @@ static void EmitEnergyHud(ImDrawList *dl)
         }
     }
 
-    if (held)
-    {
-        // Two bars, drawn from the block's own metrics so they scale with it.
-        float bh = mSub.y * 0.7f, bw = bh * 0.28f;
-        float bx = rightAlign ? (x - bw * 3.4f) : (x + w + bw * 1.4f);
-        float by = y + (h - bh) * 0.5f;
-        dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + bh), 0xC0B0B0B0u);
-        dl->AddRectFilled(ImVec2(bx + bw * 1.7f, by),
-                          ImVec2(bx + bw * 2.7f, by + bh), 0xC0B0B0B0u);
-    }
 }
 
 // Where you will be in a quarter of a second if nothing changes.
@@ -3905,12 +4399,12 @@ static void EmitEfficiencyLegend(ImDrawList *dl)
     float h = lh * (float)(n + nf) + pad * 2.0f;
     w += pad * 2.0f;
 
-    // Opposite corner to the overlay, in both axes.
-    float m = g_energy.overlayMargin;
-    int corner = (~g_energy.overlayCorner) & 3;
-    float x = (corner & 1) ? (g_sw - w - m) : m;
-    float y = (corner & 2) ? (g_sh - h - m) : m;
-    WrClampToScreen(&x, &y, w, h, m);
+    // Independent of the detailed block now: both can be dragged, so moving
+    // one must not silently throw the other to the opposite corner.
+    float x = 0.0f, y = 0.0f;
+    HudPlaceNormalised(g_render.legendPosX, g_render.legendPosY,
+                       w, h, &x, &y);
+    HudRectSet(WR_HUD_OBJECT_LEGEND, x, y, w, h);
 
     dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h), 0xA0000000u, 5.0f);
 
@@ -4021,7 +4515,7 @@ static void EmitEnergyOverlay(ImDrawList *dl)
 
     // THE BRIDGE THAT DID NOT EXIST.
     //
-    // The HUD said "no surface". The Display tab said "displacements skipped".
+    // The HUD said "no surface". Line settings said "displacements skipped".
     // They shared no word, they are on different tabs, and the chain a player
     // had to guess unaided ran: no surface -> the normal was refused -> the map
     // was never asked -> four displacements out of 756 failed a corner
@@ -4029,11 +4523,11 @@ static void EmitEnergyOverlay(ImDrawList *dl)
     //
     // Only when a map IS loaded and is not whole -- a level with no map read at
     // all is a setting, not a surprise, and the rows already say "map not read".
-    // Same orange the Display tab uses for its own two warnings.
+    // Same orange the Line settings tab uses for its own two warnings.
     if (WrBspLoadStateNow() == WR_BSPLOAD_READY && !WrBspLoadGeometryComplete())
     {
         _snprintf_s(lines[n], sizeof(lines[0]), _TRUNCATE,
-                    "map     part read -- see Display tab");
+                    "map     part read -- see Line settings");
         cols[n++] = 0xFF33BFFFu;
     }
 
@@ -4197,10 +4691,10 @@ static void EmitEnergyOverlay(ImDrawList *dl)
     float h = lh * n + pad * 2.0f;
     w += pad * 2.0f;
 
-    float m = g_energy.overlayMargin;
-    float x = (g_energy.overlayCorner & 1) ? (g_sw - w - m) : m;
-    float y = (g_energy.overlayCorner & 2) ? (g_sh - h - m) : m;
-    WrClampToScreen(&x, &y, w, h, m);
+    float x = 0.0f, y = 0.0f;
+    HudPlaceNormalised(g_energy.overlayPosX, g_energy.overlayPosY,
+                       w, h, &x, &y);
+    HudRectSet(WR_HUD_OBJECT_OVERLAY, x, y, w, h);
 
     dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h), 0xA0000000u, 5.0f);
     for (int i = 0; i < n; i++)
@@ -4322,11 +4816,12 @@ static float g_pickMs = 0.0f;
 // crosshair is simply made the origin.
 static bool PickProject(const Vec3 &p, float *w, ImVec2 *off)
 {
-    float ww = ClipW(p);
+    const Vec3 displayPos = LineDisplayPos(p);
+    float ww = ClipW(displayPos);
     if (ww < NEAR_W)
         return false;
     ImVec2 s;
-    if (!ProjectKnownW(p, ww, &s))
+    if (!ProjectKnownW(displayPos, ww, &s))
         return false;
     *w = ww;
     off->x = s.x - g_sw * 0.5f;
@@ -4417,7 +4912,8 @@ static void UpdatePick(void)
 
         if (run->boundRadius <= 0.0f || !run->chunks)
             continue;
-        if (!SphereNearRay(run->boundCentre, run->boundRadius, fwd, range, tanHalf))
+        if (!SphereNearRay(LineDisplayPos(run->boundCentre), run->boundRadius,
+                           fwd, range, tanHalf))
             continue;
 
         // Which chunks survive, nearest first, capped.
@@ -4431,7 +4927,7 @@ static void UpdatePick(void)
         {
             g_pickChunks++;
             const WrChunk &ch = run->chunks[k];
-            if (!SphereNearRay(ch.c, ch.r, fwd, range, tanHalf))
+            if (!SphereNearRay(LineDisplayPos(ch.c), ch.r, fwd, range, tanHalf))
                 continue;
             float along = WrDot(WrSub(ch.c, g_cam), fwd);
             if (nCand < WR_PICK_CHUNKS_PER_RUN)
@@ -4595,9 +5091,9 @@ static void UpdatePick(void)
     }
     else if (g_pick.slot >= 0)
     {
-        // Held, DIMMED, for a moment. Dimming rather than blanking for the same
-        // reason the energy readout dims when it is held: a display that
-        // silently stops is indistinguishable from one that is stuck.
+        // Held, DIMMED, for a moment. A picked line can briefly leave the
+        // crosshair between frames; retaining it makes that transition readable
+        // instead of flashing the tag in and out.
         g_pick.holdFor -= dt;
         g_pick.dim = true;
         const WrRun *run = WrRunAt(g_pick.slot);
@@ -4652,7 +5148,7 @@ static void EmitPickPlate(ImDrawList *dl)
     unsigned int col = WithAlpha(WrRunColour(run), fade);
 
     ImVec2 at;
-    bool onScreen = Project(g_pick.pos, &at);
+    bool onScreen = Project(LineDisplayPos(g_pick.pos), &at);
 
     if (g_render.pickRing && onScreen)
     {
@@ -4917,6 +5413,8 @@ static void EmitPickPlate(ImDrawList *dl)
 
 void WrRenderWorld(void)
 {
+    for (int i = 0; i < WR_HUD_OBJECT_COUNT; i++)
+        g_hudRect[i].valid = false;
     g_statSegments = 0;
     g_statPoints = 0;
     g_statBatches = 0;
@@ -4940,9 +5438,9 @@ void WrRenderWorld(void)
     // anything draws, because every colour below reads what this writes.
     WrRenderRefreshScales();
 
-    // Anchor to where the reference run's RUN starts, once, so that its clock
-    // and ours start at the same place -- see wr_timer.h. Only ever taken when
-    // nothing has anchored yet, so a manual anchor is never overwritten.
+    // Anchor the ENERGY readout where the reference run starts. The clock is
+    // independent and comes from Momentum's timer. Only ever taken when nothing
+    // has anchored yet, so a manual anchor is never overwritten.
     //
     // points[startIndex], not points[0]. The first recorded point is roughly
     // three quarters of a second of walking into the start zone earlier, so

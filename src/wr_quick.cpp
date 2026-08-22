@@ -200,13 +200,12 @@ static int __cdecl LegOrder(const void *a, const void *b)
 
 // The gamemode of a board we already hold for this map, or 0.
 //
-// THE STRONGEST SIGNAL THERE IS, and it costs one directory listing with no file
-// opened, because the filename carries it:
+// A useful signal for names that do not identify one discipline, and it costs
+// one directory listing with no file opened, because the filename carries it:
 // boards\<map>_g<mode>_t<type><num>.tsv. It is not a guess and not a preference
 // -- it is the mode somebody already fetched this map in, from the Board tab or
-// from this page, and it is right by construction. It is what makes
-// bhop_telehop_theory resolve to bhop without anything having to know that bhop_
-// means anything.
+// from this page. A conventional map prefix wins over it: an old accidental
+// surf cache beside bhop_hades must not redefine that map's default discipline.
 //
 // The main track wins over a stage when both are cached, since that is the leg
 // this page opens on; a lower mode number breaks any remaining tie, so the answer
@@ -260,9 +259,9 @@ static void ResolveMode(void)
 {
     int mode = g_modePicked;
     if (mode < 1)
-        mode = ModeFromCache();
-    if (mode < 1)
         mode = WrQuickGamemodeGuess(g_map);
+    if (mode < 1)
+        mode = ModeFromCache();
     if (mode < 1 || mode > WR_GAMEMODE_COUNT)
         mode = g_quick.gamemode;
     if (mode < 1 || mode > WR_GAMEMODE_COUNT)
@@ -1539,6 +1538,15 @@ static void DrawColourRow(void)
            "the gap between them -- which would leave both of them in a fraction "
            "of it. The key on screen says so when it is happening.\n\n"
            "Turning it off puts your own sliders back exactly as they were.");
+
+    ImGui::SetNextItemWidth(220.0f);
+    ImGui::SliderFloat("line height", &g_render.lineHeightOffset,
+                       -128.0f, 128.0f, "%+.0f u");
+    ImGui::SameLine();
+    Marker("Raises or lowers every drawn path without changing its physics or "
+           "real position. Runs are recorded at the player's feet: 0 is feet "
+           "level, +28 is roughly crouched eye level and +64 is standing eye "
+           "level.");
 }
 
 // The one recovery this page offers for a thing that is not about runs at all.
@@ -1640,9 +1648,10 @@ void WrQuickDraw(void)
            "per gamemode, and nearly every map has a board in nearly every mode "
            "with nothing on it -- so asking the wrong one comes back empty and "
            "looks exactly like a map nobody has run.\n\n"
-           "It is worked out for you: from a board you already fetched for this "
-           "map, then from the map's name, then from the setting. Changing it "
-           "here is remembered for this map.");
+           "It is worked out for you: a remembered manual choice first, then "
+           "the map-name convention, then an existing cache for ambiguous map "
+           "families, and finally the fallback setting. Changing it here is "
+           "remembered for this map.");
 
     // --- consent ------------------------------------------------------------
     if (!g_quick.network)
@@ -1802,7 +1811,7 @@ void WrQuickDraw(void)
         if (g_note[0])        rows += 1.0f;
         if (g_extraOn > 0)    rows += 1.0f;
         rows += 0.6f;                               // the "Colour" separator
-        rows += 3.0f;                               // two radio rows and the tick
+        rows += 4.0f;                    // two radio rows, scale and line height
         rows += 1.0f;                               // and DrawScanRow's button
 
         // Count every widget below the table, without exception. The last

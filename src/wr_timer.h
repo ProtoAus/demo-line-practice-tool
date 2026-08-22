@@ -1,18 +1,12 @@
 // wr_timer.h  --  how long you have taken, and how that compares.
 //
-// WrLines does not read the game's run timer. It could -- another memory scan --
-// but it does not need to: it already knows where you are every frame, and the
-// anchor (wr_energy.h) gives a place to start counting from. So this is our own
-// clock, started when you leave the anchor.
+// WrLines reads Momentum's networked primary timer. The clock starts only when
+// the game's TimerState becomes RUNNING and uses the game's own run-time value;
+// there is deliberately no movement/anchor stopwatch fallback.
 //
-// WHY THE ANCHOR DEFAULTS TO THE REFERENCE RUN'S FIRST POINT
-//
-// A .wrpath stores a time per point, measured from that run's own first sample.
-// Comparing your elapsed time against theirs is only meaningful if both clocks
-// start in the same place -- so by default the anchor IS their first point, and
-// then their t = 0 and your t = 0 coincide by construction. Anchor somewhere
-// else and the comparison silently acquires an offset, which is why the panel
-// says which anchor is in use rather than just showing a number.
+// The energy anchor and fitted start zone do not control this clock. They still
+// anchor the energy budget and split live recordings into attempts, but timing
+// comes only from Momentum's timer entity.
 //
 // SAVE-LOCS
 //
@@ -20,7 +14,9 @@
 // savedlocs.txt and is "-1" in every one of the 3213 entries on this machine.
 // So loading a save-loc would otherwise leave this clock reading whatever it
 // happened to say. wr_savelocs.h keeps our own note of the elapsed time at each
-// save-loc, and on a teleport into one this clock is set back to it.
+// save-loc. A rewrite of the game's file supplies a load event and its `cur`
+// field identifies the exact cps slot, including duplicate positions; the
+// displayed practice clock then resumes from our stored value.
 
 #ifndef WR_TIMER_H
 #define WR_TIMER_H
@@ -37,13 +33,17 @@ void WrTimerTick(const Vec3 &cam, float dt);
 bool WrTimerRunning(void);
 float WrTimerElapsed(void);
 
-// Force the clock, for a save-loc load or a manual set.
+// The current game's interval_per_tick, read alongside Momentum's timer. The
+// physics HUD uses this rather than borrowing the nearest downloaded run's
+// tickrate. Returns Momentum surf's usual 0.015 while the timer entity is not
+// available, which is also the historical fallback everywhere in WrLines.
+float WrTimerTickInterval(void);
+
+// Apply a stored save-loc time as an offset from Momentum's live run time.
 void WrTimerSet(float seconds, const char *why);
 
-// Run the clock without an anchor. This exists because "no anchor" used to mean
-// "no clock at all", which silently disabled save-loc timing for anyone who was
-// not chasing a loaded run -- and made practising a map by chaining save-locs
-// impossible, which is the thing people actually want it for.
+// Legacy test seams. The production UI does not expose manual clock controls;
+// a displayed run can only be started by Momentum's own timer.
 void WrTimerStart(void);
 void WrTimerStop(void);
 void WrTimerZero(void);

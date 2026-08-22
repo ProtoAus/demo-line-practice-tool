@@ -1122,7 +1122,7 @@ static void FindEfficiency(WrRun *run)
     //
     // This was WrAirPowerCeiling, which hardcodes airaccel 150 and maxspeed 250,
     // while the live gauge in wr_energy.cpp asks WrAirPowerCeilingEx with
-    // whatever the Energy tab's sliders say. So moving a slider changed the
+    // whatever the HUD settings tab's physics sliders say. So moving a slider changed the
     // gauge and left every drawn line coloured against the old ceiling, and the
     // two quietly disagreed about the same quantity. Same call, same numbers.
     float ceiling = WrAirPowerCeilingEx(g_energy.gravity, run->tickInterval,

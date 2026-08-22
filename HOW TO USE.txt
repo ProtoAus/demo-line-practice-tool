@@ -12,9 +12,9 @@ GETTING STARTED
   1. Start Momentum Mod and load into a map.
   2. Run wrinject.exe.
   3. Press INSERT in game.
-  4. Board tab -> tick "Allow downloading" -> press "Fastest 50" -> tick the
-     rows you want -> "Download". That is the map's real board, and it is where
-     the demos come from. Nothing reaches the network until that box is ticked.
+  4. Open the Board tab. The first visit on a new map reads the fastest 50 on
+     main automatically. Tick the rows you want -> "Download". That is the
+     map's real board, and it is where the demos come from.
   5. Runs tab -> "Extract new demos". Wait. The lines appear when it finishes.
 
 Step 5 also picks up whatever .mtv demos the game had already downloaded by
@@ -156,7 +156,7 @@ IF AN EXTRACTION SEEMS STUCK
 
 A FEW THINGS WORTH FINDING
 
-  - "Colour runs by rank" (Display tab). Violet for the fastest run on each
+  - "Colour runs by rank" (Line settings tab). Violet for the fastest run on each
     leg, then green through red for everyone behind it.
   - Graphs tab. Energy across a whole run, every enabled line at once, your own
     last attempt included -- and it survives failing, so you can look at what
@@ -167,8 +167,22 @@ A FEW THINGS WORTH FINDING
     the most energy air strafing could physically add. It reads over two
     seconds on purpose; a faster one measures noise, and the About and Energy
     tabs show the numbers that decided that.
-  - Save-loc times. The game has a "time" field for save-locs and never fills
-    it in, so this keeps its own. Load a loc and your clock goes back with it.
+  - The strafe bar, above the crosshair. Centre is the ideal turn rate; the
+    fill grows left when you should turn faster and right when you should turn
+    slower, on the same scale as the number and the arrow, so the three can
+    never disagree. HUD settings tab.
+  - The reference strafe bar under it, if a comparison run is loaded. A
+    downloaded run has no view angles in it, but in free air its change of
+    velocity IS what air strafing added -- so the direction it was turning is
+    recoverable. It goes blank on ramps rather than inventing a number there.
+  - "Customize / edit HUD" (HUD settings tab). Drag any of the four HUD objects
+    where you want them, including the ones currently switched off. It snaps to
+    the centre lines and to a 16-pixel inset from each edge, and remembers.
+  - Save-loc times. The clock starts only when Momentum's own timer enters its
+    running state, using the same game-tick value as the stock HUD. Creating a
+    save-loc stores that value in wrlines_data; loading it uses Momentum's exact
+    current save slot and puts the practice clock back there, even when two
+    save-locs share a position.
   - "My friends' runs" on the Board tab, if you would rather chase people you
     actually know.
 
@@ -182,7 +196,14 @@ A NOTE ON FAIR PLAY
   This is an injected DLL. Momentum has no anti-cheat and is in a testing phase,
   and this reads memory rather than writing it -- it sets no cvars, runs no
   console commands, never touches sv_cheats, and writes nothing into the game
-  install except the opt-in copies described above. But injected code may still
+  install except the opt-in copies described above.
+
+  One exception, new in v1.2.0: to put Momentum's OWN run clock on screen
+  instead of a stopwatch guessed from your movement, it calls the client's
+  published read-only lookups to find the timer entity and read two of its
+  networked fields. Those hand back values. Nothing is written, no game state
+  changes, and if anything does not match what it expects the reader switches
+  itself off and the Diagnostics tab says so. But injected code may still
   invalidate a submitted run under the project's own rules. If you care about a
   run counting, do not have this loaded while you set it.
 
@@ -222,8 +243,9 @@ IF YOUR ANTIVIRUS FLAGS THIS
 
 A NOTE ON YOUR DATA
 
-  Nothing leaves your machine unless you press a button that says it will. There
-  is no telemetry, no analytics, and no phone-home of any kind.
+  There is no telemetry, no analytics, and no phone-home of any kind. Opening
+  Board on a new map reads its fastest 50 main-track places; every other
+  network action is still an explicit button press.
 
   Up to v0.5.1 the DLL linked no HTTP client at all and dumpbin proved it in one
   line. From v0.6.0 it does: leaderboards are fetched by the DLL itself rather
@@ -241,9 +263,9 @@ A NOTE ON YOUR DATA
       request that names SteamIDs names your friends', because you pressed a
       button that says it will look them up. GitHub is sent nothing but the
       user agent, which is the version number and this project's address.
-    - It never runs on a timer, at startup, or on a map change. Only from a
-      button. That did not change when the updater arrived in v0.9.5, and
-      there is deliberately no setting to make the check automatic.
+    - It never runs on a timer or at startup. A map change arms the Board tab,
+      but makes no request until you open that tab. Update checks still happen
+      only from their button, with no setting to make them automatic.
 
   From v0.6.1 that is all of it, and from v0.7.0 there is no script left at
   all: the last thing it did was extraction, extraction reads files off your

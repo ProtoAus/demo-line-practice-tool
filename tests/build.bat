@@ -84,7 +84,7 @@ rem table, because both things it checks are interactions BETWEEN those files
 rem rather than properties of any one of them: a restart holding the recorder,
 rem and a save-loc load that does not move the camera far enough to be seen as a
 rem teleport. Neither can be restated in a harness without restating the bug.
-cl /nologo /O2 /EHsc /W3 %DEFS% /I%S% tests\test_live.cpp ^
+cl /nologo /O2 /EHsc /W3 %DEFS% /DWRLINES_TEST /I%S% tests\test_live.cpp ^
    %S%\wr_timer.cpp %S%\wr_savelocs.cpp %S%\wr_path.cpp %S%\wr_start.cpp ^
    %S%\wr_profile.cpp %S%\wr_energy.cpp %S%\wr_log.cpp ^
    /Fe:tests\test_live.exe /Fo:tests\ >nul

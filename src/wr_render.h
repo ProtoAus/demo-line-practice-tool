@@ -38,6 +38,10 @@ struct WrRenderSettings
     float maxDrawDistance;
     float fadeStartFraction;    // fraction of maxDrawDistance where fade begins
     float pixelTolerance;       // screen-space decimation
+    // Visual-only vertical lift for paths and everything attached to them.
+    // Demo points are player origins (feet), so +64 puts a standing run roughly
+    // at eye level. Physics, matching and stored coordinates remain untouched.
+    float lineHeightOffset;
     int pointBudget;            // per run, per frame; 0 disables the cap
 
     // What varies the colour ALONG a line. One of WrLineColour, because these
@@ -134,6 +138,8 @@ struct WrRenderSettings
     float effNoDataAlpha;       // multiplier where there is no reading at all
     bool effColourblind;        // blue/orange instead of red/green
     bool lineKey;               // draw the key on screen for whichever mode is on
+    float legendPosX;           // 0..1 inside the screen-safe layout rectangle
+    float legendPosY;
 
     // Aim at a line and be told whose it is.
     //
@@ -287,6 +293,12 @@ void WrStageBegin(WrStage s);
 void WrStageEnd(WrStage s);
 float WrStageMillis(WrStage s);
 const char *WrStageName(WrStage s);
+
+// The menu's HUD layout editor. It previews all four movable objects, including
+// ones currently switched off, and writes their ordinary persisted positions.
+bool WrHudEditorOpen(void);
+void WrHudEditorSetOpen(bool open);
+void WrHudEditorDraw(void);
 
 // The run the energy readout is comparing you against -- the fastest enabled
 // one whose line is currently within g_energy.compareRadius -- or NULL when

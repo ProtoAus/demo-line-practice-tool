@@ -217,4 +217,43 @@ void WrBoardShutdown(void);
 #define WR_GAMEMODE_COUNT 13
 const char *WrGamemodeName(int mode);   // 1-based; "?" outside the range
 
+// The default leaderboard implied by Momentum's map-name convention. This is
+// shared by the full Board and the Delete-key quick board so selecting a bhop_
+// map cannot inherit the surf mode from whichever map was viewed previously.
+// Zero means the name is genuinely ambiguous: the climb family has three modes
+// and tricksurf has no matching entry in Momentum's public gamemode enum.
+static inline bool WrGamemodeMapHasPrefix(const char *s, const char *prefix)
+{
+    if (!s || !prefix)
+        return false;
+    for (; *prefix; s++, prefix++)
+    {
+        if (!*s)
+            return false;
+        const char a = (*s >= 'A' && *s <= 'Z')
+                     ? (char)(*s - 'A' + 'a') : *s;
+        if (a != *prefix)
+            return false;
+    }
+    return true;
+}
+
+static inline int WrGamemodeFromMapName(const char *map)
+{
+    struct { const char *prefix; int mode; } kByName[] = {
+        { "surf_",    1 },
+        { "bhop_",    2 },
+        { "rj_",      7 },
+        { "sj_",      8 },
+        { "ahop_",    9 },
+        { "conc_",   10 },
+        { "defrag_", 11 },
+        { "df_",     11 },
+    };
+    for (int i = 0; i < (int)(sizeof(kByName) / sizeof(kByName[0])); i++)
+        if (WrGamemodeMapHasPrefix(map, kByName[i].prefix))
+            return kByName[i].mode;
+    return 0;
+}
+
 #endif // WR_BOARD_H

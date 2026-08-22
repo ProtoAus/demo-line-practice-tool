@@ -524,10 +524,8 @@ int main(void)
         // the stored time for as long as you stand there -- and it would seed
         // the energy from that save-loc on a player a fail trigger has just
         // stopped dead, which the teleport branch deliberately refuses to do.
-        // Nudged by hundredths so the camera is not bit-identical -- a still
-        // camera reads as a paused demo and the clock deliberately stops, which
-        // would make this pass for the wrong reason. Still well inside the
-        // one-unit circle, so it is the same save-loc throughout.
+        // Nudged by hundredths to exercise several distinct samples. Still well
+        // inside the one-unit circle, so it is the same save-loc throughout.
         for (int i = 0; i < 10; i++)
         {
             Vec3 c = WrVec(0.02f * (float)i, 0.0f, 64.0f);
